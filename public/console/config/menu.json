@@ -1,0 +1,6 @@
+[
+  {"id": "overview", "title": "运行准备", "icon": "layui-icon layui-icon-console", "type": 1, "openType": "_iframe", "href": "pages/overview.html"},
+  {"id": "browser", "title": "浏览器工作区", "icon": "layui-icon layui-icon-ok-circle", "type": 1, "openType": "_iframe", "href": "pages/browser.html"},
+  {"id": "tasks", "title": "任务中心", "icon": "layui-icon layui-icon-list", "type": 1, "openType": "_iframe", "href": "pages/tasks.html"},
+  {"id": "settings", "title": "设置", "icon": "layui-icon layui-icon-engine", "type": 1, "openType": "_iframe", "href": "pages/settings.html"}
+]

@@ -1,0 +1,89 @@
+diff --git a/data/generated/task-console-20261007/before/vendor/runchance/rcmaker-framework/src/Cli/WindowsRuntime.php b/vendor/runchance/rcmaker-framework/src/Cli/WindowsRuntime.php
+index 022f28a..a7698b3 100644
+--- a/data/generated/task-console-20261007/before/vendor/runchance/rcmaker-framework/src/Cli/WindowsRuntime.php
++++ b/vendor/runchance/rcmaker-framework/src/Cli/WindowsRuntime.php
+@@ -111,6 +111,11 @@ final class WindowsRuntime
+             self::printBanner($processSpecs);
+         }
+ 
++        // Register before starting children, including partial-startup failure cleanup.
++        register_shutdown_function(static function () use (&$resources): void {
++            self::closeResources($resources);
++        });
++
+         foreach ($commands as $command) {
+             $resources[$command['name']] = self::openProcess(
+                 self::childCommand($command['mode'], $command['name'])
+@@ -118,10 +123,26 @@ final class WindowsRuntime
+         }
+         self::applyConsoleTitle();
+ 
++        $restartHistory = [];
++        $restartAfter = [];
++        $commandByName = array_column($commands, null, 'name');
+         fwrite(STDOUT, PHP_EOL);
+         while (true) {
+             sleep(1);
+             foreach ($resources as $name => $resource) {
++                if ($resource === null) {
++                    if (($restartAfter[$name] ?? PHP_INT_MAX) <= time()) {
++                        $command = $commandByName[$name];
++                        try {
++                            $resources[$name] = self::openProcess(self::childCommand($command['mode'], $name));
++                            unset($restartAfter[$name]);
++                        } catch (Throwable $error) {
++                            $restartAfter[$name] = time() + 30;
++                            self::recordChildExit($name, -1, 'restart_failed');
++                        }
++                    }
++                    continue;
++                }
+                 $status = proc_get_status($resource);
+                 if (!empty($status['running'])) {
+                     continue;
+@@ -130,15 +151,42 @@ final class WindowsRuntime
+                 if (isset($monitorProcessNames[$name]) && $exitCode === 0) {
+                     fwrite(STDOUT, $name . " detected file changes, restarting windows workers...\n");
+                     self::restartResources($resources, $commands);
++                    $restartHistory = [];
++                    $restartAfter = [];
+                     continue 2;
+                 }
+-                self::closeResources($resources);
+-                fwrite(STDERR, $name . " stopped unexpectedly.\n");
+-                return 1;
++                // Reap exactly the exited child. Never terminate healthy siblings.
++                proc_close($resource);
++                $resources[$name] = null;
++                $recent = array_values(array_filter($restartHistory[$name] ?? [],
++                    static fn(int $timestamp): bool => $timestamp >= time() - 60));
++                $recent[] = time();
++                $restartHistory[$name] = $recent;
++                $reason = $exitCode === 0 ? 'normal_exit' : 'unexpected_exit';
++                self::recordChildExit($name, $exitCode, $reason);
++                if (count($recent) >= 5) {
++                    fwrite(STDERR, $name . " repeatedly exited; automatic restart paused. Other processes remain running.\n");
++                    unset($restartAfter[$name]);
++                    continue;
++                }
++                $restartAfter[$name] = time() + ($exitCode === 0 ? 0 : min(15, 1 << (count($recent) - 1)));
++                fwrite($exitCode === 0 ? STDOUT : STDERR,
++                    $name . ($exitCode === 0 ? " exited normally" : " stopped unexpectedly")
++                    . " (exit=" . $exitCode . "); restarting only this child.\n");
+             }
+         }
+     }
+ 
++    /** Persist structural exit evidence without request bodies, credentials or process arguments. */
++    private static function recordChildExit(string $name, int $exitCode, string $reason): void
++    {
++        $directory = runtime_path() . DIRECTORY_SEPARATOR . 'logs';
++        if (!is_dir($directory)) @mkdir($directory, 0777, true);
++        $line = json_encode(['time'=>date('c'), 'process'=>$name, 'exit_code'=>$exitCode,
++            'reason'=>$reason], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
++        @file_put_contents($directory . DIRECTORY_SEPARATOR . 'windows-supervisor.log', $line . PHP_EOL, FILE_APPEND | LOCK_EX);
++    }
++
+     /**
+      * Starts the main RCMaker APP in one Workerman child.
+      */

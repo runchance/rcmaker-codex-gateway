@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>任务与时间线 · RCMAKER AI</title>
+    <link rel="stylesheet" href="../component/pear/css/pear.css">
+    <link rel="stylesheet" href="../assets/gateway.css">
+</head>
+<body class="gateway-page task-page">
+    <header class="page-heading">
+        <div>
+            <div class="eyebrow">DURABLE TASKS</div>
+            <h1>任务中心</h1>
+            <p class="muted">查看 Codex 对话的任务状态、网页端交互和执行时间线；历史记录在 ChatGPT 页面离线时也能读取。</p>
+        </div>
+        <div class="actions">
+            <button id="clear-idle-tasks" type="button" class="layui-btn layui-btn-danger">清除所有非工作任务</button>
+            <button id="refresh" type="button" class="layui-btn layui-btn-primary"><i class="layui-icon layui-icon-refresh"></i> 刷新</button>
+        </div>
+    </header>
+
+    <div id="error" class="notice error" role="alert" hidden></div>
+    <div class="task-storage-bar"><span id="task-storage-size">正在读取任务数据库占用…</span><span id="task-cleanup-progress" role="status"></span></div>
+    <div id="unknown-notice" class="notice warning" hidden>有任务的执行结果无法自动确认。系统不会自动重发，请打开任务时间线核对，确认不再需要后可取消任务。</div>
+
+    <section class="metrics task-metrics" aria-label="任务概览">
+        <div class="metric"><div class="metric-label">持久任务</div><div id="metric-total" class="metric-value">0</div><div class="help">SQLite 中的任务总数</div></div>
+        <div class="metric"><div class="metric-label">正在执行 / 可继续</div><div id="metric-active" class="metric-value">0</div><div class="help">任务可继续复用自己的页面</div></div>
+        <div class="metric"><div class="metric-label">需要确认</div><div id="metric-attention" class="metric-value">0</div><div class="help">未知结果不会自动重发</div></div>
+    </section>
+
+    <section class="panel" id="task-list-panel">
+        <div class="panel-title">
+            <div><h2>任务列表</h2><p class="muted task-panel-help">按状态查看对话；后台每 2 秒跟随，切到其他页面时自动暂停。</p></div>
+            <span id="follow-status" class="badge good">自动跟随</span>
+        </div>
+        <div class="layui-tab layui-tab-brief task-status-tabs" lay-filter="task-status-tabs">
+            <ul class="layui-tab-title">
+                <li class="layui-this">可继续 <span id="tab-count-active" class="task-tab-count">0</span></li>
+                <li>需要确认 <span id="tab-count-needs_attention" class="task-tab-count">0</span></li>
+                <li>已完成 <span id="tab-count-completed" class="task-tab-count">0</span></li>
+                <li>已取消 <span id="tab-count-cancelled" class="task-tab-count">0</span></li>
+            </ul>
+        </div>
+        <div class="task-table-wrap">
+            <table class="layui-table task-table" aria-label="任务列表">
+                <thead><tr><th>任务</th><th>当前阶段</th><th>页面</th><th>更新时间</th><th>操作</th></tr></thead>
+                <tbody id="task-list"></tbody>
+            </table>
+        </div>
+        <div id="task-empty" class="task-empty" hidden>还没有可继续的任务。</div>
+        <div id="task-pagination" class="task-pagination" aria-label="任务分页"></div>
+    </section>
+
+    <script src="../assets/i18n-catalog.js"></script>
+    <script src="../assets/i18n.js"></script>
+    <script src="../component/layui/layui.js"></script>
+    <script src="../assets/gateway.js"></script>
+    <script src="../assets/tasks.js"></script>
+</body>
+</html>

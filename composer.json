@@ -1,0 +1,39 @@
+{
+  "name": "runchance/rcmaker",
+  "description": "RCMAKER AI Gateway: ChatGPT Web model backends for native local Codex development tasks.",
+  "keywords": [
+    "codex",
+    "chatgpt",
+    "mcp",
+    "gateway",
+    "rcmaker"
+  ],
+  "homepage": "http://rcmaker.runchance.com",
+  "license": "Apache-2.0",
+  "authors": [
+    {
+      "name": "wobless",
+      "email": "wobless@runchance.com",
+      "homepage": "https://github.com/runchance",
+      "role": "Developer"
+    }
+  ],
+  "type": "project",
+  "require": {
+    "php": ">=8.1",
+    "runchance/rcmaker-framework": "^3.0"
+  },
+  "suggest": {
+    "ext-event": "For better performance. "
+  },
+  "scripts": {
+    "post-install-cmd": "@php support/process/apply-framework-patch.php",
+    "post-update-cmd": "@php support/process/apply-framework-patch.php"
+  },
+  "autoload": {
+    "psr-4": {
+      "app\\": "apps/",
+      "support\\": "support/"
+    }
+  }
+}

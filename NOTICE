@@ -1,0 +1,19 @@
+RCMAKER AI Gateway
+Copyright 2026 RCMAKER AI Gateway contributors.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This application contains modifications to the RCMaker application scaffold
+and uses the RCMaker framework by runchance / wobless. Original attribution
+and dependency license notices are retained.
+
+Transport compatibility and prompt/tool contract work references
+codex-chatgpt-web, Copyright (c) 2026 codex-chatgpt-web contributors,
+licensed under the MIT License. Its applicable notice is reproduced in
+THIRD_PARTY_NOTICES. This acknowledgement does not imply endorsement.
+
+Pear Admin, Layui, tiktoken resources and Composer dependencies retain their
+respective licenses. See THIRD_PARTY_NOTICES and the bundled license files.
+
+ChatGPT, Codex and Chrome are names of their respective owners. This project
+is independent and is not an official OpenAI or Google product.

@@ -1,0 +1,6 @@
+{
+    "package": "runchance/rcmaker-framework",
+    "file": "src/Cli/WindowsRuntime.php",
+    "original_normalized_sha256": "7ca74162c16d6db0294d8a92355198d9390508285089cba526fe444353be71ca",
+    "patched_normalized_sha256": "5c9eeecd2c53bd5021e1203cf4cf117d1e6e5a76235375061051b1c6e34781f5"
+}

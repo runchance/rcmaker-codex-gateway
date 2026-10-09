@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>浏览器工作区 · RCMAKER AI</title>
+<link rel="stylesheet" href="../component/pear/css/pear.css">
+<link rel="stylesheet" href="../assets/gateway.css">
+</head>
+<body class="gateway-page">
+<header class="page-heading">
+<div><div class="eyebrow">AUTOMATION VIEW</div><h1>浏览器工作区</h1><p class="muted">查看 Codex 的 ChatGPT 网页自动化；正在工作的页面排在前面。</p></div>
+<button id="refresh" type="button" class="layui-btn layui-btn-primary"><i class="layui-icon layui-icon-refresh"></i> 刷新</button>
+</header>
+<div id="error" class="notice error" role="alert" hidden></div>
+<section id="automation-panel" class="panel browser-workbench automation-workbench" hidden>
+<div class="panel-title"><div><h2>Codex 网页自动化实况</h2><p class="muted">最多保留五个任务页面；非活动页面仍可查看或关闭，关闭后任务历史会保留。</p></div><span id="automation-status" class="badge good">自动运行中</span></div>
+<div id="automation-tabs" class="browser-tabs" role="tablist" aria-label="ChatGPT 任务页面"></div>
+<div class="browser-surface-wrap browser-surface-readonly"><img id="automation-surface" alt="Codex 正在自动操作的 ChatGPT 页面" draggable="false" hidden><div id="automation-empty" class="browser-surface-empty"><i class="layui-icon layui-icon-loading layui-anim layui-anim-rotate layui-anim-loop"></i><strong>任务页面正在准备</strong><span>页面画面出现后会持续自动更新。</span></div></div>
+<div class="browser-status-line"><span id="automation-task" class="badge">任务</span><span id="automation-title" class="muted">正在读取任务页面…</span></div>
+</section>
+<section id="automation-idle" class="panel"><div class="panel-title"><h2>网页自动化</h2><span class="badge">当前空闲</span></div><p class="muted">Codex 发起需要 ChatGPT Web 的任务后，这里会自动出现真实执行画面。无需手动打开页面或维护标签。</p></section>
+<script src="../assets/i18n-catalog.js"></script>
+    <script src="../assets/i18n.js"></script>
+    <script src="../component/layui/layui.js"></script>
+<script src="../assets/gateway.js"></script>
+<script src="../assets/browser.js"></script>
+</body>
+</html>

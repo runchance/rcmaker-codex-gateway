@@ -1,0 +1,154 @@
+name: Release encrypted binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag, for example v1.0.0 or v1.1.0-beta.1'
+        required: true
+        type: string
+      publish:
+        description: 'Publish the Release after every platform passes; disable for a build rehearsal'
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rcmaker-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate tag and generate bilingual notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.notes.outputs.tag }}
+      commit: ${{ steps.notes.outputs.commit }}
+      prerelease: ${{ steps.notes.outputs.prerelease }}
+    steps:
+      - name: Check out the exact release tag and history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Generate release identity and Chinese / English notes
+        id: notes
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_OUTPUT_DIR: ${{ runner.temp }}/rcmaker-release-notes
+        run: node .github/scripts/release-notes.cjs
+      - name: Preserve release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-release-notes
+          path: ${{ runner.temp }}/rcmaker-release-notes/
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: PHP 8.5 encrypted / ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: prepare
+    timeout-minutes: 35
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            arch: x86_64
+            runner: windows-2025
+          - platform: linux
+            arch: x86_64
+            runner: ubuntu-24.04
+          - platform: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos
+            arch: x86_64
+            runner: macos-15-intel
+          - platform: macos
+            arch: aarch64
+            runner: macos-15
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      TARGET_PLATFORM: ${{ matrix.platform }}
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up PHP 8.5 and Composer
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: '8.5'
+          extensions: curl, openssl, zip, mbstring, pdo_sqlite, sqlite3, sockets, sodium
+          coverage: none
+          ini-values: phar.readonly=0, memory_limit=512M
+          tools: composer:v2
+      - name: Install locked production dependencies and validated framework repair
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+      - name: Build, encrypt, verify payload and package
+        env:
+          RELEASE_WORK_DIR: ${{ runner.temp }}/rcmaker-release-work
+          RELEASE_OUTPUT_DIR: ${{ runner.temp }}/rcmaker-release-assets
+        run: php -d phar.readonly=0 .github/scripts/build-release.php
+      - name: Execute encrypted package metadata on its native architecture
+        env:
+          RELEASE_OUTPUT_DIR: ${{ runner.temp }}/rcmaker-release-assets
+          RELEASE_SMOKE_REPORT: ${{ runner.temp }}/rcmaker-release-smoke.json
+        run: node .github/scripts/smoke-binary.cjs
+      - name: Preserve verified binaries and archives
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-release-target-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/rcmaker-release-assets/
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Verify all assets and publish Release
+    needs: [prepare, build]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the validated publishing scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Collect all platform assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: ci-release-target-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/rcmaker-release-assets
+      - name: Collect bilingual release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ci-release-notes
+          path: ${{ runner.temp }}/rcmaker-release-notes
+      - name: Upload to a draft, verify completeness, then publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          RELEASE_OUTPUT_DIR: ${{ runner.temp }}/rcmaker-release-assets
+          RELEASE_NOTES_DIR: ${{ runner.temp }}/rcmaker-release-notes
+        run: node .github/scripts/publish-release.cjs

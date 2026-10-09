@@ -1,0 +1,38 @@
+<?php
+/** The single-machine appliance owns these groups; legacy example .env listeners remain inactive. */
+return [
+    'start_app' => false,
+    'cli_frame' => 'workerman',
+    'cli_log' => false,
+    'cli_banner' => true,
+    'default_timezone' => rcEnv('app.default_timezone', 'Asia/Shanghai'),
+    'count' => false,
+    'debug' => false,
+    'error_types' => E_ALL & ~E_NOTICE & ~E_DEPRECATED,
+    'error_msg' => '本地服务暂不可用，请检查数据目录与服务状态。',
+    'route' => false,
+    'with_custom_route' => true,
+    'index' => ['index', 'index'],
+    'default_app' => 'gateway',
+    'app_name' => 'app',
+    'app' => [
+        'gateway' => [
+            'bind_process' => 'RC_GATEWAY_API',
+            'enable_static_file' => false,
+            'route' => false,
+            'with_custom_route' => true,
+        ],
+        'console' => [
+            'bind_process' => 'RC_GATEWAY_CONSOLE',
+            'document_root' => 'console',
+            'index_default' => 'index.html',
+            'enable_static_file' => true,
+            'enable_static_php' => false,
+            'enable_static_gzip' => true,
+            'enable_static_preload' => true,
+            'static_preload_extensions' => ['html', 'css', 'js', 'json', 'svg', 'png', 'ico', 'woff', 'woff2', 'ttf'],
+            'static_preload_time_limit' => 5.0,
+            'static_only' => true,
+        ],
+    ],
+];

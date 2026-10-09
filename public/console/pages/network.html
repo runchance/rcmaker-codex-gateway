@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>网络与代理 · RCMAKER AI</title>
+    <link rel="stylesheet" href="../component/pear/css/pear.css">
+    <link rel="stylesheet" href="../assets/gateway.css">
+</head>
+<body class="gateway-page">
+    <header class="page-heading">
+        <div><div class="eyebrow">CONNECTION SETTINGS</div><h1>网络与代理</h1><p class="muted">选择本应用如何访问外网。这里的设置只影响 RCMAKER，不修改系统代理。</p></div>
+        <button id="reload" type="button" class="layui-btn layui-btn-primary">重新载入设置</button>
+    </header>
+    <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
+    <section class="panel">
+        <div class="panel-title"><h2>连接方式</h2><span id="dirty" class="badge">正在载入</span></div>
+        <form id="network-form" class="layui-form" lay-filter="network" autocomplete="off" novalidate>
+            <div class="field">
+                <label>网络模式</label>
+                <input type="radio" name="mode" value="manual" title="使用代理" lay-filter="mode" checked>
+                <input type="radio" name="mode" value="direct" title="不使用代理（直连）" lay-filter="mode">
+                <p class="help">代理失败不会静默改成直连，避免任务在你不知情的情况下走错网络。</p>
+            </div>
+            <div id="proxy-fields">
+                <div class="field"><label for="protocol">代理协议</label><select id="protocol" name="protocol" lay-filter="protocol"><option value="http">HTTP CONNECT</option></select><p class="help">这里的 HTTP 指代理监听协议，检测目标仍使用 HTTPS。SOCKS5、HTTPS 代理和系统代理模式尚未开放。</p></div>
+                <div class="form-grid">
+                    <div class="field"><label for="host">代理主机</label><input id="host" name="host" class="layui-input" maxlength="253" placeholder="例如 127.0.0.1" spellcheck="false"><p class="help">只填主机名或 IP，不包含 http://、路径和用户名。</p></div>
+                    <div class="field"><label for="port">端口</label><input id="port" name="port" class="layui-input" inputmode="numeric" maxlength="5" placeholder="1–65535"></div>
+                </div>
+                <div class="field"><label>代理认证</label><input id="authentication" type="checkbox" name="authentication" lay-skin="switch" lay-text="启用|关闭" lay-filter="authentication"><p class="help">普通本地代理通常无需认证。</p></div>
+                <div id="auth-fields" hidden>
+                    <div class="form-grid">
+                        <div class="field"><label for="username">用户名</label><input id="username" name="username" class="layui-input" maxlength="128" autocomplete="off"></div>
+                        <div class="field"><label for="password-action">密码操作</label><select id="password-action" name="password_action" lay-filter="password-action"><option value="set">输入新密码</option><option value="keep">保留已保存密码</option></select></div>
+                    </div>
+                    <div id="password-field" class="field"><label for="password">代理密码</label><input id="password" name="password" type="password" class="layui-input" maxlength="256" autocomplete="new-password"><p id="credential-help" class="help">使用当前 Windows 用户的系统密码保护；保存后不回显密码。</p></div>
+                </div>
+            </div>
+            <div id="direct-help" class="notice" hidden>不使用代理时，RCMAKER 会直接访问外网。以后需要代理，可以随时回来修改。</div>
+            <div class="actions"><button id="save" type="submit" class="layui-btn" lay-submit lay-filter="save-network">保存并使用</button><button id="continue-setup" type="button" class="layui-btn layui-btn-primary" hidden>继续准备运行组件</button><span class="help">保存后立即应用到本应用；不会修改 Windows/macOS/Linux 的系统代理。</span></div>
+        </form>
+    </section>
+    <details class="panel advanced-panel">
+        <summary>高级网络诊断与恢复</summary>
+        <p class="muted">正常使用不需要展开。网络异常时可在这里查看当前应用版本、检测连接或恢复旧配置。</p>
+    <section>
+        <h2>当前配置</h2>
+        <dl class="state-grid">
+            <div><dt>已保存</dt><dd id="saved-version">正在读取</dd></div>
+            <div><dt>PHP 当前应用</dt><dd id="active-version">正在读取</dd></div>
+        </dl>
+        <div id="consumers" class="consumer-list"></div>
+        <div class="actions"><button id="apply" type="button" class="layui-btn layui-btn-primary" disabled>应用已保存配置</button></div>
+        <p class="help">正常保存会自动应用。这里保留“应用已保存配置”用于恢复历史版本或排障。</p>
+    </section>
+    <section class="layui-form" lay-filter="diagnostic">
+        <h2>连接检测</h2>
+        <div class="form-grid">
+            <div class="field"><label for="test-source">检测版本</label><select id="test-source" lay-filter="test-source"><option value="saved">已保存配置</option><option value="active">PHP 已应用配置</option></select></div>
+            <div class="field"><label for="target">检测目标</label><select id="target" lay-filter="target"></select></div>
+        </div>
+        <button id="test" type="button" class="layui-btn layui-btn-primary" disabled>开始检测</button>
+        <div id="test-result" class="notice" role="status" aria-live="polite">尚未检测。检测只请求目标响应，不发送模型提示词。</div>
+        <div id="test-detail" class="technical muted"></div>
+        <p id="probe-readiness" class="help"></p>
+    </section>
+    <section class="layui-form" lay-filter="history">
+        <h2>恢复之前的配置</h2>
+        <p class="muted">恢复会生成一个新的已保存版本；检查后再应用。此处展示最近 20 个版本。</p>
+        <div class="actions"><select id="restore-source" lay-filter="restore-source"><option value="">尚无可恢复配置</option></select><button id="restore" type="button" class="layui-btn layui-btn-primary" disabled>恢复所选版本</button></div>
+        <table id="history-table" lay-filter="history-table"></table>
+    </section>
+    </details>
+    <script src="../assets/i18n-catalog.js"></script>
+    <script src="../assets/i18n.js"></script>
+    <script src="../component/layui/layui.js"></script>
+    <script src="../assets/gateway.js"></script>
+    <script src="../assets/network.js"></script>
+</body>
+</html>

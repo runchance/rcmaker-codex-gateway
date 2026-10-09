@@ -1,0 +1,53 @@
+name: Release automation checks
+
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+      - 'config/release.php'
+      - 'config/banner.php'
+      - 'index.php'
+      - 'composer.json'
+      - 'composer.lock'
+  push:
+    branches: ['**']
+    paths:
+      - '.github/**'
+      - 'config/release.php'
+      - 'config/banner.php'
+      - 'index.php'
+      - 'composer.json'
+      - 'composer.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up PHP 8.5
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: '8.5'
+          extensions: curl, openssl, zip, mbstring, pdo_sqlite, sqlite3, sockets, sodium
+          tools: composer:v2
+          coverage: none
+      - name: Install locked dependencies and validated framework repair
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress
+      - name: Check compiler filtering and archives
+        run: php -d phar.readonly=0 .github/tests/build-release-contract.php
+      - name: Check side-effect-free version queries and banner
+        run: php .github/tests/release-identity.php
+      - name: Check encrypted binary metadata validation
+        run: node .github/tests/smoke-binary.cjs
+      - name: Check bilingual notes in a new Git repository
+        run: node .github/tests/release-notes.cjs
+      - name: Check draft publication and safe reruns
+        run: node .github/tests/publish-release.cjs

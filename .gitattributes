@@ -1,0 +1,26 @@
+# Keep planning snapshots and the dependency lock stable across checkout settings.
+/composer.lock text eol=lf
+/data/docs/*.md text eol=lf
+/data/docs/*.json text eol=lf
+/data/docs/acceptance/*.md text eol=lf
+/data/docs/acceptance/*.json text eol=lf
+/data/scripts/*.php text eol=lf
+/data/tests/**/*.php text eol=lf
+/data/tests/**/*.json text eol=lf
+
+# The archived original uses intentional Markdown hard-break spaces.
+/data/docs/gateway-initial-design-v0.1.md whitespace=-blank-at-eol
+
+# Gateway source and shipped text assets have reproducible checkout line endings.
+/apps/gateway/**/*.php text eol=lf
+/support/middleware/Gateway*.php text eol=lf
+/support/process/GatewayProbe.php text eol=lf
+/data/tests/gateway/*.py text eol=lf
+/public/console/** text=auto eol=lf
+/windows.bat text eol=crlf
+
+# Preserve upstream template whitespace without exempting application-owned assets.
+/public/console/component/** whitespace=-blank-at-eol
+/public/console/admin/** whitespace=-blank-at-eol
+/public/console/component/pear/font/iconfont.css whitespace=-blank-at-eol,-blank-at-eof
+/public/console/component/pear/module/extends/toast.js whitespace=-blank-at-eol,-space-before-tab
