@@ -103,6 +103,10 @@ class GitHubFixture {
         this.redirectDownloads = false;
         this.evilUpload = false;
         this.corruptUploadDigest = false;
+        this.rejectExplicitTarget = null;
+        this.failCreate = null;
+        this.failRecovery = null;
+        this.creationAttempted = false;
     }
 
     /** Produce public API release metadata, intentionally omitting inline assets. */
@@ -130,6 +134,13 @@ class GitHubFixture {
 
     /** Return JSON without sharing mutable fixture objects with the publisher. */
     response(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } }); }
+
+    /** Return an API error fixture, including untrusted JSON/text and a request identifier. */
+    failure({ status, body, requestId = 'fixture-request-id', contentType = 'application/json' }) {
+        return new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+            status, headers: { 'content-type': contentType, 'x-github-request-id': requestId },
+        });
+    }
 
     /** Route the exact expected API requests and enforce credential boundaries. */
     async fetch(urlString, options = {}) {
@@ -159,6 +170,9 @@ class GitHubFixture {
         }
         assert.ok(urlString.startsWith(ROOT + '/'), `Unexpected API endpoint ${urlString}`);
         const endpoint = url.pathname.slice(new URL(ROOT).pathname.length);
+        if (method === 'GET' && endpoint.startsWith('/releases') && this.creationAttempted && this.failRecovery) {
+            return this.failure(this.failRecovery);
+        }
         if (endpoint === `/git/ref/tags/${encodeURIComponent(this.tag)}`) {
             this.tagReads++;
             if (this.tagMovesBeforePublish && this.tagReads >= 2) this.remoteCommit = 'b'.repeat(40);
@@ -170,6 +184,11 @@ class GitHubFixture {
         if (endpoint === '/releases' && method === 'GET') return this.response(this.release ? [this.release] : []);
         if (endpoint === '/releases' && method === 'POST') {
             assert.equal(JSON.parse(options.body).draft, true, 'Release must be created as a draft');
+            this.creationAttempted = true;
+            if (this.rejectExplicitTarget && Object.hasOwn(JSON.parse(options.body), 'target_commitish')) {
+                return this.failure({ status: this.rejectExplicitTarget, body: { message: 'Resource not accessible by integration: target modifies workflows' } });
+            }
+            if (this.failCreate) return this.failure(this.failCreate);
             this.release = this.releaseValue(true);
             if (this.evilUpload) this.release.upload_url = 'https://attacker.example/repos/example/gateway/releases/1/assets{?name,label}';
             if (this.ambiguousCreate) { this.ambiguousCreate = false; throw new Error('lost create response'); }
@@ -194,6 +213,9 @@ class GitHubFixture {
             assert.equal(this.assets.length, 14, 'Publishing requires all fourteen assets');
             const body = JSON.parse(options.body);
             assert.equal(body.draft, false);
+            if (this.rejectExplicitTarget && Object.hasOwn(body, 'target_commitish')) {
+                return this.failure({ status: this.rejectExplicitTarget, body: { message: 'Resource not accessible by integration: target modifies workflows' } });
+            }
             if (this.failPublish) return this.response({}, 502);
             this.release = { ...this.release, ...body };
             if (this.ambiguousPublish) { this.ambiguousPublish = false; throw new Error('lost publish response'); }
@@ -207,8 +229,12 @@ class GitHubFixture {
 async function execute(fixture, server) {
     const logs = [];
     const delays = [];
-    const result = await run({ env: fixture.env, fetch: server.fetch.bind(server), sleep: async milliseconds => delays.push(milliseconds), log: message => logs.push(message) });
-    assert.ok(logs.every(message => !message.includes(fixture.env.GITHUB_TOKEN)));
+    let result;
+    try {
+        result = await run({ env: fixture.env, fetch: server.fetch.bind(server), sleep: async milliseconds => delays.push(milliseconds), log: message => logs.push(message) });
+    } finally {
+        assert.ok(logs.every(message => !message.includes(fixture.env.GITHUB_TOKEN)));
+    }
     return { result, logs, delays };
 }
 
@@ -401,6 +427,116 @@ test('ambiguous create, upload and publication responses are reconciled without 
     assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 14);
     assert.equal(server.mutations('PATCH').length, 1);
     assert.equal(server.release.draft, false);
+});
+
+test('existing verified tags publish without asking the token to target an older workflow commit', async t => {
+    for (const status of [403, 404]) {
+        const local = await fixture(t);
+        const server = new GitHubFixture({ annotated: true });
+        server.rejectExplicitTarget = status;
+        const { result } = await execute(local, server);
+        assert.equal(result.status, 'published');
+        const creation = server.mutations('POST').filter(call => call.url === ROOT + '/releases');
+        const publication = server.mutations('PATCH');
+        assert.equal(creation.length, 1);
+        assert.equal(publication.length, 1);
+        for (const call of [...creation, ...publication]) assert.equal(Object.hasOwn(call.body, 'target_commitish'), false);
+        const createIndex = server.calls.indexOf(creation[0]);
+        const publishIndex = server.calls.indexOf(publication[0]);
+        const tagChecks = server.calls.map((call, index) => ({ call, index }))
+            .filter(({ call }) => call.url === ROOT + `/git/ref/tags/${encodeURIComponent(TAG)}`);
+        assert.ok(tagChecks.some(({ index }) => index < createIndex), 'The real tag commit must be verified before draft creation');
+        assert.ok(tagChecks.some(({ index }) => index > createIndex && index < publishIndex), 'The real tag commit must be verified again before publication');
+    }
+});
+
+test('creation rejection preserves API status, cause and request ID without retrying POST', async t => {
+    for (const [status, message] of [[403, 'Resource not accessible by integration'], [404, 'Not Found'], [422, 'Validation Failed']]) {
+        const local = await fixture(t);
+        const server = new GitHubFixture();
+        server.failCreate = {
+            status, requestId: `create-request-${status}`,
+            body: { message: `${message}\n${local.env.GITHUB_TOKEN}`, errors: [{ resource: 'Release', field: 'tag_name', code: 'custom', message: 'release creation reason' }] },
+        };
+        await assert.rejects(execute(local, server), error => {
+            assert.match(error.message, /Release creation failed and no recoverable draft exists/);
+            assert.match(error.message, /GitHub POST \/releases/);
+            assert.ok(error.message.includes(`HTTP ${status}`));
+            assert.ok(error.message.includes(message));
+            assert.ok(error.message.includes('release creation reason'));
+            assert.ok(error.message.includes(`create-request-${status}`));
+            assert.ok(!error.message.includes(local.env.GITHUB_TOKEN));
+            assert.doesNotMatch(error.message, /[\x00-\x1f\x7f]/);
+            return true;
+        });
+        const createCalls = server.mutations('POST').filter(call => call.url === ROOT + '/releases');
+        assert.equal(createCalls.length, 1);
+        assert.equal(server.mutations('PATCH').length, 0);
+        const afterCreate = server.calls.slice(server.calls.indexOf(createCalls[0]) + 1);
+        assert.ok(afterCreate.length > 0 && afterCreate.every(call => call.method === 'GET'));
+        assert.equal(server.release, null);
+    }
+});
+
+test('failed creation and failed recovery retain both independent API errors', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.failCreate = { status: 403, requestId: 'create-denied-id', body: { message: 'Creation denied' } };
+    server.failRecovery = { status: 503, requestId: 'recovery-unavailable-id', body: { message: 'Recovery lookup unavailable' } };
+    await assert.rejects(execute(local, server), error => {
+        for (const expected of ['HTTP 403', 'Creation denied', 'create-denied-id', 'HTTP 503', 'Recovery lookup unavailable', 'recovery-unavailable-id']) {
+            assert.ok(error.message.includes(expected), `Missing independent failure context: ${expected}`);
+        }
+        assert.ok(!error.message.includes(local.env.GITHUB_TOKEN));
+        return true;
+    });
+    assert.equal(server.mutations('POST').filter(call => call.url === ROOT + '/releases').length, 1);
+    assert.equal(server.mutations('PATCH').length, 0);
+});
+
+test('untrusted error text and request identifiers cannot expose credentials or control characters', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.failCreate = {
+        status: 422, requestId: `diagnostic-${local.env.GITHUB_TOKEN}`,
+        body: { message: `Validation\x00 failed\n${local.env.GITHUB_TOKEN}`, errors: [{ message: `bad\tfield ${local.env.GITHUB_TOKEN}` }] },
+    };
+    await assert.rejects(execute(local, server), error => {
+        assert.match(error.message, /HTTP 422/);
+        assert.ok(error.message.includes('Validation') && error.message.includes('failed'));
+        assert.ok(error.message.includes('diagnostic-'));
+        assert.ok(!error.message.includes(local.env.GITHUB_TOKEN));
+        assert.doesNotMatch(error.message, /[\x00-\x1f\x7f]/);
+        return true;
+    });
+});
+
+test('oversized JSON and non-JSON API failures produce bounded safe diagnostics', async t => {
+    for (const contentType of ['application/json', 'text/html']) {
+        const local = await fixture(t);
+        const server = new GitHubFixture();
+        const untrusted = `${local.env.GITHUB_TOKEN}\x00\r\n` + 'oversized untrusted payload '.repeat(10000);
+        server.failCreate = { status: 422, requestId: 'oversized-response-id', contentType,
+            body: contentType === 'application/json' ? { message: untrusted, errors: [{ message: untrusted }] } : `<html>${untrusted}</html>` };
+        await assert.rejects(execute(local, server), error => {
+            assert.match(error.message, /HTTP 422/);
+            assert.ok(error.message.includes('oversized-response-id'));
+            assert.ok(error.message.length < 4000, 'An API failure must not print an unbounded response body');
+            assert.ok(!error.message.includes(local.env.GITHUB_TOKEN));
+            assert.doesNotMatch(error.message, /[\x00-\x1f\x7f]/);
+            return true;
+        });
+        assert.equal(server.mutations('POST').filter(call => call.url === ROOT + '/releases').length, 1);
+    }
+});
+
+test('old-tag retries load the publisher from the workflow commit while builds stay pinned to the tag', async () => {
+    const workflow = await fsp.readFile(path.join(__dirname, '../workflows/release.yml'), 'utf8');
+    const build = workflow.split(/^  build:\s*$/m)[1].split(/^  publish:\s*$/m)[0];
+    const publish = workflow.split(/^  publish:\s*$/m)[1];
+    assert.match(build, /name: Check out[^\r\n]*[\s\S]*?ref: \$\{\{ needs\.prepare\.outputs\.commit \}\}/);
+    assert.match(publish, /name: Check out[^\r\n]*[\s\S]*?ref: \$\{\{ github\.workflow_sha \}\}/);
+    assert.match(publish, /RELEASE_COMMIT: \$\{\{ needs\.prepare\.outputs\.commit \}\}/);
 });
 
 test('failed publication stays draft and does not blindly repeat update', async t => {

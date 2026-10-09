@@ -24,6 +24,28 @@ function requireThat(condition, message) {
     if (!condition) throw new Error(message);
 }
 
+/** Bound untrusted diagnostics and keep credentials/control characters out of CI logs. */
+function diagnostic(value, token, limit = 1400) {
+    return String(value).split(token).join('[redacted]')
+        .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+/** Read only a small error-body prefix; never buffer an unbounded upstream failure. */
+async function errorBody(response) {
+    const chunks = [];
+    const limit = 16384;
+    let bytes = 0;
+    if (response.body) {
+        for await (const chunk of response.body) {
+            const part = Buffer.from(chunk.subarray(0, limit - bytes));
+            chunks.push(part);
+            bytes += part.length;
+            if (bytes === limit) break;
+        }
+    }
+    return Buffer.concat(chunks).toString('utf8');
+}
+
 /** Parse SemVer tags without numeric rounding; return null for other release tags. */
 function version(tag) {
     const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(tag);
@@ -226,6 +248,32 @@ class GitHub {
         this.base = `${config.apiRoot}/repos/${config.repositoryPath}`;
     }
 
+    /** Preserve API causes/request IDs without logging tokens or arbitrary large responses. */
+    async failure(response, method, endpoint) {
+        let detail = '';
+        try {
+            const text = await errorBody(response);
+            try {
+                const data = JSON.parse(text);
+                const parts = [typeof data?.message === 'string' ? data.message : ''];
+                if (Array.isArray(data?.errors)) {
+                    for (const entry of data.errors.slice(0, 5)) {
+                        if (typeof entry === 'string') parts.push(entry);
+                        else if (entry && typeof entry === 'object') {
+                            parts.push(['resource', 'field', 'code', 'message']
+                                .filter(key => typeof entry[key] === 'string').map(key => entry[key]).join(': '));
+                        }
+                    }
+                }
+                detail = parts.filter(Boolean).join('; ');
+            } catch { detail = text; }
+        } catch { /* The HTTP status/request ID remain useful if reading the body fails. */ }
+        const route = endpoint.startsWith('/') ? endpoint.split('?')[0] : new URL(endpoint).pathname;
+        const cause = diagnostic(detail, this.config.token);
+        const requestId = diagnostic(response.headers.get('x-github-request-id') || '', this.config.token, 192);
+        return new Error(`GitHub ${method} ${diagnostic(route, this.config.token, 240)} failed with HTTP ${response.status}${cause ? ': ' + cause : '.'}${requestId ? ' [request-id: ' + requestId + ']' : ''}`);
+    }
+
     /** Retry safe reads/deletes on bounded rate limits or transient upstream failures. */
     async request(endpoint, { method = 'GET', body, accept = 'application/vnd.github+json', allow404 = false, upload = false, contentType, contentLength } = {}) {
         const url = upload ? new URL(endpoint) : new URL(this.base + endpoint);
@@ -260,7 +308,7 @@ class GitHub {
             }
             if (allow404 && response.status === 404) return null;
             if (accept === 'application/octet-stream' && [301, 302, 303, 307, 308].includes(response.status)) return response;
-            requireThat(response.ok, `GitHub ${method} failed with HTTP ${response.status}.`);
+            if (!response.ok) throw await this.failure(response, method, endpoint);
             return response;
         }
     }
@@ -452,11 +500,16 @@ async function run({ env = process.env, fetch: fetchImpl = globalThis.fetch, sle
     }
     if (!release) {
         try {
-            release = await github.json('/releases', { method: 'POST', body: { tag_name: config.tag, target_commitish: config.commit, name: config.tag, body: local.body, draft: true, prerelease: config.prerelease } });
-        } catch {
+            // verifyTag already proved the existing tag; no target commit (or workflow-write permission) is needed.
+            release = await github.json('/releases', { method: 'POST', body: { tag_name: config.tag, name: config.tag, body: local.body, draft: true, prerelease: config.prerelease } });
+        } catch (createError) {
             // Creation POST is never blindly repeated: an interrupted response can still create a draft.
-            release = await github.findRelease();
-            requireThat(release, 'Release creation failed and no recoverable draft exists.');
+            const cause = diagnostic(createError.message, config.token, 1900);
+            try { release = await github.findRelease(); }
+            catch (recoveryError) {
+                throw new Error(`Release creation failed. ${cause} Recovery check failed. ${diagnostic(recoveryError.message, config.token, 1900)}`);
+            }
+            requireThat(release, `Release creation failed and no recoverable draft exists. ${cause}`);
         }
         if (release.draft === false) {
             await github.verifyPublished(release);
@@ -488,7 +541,7 @@ async function run({ env = process.env, fetch: fetchImpl = globalThis.fetch, sle
     await github.verifyTag();
     const releaseId = github.id(release.id);
     try {
-        release = await github.json(`/releases/${releaseId}`, { method: 'PATCH', body: { tag_name: config.tag, target_commitish: config.commit, name: config.tag, body: local.body, draft: false, prerelease: config.prerelease, make_latest: makeLatest } });
+        release = await github.json(`/releases/${releaseId}`, { method: 'PATCH', body: { tag_name: config.tag, name: config.tag, body: local.body, draft: false, prerelease: config.prerelease, make_latest: makeLatest } });
         requireThat(release.draft === false, 'GitHub did not publish the completed draft.');
     } catch {
         release = await github.json(`/releases/${releaseId}`);
