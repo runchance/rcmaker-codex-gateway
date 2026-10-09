@@ -37,6 +37,8 @@ Do not assume a subscription alone guarantees every feature. When a Tunnel or cu
 
 ### Packaged application
 
+For automatic installation or updates, run the appropriate [latest-Release installer](../README.md#1-start-the-application) from PowerShell (Windows) or Bash (Linux). Reuse the same installation directory when upgrading; set `RCMAKER_INSTALL_DIR` before running the command if it differs from the default. The script verifies SHA-256 and preserves `data/` and `.env`. **Stop the gateway after current tasks finish before updating.**
+
 Put the downloaded executable in a writable folder, such as `D:\Apps\RCMAKER-Gateway`, and **double-click the `.exe` to start it**. No `start` parameter is needed. PowerShell is optional:
 
 ```powershell
@@ -256,6 +258,8 @@ Historical staging uses non-Pro Medium on the selected family; gateway summaries
 ## 8. Upgrade, restore and troubleshoot
 
 ### Upgrade in place
+
+If installed with the README's one-command installer, stop the gateway and run the same installation command again to fetch the latest stable GitHub Release. It does not start the gateway automatically.
 
 1. Let active work and approvals finish. Save your Codex work and stop RCMAKER using your normal method.
 2. Keep a private backup of the existing `.env` and persistent `data` directory. Preserve the old executable for rollback. Do not copy an actively written SQLite file as though it were a consistent full backup.

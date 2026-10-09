@@ -24,6 +24,26 @@ permissions:
   contents: read
 
 jobs:
+  installers:
+    name: Test latest-Release installers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - name: Check out installation scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test Linux initial install, upgrade and invalid checksums
+        if: runner.os == 'Linux'
+        run: python3 .github/tests/install-scripts.py
+      - name: Test Windows initial install, upgrade and invalid checksums
+        if: runner.os == 'Windows'
+        run: python .github/tests/install-scripts.py
+
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

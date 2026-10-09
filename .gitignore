@@ -17,7 +17,7 @@ session_*
 test.php
 .user.ini
 php*
-.env.example
+.env
 composer.lock
 AGENTS.md
 CLAUDE.md

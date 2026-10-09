@@ -60,6 +60,24 @@ flowchart LR
 
 ### 1. 启动应用
 
+**一键安装或更新**，自动获取 [GitHub Releases 最新正式版](https://github.com/runchance/rcmaker-codex-gateway/releases/latest)：
+
+Windows（PowerShell）：
+
+```powershell
+irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
+```
+
+Linux（Bash，支持 x64 / ARM64）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
+```
+
+脚本自动识别平台、下载对应发行包并校验 SHA-256。默认安装到 Windows 的 `%LOCALAPPDATA%\rcmaker-codex-gateway` 或 Linux 的 `~/.local/share/rcmaker-codex-gateway`。安装后可双击 Windows 目录内的 `rcmaker-codex-gateway.exe`，或在 Linux 执行 `~/.local/share/rcmaker-codex-gateway/rcmaker-codex-gateway` 启动。如果要更新已有安装目录，请**先在当前终端设置 `RCMAKER_INSTALL_DIR`**，再执行同一条命令。更新前等待任务结束并关闭网关；原有 `.env`、`data/`、`runtime/` 保留，脚本不会自动启动或重启程序。需要 GitHub 已发布正式版且网络可达。执行前可查阅 [Windows 安装脚本](.github/scripts/install.ps1)和 [Linux 安装脚本](.github/scripts/install.sh)。
+
+也可以手动安装：
+
 将下载的 Windows 程序放入有写入权限的文件夹，**双击 `.exe` 即可启动**，无需添加 `start` 参数。也可以在 PowerShell 中运行（文件名以实际下载的为准）：
 
 ```powershell
@@ -118,7 +136,7 @@ ChatGPT 账号应具有所需模型和自定义 MCP 应用权限。为私有浏�
 
 ```text
 application/
-  rcmaker-codex-gateway-<version>.exe
+  rcmaker-codex-gateway.exe
   .env             # 可选的部署配置
   data/            # 首次使用创建，升级时保留
   runtime/         # 可重建的运行文件

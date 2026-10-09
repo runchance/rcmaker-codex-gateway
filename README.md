@@ -60,6 +60,24 @@ flowchart LR
 
 ### 1. Start the application
 
+**One-command install or update** from the [latest stable GitHub Release](https://github.com/runchance/rcmaker-codex-gateway/releases/latest):
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
+```
+
+Linux (Bash; x64 or ARM64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
+```
+
+The scripts select the matching release archive, verify SHA-256 checksums, and install to `%LOCALAPPDATA%\rcmaker-codex-gateway` (Windows) or `~/.local/share/rcmaker-codex-gateway` (Linux). Set `RCMAKER_INSTALL_DIR` in your shell **before** the command to use an existing installation folder. Start `rcmaker-codex-gateway.exe` in the Windows installation folder or run `~/.local/share/rcmaker-codex-gateway/rcmaker-codex-gateway` on Linux. To update, finish active tasks, stop the gateway and run the **same command again**. Existing `.env`, `data/` and `runtime/` stay intact; the scripts do not automatically start or restart the gateway. A published stable Release and network access to GitHub are required. Review the [Windows script](.github/scripts/install.ps1) or [Linux script](.github/scripts/install.sh) before running it.
+
+You can also install manually:
+
 Place the downloaded Windows executable in a writable folder and **double-click the `.exe` to start**. No `start` argument is required. You can also launch it from PowerShell, using your actual filename:
 
 ```powershell
@@ -118,7 +136,7 @@ Keep the external `data` directory and actual `.env`. Finish running tasks befor
 
 ```text
 application/
-  rcmaker-codex-gateway-<version>.exe
+  rcmaker-codex-gateway.exe
   .env             # optional deployment settings
   data/            # created on first use; preserve during upgrades
   runtime/         # rebuildable operating files

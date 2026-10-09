@@ -37,6 +37,8 @@
 
 ### 使用独立程序
 
+需要自动安装或更新时，在 Windows 的 PowerShell 或 Linux 的 Bash 执行 [README 中对应的一键安装命令](../README.zh-CN.md#1-启动应用)。脚本从 GitHub 最新正式版获取文件并校验 SHA-256，保留原有 `.env` 和 `data/`。更新已有目录时需先设置 `RCMAKER_INSTALL_DIR`，并**等待任务结束、关闭网关后再更新**。
+
 将程序放入有写入权限的目录，例如 `D:\Apps\RCMAKER-Gateway`，**双击 `.exe` 文件就能启动**，无需传入 `start` 参数。也可以使用 PowerShell：
 
 ```powershell
@@ -254,6 +256,8 @@ Tunnel/API Key 按钮在当前打开控制台的浏览器中开新标签；注�
 ## 8. 升级、恢复与排错
 
 ### 原目录升级
+
+通过 README 一键脚本安装的用户，可以在停止网关后重新执行相同命令，自动获取 GitHub 最新正式版；脚本不会自动重启网关。
 
 1. 等任务与授权等待结束，保存 Codex 工作，按日常方式停止 RCMAKER。
 2. 私下备份原 `.env` 与持久 `data`，保留旧可执行程序便于回退。不要把正在写入的单个 SQLite 文件直接复制后当作一致的完整备份。

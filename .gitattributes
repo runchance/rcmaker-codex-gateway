@@ -18,6 +18,9 @@
 /data/tests/gateway/*.py text eol=lf
 /public/console/** text=auto eol=lf
 /windows.bat text eol=crlf
+/.github/scripts/install.sh text eol=lf
+/.github/scripts/install.ps1 text eol=crlf
+/.github/tests/install-scripts.py text eol=lf
 
 # Preserve upstream template whitespace without exempting application-owned assets.
 /public/console/component/** whitespace=-blank-at-eol
