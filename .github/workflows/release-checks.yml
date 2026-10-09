@@ -27,22 +27,24 @@ jobs:
   installers:
     name: Test latest-Release installers (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        os: [ubuntu-24.04, windows-2025, macos-15, macos-15-intel]
     steps:
       - name: Check out installation scripts
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Test Linux initial install, upgrade and invalid checksums
-        if: runner.os == 'Linux'
-        run: python3 .github/tests/install-scripts.py
-      - name: Test Windows initial install, upgrade and invalid checksums
-        if: runner.os == 'Windows'
-        run: python .github/tests/install-scripts.py
+      - name: Set up PHP 8.5 for offline installer tests
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: '8.5'
+          extensions: zip, zlib, sockets
+          coverage: none
+      - name: Test initial install, directory selection, upgrade and invalid checksums
+        run: php .github/tests/install-scripts.php
 
   checks:
     runs-on: ubuntu-24.04

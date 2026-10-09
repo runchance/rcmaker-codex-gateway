@@ -68,13 +68,15 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
 ```
 
-Linux (Bash; x64 or ARM64):
+Linux or macOS (Bash; Linux x64/ARM64, macOS Intel/Apple Silicon):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
 ```
 
-The scripts select the matching release archive, verify SHA-256 checksums, and install to `%LOCALAPPDATA%\rcmaker-codex-gateway` (Windows) or `~/.local/share/rcmaker-codex-gateway` (Linux). Set `RCMAKER_INSTALL_DIR` in your shell **before** the command to use an existing installation folder. Start `rcmaker-codex-gateway.exe` in the Windows installation folder or run `~/.local/share/rcmaker-codex-gateway/rcmaker-codex-gateway` on Linux. To update, finish active tasks, stop the gateway and run the **same command again**. Existing `.env`, `data/` and `runtime/` stay intact; the scripts do not automatically start or restart the gateway. A published stable Release and network access to GitHub are required. Review the [Windows script](.github/scripts/install.ps1) or [Linux script](.github/scripts/install.sh) before running it.
+The scripts select the matching release archive and verify SHA-256 checksums. Set `RCMAKER_INSTALL_DIR` in your shell **before** the command to choose an installation folder. Otherwise, an executable in the current folder is upgraded there; a new installation defaults to `./rcmaker-codex-gateway/`. The first installation in an interactive terminal lets you enter a different folder; unattended installation uses the default without waiting for input. Relative paths are resolved from your current folder.
+
+To update, finish active tasks, stop the gateway, **change to its installation folder** (or set `RCMAKER_INSTALL_DIR`) and run the same command again. This also updates installations made by the older scripts in `%LOCALAPPDATA%\rcmaker-codex-gateway` or `~/.local/share/rcmaker-codex-gateway`. Existing `.env`, `data/` and `runtime/` stay intact; the scripts do not automatically start or restart the gateway. Start `rcmaker-codex-gateway.exe` on Windows or `./rcmaker-codex-gateway` on Linux/macOS from the installation folder. A published stable Release and network access to GitHub are required. Review the [Windows script](.github/scripts/install.ps1) or [Linux/macOS script](.github/scripts/install.sh) before running it.
 
 You can also install manually:
 

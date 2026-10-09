@@ -68,13 +68,15 @@ Windows（PowerShell）：
 irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
 ```
 
-Linux（Bash，支持 x64 / ARM64）：
+Linux / macOS（Bash；Linux 支持 x64 / ARM64，macOS 支持 Intel / Apple Silicon）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
 ```
 
-脚本自动识别平台、下载对应发行包并校验 SHA-256。默认安装到 Windows 的 `%LOCALAPPDATA%\rcmaker-codex-gateway` 或 Linux 的 `~/.local/share/rcmaker-codex-gateway`。安装后可双击 Windows 目录内的 `rcmaker-codex-gateway.exe`，或在 Linux 执行 `~/.local/share/rcmaker-codex-gateway/rcmaker-codex-gateway` 启动。如果要更新已有安装目录，请**先在当前终端设置 `RCMAKER_INSTALL_DIR`**，再执行同一条命令。更新前等待任务结束并关闭网关；原有 `.env`、`data/`、`runtime/` 保留，脚本不会自动启动或重启程序。需要 GitHub 已发布正式版且网络可达。执行前可查阅 [Windows 安装脚本](.github/scripts/install.ps1)和 [Linux 安装脚本](.github/scripts/install.sh)。
+脚本自动识别平台、下载对应发行包并校验 SHA-256。**先在当前终端设置 `RCMAKER_INSTALL_DIR`** 可指定安装目录；没有指定时，当前目录已有程序就原位升级，否则默认安装到 `当前目录/rcmaker-codex-gateway/`。首次在交互终端安装时可以输入其他目录；非交互安装直接使用默认值，不等待输入。相对路径按当前目录解析。
+
+更新前等待任务结束并关闭网关，**进入已有安装目录**（或设置 `RCMAKER_INSTALL_DIR`）后再次执行同一条命令。旧脚本安装在 `%LOCALAPPDATA%\rcmaker-codex-gateway` 或 `~/.local/share/rcmaker-codex-gateway` 的用户也按此方式升级。原有 `.env`、`data/`、`runtime/` 保留，脚本不会自动启动或重启程序。安装后双击 Windows 目录内的 `rcmaker-codex-gateway.exe`，或在 Linux / macOS 的安装目录执行 `./rcmaker-codex-gateway` 启动。需要 GitHub 已发布正式版且网络可达。执行前可查阅 [Windows 安装脚本](.github/scripts/install.ps1)和 [Linux / macOS 安装脚本](.github/scripts/install.sh)。
 
 也可以手动安装：
 

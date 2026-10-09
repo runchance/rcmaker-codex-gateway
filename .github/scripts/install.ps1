@@ -1,11 +1,80 @@
 # Install or update the latest stable Windows x64 release in a user-owned folder.
 # Usage: irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
 # To reuse a different installation: $env:RCMAKER_INSTALL_DIR = 'D:\Apps\RCMAKER-Gateway'
+# Without an explicit directory, reuse the current installation or install in ./rcmaker-codex-gateway.
 param([string]$InstallDir = $env:RCMAKER_INSTALL_DIR)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
+
+# Resolve relative and provider-qualified paths using PowerShell's location, not the process working directory.
+function Resolve-InstallDirectory {
+    param([string]$Directory)
+
+    $providerInfo = $null
+    $driveInfo = $null
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $Directory, [ref]$providerInfo, [ref]$driveInfo
+    )
+    if ($providerInfo.Name -ne 'FileSystem') { throw 'The installation directory must be a filesystem path.' }
+    return [IO.Path]::GetFullPath($resolved)
+}
+
+# Only ask through a real console host. Redirected or -NonInteractive invocations keep the unattended default.
+function Test-InstallDirectoryPrompt {
+    if ($Host.Name -ne 'ConsoleHost' -or -not [Environment]::UserInteractive -or
+        [Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        return $false
+    }
+    foreach ($argument in [Environment]::GetCommandLineArgs()) {
+        if ($argument -match '^[-/](non[a-z]*)$' -and
+            'noninteractive'.StartsWith($Matches[1], [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+# Explicit settings win; existing binaries are upgraded in place without asking for a new destination.
+function Get-InstallDirectory {
+    param([string]$RequestedDirectory)
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedDirectory)) {
+        return Resolve-InstallDirectory -Directory $RequestedDirectory
+    }
+    $location = Get-Location
+    if ($location.Provider.Name -ne 'FileSystem') { throw 'Run the installer from a filesystem directory, or set RCMAKER_INSTALL_DIR.' }
+    $defaultDirectory = Join-Path $location.Path 'rcmaker-codex-gateway'
+    if (Test-Path -LiteralPath (Join-Path $location.Path 'rcmaker-codex-gateway.exe') -PathType Leaf) {
+        return Resolve-InstallDirectory -Directory $location.Path
+    }
+    if (Test-Path -LiteralPath (Join-Path $defaultDirectory 'rcmaker-codex-gateway.exe') -PathType Leaf) {
+        return Resolve-InstallDirectory -Directory $defaultDirectory
+    }
+    if (Test-InstallDirectoryPrompt) {
+        Write-Host "Installation directory (press Enter to use $defaultDirectory):"
+        $answer = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($answer)) {
+            $defaultDirectory = $answer.Trim()
+        }
+    }
+    return Resolve-InstallDirectory -Directory $defaultDirectory
+}
+
+# Check the absolute staging target before moving files or recursively removing its disposable contents.
+function Assert-InstallStagePath {
+    param([string]$Directory, [string]$StageDirectory)
+
+    $root = [IO.Path]::GetFullPath($Directory).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+    $resolvedStage = [IO.Path]::GetFullPath($StageDirectory)
+    $parent = [IO.Path]::GetDirectoryName($resolvedStage).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedStage.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $parent.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($resolvedStage) -cnotmatch '^\.install-[a-f0-9]{32}$') {
+        throw 'Refusing to access a staging directory outside the selected installation directory.'
+    }
+}
 
 function Get-ReleaseFileHash {
     param([string]$File)
@@ -66,13 +135,11 @@ foreach ($name in $names) {
     $urls[$name] = $url
 }
 
-if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-    $InstallDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'rcmaker-codex-gateway'
-}
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$InstallDir = Get-InstallDirectory -RequestedDirectory $InstallDir
 [void][IO.Directory]::CreateDirectory($InstallDir)
 $target = Join-Path $InstallDir 'rcmaker-codex-gateway.exe'
 $stage = Join-Path $InstallDir ('.install-' + [Guid]::NewGuid().ToString('N'))
+Assert-InstallStagePath -Directory $InstallDir -StageDirectory $stage
 [void][IO.Directory]::CreateDirectory($stage)
 
 try {
@@ -113,6 +180,7 @@ try {
 
     $old = Join-Path $stage 'previous.exe'
     $hadOld = Test-Path -LiteralPath $target -PathType Leaf
+    Assert-InstallStagePath -Directory $InstallDir -StageDirectory $stage
     if ($hadOld) {
         try { Move-Item -LiteralPath $target -Destination $old -ErrorAction Stop }
         catch { throw "Close rcmaker-codex-gateway.exe before updating. $($_.Exception.Message)" }
@@ -132,6 +200,7 @@ try {
     Write-Host "Installed $tag at $target"
     Write-Host 'The gateway was not started. Launch it after stopping any previous instance, and wait for its Ready message before starting/restarting Codex.'
 } finally {
+    Assert-InstallStagePath -Directory $InstallDir -StageDirectory $stage
     $strandedOld = Join-Path $stage 'previous.exe'
     if ((Test-Path -LiteralPath $strandedOld -PathType Leaf) -and
         -not (Test-Path -LiteralPath $target -PathType Leaf)) {
