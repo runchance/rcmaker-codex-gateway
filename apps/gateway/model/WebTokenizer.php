@@ -5,6 +5,9 @@ namespace app\gateway\model;
 /** PHP o200k_base byte-pair token counter, using OpenAI's pinned vocabulary and pre-tokenizer. */
 final class WebTokenizer
 {
+    /** SHA-256 of the immutable upstream LF vocabulary, also used by release verification. */
+    public const VOCABULARY_SHA256 = '446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d';
+
     private static ?array $ranks = null;
     private static array $cache = [];
 
@@ -46,8 +49,14 @@ REGEX;
     {
         if (self::$ranks !== null) return;
         $path = base_path() . '/apps/gateway/resource/o200k_base.tiktoken';
-        if (!is_file($path) || hash_file('sha256', $path) !== '446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d') {
-            throw new GatewayError('tokenizer_unavailable', '项目内置上下文词表缺失或损坏，请修复运行组件。', 503);
+        $hash = is_file($path) ? hash_file('sha256', $path) : false;
+        if ($hash !== self::VOCABULARY_SHA256) {
+            // Git may convert LF to CRLF on Windows. Accept only the same pinned vocabulary
+            // after that exact reversal; token/rank changes, BOM and bare CR remain invalid.
+            $contents = is_file($path) ? file_get_contents($path) : false;
+            if ($contents === false || hash('sha256', str_replace("\r\n", "\n", $contents)) !== self::VOCABULARY_SHA256) {
+                throw new GatewayError('tokenizer_unavailable', '项目内置上下文词表缺失或损坏，请修复运行组件。', 503);
+            }
         }
         $ranks = []; $file = fopen($path, 'rb');
         try {

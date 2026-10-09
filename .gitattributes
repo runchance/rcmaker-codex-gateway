@@ -13,6 +13,8 @@
 
 # Gateway source and shipped text assets have reproducible checkout line endings.
 /apps/gateway/**/*.php text eol=lf
+# The tokenizer pins upstream bytes by SHA-256; never rewrite its line endings on checkout.
+/apps/gateway/resource/*.tiktoken -text
 /support/middleware/Gateway*.php text eol=lf
 /support/process/GatewayProbe.php text eol=lf
 /data/tests/gateway/*.py text eol=lf

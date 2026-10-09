@@ -7,10 +7,17 @@ final class TaskContext
 {
     public const WIRE_NAME = 'rcmaker.context_read';
 
-    /** Rejected messages and bounded extended windows can read originals; never shadow a host tool. */
+    /**
+     * Expose the bounded original reader without shadowing a host tool.
+     * Optional imported-history access never requires a final read proof.
+     * @param array $budget Pinned request budget, including optional archive availability.
+     * @param array $environment Exact native tool registry supplied by this Codex turn.
+     * @return bool Whether this request may discover the task-scoped read-only reader.
+     */
     public static function enabled(array $budget, array $environment): bool
     {
-        if (empty($budget['message_limit_source_response_id']) && empty($budget['original_context_required'])) return false;
+        if (empty($budget['message_limit_source_response_id']) && empty($budget['original_context_required'])
+            && empty($budget['imported_original_context_available'])) return false;
         foreach ($environment['tools'] ?? [] as $tool) if (($tool['wire_name'] ?? '') === self::WIRE_NAME) return false;
         return true;
     }

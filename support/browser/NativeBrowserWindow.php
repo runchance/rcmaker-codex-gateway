@@ -5,6 +5,7 @@ namespace support\browser;
 use app\gateway\model\BrowserState;
 use app\gateway\model\GatewayError;
 use RC\Config;
+use Workerman\Timer;
 
 /** One optional native setup window in the existing private Chrome; no profile or task-page replacement. */
 final class NativeBrowserWindow
@@ -185,23 +186,56 @@ final class NativeBrowserWindow
                         self::request($client, $browser, 'Browser.setWindowBounds', ['windowId' => $record['window_id'], 'bounds' => ['windowState' => 'normal']],
                             function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
                                 if ($error !== null) { $done($error, []); return; }
-                                self::request($client, $browser, 'Browser.setWindowBounds', ['windowId' => $record['window_id'],
-                                    'bounds' => $visible ? ['left' => 80, 'top' => 80, 'width' => 1280, 'height' => 900]
-                                        : ['left' => -32000, 'top' => -32000]],
+                                // macOS acknowledges leaving fullscreen before the native window finishes its transition.
+                                self::waitForBounds($client, $browser, $record['window_id'],
+                                    static fn(array $bounds): bool => ($bounds['windowState'] ?? '') === 'normal',
                                     function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
                                         if ($error !== null) { $done($error, []); return; }
-                                        $record['visible'] = $visible;
-                                        try { self::save($record); } catch (GatewayError $failure) { $done($failure, []); return; }
-                                        if (!$visible) { $done(null, ['visible' => false]); return; }
-                                        self::request($client, $browser, 'Target.activateTarget', ['targetId' => $record['target_id']],
-                                            function ($error) use ($client, $browser, $record, $url, $done): void {
+                                        self::request($client, $browser, 'Browser.setWindowBounds', ['windowId' => $record['window_id'],
+                                            'bounds' => $visible ? ['left' => 80, 'top' => 80, 'width' => 1280, 'height' => 900]
+                                                : ['left' => -32000, 'top' => -32000]],
+                                            function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
                                                 if ($error !== null) { $done($error, []); return; }
-                                                if (!empty($record['initialized'])) { $done(null, ['visible' => true]); return; }
-                                                self::navigate($client, $browser, $record, $url, $done);
+                                                self::waitForBounds($client, $browser, $record['window_id'],
+                                                    static fn(array $bounds): bool => ($bounds['windowState'] ?? '') === 'normal'
+                                                        && ($visible || ((int) ($bounds['left'] ?? 0) === -32000 && (int) ($bounds['top'] ?? 0) === -32000)),
+                                                    function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
+                                                        if ($error !== null) { $done($error, []); return; }
+                                                        self::publishVisibility($client, $browser, $record, $visible, $url, $done);
+                                                    }, microtime(true) + 5.0);
                                             });
-                                    });
+                                    }, microtime(true) + 5.0);
                             });
                     });
+            });
+    }
+
+    /** Publish only confirmed window state; opening a reused page must not reload its login form. */
+    private static function publishVisibility(CdpClient $client, array $browser, array $record, bool $visible, string $url, callable $done): void
+    {
+        $record['visible'] = $visible;
+        try { self::save($record); } catch (GatewayError $failure) { $done($failure, []); return; }
+        if (!$visible) { $done(null, ['visible' => false]); return; }
+        self::request($client, $browser, 'Target.activateTarget', ['targetId' => $record['target_id']],
+            function ($error) use ($client, $browser, $record, $url, $done): void {
+                if ($error !== null) { $done($error, []); return; }
+                if (!empty($record['initialized'])) { $done(null, ['visible' => true]); return; }
+                self::navigate($client, $browser, $record, $url, $done);
+            });
+    }
+
+    /** Wait without blocking the browser worker; an acknowledgement alone is not native-window state evidence. */
+    private static function waitForBounds(CdpClient $client, array $browser, int $windowId, callable $matches, callable $done, float $deadline): void
+    {
+        self::request($client, $browser, 'Browser.getWindowBounds', ['windowId' => $windowId],
+            function ($error, $result) use ($client, $browser, $windowId, $matches, $done, $deadline): void {
+                if ($error !== null) { $done($error); return; }
+                if (!is_array($result['bounds'] ?? null)) { $done(self::windowError()); return; }
+                if ($matches($result['bounds'])) { $done(null); return; }
+                if (microtime(true) >= $deadline) { $done(self::windowError()); return; }
+                Timer::add(0.1, static function () use ($client, $browser, $windowId, $matches, $done, $deadline): void {
+                    self::waitForBounds($client, $browser, $windowId, $matches, $done, $deadline);
+                }, [], false);
             });
     }
 

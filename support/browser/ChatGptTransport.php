@@ -80,12 +80,15 @@ final class ChatGptTransport
 
     /**
      * Observe a stopped, owned empty answer without manufacturing a successful completion.
-     * The caller supplies current transport settlement and a fresh drained MCP fence revision;
+     * The caller supplies exact transport settlement or returned Send after delivered receipts,
+     * and a fresh drained MCP fence revision. The UI-only fallback fails an empty answer; it
+     * never authorizes successful completion or bypasses pending host execution.
      * a missing fence, changing ownership, activity, content or observation gap resets the window.
      * Generation duration is deliberately absent from this rule.
      * @param array|null $previous Prior candidate from this exact runtime turn, or null.
      * @param array $snapshot Current responseExpression() observation.
      * @param array $evidence Owned response/session/document/assistant/request IDs, transport_settled,
+     *     ui_receipts_settled (optional, exact source receipts delivered and Send returned),
      *     mcp_revision (null while tools are pending), round_markdown and has_artifacts.
      * @param float $now Current observation time in seconds; tests may use a deterministic clock.
      * @return array{candidate:?array,error_code:?string} Updated private observation and optional failure.
@@ -94,15 +97,16 @@ final class ChatGptTransport
     public static function emptyResponseHealth(?array $previous, array $snapshot, array $evidence, float $now): array
     {
         $empty = ['candidate' => null, 'error_code' => null];
+        $settled = ($evidence['transport_settled'] ?? null) === true
+            || (($evidence['ui_receipts_settled'] ?? null) === true
+                && ($snapshot['send_button_visible'] ?? null) === true);
         if (!is_finite($now) || $now < 0.0
-            || ($snapshot['generation_running'] ?? null) !== false
-            || ($snapshot['response_present'] ?? null) !== true
-            || ($snapshot['completion_action_visible'] ?? null) !== true
+            || !self::hasTerminalAnswer($snapshot, $settled)
             || ($snapshot['content_present'] ?? null) !== false
             || !is_string($snapshot['markdown'] ?? null) || trim($snapshot['markdown']) !== ''
             || !is_string($snapshot['visible_text'] ?? null) || trim($snapshot['visible_text']) !== ''
             || ($evidence['round_markdown'] ?? null) !== '' || !empty($evidence['has_artifacts'])
-            || ($evidence['transport_settled'] ?? null) !== true
+            || !$settled
             || !is_int($evidence['mcp_revision'] ?? null) || $evidence['mcp_revision'] < 0) return $empty;
 
         $identity = [];
@@ -115,7 +119,8 @@ final class ChatGptTransport
         $signature = hash('sha256', json_encode([
             $identity, $evidence['mcp_revision'], $evidence['request_finished_at'] ?? null,
             $evidence['source_receipt_signature'] ?? '', $snapshot['response_html'] ?? '',
-            $snapshot['commentary_blocks'] ?? [],
+            $snapshot['commentary_blocks'] ?? [], $snapshot['send_button_visible'] ?? null,
+            $snapshot['completion_action_visible'] ?? null,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         $since = $now;
         if (is_array($previous) && ($previous['signature'] ?? null) === $signature
@@ -535,17 +540,26 @@ final class ChatGptTransport
     /**
      * Choose inline delivery or the smallest fitting reference multipart shape for new turns.
      * Older pinned budgets retain their recorded partition policy for deterministic recovery.
-     * @param array $budget Pinned token, composer and context limits for this turn.
+     * @param array $budget Pinned limits, optionally with a first-import-only fixed transaction ID.
      * @param array $settings User transport cap and extended-context setting.
      * @param array $capabilities Observed account controls needed for Medium staging.
-     * @param string|null $transactionId Existing transaction identity when rebuilding a turn.
+     * @param string|null $transactionId Existing recovery identity; takes priority over the import budget ID.
      * @param int $finalAttachmentTokens Image and skill-file reserve on the commit message.
      * @param array|null $decisionEvidence Optional diagnostic output; never changes the returned plan or its wire text.
      * @return array|null Null when the complete prompt fits inline; otherwise a staged plan.
-     * @throws GatewayError When no authorized partition fits the physical limits.
+     * @throws GatewayError When no authorized partition fits, or an internal import transaction ID is invalid.
      */
     public static function plan(string $prompt, array $budget, array $settings, array $capabilities, ?string $transactionId = null, int $finalAttachmentTokens = 0, ?array &$decisionEvidence = null): ?array
     {
+        // First-import admission and its actual send must count the same random envelope.
+        // A caller's explicit recovery ID remains authoritative; ordinary plans stay random.
+        if ($transactionId === null && is_array($budget['imported_history_selection'] ?? null)
+            && array_key_exists('imported_transport_transaction_id', $budget)) {
+            $transactionId = $budget['imported_transport_transaction_id'];
+            if (!is_string($transactionId) || preg_match('/\Actx_[a-f0-9]{32}\z/D', $transactionId) !== 1) {
+                throw new GatewayError('CHATGPT_CONTEXT_TRANSACTION_INVALID', '导入上下文的分段事务标识无效。', 500);
+            }
+        }
         $finalAttachmentTokens = max(0, $finalAttachmentTokens);
         $settings = array_replace($settings, array_intersect_key($budget, array_flip(['context_transport','context_max_parts','context_extended'])));
         $reserve = (int) ($budget['contract_reserve_tokens'] ?? 0) + (int) $budget['output_reserve_tokens'];

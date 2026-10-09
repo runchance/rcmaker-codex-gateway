@@ -161,7 +161,12 @@ final class BrowserProcess
         return $path === $root || str_starts_with($path . '/', $root . '/');
     }
 
-    /** Build a minimal child environment with browser-owned home/cache/temp paths. */
+    /**
+     * Build a minimal child environment with browser-owned home/cache/temp paths.
+     * Linux retains the existing X11 authority path before HOME becomes private; no cookie is copied.
+     * @param string $home Private browser home. @param string $cache Private cache. @param string $temp Private temp.
+     * @return array<string,string> Child-only environment, preserving an explicitly configured XAUTHORITY.
+     */
     private static function privateEnvironment(string $home, string $cache, string $temp): array
     {
         $environment = [];
@@ -174,6 +179,27 @@ final class BrowserProcess
         foreach ($copy as $name) {
             $value = getenv($name);
             if (is_string($value) && $value !== '') $environment[$name] = $value;
+        }
+        if (PHP_OS_FAMILY === 'Linux') {
+            $authority = getenv('XAUTHORITY');
+            if (is_string($authority)) {
+                // An explicit empty value is also deployment intent, so do not replace it.
+                $environment['XAUTHORITY'] = $authority;
+            } else {
+                $accountHome = getenv('HOME');
+                if ((!is_string($accountHome) || $accountHome === '')
+                    && function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+                    $account = @posix_getpwuid(posix_geteuid());
+                    $accountHome = is_array($account) ? ($account['dir'] ?? '') : '';
+                }
+                if (is_string($accountHome) && $accountHome !== '') {
+                    $path = rtrim($accountHome, '/') . '/.Xauthority';
+                    $resolved = realpath($path);
+                    if ($resolved !== false && is_file($resolved) && is_readable($resolved)) {
+                        $environment['XAUTHORITY'] = $resolved;
+                    }
+                }
+            }
         }
         $environment['HOME'] = $home;
         if (PHP_OS_FAMILY === 'Windows') {
@@ -497,6 +523,35 @@ final class BrowserProcess
     {
         if (PHP_OS_FAMILY !== 'Windows' || $pid < 1 || $debugPort < 1) return null;
         return self::windowsLoopbackListenerOwnedByPid($pid, $debugPort);
+    }
+
+    /**
+     * Probe a recorded Unix PID without sending a signal or claiming process ownership.
+     * @param int $pid Positive recorded browser PID; process groups and invalid IDs are never probed.
+     * @return bool|null True means a live PID; false requires ESRCH; permission/unsupported errors mean unknown.
+     */
+    public static function unixProcessRunning(int $pid): ?bool
+    {
+        if (!in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || $pid < 1
+            || !function_exists('posix_kill') || !function_exists('posix_get_last_error')) return null;
+        if (@posix_kill($pid, 0)) return true;
+        // ESRCH is 3 on both supported Unix families. EPERM and every other error stay unknown.
+        return posix_get_last_error() === 3 ? false : null;
+    }
+
+    /**
+     * Check whether the recorded IPv4 loopback CDP port still has any listener.
+     * This sends no HTTP/CDP frame and never interprets an unrelated listener as an owned browser.
+     * @param int $debugPort Valid recorded CDP port.
+     * @return bool|null False requires ECONNREFUSED; timeouts and unsupported probes remain unknown.
+     */
+    public static function unixLoopbackListenerPresent(int $debugPort): ?bool
+    {
+        if (!in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || $debugPort < 1 || $debugPort > 65535
+            || !defined('SOCKET_ECONNREFUSED')) return null;
+        $connection = @stream_socket_client('tcp://127.0.0.1:' . $debugPort, $errorCode, $errorMessage, 0.2);
+        if (is_resource($connection)) { fclose($connection); return true; }
+        return $errorCode === SOCKET_ECONNREFUSED ? false : null;
     }
 
     /** Linux exposes launch markers locally; Windows recovery uses the recorded CDP listener instead. */

@@ -263,30 +263,12 @@ final class TunnelRuntime
         ];
     }
 
+    /** Validate, clean and publish the private executable while holding one installation lock. */
     private static function install(array $revision): string
     {
         self::ensureDirs();
         $binary = self::binaryPath();
         $manifestFile = self::manifestPath();
-        self::cleanupStaleInstallArtifacts(self::root(), $binary);
-        if (is_file($binary) && is_file($manifestFile)) {
-            try {
-                $manifest = json_decode((string) file_get_contents($manifestFile), true, 16, JSON_THROW_ON_ERROR);
-                if (($manifest['version'] ?? null) === 1
-                    && ($manifest['tunnel_client_version'] ?? null) === self::VERSION
-                    && is_string($manifest['binary_sha256'] ?? null)
-                    && hash_equals((string) $manifest['binary_sha256'], hash_file('sha256', $binary) ?: '')
-                    && self::binaryReportsVersion($binary)) {
-                    return $binary;
-                }
-            } catch (\Throwable) {}
-            self::removeFile($binary, true);
-            self::removeFile($manifestFile, true);
-        } elseif (is_file($binary) || is_file($manifestFile)) {
-            self::removeFile($binary, true);
-            self::removeFile($manifestFile, true);
-        }
-
         $lock = self::quiet(static fn() => fopen(self::root() . '/install.lock', 'c'));
         if ($lock === false) throw new GatewayError('TUNNEL_INSTALL_FAILED', '无法创建工具隧道安装锁。', 503);
         $deadline = microtime(true) + 120;
@@ -298,7 +280,27 @@ final class TunnelRuntime
             } while (!$locked && microtime(true) < $deadline);
             if (!$locked) throw new GatewayError('TUNNEL_INSTALL_BUSY', '工具隧道正在由另一个进程准备。', 409);
 
-            if (is_file($binary) && is_file($manifestFile) && self::binaryReportsVersion($binary)) return $binary;
+            clearstatcache(true, $binary);
+            clearstatcache(true, $manifestFile);
+            self::cleanupStaleInstallArtifacts(self::root(), $binary);
+            if (is_file($binary) && is_file($manifestFile)) {
+                try {
+                    $manifest = json_decode((string) file_get_contents($manifestFile), true, 16, JSON_THROW_ON_ERROR);
+                    if (($manifest['version'] ?? null) === 1
+                        && ($manifest['tunnel_client_version'] ?? null) === self::VERSION
+                        && is_string($manifest['binary_sha256'] ?? null)
+                        && hash_equals((string) $manifest['binary_sha256'], hash_file('sha256', $binary) ?: '')
+                        && self::binaryReportsVersion($binary)) {
+                        return $binary;
+                    }
+                } catch (\Throwable) {}
+                self::removeFile($binary, true);
+                self::removeFile($manifestFile, true);
+            } elseif (is_file($binary) || is_file($manifestFile)) {
+                self::removeFile($binary, true);
+                self::removeFile($manifestFile, true);
+            }
+
             $asset = self::assetName();
             $archive = self::root() . '/tmp/' . $asset;
             $sums = self::downloadText($revision, self::RELEASE_BASE . '/SHA256SUMS.txt', 1048576);
@@ -338,7 +340,7 @@ final class TunnelRuntime
         }
     }
 
-    /** Remove only interrupted installer/probe files owned by this private Runtime. */
+    /** Remove interrupted installer/probe files while the caller holds this Runtime's install.lock. */
     private static function cleanupStaleInstallArtifacts(string $root, string $binary): void
     {
         $binDir = dirname($binary);

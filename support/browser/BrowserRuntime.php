@@ -59,6 +59,8 @@ final class BrowserRuntime
     private bool $switchingTarget = false;
     private bool $stopping = false;
     private float $lastDiscovery = 0.0;
+    /** Bound Unix death checks independently of CDP discovery and in-flight startup deadlines. */
+    private float $lastUnixExitCheck = 0.0;
     private float $lastHeartbeat = 0.0;
     private float $lastChatGptInspection = 0.0;
     /** Serialize event/tick capability reads so an older setup document cannot replace a native-page observation. */
@@ -206,6 +208,11 @@ final class BrowserRuntime
                 $this->forgetExitedBrowser($state);
                 $state = BrowserState::state();
             }
+        }
+        if ($state['status'] !== 'stopped' && in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true)
+            && $this->pendingStartCommand === null && microtime(true) - $this->lastUnixExitCheck >= 0.5) {
+            $this->lastUnixExitCheck = microtime(true);
+            $state = $this->reconcileExitedUnixBrowser($state);
         }
         if ($state['status'] !== 'stopped' && !$this->cdp->ready() && !$this->connecting) {
             $this->tryConnect($state);
@@ -1470,6 +1477,30 @@ JS;
             BrowserState::finish($commandId, true, ['status' => 'cleared', 'removed' => $removed]);
         });
         $this->commandBusy = false;
+    }
+
+    /**
+     * Reconcile Unix hard-exit state without authorizing a process kill or replaying a submitted task.
+     * @param array $state Current durable browser state, protected by the browser worker ownership lock.
+     * @return array Updated state only when the PID is certainly dead and the CDP listener is certainly absent.
+     * @throws \Throwable When cleanup of this worker's verified guardian or durable state fails.
+     */
+    private function reconcileExitedUnixBrowser(array $state): array
+    {
+        $pid = (int) ($state['browser_pid'] ?? 0);
+        $port = (int) ($state['debug_port'] ?? 0);
+        if (BrowserProcess::unixProcessRunning($pid) !== false
+            || BrowserProcess::unixLoopbackListenerPresent($port) !== false) return $state;
+        if ($this->ownedProcess !== null) {
+            $profile = (string) Config::get('gateway', 'browser_profile_dir');
+            if ((int) ($this->ownedProcess['pid'] ?? 0) !== $pid
+                || (int) ($this->ownedProcess['debug_port'] ?? 0) !== $port
+                || !BrowserProcess::sameProfile((string) ($this->ownedProcess['profile'] ?? ''), $profile)) return $state;
+            // The live handle belongs to this exact launch. Wait for its guardian to finish reclaiming descendants.
+            OwnedRuntime::stop($this->ownedProcess);
+        }
+        $this->forgetExitedBrowser($state);
+        return BrowserState::state();
     }
 
     /** Clear stale runtime state after the exact recorded browser/CDP listener has disappeared. */
@@ -3487,7 +3518,7 @@ JS;
                             $this->taskFailTurn($responseId, $code, $message . ' [focus ' . $detail . ']');
                             return;
                         }
-                        $this->dispatchTaskKey($responseId, 'Control+A',
+                        $this->dispatchTaskKey($responseId, PHP_OS_FAMILY === 'Darwin' ? 'Command+A' : 'Control+A',
                             function ($selectError) use ($responseId, $code, $message, $after, $detail): void {
                                 if ($selectError !== null && ($selectError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                                     $this->taskFailTurn($responseId, $code, $message . ' [select ' . $detail . ']');
@@ -5354,6 +5385,9 @@ JS;
             $postToolBaseline = $this->chatGptTurns[$responseId]['post_tool_answer_baseline'] ?? null;
             $sourceTransportSettled = false;
             $sourceNewPostSettled = false;
+            $deliveredAt = null;
+            $deliveredAtUs = null;
+            $deliverySignature = '';
             if ($activeCompact || ($toolCapable && is_string($postToolBaseline))) {
                 $sourceId = (string)($logicalJob['previous_response_id'] ?? '');
                 try {
@@ -5415,6 +5449,13 @@ JS;
                 $emptyTransportSettled = !empty($emptySession['submission_request_id'])
                     && !empty($emptySession['submission_finished']) && empty($emptySession['submission_failed'])
                     && (!is_string($postToolBaseline) || $sourceTransportSettled);
+                // A tool-only answer may return to Send without a final body or Copy action,
+                // while its private stream observer still lacks a post-receipt finish event.
+                // Exact delivered source receipts plus a drained MCP fence can settle this
+                // empty terminal as a failure; they never manufacture a successful answer.
+                $emptyUiReceiptsSettled = $toolCapable && $deliveredAt !== null
+                    && $deliverySignature !== '' && ($snapshot['send_button_visible'] ?? null) === true
+                    && ($snapshot['generation_running'] ?? null) === false;
                 if ($this->observeEmptyResponseFailure($responseId, $logicalResponseId, $snapshot, [
                     'response_id' => $logicalResponseId,
                     'session_id' => (string) $turn['session_id'],
@@ -5424,6 +5465,7 @@ JS;
                     'request_finished_at' => $emptySession['submission_finished_at'] ?? null,
                     'source_receipt_signature' => $this->chatGptTurns[$responseId]['source_receipt_signature'] ?? '',
                     'transport_settled' => $emptyTransportSettled,
+                    'ui_receipts_settled' => $emptyUiReceiptsSettled,
                     'round_markdown' => $roundMarkdown,
                     'has_artifacts' => $hasArtifacts,
                 ], $now)) return;
@@ -6933,6 +6975,7 @@ JS;
         $this->cdp->close($code);
     }
 
+    /** Map a native key/chord to CDP parameters; Command+A uses macOS's Meta modifier. */
     private static function keyParams(string $key): array
     {
         $map = [
@@ -6940,6 +6983,7 @@ JS;
             'Tab' => ['key' => 'Tab', 'code' => 'Tab', 'windowsVirtualKeyCode' => 9],
             'Backspace' => ['key' => 'Backspace', 'code' => 'Backspace', 'windowsVirtualKeyCode' => 8],
             'Control+A' => ['key' => 'a', 'code' => 'KeyA', 'windowsVirtualKeyCode' => 65, 'modifiers' => 2],
+            'Command+A' => ['key' => 'a', 'code' => 'KeyA', 'windowsVirtualKeyCode' => 65, 'modifiers' => 4],
             'Escape' => ['key' => 'Escape', 'code' => 'Escape', 'windowsVirtualKeyCode' => 27],
             'ArrowUp' => ['key' => 'ArrowUp', 'code' => 'ArrowUp', 'windowsVirtualKeyCode' => 38],
             'ArrowDown' => ['key' => 'ArrowDown', 'code' => 'ArrowDown', 'windowsVirtualKeyCode' => 40],

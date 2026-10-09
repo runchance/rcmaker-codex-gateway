@@ -86,7 +86,8 @@ final class ChromeForTestingRuntime
         $expectedIntegrity = 'stable/' . $data['version'] . '/' . self::INTEGRITY_FILE;
         if ($integrityRelative !== $expectedIntegrity) return null;
         $versionRoot = rtrim($root, '\\/') . DIRECTORY_SEPARATOR . 'stable' . DIRECTORY_SEPARATOR . $data['version'];
-        if (!self::verifyIntegrity($versionRoot, (string) $data['integrity_sha256'])) return null;
+        $unixPermissions = PHP_OS_FAMILY !== 'Windows' && ($platform['os'] ?? '') !== 'windows';
+        if (!self::verifyIntegrity($versionRoot, (string) $data['integrity_sha256'], $unixPermissions)) return null;
         return self::browserRecord($data, $path);
     }
 
@@ -119,6 +120,12 @@ final class ChromeForTestingRuntime
             // Double-check after the lock: another worker may have completed installation.
             $existing = self::installed($platform, $root);
             if ($existing !== null) return $existing;
+            // Unix schema-1 installations can have intact bytes but sealed, non-executable helpers.
+            // Repair only authenticated local files while holding the same lock as installation.
+            if (PHP_OS_FAMILY !== 'Windows' && self::repairInstalledRuntimePermissions($root, $platform)) {
+                $existing = self::installed($platform, $root);
+                if ($existing !== null) return $existing;
+            }
             return self::installLocked($revision, $platform, $root, $progress);
         } finally {
             if ($locked) @flock($lock, LOCK_UN);
@@ -391,8 +398,23 @@ final class ChromeForTestingRuntime
                 if (!is_resource($input) || $output === false) self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', '无法解压浏览器文件。', $platform, 'extracting');
                 try { if (stream_copy_to_stream($input, $output) === false) self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', '浏览器文件解压中断。', $platform, 'extracting'); }
                 finally { fclose($input); fclose($output); }
+                if (PHP_OS_FAMILY !== 'Windows' && !@chmod($target, self::archiveFileMode($opsys, $attr))) {
+                    self::fail('BROWSER_RUNTIME_PERMISSIONS_FAILED', '无法恢复浏览器文件的安全执行权限。', $platform, 'extracting');
+                }
             }
         } finally { $zip->close(); }
+    }
+
+    /**
+     * Preserve only a Unix archive's executable intent while files remain private and mutable.
+     * @param int $opsys ZIP creator OS; only Unix attributes can grant execute permission.
+     * @param int $attributes ZIP external attributes, including the Unix mode in the high word.
+     * @return int Owner-only read/write, plus owner execute when the original regular file executes.
+     */
+    private static function archiveFileMode(int $opsys, int $attributes): int
+    {
+        $mode = ($attributes >> 16) & 0177777;
+        return $opsys === \ZipArchive::OPSYS_UNIX && ($mode & 0170000) === 0100000 && ($mode & 0111) !== 0 ? 0700 : 0600;
     }
 
     private static function locateExecutable(string $root, string $cft, array $platform): string
@@ -421,9 +443,10 @@ final class ChromeForTestingRuntime
     /** Write a deterministic hash manifest before the version directory becomes immutable. */
     private static function writeIntegrity(string $versionRoot, array $platform): string
     {
-        $entries = self::integrityEntries($versionRoot);
+        $unixPermissions = PHP_OS_FAMILY !== 'Windows';
+        $entries = self::integrityEntries($versionRoot, $unixPermissions);
         if ($entries === null) self::fail('BROWSER_RUNTIME_INTEGRITY_FAILED', '无法生成浏览器 Runtime 完整性清单。', $platform, 'integrity');
-        $payload = ['schema' => 1, 'files' => $entries];
+        $payload = ['schema' => $unixPermissions ? 2 : 1, 'files' => $entries];
         $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . PHP_EOL;
         $path = rtrim($versionRoot, '\\/') . DIRECTORY_SEPARATOR . self::INTEGRITY_FILE;
         if (@file_put_contents($path, $json, LOCK_EX) !== strlen($json)) {
@@ -432,20 +455,35 @@ final class ChromeForTestingRuntime
         return hash('sha256', $json);
     }
 
-    /** Refuse a Runtime when any installed file is added, removed or changed. */
-    private static function verifyIntegrity(string $versionRoot, string $expectedHash): bool
+    /**
+     * Verify all bytes/links and, for Unix schema 2, executable intent before a Runtime is reused.
+     * Permission repair can ignore current mode only after the hashed manifest and all file bytes agree.
+     */
+    private static function verifyIntegrity(string $versionRoot, string $expectedHash, bool $requireUnixPermissions = false, bool $checkPermissions = true): bool
     {
         $path = rtrim($versionRoot, '\\/') . DIRECTORY_SEPARATOR . self::INTEGRITY_FILE;
         $raw = @file_get_contents($path);
         if (!is_string($raw) || strlen($raw) > 32 * 1024 * 1024 || !hash_equals($expectedHash, hash('sha256', $raw))) return false;
         try { $data = json_decode($raw, true, 64, JSON_THROW_ON_ERROR); } catch (\Throwable) { return false; }
-        if (!is_array($data) || ($data['schema'] ?? null) !== 1 || !is_array($data['files'] ?? null)) return false;
-        $actual = self::integrityEntries($versionRoot);
-        return $actual !== null && $actual === $data['files'];
+        if (!is_array($data) || !in_array($data['schema'] ?? null, [1, 2], true) || !is_array($data['files'] ?? null)) return false;
+        if ($requireUnixPermissions && $data['schema'] !== 2) return false;
+        $expected = $data['files'];
+        if ($data['schema'] === 2) {
+            foreach ($expected as &$entry) {
+                if (!is_array($entry)) return false;
+                if (($entry['type'] ?? '') === 'file') {
+                    if (!is_bool($entry['executable'] ?? null)) return false;
+                    if (!$checkPermissions) unset($entry['executable']);
+                }
+            }
+            unset($entry);
+        }
+        $actual = self::integrityEntries($versionRoot, $data['schema'] === 2 && $checkPermissions);
+        return $actual !== null && $actual === $expected;
     }
 
-    /** @return array<string,array>|null */
-    private static function integrityEntries(string $versionRoot): ?array
+    /** @return array<string,array>|null Content records, optionally binding each regular file's executable intent. */
+    private static function integrityEntries(string $versionRoot, bool $includePermissions = false): ?array
     {
         if (!is_dir($versionRoot)) return null;
         $root = rtrim($versionRoot, '\\/');
@@ -471,6 +509,7 @@ final class ChromeForTestingRuntime
                 $hash = @hash_file('sha256', $full);
                 if (!is_string($hash)) return null;
                 $entries[$relative] = ['type' => 'file', 'size' => (int) $info->getSize(), 'sha256' => $hash];
+                if ($includePermissions) $entries[$relative]['executable'] = ($info->getPerms() & 0111) !== 0;
             }
         } catch (\Throwable) {
             return null;
@@ -501,7 +540,10 @@ final class ChromeForTestingRuntime
         self::log('project Runtime version sealed read-only', $platform);
     }
 
-    /** Repair only a previously installed product-owned version tree, then re-run integrity checks. */
+    /**
+     * Repair only a previously installed version. Unix callers hold the installation lock; bytes
+     * must match the original hashed manifest before chmod or a legacy manifest migration occurs.
+     */
     private static function repairInstalledRuntimePermissions(string $root, array $platform): bool
     {
         $manifest = rtrim($root, '\\/') . DIRECTORY_SEPARATOR . 'installed.json';
@@ -516,8 +558,81 @@ final class ChromeForTestingRuntime
             || !preg_match('/\A\d+(?:\.\d+){3}\z/', $data['version'])) return false;
         $versionRoot = rtrim($root, '\\/') . DIRECTORY_SEPARATOR . 'stable' . DIRECTORY_SEPARATOR . $data['version'];
         if (!is_dir($versionRoot)) return false;
+        if (PHP_OS_FAMILY !== 'Windows') {
+            $realRoot = realpath($root);
+            $realVersion = realpath($versionRoot);
+            $executable = is_string($data['executable'] ?? null) ? self::safeRelative($data['executable']) : null;
+            if ($realRoot === false || $realVersion === false || is_link($versionRoot)
+                || !self::pathInside($realVersion, $realRoot)
+                || $executable === null || !str_starts_with($executable, 'stable/' . $data['version'] . '/')
+                || !is_file($root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $executable))
+                || ($data['integrity_manifest'] ?? '') !== 'stable/' . $data['version'] . '/' . self::INTEGRITY_FILE
+                || !is_string($data['integrity_sha256'] ?? null)
+                || !preg_match('/\A[a-f0-9]{64}\z/', $data['integrity_sha256'])
+                || !self::verifyIntegrity($versionRoot, $data['integrity_sha256'], false, false)) return false;
+            $integrityPath = $versionRoot . DIRECTORY_SEPARATOR . self::INTEGRITY_FILE;
+            $integrity = json_decode((string) file_get_contents($integrityPath), true, 64, JSON_THROW_ON_ERROR);
+            $legacy = $integrity['schema'] === 1;
+            try {
+                foreach ($integrity['files'] as $relative => $entry) {
+                    if (($entry['type'] ?? '') !== 'file') continue;
+                    $path = $versionRoot . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+                    $executable = $legacy ? self::legacyExecutable($path, $relative) : $entry['executable'];
+                    if (!@chmod($path, $executable ? 0555 : 0444)) {
+                        self::fail('BROWSER_RUNTIME_PERMISSIONS_FAILED', '无法修复浏览器辅助程序的执行权限。', $platform, 'permissions');
+                    }
+                }
+                if ($legacy) {
+                    // Only the integrity metadata becomes writable; authenticated runtime bytes stay sealed.
+                    if (!@chmod($versionRoot, 0700) || !@chmod($integrityPath, 0600)) {
+                        self::fail('BROWSER_RUNTIME_PERMISSIONS_FAILED', '无法迁移浏览器权限清单。', $platform, 'permissions');
+                    }
+                    clearstatcache();
+                    $data['integrity_sha256'] = self::writeIntegrity($versionRoot, $platform);
+                }
+            } finally {
+                clearstatcache();
+                self::sealRuntimePermissions($versionRoot, $platform);
+            }
+            if ($legacy) self::writeInstalled($root, $data, $platform);
+            clearstatcache();
+            return self::verifyIntegrity($versionRoot, $data['integrity_sha256'], true);
+        }
         self::sealRuntimePermissions($versionRoot, $platform);
         return true;
+    }
+
+    /**
+     * Recover executable intent from authenticated legacy bytes after the old installer lost ZIP modes.
+     * ELF executable/shared-object and Mach-O executable/dylib headers cover CfT native helpers and
+     * libraries. Only Chrome's exact Linux wrapper path may obtain execute from a script header.
+     * @param string $path Integrity-verified regular file; never a symlink or an external path.
+     * @param string $relative Safe path within the verified version tree.
+     * @return bool Whether the old file is a native runtime program/library or the official wrapper.
+     */
+    private static function legacyExecutable(string $path, string $relative): bool
+    {
+        $stream = @fopen($path, 'rb');
+        if ($stream === false) return false;
+        try {
+            $header = (string) fread($stream, 64);
+            if (str_starts_with($header, "\x7fELF") && strlen($header) >= 18 && in_array(ord($header[5]), [1, 2], true)) {
+                $type = unpack(ord($header[5]) === 1 ? 'vtype' : 'ntype', substr($header, 16, 2));
+                return in_array($type['type'], [2, 3], true);
+            }
+            $magic = substr($header, 0, 4);
+            $little = in_array($magic, ["\xce\xfa\xed\xfe", "\xcf\xfa\xed\xfe"], true);
+            if (strlen($header) >= 16 && ($little || in_array($magic, ["\xfe\xed\xfa\xce", "\xfe\xed\xfa\xcf"], true))) {
+                $type = unpack($little ? 'Vtype' : 'Ntype', substr($header, 12, 4));
+                return in_array($type['type'], [2, 6], true);
+            }
+            if (in_array($relative, ['chrome-linux64/chrome-wrapper', 'chrome-linux-arm64/chrome-wrapper'], true)) {
+                return str_starts_with($header, '#!');
+            }
+            return false;
+        } finally {
+            fclose($stream);
+        }
     }
 
     /** Temporarily unlock only a stale product-owned version tree before replacing it. */

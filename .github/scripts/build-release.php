@@ -6,6 +6,7 @@ use RC\Cli\BuildBinary;
 use RC\Cli\Filesystem;
 use RC\Cli\ProcessRunner;
 use RC\Helper\Validator;
+use app\gateway\model\WebTokenizer;
 
 /**
  * Noninteractive release adapter for the framework's native encrypted builder.
@@ -19,6 +20,8 @@ $releaseProjectRoot = dirname(__DIR__, 2);
 foreach (['Cli/Filesystem', 'Cli/ProcessRunner', 'Cli/ArtifactRepository', 'Cli/BuildBinary', 'Helper/Validator'] as $releaseClass) {
     require_once $releaseProjectRoot . '/vendor/runchance/rcmaker-framework/src/' . $releaseClass . '.php';
 }
+// This stateless class defines the pinned resource identity without bootstrapping the application.
+require_once $releaseProjectRoot . '/apps/gateway/model/WebTokenizer.php';
 
 final class GatewayReleaseBuilder
 {
@@ -128,6 +131,24 @@ final class GatewayReleaseBuilder
             if (!is_file($target . '/' . $required)) {
                 throw new RuntimeException('Release runtime input is missing: ' . $required);
             }
+        }
+        self::verifyTokenizerVocabulary($target);
+    }
+
+    /**
+     * Refuse an unusable tokenizer before protecting and publishing the staged runtime.
+     * @param string $sourceRoot Isolated runtime tree; this resource belongs inside the PHAR, not external data.
+     * @return void The staged bytes must exactly match upstream, independently of checkout settings.
+     * @throws RuntimeException If the vocabulary is missing, unreadable or altered (including CRLF conversion).
+     */
+    private static function verifyTokenizerVocabulary(string $sourceRoot): void
+    {
+        $relative = 'apps/gateway/resource/o200k_base.tiktoken';
+        $path = $sourceRoot . '/' . $relative;
+        $hash = is_file($path) && is_readable($path) ? @hash_file('sha256', $path) : false;
+        if (!is_string($hash) || !hash_equals(WebTokenizer::VOCABULARY_SHA256, $hash)) {
+            throw new RuntimeException('Release tokenizer vocabulary is missing, unreadable or changed: ' . $relative
+                . '. Preserve the pinned file bytes; check Git line-ending conversion before rebuilding.');
         }
     }
 

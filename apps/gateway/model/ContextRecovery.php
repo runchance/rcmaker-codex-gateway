@@ -160,23 +160,35 @@ final class ContextRecovery
         $environment['tools'] = [];
         $environmentJson = ContextHistory::canonical($environment);
         $budget = json_decode((string)$job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
-        $attachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $job['context_json'], false));
-        if ($job['operation_kind'] !== 'response') {
-            $physicalAttachmentTokens = AttachmentStore::tokenReserve(
-                AttachmentStore::selectForContext([], $job['context_json']));
-            $budget = ContextBudget::forCompactionPrompt($budget,
-                ContextCompaction::prompt((string) $job['context_json']), $physicalAttachmentTokens);
-        }
-        $spec = ContextWindow::prepare([
+        $spec = [
             'budget'=>$budget, 'context_json'=>$job['context_json'], 'full_context_json'=>$job['context_json'],
             'tool_environment_json'=>$environmentJson, 'tool_environment_hash'=>hash('sha256', $environmentJson),
             'browser_lease_key'=>$job['browser_lease_key'], 'operation_kind'=>$job['operation_kind'],
             'checkpoint_marker'=>$job['checkpoint_marker'], 'tools'=>[], 'tool_choice'=>'none', 'tool_outputs'=>[],
-        ], $attachmentTokens);
+        ];
+        if ($job['operation_kind'] === 'response' && array_key_exists('imported_history_selection', $budget)) {
+            $spec['model'] = $job['model'] ?? null;
+            $spec['reasoning_effort'] = $job['reasoning_effort'] ?? null;
+            $spec = self::restoreImportedWindow($spec);
+        }
+        $logicalContext = (string)($spec['imported_budget_context_json'] ?? $job['context_json']);
+        $attachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $logicalContext, false));
+        if ($job['operation_kind'] !== 'response') {
+            $physicalAttachmentTokens = AttachmentStore::tokenReserve(
+                AttachmentStore::selectForContext([], $job['context_json']));
+            $spec['budget'] = ContextBudget::forCompactionPrompt($budget,
+                ContextCompaction::prompt((string) $job['context_json']), $physicalAttachmentTokens);
+        }
+        $spec = ContextWindow::prepare($spec, $attachmentTokens);
         $transport = (string)($spec['transport_context_json'] ?? $spec['context_json']);
         if ($job['operation_kind'] === 'response') {
-            // A normal response still owes the complete resident logical image budget.
-            ContextBudget::validate($transport, $spec['budget'], $attachmentTokens);
+            // A selected import owns only its retained logical images. Ordinary responses
+            // continue to owe the complete resident reserve, even on a physical projection.
+            $logicalContext = (string)($spec['imported_budget_context_json'] ?? $transport);
+            if (isset($spec['imported_budget_context_json'])) {
+                $attachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $logicalContext, false));
+            }
+            ContextBudget::validate($logicalContext, $spec['budget'], $attachmentTokens);
         } else {
             $physicalAttachments = AttachmentStore::selectForContext([], $transport);
             ContextBudget::validate(AttachmentStore::transportJson($transport), $spec['budget'],
@@ -200,6 +212,27 @@ final class ContextRecovery
             'budget_json'=>json_encode($spec['budget'], JSON_THROW_ON_ERROR),
             'tool_environment_json'=>$environmentJson, 'tool_environment_hash'=>hash('sha256', $environmentJson),
         ]];
+    }
+
+    /**
+     * Restore a persisted import on a fresh page, never the exact-prefix delta of its lost page.
+     * @param array $spec Durable ordinary-response source and its persisted selection budget.
+     * @return array Verified selected transport with the complete archive retained separately.
+     * @throws GatewayError If the durable prefix or selection no longer proves a safe replay.
+     */
+    private static function restoreImportedWindow(array $spec): array
+    {
+        unset($spec['budget']['imported_transport_transaction_id'], $spec['budget']['imported_transport_context_sha256']);
+        $source = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        unset($source['continuation']);
+        $spec['context_json'] = ContextHistory::canonical($source);
+        unset($spec['transport_context_json']);
+        $spec['continuation_source_response_id'] = null;
+        $spec = ContextWindow::selectImportedHistory($spec, false);
+        if (!isset($spec['imported_budget_context_json'])) {
+            throw new GatewayError('recovery_conflict', '已保存的导入历史选择无法验证，未重新发送完整原文。', 409);
+        }
+        return $spec;
     }
 
     /**
@@ -310,6 +343,22 @@ final class ContextRecovery
             $context = json_decode((string) ($rebuildFull ? $job['context_json']
                 : ($job['transport_context_json'] ?? $job['context_json'])), true, 128, JSON_THROW_ON_ERROR);
             $canonicalContext = ContextHistory::canonical($context);
+            $importedRestore = null;
+            if ($job['operation_kind'] === 'response' && array_key_exists('imported_history_selection', $budget)) {
+                $environment = json_decode((string)$job['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
+                $importedRestore = self::restoreImportedWindow([
+                    'budget'=>$budget, 'context_json'=>$job['context_json'], 'full_context_json'=>$job['context_json'],
+                    'tool_environment_json'=>$job['tool_environment_json'], 'tool_environment_hash'=>$job['tool_environment_hash'],
+                    'browser_lease_key'=>$job['browser_lease_key'], 'operation_kind'=>'response',
+                    'checkpoint_marker'=>$job['checkpoint_marker'], 'tools'=>$environment['tools'] ?? [],
+                    'tool_choice'=>empty($job['mcp_binding_id']) ? 'none' : 'auto', 'tool_outputs'=>[],
+                ]);
+                $logicalAttachments = AttachmentStore::selectForContext([], $importedRestore['imported_budget_context_json'], false);
+                $importedRestore = ContextWindow::prepare($importedRestore, AttachmentStore::tokenReserve($logicalAttachments));
+                $budget = $importedRestore['budget'];
+                $canonicalContext = (string)$importedRestore['transport_context_json'];
+                $context = json_decode($canonicalContext, true, 128, JSON_THROW_ON_ERROR);
+            }
             $newBindingId = $job['mcp_binding_id'];
             $archivePrompt = null;
             if ($readOnlyFallback && empty($job['mcp_binding_id'])) {
@@ -347,13 +396,37 @@ final class ContextRecovery
                 ContextBudget::validate(AttachmentStore::transportJson($canonicalContext), $budget,
                     AttachmentStore::tokenReserve($attachments));
             }
-            $prompt = $archivePrompt ?? (empty($job['mcp_binding_id'])
-                ? (in_array((string)($job['operation_kind'] ?? ''), ['compact_v1', 'compact_v2'], true)
-                    ? ContextCompaction::prompt($readOnlyFallback ? (string)$job['context_json'] : $canonicalContext)
-                    : ContextHistory::plainPrompt($context))
-                : ToolBroker::rebuildUnsentPromptUnlocked($job));
+            $promptJob = $job;
+            if ($importedRestore !== null) {
+                // The existing capability still proves it was never sent or used. Give its
+                // prompt builder the restored transport without replacing its original archive.
+                $promptJob['transport_context_json'] = $canonicalContext;
+                $promptJob['continuation_source_response_id'] = null;
+                $promptJob['budget_json'] = json_encode($budget, JSON_THROW_ON_ERROR);
+            }
+            $exactImportedReadonly = $importedRestore !== null && empty($job['mcp_binding_id'])
+                && $job['operation_kind'] === 'response';
+            if ($exactImportedReadonly) {
+                // Keep the import omission notice outside the JSON record projection, where
+                // multipart commits preserve it. Reuse the original answer/footer controls.
+                $readonlySpec = array_replace($importedRestore, [
+                    'model'=>$job['model'], 'reasoning_effort'=>$job['reasoning_effort'] ?? null,
+                    'checkpoint_marker'=>$job['checkpoint_marker'], 'budget'=>$budget,
+                    'context_json'=>$canonicalContext, 'full_context_json'=>$job['context_json'],
+                    'tool_environment_json'=>$job['tool_environment_json'],
+                    'tool_environment_hash'=>$job['tool_environment_hash'],
+                    'tools'=>[], 'tool_choice'=>'none', 'tool_outputs'=>[],
+                ]);
+                $prompt = ToolBroker::previewPromptForBudget($readonlySpec, $canonicalContext)['prompt'];
+            } else {
+                $prompt = $archivePrompt ?? (empty($job['mcp_binding_id'])
+                    ? (in_array((string)($job['operation_kind'] ?? ''), ['compact_v1', 'compact_v2'], true)
+                        ? ContextCompaction::prompt($readOnlyFallback ? (string)$job['context_json'] : $canonicalContext)
+                        : ContextHistory::plainPrompt($context))
+                    : ToolBroker::rebuildUnsentPromptUnlocked($promptJob));
+            }
             if ($prompt === null) return null;
-            if (!$readOnlyFallback && empty($job['mcp_binding_id']) && !empty($job['checkpoint_marker'])) {
+            if (!$exactImportedReadonly && !$readOnlyFallback && empty($job['mcp_binding_id']) && !empty($job['checkpoint_marker'])) {
                 $prompt = LunaCheckpoint::instructions($job['checkpoint_marker']) . "\n\n" . $prompt;
             }
             if ($staging && $code === 'CHATGPT_MESSAGE_TOO_LARGE') {

@@ -156,18 +156,57 @@ final class ResponseJob
             }
             $budget = $spec['budget'] ?? $budget;
             $spec = LunaCheckpoint::applyUnlocked($spec);
+            if (($spec['operation_kind'] ?? 'response') === 'response') {
+                // A foreign/forked conversation can be larger than this model's window before
+                // it has any local epoch. Select its recent history before the admission check;
+                // later rounds must inherit the same selection instead of importing it again.
+                $contextTaskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
+                $historyJob = null;
+                if (!empty($spec['previous_response_id'])) {
+                    $historyJob = $db->table('gateway_response_jobs')->where('id', (string) $spec['previous_response_id'])
+                        ->where('task_id', $contextTaskId)->find();
+                }
+                if (!is_array($historyJob)) {
+                    $historyJob = $db->table('gateway_response_jobs')->where('task_id', $contextTaskId)
+                        ->order([['rowid', 'DESC']])->limit(1)->find();
+                }
+                $noGatewayHistory = !is_array($historyJob)
+                    && !is_array($db->table('gateway_task_epochs')->where('task_id', $contextTaskId)->limit(1)->find());
+                if ($noGatewayHistory && LunaCheckpoint::enabled($spec)) {
+                    // Count the same private footer that this first physical submission
+                    // will use; generating it after selection would enlarge the prompt.
+                    $spec['checkpoint_marker'] = LunaCheckpoint::marker($spec);
+                }
+                $spec = ContextWindow::selectImportedHistory($spec, $noGatewayHistory, is_array($historyJob) ? $historyJob : null);
+                if (!empty($spec['steering_restart']) && isset($spec['imported_budget_context_json'])) {
+                    // Steering starts a fresh physical page. Carry the verified selected
+                    // history plus every new instruction/receipt, not its oversized archive.
+                    // Ordinary receipt rounds keep their already-bound selected transport.
+                    $spec['context_json'] = $spec['transport_context_json'] = $spec['imported_budget_context_json'];
+                    $spec['prompt'] = ContextHistory::plainPrompt(json_decode($spec['context_json'], true, 128, JSON_THROW_ON_ERROR));
+                    $spec['continuation_source_response_id'] = null;
+                    // This is a new physical page carrying new instructions, not a rebuild
+                    // of the import's original staged transaction.
+                    unset($spec['budget']['imported_transport_transaction_id'],
+                        $spec['budget']['imported_transport_context_sha256']);
+                }
+                $budget = $spec['budget'];
+            }
             $logicalContext = (string) ($spec['full_context_json'] ?? $spec['context_json']);
             $physical = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
             $exactPrefix = ($physical['continuation']['mode'] ?? null) === 'exact_prefix';
             $transportContext = (string) ($spec['transport_context_json']
                 ?? ($exactPrefix ? $spec['context_json'] : $logicalContext));
             $spec['transport_context_json'] = $transportContext;
-            $budgetContext = !empty($spec['rolling_source_response_id']) ? $transportContext : $logicalContext;
+            $budgetContext = (string) ($spec['imported_budget_context_json']
+                ?? (!empty($spec['rolling_source_response_id']) ? $transportContext : $logicalContext));
             // context_json is the context carried by this physical browser message after exact-prefix
             // continuation / rolling compaction. full_context_json remains the durable recovery/budget source.
             // Full logical context still owns the model budget even when exact-prefix continuation
             // sends only a suffix. File-backed skill text and retained images must therefore keep
             // consuming context tokens after their bytes stop being re-uploaded on the same page.
+            // An explicitly selected import counts its retained history, while the complete
+            // incoming source remains stored separately as read-only evidence.
             $budgetAttachments = AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $budgetContext, false);
             $attachmentTokens = AttachmentStore::tokenReserve($budgetAttachments);
             $inputTokens = ContextBudget::inputTokens($budgetContext, $budget, $attachmentTokens);
@@ -207,7 +246,7 @@ final class ResponseJob
             }
             // All logical tool rounds belong to one physical submission and share its delimiter.
             $marker = !empty($spec['tool_outputs']) && empty($spec['steering_restart']) && is_array($prior)
-                ? ($prior['checkpoint_marker'] ?? null) : LunaCheckpoint::marker($spec);
+                ? ($prior['checkpoint_marker'] ?? null) : ($spec['checkpoint_marker'] ?? LunaCheckpoint::marker($spec));
             $spec['checkpoint_marker'] = $marker;
             $bridge = ToolBroker::prepareRoundUnlocked($spec, $reservation, $responseId);
             $prompt = (string) $spec['prompt'];

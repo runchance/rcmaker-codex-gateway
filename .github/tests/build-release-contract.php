@@ -116,6 +116,7 @@ try {
         'public/assets/logo.svg' => '<svg/>', 'public/assets/route.yaml' => 'route: runtime',
         'vendor/pkg/ca-bundle.pem' => 'PUBLIC CA CERTIFICATE', 'vendor/pkg/config.xml' => '<config/>',
         'view/default.html' => '<h1>fixture</h1>', 'apps/gateway/schema.json' => '{}',
+        'apps/gateway/resource/o200k_base.tiktoken' => file_get_contents(dirname(__DIR__, 2) . '/apps/gateway/resource/o200k_base.tiktoken'),
         'LICENSE' => 'license fixture', 'NOTICE' => 'notice fixture', 'THIRD_PARTY_NOTICES' => 'third party fixture',
     ];
     $source = $releaseFixture . '/source';
@@ -138,6 +139,15 @@ try {
     ksort($actual);
     ksort($resources);
     releaseCheck('staging-keeps-exact-runtime-resources-without-secrets', $actual === $resources);
+    $vocabularyName = 'apps/gateway/resource/o200k_base.tiktoken';
+    $vocabulary = $resources[$vocabularyName];
+    releaseFixtureFile($source, $vocabularyName, str_replace("\n", "\r\n", $vocabulary));
+    releaseRejects('reject-checkout-crlf-vocabulary-before-build', static fn() => GatewayReleaseBuilder::stage($source, $releaseFixture . '/crlf-staged'));
+    releaseFixtureFile($source, $vocabularyName, $vocabulary . "invalid-vocabulary-record\n");
+    releaseRejects('reject-corrupt-vocabulary-before-build', static fn() => GatewayReleaseBuilder::stage($source, $releaseFixture . '/corrupt-staged'));
+    unlink($source . '/' . $vocabularyName);
+    releaseRejects('reject-missing-vocabulary-before-build', static fn() => GatewayReleaseBuilder::stage($source, $releaseFixture . '/missing-staged'));
+    releaseFixtureFile($source, $vocabularyName, $vocabulary);
 
     foreach ([['windows', 'x86_64', 'PE'], ['linux', 'x86_64', 'ELF'], ['linux', 'aarch64', 'ELF'],
         ['macos', 'x86_64', 'Mach-O'], ['macos', 'aarch64', 'Mach-O']] as [$platform, $arch, $format]) {
@@ -180,6 +190,8 @@ try {
         'unchanged-source' => static fn(Phar $archive) => $archive['index.php'] = $resources['index.php'],
         'secret-entry' => static fn(Phar $archive) => $archive['.env'] = 'SECRET-CANARY',
         'resource-corruption' => static fn(Phar $archive) => $archive['public/assets/locale.json'] = '{}',
+        'tokenizer-crlf' => static fn(Phar $archive) => $archive['apps/gateway/resource/o200k_base.tiktoken'] = str_replace("\n", "\r\n", $resources['apps/gateway/resource/o200k_base.tiktoken']),
+        'missing-tokenizer' => static fn(Phar $archive) => $archive->delete('apps/gateway/resource/o200k_base.tiktoken'),
         'missing-runtime-file' => static fn(Phar $archive) => $archive->delete('view/default.html'),
     ] as $name => $mutation) {
         $invalid = releaseFixturePayload($releaseFixture, $staged, $mutation);

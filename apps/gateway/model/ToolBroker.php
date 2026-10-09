@@ -193,6 +193,40 @@ final class ToolBroker
     }
 
     /**
+     * Render a normal response with the exact existing contract before reserving any capability.
+     * An import may reuse the returned opaque token in its first new binding, so admission and
+     * execution count identical bytes rather than estimating contract or random-token overhead.
+     * @param array $spec Prepared request; only settings, context and tool permissions are read.
+     * @param string $contextJson Candidate complete working context, never a browser transcript.
+     * @param ?string $turnToken Reuse one previously generated preview token across candidates.
+     * @return array{prompt:string,turn_token:?string} Exact prompt; read-only turns have no token.
+     * @throws GatewayError If the internal operation or supplied preview token is invalid.
+     */
+    public static function previewPromptForBudget(array $spec, string $contextJson, ?string $turnToken = null): array
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response') {
+            throw new GatewayError('context_budget_preview_invalid', '上下文预算预览仅用于普通响应。', 500);
+        }
+        $candidate = $spec;
+        $candidate['context_json'] = $contextJson;
+        $archive = !empty($spec['budget']['original_context_required']);
+        $contextOnly = (array)($spec['tools'] ?? []) === [] || ($spec['tool_choice'] ?? null) === 'none';
+        if ($contextOnly && !$archive) {
+            return ['prompt'=>self::readOnlyControlPrompt($candidate), 'turn_token'=>null];
+        }
+        $turnToken ??= self::opaque('turn');
+        if (preg_match('/\Aturn_[A-Za-z0-9]{32}\z/D', $turnToken) !== 1) {
+            throw new GatewayError('context_budget_preview_invalid', '上下文预算预览令牌无效。', 500);
+        }
+        $environment = json_decode((string)($spec['tool_environment_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
+        return ['prompt'=>self::controlPrompt($turnToken, $contextJson, $spec['checkpoint_marker'] ?? null,
+            TaskContext::enabled((array)($spec['budget'] ?? []), $environment), 'response', $contextOnly, $archive,
+            array_column((array)($environment['tools'] ?? []), 'wire_name'), !empty($spec['parallel_tool_calls']),
+            self::hostShellFromContext((string)($spec['full_context_json'] ?? $contextJson)),
+            (array)($spec['budget']['output_control'] ?? [])), 'turn_token'=>$turnToken];
+    }
+
+    /**
      * Prepare a Responses round while the caller owns the Schema transaction.
      * @return array{binding_id:?string,token:?string,control_prompt:string,is_continuation:bool}
      */
@@ -353,7 +387,14 @@ final class ToolBroker
         }
 
         $settings = GatewaySettings::internal();
-        $token = self::opaque('turn');
+        $previewToken = is_array($spec['budget']['imported_history_selection'] ?? null)
+            && isset($spec['imported_prompt_turn_token']) ? (string)$spec['imported_prompt_turn_token'] : null;
+        if ($previewToken !== null) {
+            $token = $previewToken;
+            if (preg_match('/\Aturn_[A-Za-z0-9]{32}\z/D', $token) !== 1) {
+                throw new GatewayError('context_budget_preview_invalid', '导入上下文的预算令牌无效。', 500);
+            }
+        } else $token = self::opaque('turn');
         $bindingId = self::opaque('bind');
         // The Web model owns the decision to use a tool when Codex requested auto.
         // Only an explicit native tool_choice=required creates a server-side call fence.
@@ -2391,6 +2432,7 @@ final class ToolBroker
         if ($contextJson === '') {
             $contextJson = '{"version":3,"system":[],"messages":[]}';
         }
+        $importNotice = self::importWindowNotice($contextJson);
         $contextJson = AttachmentStore::transportJson($contextJson);
         if ($operation !== 'response') {
             return "You are preparing a handoff of the original user task, not a handoff of these checkpoint instructions. "
@@ -2409,9 +2451,20 @@ final class ToolBroker
         $context = json_decode($contextJson, true, 128, JSON_THROW_ON_ERROR);
         $retainedPage = ($context['continuation']['mode'] ?? null) === 'exact_prefix';
         $contextJson = WebContract::contextJson($contextJson);
-        return self::conciseControlPrompt($token, $contextJson, $checkpointMarker, $readContext,
+        $prompt = self::conciseControlPrompt($token, $contextJson, $checkpointMarker, $readContext,
             $contextOnly, $archiveRequired, $hostToolNames, $parallelToolCalls, $hostShell, $outputControl,
             $retainedPage);
+        return $importNotice === '' ? $prompt : $prompt . "\n" . $importNotice;
+    }
+
+    /** Keep an authorized import's omission notice outside JSON so multipart commits retain it. */
+    private static function importWindowNotice(string $contextJson): string
+    {
+        $context = json_decode($contextJson, true, 128, JSON_THROW_ON_ERROR);
+        $original = $context['original_context'] ?? [];
+        if (($original['reason'] ?? null) !== 'import_budget_selection'
+            || !is_string($original['notice'] ?? null) || $original['notice'] === '') return '';
+        return "<codex_context_window_notice>\n" . $original['notice'] . "\n</codex_context_window_notice>";
     }
 
     /** Keep the tool-capable Web contract aligned with the reference transport and preserve its exact context JSON. */
@@ -2487,6 +2540,7 @@ final class ToolBroker
     {
         $contextJson = (string)($spec['context_json'] ?? '');
         if ($contextJson === '') $contextJson = '{"version":3,"system":[],"messages":[]}';
+        $importNotice = self::importWindowNotice($contextJson);
         $contextJson = WebContract::contextJson($contextJson);
         $effort = strtolower((string)($spec['reasoning_effort'] ?? 'high'));
         if ($effort === 'ultra') $effort = 'max';
@@ -2499,7 +2553,7 @@ final class ToolBroker
                 'xhigh'=>'Extra High', 'max'=>'Pro'][$effort] ?? 'High',
         };
         $marker = $spec['checkpoint_marker'] ?? null;
-        return WebContract::renderReadOnly(GatewaySettings::internal(), [
+        $prompt = WebContract::renderReadOnly(GatewaySettings::internal(), [
             'context_json' => $contextJson,
             'latest_user_prompt' => WebContract::latestUserPrompt($contextJson),
             'skill_contract' => WebContract::skillContract($contextJson),
@@ -2510,6 +2564,7 @@ final class ToolBroker
                 ? 'Return the complete answer that the outer Codex task should receive, then the required private checkpoint tail.'
                 : 'Return only the answer that the outer Codex task should receive.',
         ]);
+        return $importNotice === '' ? $prompt : $prompt . "\n" . $importNotice;
     }
 
     /** Match the native response's final-answer controls without changing task intent. */
