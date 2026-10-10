@@ -718,7 +718,10 @@ final class BrowserRuntime
                     && (int) ($value['effort_control_count'] ?? -1) === 0) {
                     $absenceSince ??= microtime(true);
                     if (microtime(true) - $absenceSince >= 3) {
-                        $capabilities = ['account_plan' => $value['account_plan'] ?? 'unknown', 'sol_available' => false, 'extra_high_available' => false, 'pro_available' => false];
+                        $capabilities = ['account_plan' => $value['account_plan'] ?? 'unknown', 'sol_available' => false,
+                            'extra_high_available' => false, 'pro_available' => false,
+                            'think_available' => (int)($value['think_control_count'] ?? 0) === 1
+                                && is_bool($value['think_pressed'] ?? null)];
                         \app\gateway\model\ModelCatalog::observe($capabilities);
                         $this->observeUsageAccount();
                         $this->finishCommand($commandId, ['models' => \app\gateway\model\ModelCatalog::routes($capabilities)]);
@@ -2914,6 +2917,7 @@ JS;
                         'sol_available' => false,
                         'extra_high_available' => false,
                         'pro_available' => false,
+                        'think_available' => $thinkCount === 1 && is_bool($state['think_pressed'] ?? null),
                     ], $recover);
                     return;
                 }

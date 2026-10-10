@@ -220,7 +220,9 @@ JS);
 const composer=visibleOne(COMPOSER);if(!composer)return {ok:false,code:'CHATGPT_EDITOR_MISSING'};
 const form=composer.closest('form');if(!form)return {ok:false,code:'CHATGPT_EDITOR_FORM_MISSING'};
 const controls=[...form.querySelectorAll(__EFFORT__)].filter(visible);
-const think=[...form.querySelectorAll('button')].filter(el=>visible(el)&&String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').trim()==='Think');
+// The same semantic toggle is captioned "思考" on a Chinese ChatGPT page.
+const thinkNames=new Set(['Think','思考']);
+const think=[...form.querySelectorAll('button[aria-pressed]')].filter(el=>visible(el)&&thinkNames.has(String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').trim()));
 let thinkPressed=null;
 if(think.length===1){const pressed=think[0].getAttribute('aria-pressed');thinkPressed=pressed==='true'?true:pressed==='false'?false:null;}
 const expanded=controls.length===1?controls[0].getAttribute('aria-expanded'):null;
@@ -349,7 +351,8 @@ JS));
     {
         return self::wrap(<<<'JS'
 const composer=visibleOne(COMPOSER);const form=composer?.closest('form');if(!form)return {ok:false,code:'CHATGPT_EDITOR_FORM_MISSING'};
-const controls=[...form.querySelectorAll('button')].filter(el=>visible(el)&&String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').trim()==='Think');
+const thinkNames=new Set(['Think','思考']);
+const controls=[...form.querySelectorAll('button[aria-pressed]')].filter(el=>visible(el)&&thinkNames.has(String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').trim()));
 if(controls.length>1)return {ok:false,code:'CHATGPT_THINK_CONTROL_INVALID',count:controls.length};
 if(controls.length===0)return {ok:true,count:0,pressed:false};
 const pressed=controls[0].getAttribute('aria-pressed');if(pressed!=='true'&&pressed!=='false')return {ok:false,code:'CHATGPT_THINK_STATE_INVALID',count:1};

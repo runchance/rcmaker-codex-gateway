@@ -30,8 +30,10 @@ final class ModelCatalog
         // the account badge was also unknown. Treat that observation as unverified and retry.
         $unprovenLuna = array_key_exists('sol_available', $caps) && empty($caps['sol_available'])
             && !in_array((string) ($caps['account_plan'] ?? 'unknown'), ['free', 'go'], true);
+        $unprovenFreeThink = ($caps['account_plan'] ?? '') === 'free' && empty($caps['sol_available'])
+            && !array_key_exists('think_available', $caps);
         $stale = (int) ($row['observed_at'] ?? 0) === 0 || (int) ($row['browser_generation'] ?? -1) !== (int) $state['surface_generation']
-            || (!empty($caps['sol_available']) && self::families($caps) === []) || $unprovenLuna;
+            || (!empty($caps['sol_available']) && self::families($caps) === []) || $unprovenLuna || $unprovenFreeThink;
         $availabilityExpired = !empty($caps['sol_available']) && (int)($row['observed_at'] ?? 0) < time() - 60;
         if (!$changed && !$stale && empty($caps['refresh_required']) && !$availabilityExpired) return;
         if ((int) ($caps['probe_attempted_at'] ?? 0) > time() - 60) return;
@@ -359,6 +361,8 @@ final class ModelCatalog
 
     /**
      * Project runtime families into fixed Instant/Pro and window-compatible Thinking choices.
+     * A verified Free account advertises only its actual Think control, keeping ordinary
+     * Luna available to existing task identities without injecting a second native model.
      * Separate existing wire identities protect saved unified Low/Max choices from a different window.
      * Instant remains separate even when its window matches Thinking because the grouped legacy wire
      * identity does not accept Low. The console and native catalog consume this same pure projection.
@@ -367,6 +371,18 @@ final class ModelCatalog
      */
     public static function catalogRoutes(?array $capabilities = null): array
     {
+        $capabilities ??= self::observedCapabilities();
+        if (is_array($capabilities) && ($capabilities['account_plan'] ?? '') === 'free'
+            && array_key_exists('sol_available', $capabilities) && empty($capabilities['sol_available'])) {
+            if (empty($capabilities['think_available'])) return [];
+            foreach (self::routes($capabilities) as $route) {
+                if ($route['id'] !== 'chatgpt-web/think') continue;
+                $route['label'] = 'GPT-Free.Thinging.RC(Web)';
+                $route['website_label'] = 'Think';
+                return [$route];
+            }
+            return [];
+        }
         $routes = [];
         foreach (self::routes($capabilities) as $route) {
             if (!str_starts_with($route['id'], 'chatgpt-web/model/')) {
@@ -409,12 +425,16 @@ final class ModelCatalog
         $settings = GatewaySettings::internal();
         $caps = self::observedCapabilities();
         $routes = self::catalogRoutes($caps);
-        if (is_array($caps) && !empty($caps['sol_available'])) {
+        $freeAccount = is_array($caps) && ($caps['account_plan'] ?? '') === 'free'
+            && array_key_exists('sol_available', $caps) && empty($caps['sol_available']);
+        if (is_array($caps) && (!empty($caps['sol_available']) || $freeAccount)) {
             $knownIds = array_fill_keys(array_column($routes, 'id'), true);
             $compatibility = self::routes($caps);
             foreach ($compatibility as &$route) $route['legacy'] = true;
             unset($route);
-            foreach (array_merge($compatibility, self::legacyRoutes($caps)) as $route) {
+            $hiddenRoutes = !empty($caps['sol_available'])
+                ? array_merge($compatibility, self::legacyRoutes($caps)) : $compatibility;
+            foreach ($hiddenRoutes as $route) {
                 if (isset($knownIds[$route['id']])) continue;
                 $routes[] = $route;
                 $knownIds[$route['id']] = true;

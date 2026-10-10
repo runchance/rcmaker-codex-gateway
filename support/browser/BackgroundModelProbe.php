@@ -107,7 +107,9 @@ final class BackgroundModelProbe
                 return;
             }
             if (empty($value['sol_available']) && in_array($value['account_plan'] ?? '', ['free','go'], true)) {
-                $this->finish(['account_plan'=>$value['account_plan'],'sol_available'=>false,'pro_available'=>false]); return;
+                $this->finish(['account_plan'=>$value['account_plan'],'sol_available'=>false,'pro_available'=>false,
+                    'think_available'=>(int)($value['think_control_count'] ?? 0) === 1
+                        && is_bool($value['think_pressed'] ?? null)]); return;
             }
             $this->later();
         });
