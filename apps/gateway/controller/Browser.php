@@ -19,10 +19,32 @@ use support\browser\ChromeForTestingRuntime;
 /** Local private-browser setup API. Browser I/O stays queued to the dedicated worker. */
 final class Browser
 {
-    /** @return mixed Current safe browser state plus the ordinary-user setup projection. */
+    /**
+     * Read browser setup and workspace state, optionally confirming up to five exact page closes.
+     * @param Request $request Local console request; closing_surfaces is an optional comma-separated ID list.
+     * @return mixed Current safe browser state and bounded operator-facing projections.
+     */
     public function read(Request $request)
     {
-        return $this->respond($request, function (): array {
+        return $this->respond($request, function () use ($request): array {
+            $closingSurfaceIds = [];
+            $requestedCloses = $request->get('closing_surfaces');
+            if ($requestedCloses !== null) {
+                if (!is_string($requestedCloses)) {
+                    throw new GatewayError('INVALID_BROWSER_SURFACE', '任务页面标识无效。', 400);
+                }
+                $requestedCloses = $this->text($requestedCloses, 1, 200, '任务页面');
+                $closingSurfaceIds = explode(',', $requestedCloses);
+                if (count($closingSurfaceIds) > TaskLedger::MAX_SURFACES
+                    || count(array_unique($closingSurfaceIds)) !== count($closingSurfaceIds)) {
+                    throw new GatewayError('INVALID_BROWSER_SURFACE', '任务页面标识无效。', 400);
+                }
+                foreach ($closingSurfaceIds as $surfaceId) {
+                    if (!preg_match('/\Asurf_[a-f0-9]{24}\z/D', $surfaceId)) {
+                        throw new GatewayError('INVALID_BROWSER_SURFACE', '任务页面标识无效。', 400);
+                    }
+                }
+            }
             $choices = [];
             $hasBundled = false;
             foreach (BrowserProcess::detected() as $browser) {
@@ -40,7 +62,7 @@ final class Browser
             $rawState = BrowserState::state();
             $runtime = ChromeForTestingRuntime::status();
             $monitor = TaskLedger::monitor();
-            $monitors = TaskLedger::monitors();
+            $monitors = TaskLedger::monitors($closingSurfaceIds);
             $networkState = NetworkSettings::state();
             $saved = NetworkSettings::revision((int) $networkState['saved_revision']);
             $page = ResponseJob::pageSnapshot($rawState);
@@ -61,6 +83,7 @@ final class Browser
                 ],
                 'monitor' => $monitor,
                 'monitors' => $monitors,
+                'close_states' => TaskLedger::monitorClosures($closingSurfaceIds),
                 'native_window' => \support\browser\NativeBrowserWindow::snapshot($rawState),
             ];
         });

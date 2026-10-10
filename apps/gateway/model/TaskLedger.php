@@ -2207,17 +2207,38 @@ final class TaskLedger
         ];
     }
 
-    /** List the at most five retained task pages for the read-only browser workspace. */
-    public static function monitors(): array
+    /**
+     * Project retained pages and bounded pending physical closes into the browser workspace.
+     * Closing rows do not reserve task slots and disappear only after the browser confirms absence.
+     * @param list<string> $closingSurfaceIds Up to five operator-requested closes, shown first.
+     * @return list<array> At most five retained pages plus five pending physical closes.
+     * @throws GatewayError If the page projection cannot be read from durable storage.
+     */
+    public static function monitors(array $closingSurfaceIds = []): array
     {
         Schema::initialize();
-        // The first-round context is immutable. Keep only titles for the current five pages
+        // The first-round context is immutable. Keep only titles for the bounded current pages
         // in this API worker so frequent console polling does not decode large histories.
         static $titleByTask = [];
         $db = SDB(null, 'medoo', 'sqlite');
         $surfaces = $db->table('gateway_browser_surfaces')->where('status', '<>', 'retired')
             ->order([['created_at', 'ASC'], ['id', 'ASC']])->limit(self::MAX_SURFACES)->select();
         if (!is_array($surfaces)) throw new GatewayError('storage_unavailable', '任务页面列表暂不可读取。', 503);
+        $requestedClosing = [];
+        if ($closingSurfaceIds !== []) {
+            $requestedClosing = $db->table('gateway_browser_surfaces')->where('status', 'retired')
+                ->where('target_id', '<>', null)->where('id', 'IN', array_slice($closingSurfaceIds, 0, self::MAX_SURFACES))
+                ->order([['retired_at', 'ASC'], ['id', 'ASC']])->limit(self::MAX_SURFACES)->select();
+            if (!is_array($requestedClosing)) throw new GatewayError('storage_unavailable', '任务页面关闭状态暂不可读取。', 503);
+        }
+        $closing = $db->table('gateway_browser_surfaces')->where('status', 'retired')
+            ->where('target_id', '<>', null)
+            ->order([['retired_at', 'ASC'], ['id', 'ASC']])->limit(self::MAX_SURFACES)->select();
+        if (!is_array($closing)) throw new GatewayError('storage_unavailable', '任务页面关闭状态暂不可读取。', 503);
+        $closingById = [];
+        foreach (array_merge($requestedClosing, $closing) as $surface) $closingById[(string) $surface['id']] = $surface;
+        $closing = array_slice(array_values($closingById), 0, self::MAX_SURFACES);
+        $surfaces = array_merge($surfaces, $closing);
         $items = [];
         $seenTasks = [];
         foreach ($surfaces as $surface) {
@@ -2238,6 +2259,8 @@ final class TaskLedger
             $threadId = (string) ($task['thread_id'] ?? '');
             $title = $titleByTask[$taskId];
             if ($title === '') $title = $threadId !== '' ? mb_substr($threadId, 0, 80) : '任务 ' . mb_substr($taskId, -8);
+            $isClosing = (string) $surface['status'] === 'retired';
+            $closeBlocker = $isClosing ? 'page_closing' : self::idleSurfaceCloseBlockerUnlocked($db, $task, $surface, $turn);
             $items[] = [
                 'surface_id' => (string) $surface['id'],
                 'task_id' => $taskId,
@@ -2248,14 +2271,45 @@ final class TaskLedger
                 'surface_status' => (string) $surface['status'],
                 'turn_status' => is_array($turn) ? (string) $turn['status'] : null,
                 'url' => (string) $surface['url'],
-                'closable' => self::idleSurfaceClosableUnlocked($db, $task, $surface, $turn),
+                'closing' => $isClosing,
+                'closable' => $closeBlocker === null,
+                'close_blocker_code' => $closeBlocker,
             ];
         }
         $titleByTask = array_intersect_key($titleByTask, $seenTasks);
         return $items;
     }
 
-    /** Retire an explicitly closed, completed task page while preserving its durable task history. */
+    /**
+     * Confirm exact requested page closures independently of the bounded workspace projection.
+     * Missing history or an open surface never establishes physical closure. No browser action is sent.
+     * @param list<string> $surfaceIds Up to five validated surface IDs from the local console.
+     * @return array<string,string> Each ID maps to closing, closed, open or unknown.
+     * @throws GatewayError If durable closure evidence cannot be read.
+     */
+    public static function monitorClosures(array $surfaceIds): array
+    {
+        if ($surfaceIds === []) return [];
+        Schema::initialize();
+        $ids = array_values(array_unique(array_slice($surfaceIds, 0, self::MAX_SURFACES)));
+        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces')->where('id', 'IN', $ids)
+            ->select('id,status,target_id');
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '任务页面关闭状态暂不可读取。', 503);
+        $states = array_fill_keys($ids, 'unknown');
+        foreach ($rows as $row) {
+            $states[(string) $row['id']] = (string) $row['status'] !== 'retired' ? 'open'
+                : (!empty($row['target_id']) ? 'closing' : 'closed');
+        }
+        return $states;
+    }
+
+    /**
+     * Request physical closure of a completed page, preserving task history and close provenance.
+     * The browser worker confirms disappearance before the workspace removes its pending row.
+     * @param string $surfaceId Completed task surface selected by the operator.
+     * @return array{task_id:string,surface_id:string,closing:bool} Pending physical-close receipt.
+     * @throws GatewayError If the surface is missing, unsafe to close, or cannot be persisted.
+     */
     public static function retireIdleTaskSurface(string $surfaceId): array
     {
         return Schema::transaction(static function () use ($surfaceId): array {
@@ -2272,22 +2326,33 @@ final class TaskLedger
                 throw new GatewayError('surface_not_closable', '只有已完成且无待确认的空闲任务页面可以关闭。', 409);
             }
             self::retireEpochUnlocked($taskId, (string) $surface['epoch_id'], 'operator_closed_idle_page');
-            return ['task_id' => $taskId, 'surface_id' => $surfaceId];
+            return ['task_id' => $taskId, 'surface_id' => $surfaceId, 'closing' => !empty($surface['target_id'])];
         });
     }
 
     /** Authoritative close guard shared by the list hint and the transactional close action. */
     private static function idleSurfaceClosableUnlocked($db, array $task, array $surface, mixed $lastTurn): bool
     {
-        if ((string) $task['status'] !== 'active' || (string) $surface['status'] !== 'ready'
-            || (string) $task['current_epoch_id'] !== (string) $surface['epoch_id']
-            || !is_array($lastTurn) || (string) $lastTurn['status'] !== 'committed') return false;
+        return self::idleSurfaceCloseBlockerUnlocked($db, $task, $surface, $lastTurn) === null;
+    }
+
+    /** Return a stable UI reason while retaining the same authoritative transactional close guard. */
+    private static function idleSurfaceCloseBlockerUnlocked($db, array $task, array $surface, mixed $lastTurn): ?string
+    {
+        if ((string) $surface['status'] === 'needs_attention' || (string) $task['status'] === 'needs_attention') {
+            return 'page_needs_attention';
+        }
+        if ((string) $task['status'] !== 'active'
+            || (string) $task['current_epoch_id'] !== (string) $surface['epoch_id']) return 'page_inactive_epoch';
+        if ((string) $surface['status'] !== 'ready') return 'page_active';
+        if (!is_array($lastTurn) || (string) $lastTurn['status'] !== 'committed') return 'page_incomplete';
         $activeTurns = $db->table('gateway_task_turns')->where('surface_id', (string) $surface['id'])
             ->where('status', 'IN', self::ACTIVE_TURNS)->count();
-        if ($activeTurns === false || $activeTurns === null || (int) $activeTurns !== 0) return false;
+        if ($activeTurns === false || $activeTurns === null || (int) $activeTurns !== 0) return 'page_active';
         $openBindings = $db->table('gateway_mcp_bindings')->where('task_id', (string) $task['id'])
             ->where('status', 'NOT IN', ['completed', 'revoked'])->count();
-        return $openBindings !== false && $openBindings !== null && (int) $openBindings === 0;
+        if ($openBindings === false || $openBindings === null || (int) $openBindings !== 0) return 'page_tools_pending';
+        return null;
     }
 
     /** Resolve an active page's physical target for a requested monitor screenshot. */

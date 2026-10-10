@@ -28,7 +28,14 @@ final class ChatGptPage
         return $origin . '/?temporary-chat=true';
     }
 
-    /** True only for a Temporary Chat root or its exact conversation URL on the configured origin. */
+    /**
+     * Recognize explicit Temporary Chat routes on the configured origin, including SPA local IDs.
+     * A local conversation can remain in use while native tools run; elapsed time does not revoke
+     * its explicit temporary-chat flag. Ordinary chats and missing/conflicting flags stay rejected.
+     * @param string $url Observed page URL.
+     * @param string $modelUrl Configured ChatGPT origin.
+     * @return bool Whether the exact root or UUID conversation route has one true temporary flag.
+     */
     public static function isTemporaryChatUrl(string $url, string $modelUrl): bool
     {
         $actual = parse_url($url);
@@ -40,7 +47,7 @@ final class ChatGptPage
             return false;
         }
         $path = (string) ($actual['path'] ?? '/');
-        if ($path !== '/' && preg_match('~^/c/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$~i', $path) !== 1) return false;
+        if ($path !== '/' && preg_match('~^/c/(?:local-chatgpt%3a)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$~i', $path) !== 1) return false;
         $temporaryValues = [];
         foreach (explode('&', (string) ($actual['query'] ?? '')) as $part) {
             [$key, $value] = array_pad(explode('=', $part, 2), 2, '');
@@ -56,7 +63,7 @@ final class ChatGptPage
             && self::isTemporaryChatUrl($url, $modelUrl);
     }
 
-    /** A brief post-submit SPA URL before ChatGPT assigns the final Temporary Chat ID. */
+    /** A post-submit SPA route whose explicit Temporary Chat flag is not confirmed yet. */
     public static function isTemporaryChatNavigationUrl(string $url, string $modelUrl): bool
     {
         $actual = parse_url($url);
@@ -1368,7 +1375,7 @@ const generationStop=()=>{
 const temporaryChatPage=(path,search)=>{
     const flags=new URLSearchParams(search||'').getAll('temporary-chat');
     return flags.length===1&&flags[0]==='true'
-        &&(path==='/'||/^\/c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(path));
+        &&(path==='/'||/^\/c\/(?:local-chatgpt%3a)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(path));
 };
 const composerSendButtons=editor=>{
     const form=editor.closest('form');

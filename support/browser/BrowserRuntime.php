@@ -1603,8 +1603,15 @@ JS;
         return $targets;
     }
 
-    /** Use framework Curl only against the loopback DevTools HTTP endpoint. */
-    private function devtoolsRequest(int $port, string $path, string $method = 'GET'): mixed
+    /**
+     * Read a loopback DevTools endpoint through framework Curl.
+     * @param int $port Existing private browser's debug port.
+     * @param string $path DevTools endpoint path.
+     * @param string $method GET or PUT according to the endpoint's protocol.
+     * @param bool $rawResponse Preserve JSON root types for authoritative physical-target checks.
+     * @return mixed Decoded response, raw bytes when requested, or null when transport failed.
+     */
+    private function devtoolsRequest(int $port, string $path, string $method = 'GET', bool $rawResponse = false): mixed
     {
         $client = curl();
         try {
@@ -1617,12 +1624,38 @@ JS;
             $response = $method === 'PUT' ? $client->put($url) : $client->get($url);
             if ($client->curlErrorCode !== 0 || (int) $client->httpStatusCode !== 200) return null;
             $raw = (string) $client->rawResponse;
+            if ($rawResponse) return $raw;
             $decoded = json_decode($raw, true, 32);
             if (json_last_error() === JSON_ERROR_NONE) return $decoded;
             return $raw !== '' ? $raw : $response;
         } finally {
             $client->close();
         }
+    }
+
+    /**
+     * Read a complete physical page inventory without confusing attachability with existence.
+     * A page can exist before its WebSocket URL is available. An invalid or partial inventory
+     * must retain the pending close target rather than falsely confirm that it disappeared.
+     * @param int $port Existing private browser's debug port.
+     * @return array<string,true>|null Physical page IDs, or null when the snapshot is untrustworthy.
+     */
+    private function discoverPhysicalPageIdsIfAvailable(int $port): ?array
+    {
+        $raw = $this->devtoolsRequest($port, '/json/list', 'GET', true);
+        if (!is_string($raw)) return null;
+        try { $rows = json_decode($raw, false, 32, JSON_THROW_ON_ERROR); }
+        catch (\JsonException) { return null; }
+        if (!is_array($rows)) return null;
+        $seen = [];
+        $pages = [];
+        foreach ($rows as $row) {
+            if (!$row instanceof \stdClass || !is_string($row->id ?? null) || $row->id === ''
+                || !is_string($row->type ?? null) || $row->type === '' || isset($seen[$row->id])) return null;
+            $seen[$row->id] = true;
+            if ($row->type === 'page') $pages[$row->id] = true;
+        }
+        return $pages;
     }
 
     /** Connect directly to one page target websocket; switching tabs replaces this transport. */
@@ -6918,12 +6951,17 @@ JS;
             }, 3.0);
     }
 
+    /**
+     * Close only retired task targets and acknowledge closure from a complete physical inventory.
+     * Failed requests or untrustworthy inventories preserve ownership for the next cleanup tick.
+     * @param array $state Existing private browser state with its owned debug port.
+     */
     private function cleanupRetiredTaskSurfaces(array $state): void
     {
         $port = (int) ($state['debug_port'] ?? 0);
         if ($port < 1) return;
         try {
-            $live = $this->discoverTargetsIfAvailable($port);
+            $live = $this->discoverPhysicalPageIdsIfAvailable($port);
             if ($live === null) return;
             TaskLedger::reconcilePhysicalTargets(array_keys($live));
             $retired = TaskLedger::retiredTargets();
@@ -6931,7 +6969,7 @@ JS;
             foreach ($retired as $targetId => $surfaceId) {
                 if (isset($live[$targetId])) {
                     $this->devtoolsRequest($port, '/json/close/' . rawurlencode($targetId));
-                    $after = $this->discoverTargetsIfAvailable($port);
+                    $after = $this->discoverPhysicalPageIdsIfAvailable($port);
                     if ($after === null || isset($after[$targetId])) continue;
                 }
                 TaskLedger::targetClosed($surfaceId);
