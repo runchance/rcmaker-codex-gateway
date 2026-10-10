@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>运行日志 · RCMAKER AI</title>
+    <link rel="stylesheet" href="../component/pear/css/pear.css">
+    <link rel="stylesheet" href="../assets/gateway.css">
+</head>
+<body class="gateway-page">
+    <header class="page-heading">
+        <div>
+            <div class="eyebrow">DIAGNOSTICS</div>
+            <h1>运行日志</h1>
+            <p class="muted">遇到异常时，下载诊断包发给维护者，无需发送整个数据库。</p>
+        </div>
+    </header>
+    <div id="diagnostics-error" class="notice error" role="alert" hidden></div>
+    <section class="panel" aria-labelledby="export-heading">
+        <div class="panel-title"><h2 id="export-heading">导出运行日志</h2><span class="badge">只读采集</span></div>
+        <form id="diagnostics-form" class="layui-form">
+            <div class="field">
+                <label for="diagnostics-hours">排查时间范围</label>
+                <select id="diagnostics-hours" lay-filter="diagnostics-hours">
+                    <option value="1">最近 1 小时</option>
+                    <option value="24" selected>最近 24 小时</option>
+                    <option value="72">最近 3 天</option>
+                    <option value="168">最近 7 天</option>
+                </select>
+            </div>
+            <p class="muted">默认导出最近 24 小时的有界记录和当前运行状态。诊断数据最多 4 MiB；超出部分、缺失日志和采样上限会在包内说明。</p>
+            <div class="actions">
+                <button id="download-diagnostics" type="submit" class="layui-btn"><i class="layui-icon layui-icon-download-circle"></i> <span id="diagnostics-button-label">下载诊断包</span></button>
+                <span id="diagnostics-progress" class="muted" role="status" aria-live="polite"></span>
+            </div>
+        </form>
+        <div id="diagnostics-result" class="notice" role="status" hidden></div>
+    </section>
+    <section class="panel" aria-labelledby="contents-heading">
+        <div class="panel-title"><h2 id="contents-heading">诊断包包含什么</h2></div>
+        <p>程序版本、运行环境、任务与回合状态、压缩交接、工具调用状态、浏览器和连接器状态，以及近期文件日志的结构化错误信息。</p>
+        <p>不包含完整数据库、API Key、Cookie、登录资料、会话令牌、聊天正文、工具参数或返回正文、摘要正文和附件内容。</p>
+        <p class="muted">只读取现有记录，不会暂停任务、重发消息或调用模型。即使浏览器或模型尚未就绪，也可以导出。</p>
+        <p class="muted">文件仅下载到本机，不会自动上传。通常为 ZIP；运行环境缺少 ZIP 扩展时会下载 JSON。公开分享前请先检查内容。</p>
+    </section>
+    <script src="../assets/i18n-catalog.js"></script>
+    <script src="../assets/i18n.js"></script>
+    <script src="../component/layui/layui.js"></script>
+    <script src="../assets/gateway.js"></script>
+    <script src="../assets/diagnostics.js"></script>
+</body>
+</html>

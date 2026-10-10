@@ -2,6 +2,8 @@
     'use strict';
 
     const byId = id => document.getElementById(id);
+    const diagnosticsButton = byId('open-diagnostics');
+    if (diagnosticsButton) diagnosticsButton.addEventListener('click', () => Gateway.openDiagnostics());
     const state = {
         tasks: [], status: 'active', page: 1, pageSize: 20, total: 0, pages: 1,
         counts: {total: 0, active: 0, needs_attention: 0, completed: 0, cancelled: 0},

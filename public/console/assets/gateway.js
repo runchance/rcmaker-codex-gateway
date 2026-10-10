@@ -61,17 +61,17 @@
     }
 
     /** Fetch a local binary response with the same origin/header boundary as JSON APIs. */
-    async function binary(path) {
+    async function binary(path, options) {
         const config = await bootstrap();
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
+        const timeout = setTimeout(() => controller.abort(), options && options.timeoutMs || 8000);
         try {
             const response = await fetch(config.api_origin + path, {
                 method: 'GET', cache: 'no-store', credentials: 'omit',
                 headers: {'X-Gateway-Request': 'console'}, signal: controller.signal
             });
             if (!response.ok) {
-                let message = I18n.t('本地页面画面暂不可用。');
+                let message = I18n.t(options && options.errorMessage || '本地页面画面暂不可用。');
                 try { message = (await response.json()).message || message; } catch (_) {}
                 const error = new Error(I18n.error(message, response.status === 404 ? 'NOT_READY' : 'HTTP_ERROR'));
                 error.originalMessage = message;
@@ -308,5 +308,15 @@
         }
     }
 
-    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks};
+    /** Open support exports even when browser/model readiness is unavailable. */
+    function openDiagnostics() {
+        if (window.parent !== window && window.parent.PearAdmin) {
+            window.parent.PearAdmin.instances.tabPage.changePage({id: 'diagnostics', title: I18n.t('运行日志'), type: '_iframe', url: 'pages/diagnostics.html', close: true});
+            window.parent.PearAdmin.instances.menu.selectItem('diagnostics');
+        } else {
+            window.location.href = 'diagnostics.html';
+        }
+    }
+
+    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics};
 })();
