@@ -38,8 +38,9 @@ final class ContextPortability
             if (($item->type ?? '') === 'reasoning' && str_starts_with((string) ($item->encrypted_content ?? ''), 'ocxr1:')) $crossed = true;
             if (($item->type ?? '') === 'reasoning' && preg_match('/\Ars_[a-f0-9]{32}\z/i', (string) ($item->id ?? ''))
                 && !isset($item->encrypted_content) && (is_array($item->summary ?? null) || is_array($item->content ?? null))) $crossed = true;
-            // RCMAKER generates 12-byte IDs; native records use their own longer identity format.
-            if (preg_match('/\A(?:msg_|fc_)[a-f0-9]{24}\z/', (string) ($item->id ?? ''))
+            // RCMAKER generates 12-byte IDs, including legacy fc_ custom calls;
+            // native records use their own longer identity format.
+            if (preg_match('/\A(?:msg_|fc_|ctc_|tsc_)[a-f0-9]{24}\z/', (string) ($item->id ?? ''))
                 || preg_match('/\Amsg_c_[a-f0-9]{32}\z/', (string) ($item->id ?? ''))) $crossed = true;
         }
         if ($localReference) {

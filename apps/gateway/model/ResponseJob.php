@@ -893,6 +893,7 @@ final class ResponseJob
      * and delivers the exact call set in this same transaction, so a crash cannot leave a
      * completed Responses stream with only some calls marked delivered. Replays must match
      * the committed call IDs, arguments, and order before returning idempotently.
+     * Item IDs use native type-specific prefixes; call_id remains the broker receipt identity.
      * @param list<array> $invocations Verified broker invocations in delivery order.
      * @param ?string $visibleRoundText Answer-root Markdown from this Web round, if observed.
      */
@@ -987,7 +988,9 @@ final class ResponseJob
                 $events = array_slice(ResponsesProtocol::completionEvents($responseId, (string) $job['item_id'], $text, $textIndex), 0, 3);
             }
             foreach ($invocations as $invocation) {
-                $toolItemId = (!empty($invocation['tool_search']) ? 'tsc_' : 'fc_') . bin2hex(random_bytes(12));
+                $toolItemPrefix = !empty($invocation['tool_search']) ? 'tsc_'
+                    : (!empty($invocation['freeform']) ? 'ctc_' : 'fc_');
+                $toolItemId = $toolItemPrefix . bin2hex(random_bytes(12));
                 $toolIndex = count($output);
                 $events = array_merge($events, ResponsesProtocol::brokerToolItemEvents($invocation, $toolItemId, $toolIndex));
                 $output[] = ResponsesProtocol::brokerToolItem($invocation, $toolItemId);
