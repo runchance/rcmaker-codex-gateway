@@ -25,7 +25,8 @@ final class WebModelAdapterRegistry
     {
         $required = [
             'capabilityExpression', 'modelControlStateExpression', 'focusEffortControlExpression', 'effortSliderExpression',
-            'focusEffortSliderOwnerExpression', 'thinkStateExpression', 'thinkCommandMenuExpression', 'baselineExpression',
+            'focusEffortSliderOwnerExpression', 'thinkStateExpression', 'focusThinkControlExpression',
+            'thinkCommandMenuExpression', 'baselineExpression',
             'focusAndClearExpression', 'focusComposerExpression', 'insertPlainTextExpression', 'composerTextExpression',
             'promptTextExpression', 'sendReadinessExpression', 'focusSendExpression', 'connectorMenuExpression',
             'connectorSelectedExpression', 'toolConfirmationExpression', 'focusToolConfirmationExpression',

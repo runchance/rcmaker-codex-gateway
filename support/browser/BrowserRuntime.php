@@ -3396,6 +3396,27 @@ JS;
                     $after();
                     return;
                 }
+                // Free's current composer exposes a real, stateful Think button.
+                // Activate only that verified button and read its state back; keep
+                // the older slash-command flow for legacy pages without a toggle.
+                if ((int) ($state['count'] ?? 0) === 1) {
+                    $this->evaluateModelSelection($responseId, WebModelPage::focusThinkControlExpression(),
+                        function ($focusError, $focused) use ($responseId, $enabled, $after, $recover): void {
+                            if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
+                                $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法聚焦 ChatGPT Think 按钮。', $recover);
+                                return;
+                            }
+                            $this->dispatchModelSelectionKey($responseId, 'Enter',
+                                function ($keyError) use ($responseId, $enabled, $after, $recover): void {
+                                    if ($keyError !== null) {
+                                        $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法切换 ChatGPT Think 按钮。', $recover);
+                                        return;
+                                    }
+                                    $this->waitTaskThinkState($responseId, $enabled, $after, $recover, microtime(true) + 5.0);
+                                });
+                        });
+                    return;
+                }
                 $this->evaluateModelSelection($responseId, WebModelPage::focusAndClearExpression(),
                     function ($clearError, $cleared) use ($responseId, $enabled, $after, $recover): void {
                         if ($clearError !== null || !is_array($cleared) || empty($cleared['ok'])) {

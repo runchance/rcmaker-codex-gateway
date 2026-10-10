@@ -360,6 +360,19 @@ return {ok:true,count:1,pressed:pressed==='true'};
 JS);
     }
 
+    /** Focus the exact semantic Think toggle before a native keyboard activation. */
+    public static function focusThinkControlExpression(): string
+    {
+        return self::wrap(<<<'JS'
+const composer=visibleOne(COMPOSER);const form=composer?.closest('form');if(!form)return {ok:false,code:'CHATGPT_EDITOR_FORM_MISSING'};
+const thinkNames=new Set(['Think','思考']);
+const controls=[...form.querySelectorAll('button[aria-pressed]')].filter(el=>visible(el)&&thinkNames.has(String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').trim()));
+if(controls.length!==1)return {ok:false,code:'CHATGPT_THINK_CONTROL_INVALID',count:controls.length};
+const pressed=controls[0].getAttribute('aria-pressed');if(pressed!=='true'&&pressed!=='false')return {ok:false,code:'CHATGPT_THINK_STATE_INVALID'};
+controls[0].focus();return {ok:document.activeElement===controls[0],pressed:pressed==='true'};
+JS);
+    }
+
     /** Inspect the slash-command popup used by ChatGPT to toggle Luna Think. */
     public static function thinkCommandMenuExpression(): string
     {
@@ -1387,8 +1400,23 @@ const composerSendButtons=editor=>{
     if(legacy.length)return legacy;
     return [...form.querySelectorAll('button[type="submit"]')].filter(visible);
 };
-// Only the account badge is evidence of a plan; never inspect names, messages or upgrade offers.
-const accountPlan=()=>{const plans=new Set();for(const profile of document.querySelectorAll('[data-testid="accounts-profile-button"]')){if(!visible(profile))continue;for(const badge of profile.querySelectorAll('.text-caption-regular.text-token-text-tertiary')){const label=String(badge.textContent||'').trim().toLowerCase();const plan=({'free':'free','免费':'free','免费版':'free','go':'go','plus':'plus','pro':'pro','business':'business','team':'team','enterprise':'enterprise'})[label];if(plan)plans.add(plan);}}return plans.size===1?[...plans][0]:'unknown'};
+// The account plan is read only from a plan badge inside the profile-menu button.
+// New ChatGPT renders this button by accessible name and uses a text-xs badge;
+// older builds use accounts-profile-button and text-caption-regular. Never infer
+// a plan from a person's name, an upgrade offer, or conversation content.
+const accountPlan=()=>{
+    const profiles=document.querySelectorAll('[data-testid="accounts-profile-button"],button[aria-label="打开个人资料菜单"],button[aria-label="Open profile menu"],button[aria-label="Open account menu"]');
+    const names={'free':'free','免费':'free','免费版':'free','go':'go','plus':'plus','pro':'pro','business':'business','team':'team','enterprise':'enterprise'};
+    const plans=new Set();
+    for(const profile of profiles){
+        if(!visible(profile))continue;
+        for(const badge of profile.querySelectorAll('.text-caption-regular.text-token-text-tertiary,.text-xs')){
+            const plan=names[String(badge.textContent||'').trim().toLowerCase()];
+            if(plan)plans.add(plan);
+        }
+    }
+    return plans.size===1?[...plans][0]:'unknown';
+};
 const userTurns=()=>[...document.querySelectorAll(USER)]
     .filter(el=>el.hasAttribute('data-turn-key')||!el.closest('[data-turn-key]'));
 const assistantTurns=()=>{
