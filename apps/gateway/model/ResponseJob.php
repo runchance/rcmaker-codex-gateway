@@ -327,7 +327,7 @@ final class ResponseJob
         }
 
         try {
-            $commandId = BrowserState::enqueue('chatgpt_text', ['response_id' => $responseId], false);
+            $commandId = self::enqueueBrowserTurn($responseId);
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->where('status', 'queued')->update(['command_id' => $commandId]);
             if (!$updated || $updated->rowCount() !== 1) {
                 throw new GatewayError('storage_unavailable', 'Responses 请求无法绑定浏览器命令。', 503);
@@ -338,6 +338,27 @@ final class ResponseJob
             throw new GatewayError('browser_queue_failed', '浏览器任务无法入队。', 503);
         }
         return self::get($responseId);
+    }
+
+    /**
+     * Let the worker publish a real heartbeat after a reservation releases SQLite's writer.
+     * Only the pre-insert liveness rejection is retryable: it has enqueued no command. Each
+     * attempt retains BrowserState's freshness/ownership guards, and waits outside a transaction.
+     * Storage errors or any other failure remain non-retryable here.
+     */
+    private static function enqueueBrowserTurn(string $responseId, bool $recover = false): int
+    {
+        $payload = ['response_id' => $responseId];
+        if ($recover) $payload['recover'] = true;
+        $deadline = microtime(true) + 5.0;
+        do {
+            try {
+                return BrowserState::enqueue('chatgpt_text', $payload, false);
+            } catch (GatewayError $error) {
+                if ($error->errorCode !== 'BROWSER_WORKER_UNAVAILABLE' || microtime(true) >= $deadline) throw $error;
+            }
+            usleep(100000);
+        } while (true);
     }
 
     /** Reconcile interrupted durable turns without replaying anything that may already have reached the page. */
@@ -352,7 +373,7 @@ final class ResponseJob
             $command = $commandId > 0
                 ? SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('id', $commandId)->find() : null;
             if (!is_array($command) || (string) ($command['status'] ?? '') !== 'queued') {
-                $commandId = BrowserState::enqueue('chatgpt_text', ['response_id' => $responseId], false);
+                $commandId = self::enqueueBrowserTurn($responseId);
                 $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->where('status', 'IN', ['queued', 'running'])->update(['command_id' => $commandId]);
                 if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '未发送任务无法重新排队。', 503);
             }
@@ -364,7 +385,7 @@ final class ResponseJob
         foreach ($ledger['resume'] as $responseId) {
             $row = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find();
             if (!is_array($row) || (string) $row['status'] !== 'running') continue;
-            $commandId = BrowserState::enqueue('chatgpt_text', ['response_id' => $responseId, 'recover' => true], false);
+            $commandId = self::enqueueBrowserTurn($responseId, true);
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->where('status', 'running')->update(['command_id' => $commandId]);
             if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '恢复观察任务无法重新排队。', 503);
         }

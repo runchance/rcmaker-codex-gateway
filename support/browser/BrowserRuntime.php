@@ -4360,15 +4360,72 @@ JS;
                 $this->prepareTaskAttachments($responseId);
                 return;
             }
+            $this->confirmTaskConnector($responseId, $connectorName,
+                fn() => $this->prepareTaskAttachments($responseId),
+                '输入任务内容后未能确认工具连接器，已停止发送。');
+        });
+    }
+
+    /**
+     * Confirm the exact single Connector after composer rendering, without altering the draft.
+     * Transient DOM/CDP reads may settle within 15 seconds; duplicate/conflicting pills fail
+     * immediately. Retries retain the original surface/document/owner and never reselect or send.
+     * @param callable():void $onSelected Next integrity check after positive identity evidence.
+     * @param float|null $deadline Absolute clock, bounded by the current turn's deadline.
+     */
+    private function confirmTaskConnector(string $responseId, string $connectorName, callable $onSelected,
+        string $failureMessage, ?float $deadline = null): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $deadline = min((float)$turn['deadline'], $deadline ?? microtime(true) + 15.0);
+        $owner = array_intersect_key($turn, array_flip([
+            'surface_id', 'target_id', 'session_id', 'document_nonce', 'owner_incarnation', 'fencing_version',
+        ]));
+        $sameOwner = function () use ($responseId, $owner): bool {
+            $current = $this->chatGptTurns[$responseId] ?? null;
+            return is_array($current) && array_intersect_key($current, $owner) === $owner;
+        };
+        $lastFailureCode = 'CHATGPT_CONNECTOR_SELECTION_LOST';
+        $lastDetail = '';
+        $observe = function () use (&$observe, $responseId, $connectorName, $onSelected,
+            $failureMessage, $deadline, $sameOwner, &$lastFailureCode, &$lastDetail): void {
+            if (!$sameOwner()) return;
+            if (microtime(true) >= $deadline) {
+                $this->taskFailTurn($responseId, $lastFailureCode, $failureMessage . $lastDetail);
+                return;
+            }
             $this->evaluateTask($responseId, WebModelPage::connectorSelectedExpression($connectorName),
-                function ($connectorError, $selected) use ($responseId): void {
-                    if ($connectorError !== null || !is_array($selected) || empty($selected['selected']) || (int) ($selected['count'] ?? 0) !== 1) {
-                        $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_LOST', '输入任务内容后工具连接器状态发生变化，已停止发送。');
+                function ($error, $selected) use (&$observe, $responseId, $onSelected,
+                    $failureMessage, $deadline, $sameOwner, &$lastFailureCode, &$lastDetail): void {
+                    if (!$sameOwner()) return;
+                    if ($error === null && is_array($selected)
+                        && ((int)($selected['count'] ?? 0) > 1 || (int)($selected['total_count'] ?? 0) > 1
+                            || ($selected['code'] ?? null) === 'CHATGPT_CONNECTOR_CONFLICT')) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_DUPLICATE',
+                            'ChatGPT 页面出现了重复或冲突的工具连接器，未发送。');
                         return;
                     }
-                    $this->prepareTaskAttachments($responseId);
-                });
-        });
+                    if (microtime(true) < $deadline && $error === null && is_array($selected)
+                        && !empty($selected['selected']) && (int)($selected['count'] ?? 0) === 1
+                        && (int)($selected['total_count'] ?? 0) === 1) {
+                        $onSelected();
+                        return;
+                    }
+                    $unreadable = $error !== null || !is_array($selected);
+                    $lastDetail = $unreadable
+                        ? ' observation=' . mb_substr((string)($error['message'] ?? 'INVALID_CONNECTOR_STATE'), 0, 160)
+                        : ' count=' . (int)($selected['count'] ?? 0) . ' total_count=' . (int)($selected['total_count'] ?? 0);
+                    $lastFailureCode = $unreadable
+                        ? 'CHATGPT_CONNECTOR_STATE_UNAVAILABLE' : 'CHATGPT_CONNECTOR_SELECTION_LOST';
+                    if (microtime(true) + 0.25 < $deadline) {
+                        Timer::add(0.25, $observe, null, false);
+                        return;
+                    }
+                    $this->taskFailTurn($responseId, $lastFailureCode, $failureMessage . $lastDetail);
+                }, min(3.0, max(0.1, $deadline - microtime(true))));
+        };
+        $observe();
     }
 
     /** Attach project-private files only on the final commit message, with one bounded input-discovery deadline. */
@@ -4698,30 +4755,17 @@ JS;
                 });
             };
             if ($controlHandoff) {
-                $this->evaluateTask($responseId, WebModelPage::connectorSelectedExpression($connectorName),
-                    function ($connectorError, $selected) use ($responseId, $readPrompt): void {
-                        if ($connectorError !== null || !is_array($selected)
-                            || empty($selected['selected']) || (int)($selected['count'] ?? 0) !== 1) {
-                            $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_LOST',
-                                '检查点消息未选中原工具连接器，未发送。');
-                            return;
-                        }
-                        $readPrompt();
-                    });
+                $this->confirmTaskConnector($responseId, $connectorName, $readPrompt,
+                    '检查点消息未能确认原工具连接器，未发送。');
                 return;
             }
             $readPrompt();
             return;
         }
-        $this->evaluateTask($responseId, WebModelPage::connectorSelectedExpression($connectorName),
-            function ($connectorError, $selected) use ($responseId): void {
+        $this->confirmTaskConnector($responseId, $connectorName,
+            function () use ($responseId): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
-                if ($connectorError !== null || !is_array($selected)
-                    || empty($selected['selected']) || (int) ($selected['count'] ?? 0) !== 1) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_LOST', '发送前稳定等待后工具连接器状态已经变化。');
-                    return;
-                }
                 $this->evaluateTask($responseId, WebModelPage::promptTextExpression(),
                     function ($promptError, $draft) use ($responseId): void {
                         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -4735,7 +4779,7 @@ JS;
                         }
                         $this->verifyTaskAttachmentsThenSend($responseId);
                     });
-            });
+            }, '发送前稳定等待后未能确认工具连接器，未发送。');
     }
 
     /** Final file-integrity fence immediately before irreversible submit. */
