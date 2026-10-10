@@ -50,6 +50,8 @@ final class ContextCompaction
      * checkpoint was produced by or directly summarizes that exact prior turn.
      * Repeated compaction in one Codex turn forms a chain of derived ledger turns;
      * the native client still sends the original turn_id after every checkpoint.
+     * Match the trusted summary after the parser's historical-handle normalization;
+     * the signed checkpoint and its stored source evidence remain unchanged.
      * @param array $spec Normalized continuation request in the routed task transaction.
      * @return array Request with a derived turn ID only for the verified checkpoint.
      */
@@ -69,7 +71,7 @@ final class ContextCompaction
         if (!is_array($checkpoint) || (string) ($checkpoint['protocol'] ?? '') !== 'compact_v2'
             || !self::checkpointMatchesEpoch($checkpoint, (string) $spec['compaction_epoch'])) return $spec;
         $context = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
-        $summary = self::SUMMARY_PREFIX . "\n" . (string) $checkpoint['summary'];
+        $summary = ResponsesProtocol::retireTransportHandles(self::SUMMARY_PREFIX . "\n" . (string) $checkpoint['summary']);
         $containsSummary = false;
         foreach ((array) ($context['messages'] ?? []) as $message) {
             if (($message['role'] ?? '') === 'user' && self::historyProofText($message['content'] ?? '', false) === $summary) {
@@ -1941,7 +1943,7 @@ final class ContextCompaction
             }
             if (!$matchesEpoch) continue;
             self::replay($item['encrypted_content']);
-            $summary = self::SUMMARY_PREFIX . "\n" . (string) $row['summary'];
+            $summary = ResponsesProtocol::retireTransportHandles(self::SUMMARY_PREFIX . "\n" . (string) $row['summary']);
             $inSource = false;
             $inRequest = false;
             foreach ((array) ($sourceContext['messages'] ?? []) as $message) {

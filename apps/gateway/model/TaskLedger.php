@@ -1178,27 +1178,40 @@ final class TaskLedger
     public static function submitted(string $responseId): void
     {
         Schema::transaction(function () use ($responseId): void {
-            $db = SDB(null, 'medoo', 'sqlite');
-            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
-            if (!self::ownsCurrentGeneration($job, $turn)) return;
-            if (in_array((string) $turn['status'], ['submitted', 'running', 'committed'], true)) return;
-            if ((string) $turn['status'] !== 'submit_intent') throw new GatewayError('turn_state_invalid', '页面接收证据对应的回合状态无效。', 409);
-            $now = time();
-            $turnValues = [
-                'status' => 'submitted', 'submitted_at' => $now, 'updated_at' => $now,
-            ];
-            if (in_array((string) ($job['operation_kind'] ?? 'response'), ['compact_v1', 'compact_v2'], true)) {
-                $acceptedAt = (int) ($job['accepted_at'] ?? 0);
-                if ($acceptedAt <= 0) {
-                    throw new GatewayError('turn_state_invalid', '上下文压缩缺少已保存的页面接收证据。', 409);
-                }
-                $budget = json_decode((string) $job['budget_json'], true, 32, JSON_THROW_ON_ERROR);
-                $turnValues['deadline_at'] = $acceptedAt + (int) ($budget['compaction_timeout_seconds'] ?? 180);
-            }
-            $updated = $db->table('gateway_task_turns')->where('id', $turn['id'])->where('status', 'submit_intent')->update($turnValues);
-            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '页面接收证据账本无法提交。', 503);
-            self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'], 'page_submitted', []);
+            self::submittedUnlocked($responseId);
         });
+    }
+
+    /**
+     * Apply the ordinary acceptance transition inside a caller-owned writer transaction.
+     * Both the browser callback and a verified complete native receipt use identical ownership,
+     * state and deadline checks; this method never opens a nested SQLite transaction.
+     * @param string $responseId Response with acceptance evidence persisted by its caller.
+     * @return void Superseded or already acknowledged generations remain unchanged.
+     * @throws GatewayError If the turn state, compact acceptance evidence or storage is invalid.
+     */
+    public static function submittedUnlocked(string $responseId): void
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+        if (!self::ownsCurrentGeneration($job, $turn)) return;
+        if (in_array((string) $turn['status'], ['submitted', 'running', 'committed'], true)) return;
+        if ((string) $turn['status'] !== 'submit_intent') throw new GatewayError('turn_state_invalid', '页面接收证据对应的回合状态无效。', 409);
+        $now = time();
+        $turnValues = [
+            'status' => 'submitted', 'submitted_at' => $now, 'updated_at' => $now,
+        ];
+        if (in_array((string) ($job['operation_kind'] ?? 'response'), ['compact_v1', 'compact_v2'], true)) {
+            $acceptedAt = (int) ($job['accepted_at'] ?? 0);
+            if ($acceptedAt <= 0) {
+                throw new GatewayError('turn_state_invalid', '上下文压缩缺少已保存的页面接收证据。', 409);
+            }
+            $budget = json_decode((string) $job['budget_json'], true, 32, JSON_THROW_ON_ERROR);
+            $turnValues['deadline_at'] = $acceptedAt + (int) ($budget['compaction_timeout_seconds'] ?? 180);
+        }
+        $updated = $db->table('gateway_task_turns')->where('id', $turn['id'])->where('status', 'submit_intent')->update($turnValues);
+        if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '页面接收证据账本无法提交。', 503);
+        self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'], 'page_submitted', []);
     }
 
     public static function running(string $responseId): void

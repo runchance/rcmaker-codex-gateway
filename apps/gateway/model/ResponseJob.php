@@ -122,6 +122,10 @@ final class ResponseJob
             $conversation = TaskLedger::routeConversationUnlocked($spec);
             $spec = $conversation['spec'];
             if (!$conversation['prepared']) $spec = ContextHistory::prepareUnlocked($spec);
+            // An exact native host receipt may settle before the browser's DOM acceptance poll.
+            // Prove that receipt and acknowledge its original submission before reserving the next
+            // round; later validation failures roll back both changes in this same transaction.
+            ToolBroker::acknowledgeHostReceiptUnlocked($spec);
             if (!empty($spec['operational_context_source_response_id'])) {
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
                 TaskLedger::queueOperationalContextUnlocked($source, $spec['operational_context_updates'],

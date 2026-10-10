@@ -915,8 +915,11 @@ final class ResponsesProtocol
     /**
      * Retire capability handles replayed inside accumulated task text so a later ChatGPT turn can
      * only bind through the fresh turn_token carried by the outer transport contract.
+     * Checkpoint identity proofs must apply this same normalization to the trusted stored summary.
+     * @param mixed $value Task text or recursively compiled context; unrelated values stay unchanged.
+     * @return mixed Context with historical transport handles retired, without changing stored evidence.
      */
-    private static function retireTransportHandles(mixed $value): mixed
+    public static function retireTransportHandles(mixed $value): mixed
     {
         if (is_string($value)) {
             return preg_replace_callback(

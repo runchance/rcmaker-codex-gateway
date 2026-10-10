@@ -33,13 +33,26 @@ final class WebMessageAudit
     public static function markAccepted(string $responseId, string $kind, ?int $stageNo = null): void
     {
         Schema::transaction(static function () use ($responseId, $kind, $stageNo): void {
-            $query = SDB(null, 'medoo', 'sqlite')->table('gateway_web_messages')
-                ->where('response_id', $responseId)->where('direction', 'outbound')
-                ->where('kind', $kind)->where('status', 'intent');
-            if ($stageNo !== null) $query = $query->where('stage_no', $stageNo);
-            $updated = $query->update(['status' => 'accepted', 'updated_at' => time()]);
-            if ($updated === false) throw new GatewayError('storage_unavailable', '网页消息接收记录无法保存。', 503);
+            self::markAcceptedUnlocked($responseId, $kind, $stageNo);
         });
+    }
+
+    /**
+     * Mark existing outgoing intent records inside the caller's acceptance transaction.
+     * @param string $responseId Exact response whose persisted submission was acknowledged.
+     * @param string $kind Outgoing message kind; historical text is never changed.
+     * @param ?int $stageNo Restrict to one multipart stage, or acknowledge every stage of this kind.
+     * @return void Already accepted or absent records remain unchanged.
+     * @throws GatewayError If the message acceptance update cannot be saved.
+     */
+    public static function markAcceptedUnlocked(string $responseId, string $kind, ?int $stageNo = null): void
+    {
+        $query = SDB(null, 'medoo', 'sqlite')->table('gateway_web_messages')
+            ->where('response_id', $responseId)->where('direction', 'outbound')
+            ->where('kind', $kind)->where('status', 'intent');
+        if ($stageNo !== null) $query = $query->where('stage_no', $stageNo);
+        $updated = $query->update(['status' => 'accepted', 'updated_at' => time()]);
+        if ($updated === false) throw new GatewayError('storage_unavailable', '网页消息接收记录无法保存。', 503);
     }
 
     /** Metadata stays small; the exact body is fetched only when the user opens it. */

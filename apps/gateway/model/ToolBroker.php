@@ -56,6 +56,70 @@ final class ToolBroker
     }
 
     /**
+     * A complete native host receipt proves acceptance of its exact submitted Web tool round even
+     * when the DOM poll is late. Connector arrival alone never supplies this proof. The caller must
+     * own the short response-reservation transaction so every later admission failure rolls back
+     * this acknowledgement together with the new round; no Web message or host call is replayed.
+     *
+     * @param array $spec Routed, history-prepared request carrying the original issued call IDs.
+     * @return void Unrelated requests and already acknowledged turns keep their existing behavior.
+     * @throws GatewayError When an eligible receipt has lost its capability, surface or batch proof.
+     */
+    public static function acknowledgeHostReceiptUnlocked(array $spec): void
+    {
+        $outputs = (array) ($spec['tool_outputs'] ?? []);
+        $sourceId = (string) ($spec['previous_response_id'] ?? '');
+        if ($outputs === [] || $sourceId === '') return;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
+        $source = $db->table('gateway_response_jobs')->where('id', $sourceId)->find();
+        if (!is_array($source) || (string) $source['task_id'] !== $taskId
+            || (string) $source['status'] !== 'completed' || (string) $source['round_kind'] !== 'tool_call'
+            || (string) $source['operation_kind'] !== 'response'
+            || (string) $source['model'] !== (string) $spec['model']
+            || ($source['reasoning_effort'] ?? null) !== ($spec['reasoning_effort'] ?? null)
+            || (string) ($source['turn_id'] ?? '') !== (string) ($spec['turn_id'] ?? '')
+            || empty($source['submit_intent_at']) || empty($source['submitted_document_nonce'])
+            || empty($source['mcp_binding_id'])) return;
+        $turn = $db->table('gateway_task_turns')->where('id', (string) $source['durable_turn_id'])->find();
+        if (!is_array($turn) || (string) $turn['status'] !== 'submit_intent') return;
+        $surface = $db->table('gateway_browser_surfaces')->where('id', (string) $source['surface_id'])->find();
+        $binding = self::bindingByIdUnlocked((string) $source['mcp_binding_id']);
+        if ((string) $binding['task_id'] !== $taskId
+            || (string) $binding['turn_id'] !== (string) $turn['id']
+            || (string) $binding['current_response_id'] !== $sourceId
+            || (string) $turn['task_id'] !== $taskId
+            || (string) $turn['response_id'] !== $sourceId
+            || (string) $turn['generation_id'] !== (string) $source['generation_id']
+            || (string) $turn['surface_id'] !== (string) $source['surface_id']
+            || (string) $turn['epoch_id'] !== (string) $source['epoch_id']
+            || !is_array($surface) || (string) $surface['status'] !== 'busy'
+            || (string) $surface['task_id'] !== $taskId
+            || (string) $surface['epoch_id'] !== (string) $source['epoch_id']
+            || empty($surface['target_id']) || empty($surface['session_id'])
+            || (string) $surface['document_nonce'] !== (string) $source['submitted_document_nonce']
+            || (string) $surface['owner_incarnation'] !== (string) $turn['owner_incarnation']
+            || (int) $surface['fencing_version'] !== (int) $turn['fencing_version']) {
+            throw new GatewayError('tool_binding_scope_mismatch', '工具回执的源页面或回合归属已变化。', 409);
+        }
+        self::assertLiveUnlocked($binding, true);
+        self::assertCompleteOutputBatchUnlocked($binding, $sourceId, $outputs);
+        if ($source['accepted_at'] === null) {
+            // The source tool-call response already completed, so the ordinary running-only
+            // browser callback cannot persist accepted_at here. Keep this update conditional.
+            $updated = $db->table('gateway_response_jobs')->where('id', $sourceId)
+                ->where('status', 'completed')->where('round_kind', 'tool_call')->where('accepted_at', null)
+                ->update(['accepted_at' => time()]);
+            if (!$updated || $updated->rowCount() !== 1) {
+                throw new GatewayError('storage_unavailable', '工具回执接收证据无法保存。', 503);
+            }
+        }
+        TaskLedger::submittedUnlocked($sourceId);
+        WebMessageAudit::markAcceptedUnlocked($sourceId, 'commit');
+        WebMessageAudit::markAcceptedUnlocked($sourceId, 'continuation');
+    }
+
+    /**
      * Prove that a native compact carries every current source-tool result and no unknown host
      * effect. The caller owns the checkpoint reservation transaction. Registered calls with no
      * response_id have never been delivered to Codex and are interrupted during continuation.
