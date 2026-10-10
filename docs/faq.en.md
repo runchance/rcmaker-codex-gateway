@@ -2,7 +2,7 @@
 
 **English** · [简体中文](faq.zh-CN.md) · [User guide](user-guide.en.md) · [README](../README.md)
 
-Checked against the project on 9 October 2026. Diagnose the exact stage and error; do not treat every delay as the same connection problem.
+Start with the user guide's [troubleshooting table](user-guide.en.md#troubleshooting), then use the sections below for details. Do not treat every delay as the same connection problem.
 
 ## Find the right section
 
@@ -17,6 +17,7 @@ Checked against the project on 9 October 2026. Diagnose the exact stage and erro
 | Task deletion, data growth and upgrades | [Cleanup and storage](#cleanup) |
 
 <a id="network"></a>
+
 ## Startup and network
 
 ### The console does not open. What should I check first?
@@ -36,6 +37,7 @@ A target HTTP response after a successful TLS connection proves that the network
 The application's browser, runtime download and tunnel consumers use the saved network configuration. Check that the route was saved/applied and that the proxy is running. Inspect the download error and disk space before retrying. Do not disable certificate checks or swap to an unrelated download source as a shortcut.
 
 <a id="connector"></a>
+
 ## Connector
 
 ### ChatGPT cannot create the plugin. Which order should I follow?
@@ -65,6 +67,7 @@ Use the current [Add custom MCP server instructions](https://developers.openai.c
 Return to Setup, allow account/model detection to settle, and use **Refresh status** or **Refresh page** when needed. Ensure you signed into RCMAKER's private native window, not only system Chrome. Do not clear all profiles as a first response; that removes login state and requires a new sign-in.
 
 <a id="models"></a>
+
 ## Models
 
 ### Web entries do not appear in Codex after saving integration.
@@ -84,6 +87,7 @@ Choose the separate **… · Pro · RC (Web)** entry when detected. You do not n
 Screenshot names and sample data illustrate the controls. Account plans, quota, model retirement and website changes affect the actual list. Use your current detection result. The gateway's context-budget figures are implementation policy, not a claim about OpenAI's maximum context size.
 
 <a id="history"></a>
+
 ## Context and history
 
 ### Does 3× history triple the model's context window?
@@ -111,7 +115,20 @@ They cannot directly decrypt provider-private checkpoints. The default route pre
 The current console describes up to **10 uploaded files per submission**. Recent images are selected automatically; optionally uploaded selected-skill files share those slots. Skill text is normally transported in the context instead of as uploaded files. This is the gateway's current transfer policy, not a universal ChatGPT limit. Inspect the task's original-message/attachment record when a specific image matters.
 
 <a id="recovery"></a>
+
 ## Tasks and recovery
+
+### Local tools return 502 and another connection returns MCP SSE 404. What should I check?
+
+Check tunnel and connector readiness, confirm that Codex is still running, and identify which connector owns the failed tool. A 404 from another connection is not a test of the RCMAKER connection itself. When tool definitions need updating, refresh the tools in ChatGPT, then check the connector locally.
+
+These errors mean the corresponding requests did not return normally; they do not establish that project files or context are corrupt. If an earlier write may have executed, inspect the files and task receipts before retrying. For persistent failures, provide the timestamp and a redacted timeline.
+
+### Compaction has taken more than ten minutes. Should I resend?
+
+Check whether context parts are progressing, an approval is pending, a summary receipt exists, or the Web model is still generating. Large histories can take time to stage and summarize; elapsed time alone establishes neither success nor failure. If progress stops, or the page finishes while Codex keeps waiting, preserve both states for diagnosis.
+
+When a summary is already unconfirmed, inspect that original summary before starting another. Changing the waiting setting affects newly created summaries; it neither changes an existing wait nor repairs a missing receipt.
 
 ### The website says “connection interrupted” while tools keep running.
 
@@ -123,7 +140,9 @@ Use its exact message. “Unknown execution result,” “task cancelled,” “
 
 ### What about `context_json` decoding errors or `SCHEMA_MISMATCH`?
 
-Keep the exact error code and a redacted original-message export. They indicate a format/protocol problem, not proof of a bad password or a need to recreate every account. Version 1.0.4 includes a fix for browser-notice insertion corrupting historical JSON; a new decoding error still needs its own evidence. Do not manually edit stored history to make the parser accept it.
+Keep the exact error code and a redacted original-message export. They point to a format/protocol issue, not proof of a bad password or a need to recreate every account. Include the version, model and whether you switched from an official model or another gateway. Do not manually edit stored history to make the parser accept it.
+
+An `invalid_id_prefix` error, such as expecting `ctc_` but receiving `fc_`, identifies a mismatch between that history item's ID and the requested type; it does not mean the entire conversation was lost. Keep the original conversation and exact error for a compatibility review. Do not bulk-replace IDs in session files.
 
 ### The model claims a safety block. How can I tell whether it happened?
 
@@ -138,6 +157,7 @@ Yes—use the same Codex conversation. Describe the correction or question expli
 No. A small task may be complete quickly. Judge file changes, real tool results, testing and whether the requested outcome was met. Repeated gateway “continue” messages, a long clock or a large tool-call count are not sufficient evidence of quality.
 
 <a id="usage"></a>
+
 ## Usage
 
 ### Is the console's Pro remaining number official?
@@ -153,6 +173,7 @@ The current policy uses non-Pro Medium for history intake/connector checks and n
 Yes, when you select an official model through the native forwarding route, or explicitly enable the optional official-model handoff summary. The latter is off by default. Console usage estimates cannot establish all official account charges; check the account's provider-facing usage information separately.
 
 <a id="cleanup"></a>
+
 ## Cleanup and storage
 
 ### Does deleting a task delete the project or Codex conversation?

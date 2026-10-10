@@ -1,172 +1,140 @@
-# rcmaker-codex-gateway
+# RCMAKER Codex Gateway
+
+**Use ChatGPT Web models for local work in Codex.**
 
 **English** · [简体中文](README.zh-CN.md)
 
-Connect ChatGPT Web models to your local Codex development workflow. Keep working in Codex while the gateway delivers context, relays native tool calls and streams the model's public progress and final answer.
+[Install a binary](#binary-install) · [Run from source](#source-install) · [First-time setup](#quick-start) · [User guide](docs/user-guide.en.md) · [Troubleshooting](docs/faq.en.md)
 
-**This application is developed on the [RCMAKER PHP framework](https://github.com/runchance/rcmaker).** File changes, commands, browser tools, skills and configured MCP tools execute through the existing Codex runtime, subject to its own permissions and approvals.
+RCMAKER Codex Gateway connects your local Codex workflow to ChatGPT Web. Submit a task in Codex; the gateway delivers its context to the Web model, routes tool calls back to Codex, and streams progress and answers into the same conversation. File access, commands and approvals stay with your Codex runtime.
 
-## Documentation
+Built with the [RCMAKER PHP framework](https://github.com/runchance/rcmaker).
 
-| Start here | What you will find |
+## What you get
+
+| Capability | In everyday use |
 | --- | --- |
-| **[Illustrated user guide](docs/user-guide.en.md)** | Installation, screenshots for every setup step, first task, daily use and upgrades |
-| **[Frequently asked questions](docs/faq.en.md)** | Connections, models, context compaction, usage and recovery |
+| Local tools and Web models | Work on project files with the tools, skills and MCP integrations available in Codex |
+| Long-running work | Continue through tool calls and context handoffs; send corrections from the same Codex chat |
+| Visible task activity | Watch up to five task pages, inspect timelines, and copy or download the full sent messages |
+| Account-aware model selection | Detect available Web models and modes; identify gateway entries by their **RC (Web)** suffix |
+| A local control panel | Configure sign-in, network access, context settings, language and local usage tracking |
+| Standalone or source deployment | Use a packaged executable, or run the PHP source; keep persistent data outside the binary |
 
-| [Chinese documentation](README.zh-CN.md) | Separate Chinese README, user guide and FAQ |
+![RCMAKER startup console showing readiness checks](docs/images/user-guide/en/rcmaker-console.png)
 
-![Setup: from network configuration to Codex integration](docs/images/user-guide/en/setup.jpg)
+*Startup checks show what is ready and what still needs your attention.*
 
-*Screenshots use the current console templates with labelled sample data, not real credentials or private project conversations.*
+## Before you install
 
-## Why RCMAKER
+You need Codex on the computer where the gateway will run, a ChatGPT account with access to the required Web models and custom MCP plugins, and permission to use a Secure MCP Tunnel. The setup wizard guides you through the Tunnel and its ordinary runtime API key. Account/workspace access follows [OpenAI's Tunnel requirements](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
 
-The [framework repository](https://github.com/runchance/rcmaker) describes RCMAKER as a PHP framework for rapid development and standalone delivery:
+Choose **one** installation method below. Packaged releases include PHP; source installations require PHP and Composer.
 
-| Framework capability | Value for this application |
-| --- | --- |
-| PHP and Composer ecosystem | Familiar development tools and reusable components |
-| Resident CLI services | Less repeated initialization for a continuously running gateway |
-| Multiple applications and process groups | Separate console, API and background responsibilities |
-| Standalone executable packaging | Deliver PHP, application code and dependencies together |
+<a id="binary-install"></a>
 
-Framework source: **https://github.com/runchance/rcmaker**. Framework documentation: [rcmaker.runchance.com](https://rcmaker.runchance.com/).
+## Install a binary
 
-## Main capabilities
+**Recommended for using the gateway without setting up PHP.** The installer downloads the latest stable [Release](https://github.com/runchance/rcmaker-codex-gateway/releases/latest), selects your platform and verifies SHA-256 checksums.
 
-- Native Codex tools, parallel calls and long-running command sessions, with real execution receipts.
-- Streaming public progress, reasoning-status summaries and Markdown answers; a task-owned browser workspace and retained task history.
-- Up to five task pages, mid-task guidance, model switching, attachments and context handoff.
-- Fresh-install defaults of **3× history intake and at most six automatic parts**. History parts use non-Pro Medium; summaries use non-Pro High; real tasks use your selected model and effort.
-- Private Chrome for Testing, separate from system Chrome; native-window sign-in alongside the embedded view.
-- English/Chinese console, separate preferences and model contracts, original-message copy/download, and local usage estimates.
-- Standalone deployment with persistent data outside the executable.
+### Windows · x64
 
-Available models, tiers and account capabilities follow the current ChatGPT account. Duration depends on the work requested; the gateway does not guarantee a minimum running time or enlarge the model's actual context window.
-
-## How it works
-
-Codex sends tasks to the local gateway through a Responses-compatible endpoint. The gateway delivers context to ChatGPT Web using a private Chrome session and streams progress and answers back. Web-model tool requests travel through a Secure MCP Tunnel; the gateway forwards them to Codex's native tools, where normal permissions apply, and relays their actual results.
-
-```mermaid
-flowchart LR
-    C["Codex<br/>Tasks and local tools"] <-->|"Responses / SSE"| G["rcmaker-codex-gateway"]
-    G <-->|"CDP"| B["Private Chrome"]
-    B <-->|"Web UI"| W["ChatGPT Web"]
-    W <-->|"MCP calls and results<br/>via Secure Tunnel"| G
-```
-
-## Quick start
-
-### 1. Start the application
-
-**One-command install or update** from the [latest stable GitHub Release](https://github.com/runchance/rcmaker-codex-gateway/releases/latest):
-
-Windows (PowerShell):
+Run in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
 ```
 
-Linux or macOS (Bash; Linux x64/ARM64, macOS Intel/Apple Silicon):
+Open the installation folder printed by the script and double-click **`rcmaker-codex-gateway.exe`**.
+
+### Linux / macOS · x64 and ARM64
+
+Run in Bash:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
 ```
 
-The scripts select the matching release archive and verify SHA-256 checksums. Set `RCMAKER_INSTALL_DIR` in your shell **before** the command to choose an installation folder. Otherwise, an executable in the current folder is upgraded there; a new installation defaults to `./rcmaker-codex-gateway/`. The first installation in an interactive terminal lets you enter a different folder; unattended installation uses the default without waiting for input. Relative paths are resolved from your current folder.
+In the installation folder, start:
 
-To update, finish active tasks, stop the gateway, **change to its installation folder** (or set `RCMAKER_INSTALL_DIR`) and run the same command again. This also updates installations made by the older scripts in `%LOCALAPPDATA%\rcmaker-codex-gateway` or `~/.local/share/rcmaker-codex-gateway`. Existing `.env`, `data/` and `runtime/` stay intact; the scripts do not automatically start or restart the gateway. Start `rcmaker-codex-gateway.exe` on Windows or `./rcmaker-codex-gateway` on Linux/macOS from the installation folder. A published stable Release and network access to GitHub are required. Review the [Windows script](.github/scripts/install.ps1) or [Linux/macOS script](.github/scripts/install.sh) before running it.
-
-You can also install manually:
-
-Place the downloaded Windows executable in a writable folder and **double-click the `.exe` to start**. No `start` argument is required. You can also launch it from PowerShell, using your actual filename:
-
-```powershell
-.\rcmaker-codex-gateway.exe
+```bash
+./rcmaker-codex-gateway
 ```
 
-No existing `data` directory is required. First use creates persistent storage beside the executable. Open the [local console](http://127.0.0.1:28910/).
+By default, a fresh installation uses `./rcmaker-codex-gateway/`; an existing installation in the current folder is reused. An interactive first install lets you choose another folder. To set the location explicitly, define `RCMAKER_INSTALL_DIR` **before** running the installer. The installer does not start the application automatically.
 
-For a source installation on Windows, macOS or Linux, use **PHP 8.1–8.5 (inclusive)**. We recommend following the [RCMAKER official quick start — prepare your environment](https://rcmaker.runchance.com/doc/#/md/quick-start?id=_1-%E5%87%86%E5%A4%87%E7%8E%AF%E5%A2%83) to set up PHP, required extensions and Composer. Then run these commands from the project's source directory:
+Prefer a manual download? Get the archive for your system from Releases, extract it into a writable folder, and run the included executable. See [custom directories and manual installation](docs/user-guide.en.md#binary-install). Installer sources: [PowerShell](.github/scripts/install.ps1) · [Bash](.github/scripts/install.sh).
 
-```sh
+<a id="source-install"></a>
+
+## Run from source
+
+**For contributors and users who maintain their own PHP environment.** Prepare PHP 8.1–8.5 and Composer; the [source installation guide](docs/user-guide.en.md#source-install) covers extensions and environment checks.
+
+```bash
+git clone https://github.com/runchance/rcmaker-codex-gateway.git
+cd rcmaker-codex-gateway
 composer install
 php index.php start
 ```
 
-For a packaged installation, download the executable built for your operating system and architecture.
+Deployment overrides are optional; see [`.env.example`](.env.example). Source and binary installations use the same setup flow below.
 
-### 2. Complete Setup in order
+<a id="quick-start"></a>
 
-| Step | Action | Ready when |
+## First-time setup
+
+Keep the gateway running and open the **[local console](http://127.0.0.1:28910/)**. The interface defaults to English; switch to Chinese in **Settings → Console language**.
+
+| Step | What to do | Continue when |
 | --- | --- | --- |
-| 1 · Network | Choose direct access or configure HTTP CONNECT; **Save and test** | Connectivity is confirmed |
-| 2 · Runtime | Prepare the private Chrome and tunnel components | Components are ready |
-| 3 · ChatGPT | Sign in through the private embedded page or native window | Account and model checks pass |
-| 4 · Codex tools | Save Tunnel ID, ordinary runtime API key and connector name; create the matching ChatGPT plugin | **Check connector** succeeds |
-| Codex integration | Detect models, preview the integration and save it | Configuration is saved and Codex has been fully restarted |
+| 1. Network | Choose direct access or enter an HTTP proxy; select **Save and test** | The network check passes |
+| 2. Components | Select **Prepare runtime components → Start preparation** | Private Chrome and tunnel components are ready |
+| 3. ChatGPT | Open the sign-in page; use **Open native browser** for direct interaction | Your account and available models are detected |
+| 4. Tool connection | Save the Tunnel ID, runtime API key and connector name; then create the matching ChatGPT plugin | **Check connector** passes |
+| 5. Codex integration | **Detect available models → Preview integration → Save integration** | Configuration is saved |
 
-The [illustrated guide](docs/user-guide.en.md#connect-tools) explains the fields, screenshots and exact order. A new installation defaults to **RCMAKER Codex**; the suffix is editable. The full name must match in the console and ChatGPT.
+The default connector name is **RCMAKER Codex**. Its suffix is editable; copy the full name into ChatGPT exactly. **Connect the tunnel before creating the plugin.** The [illustrated setup guide](docs/user-guide.en.md#connect-tools) shows each field.
 
-**Wait for the shell console to display** `Ready. Start Codex; if it is already open, fully quit and restart it.` This confirms that network access, private Chrome, ChatGPT login, model detection and the connector are ready. If a step is still waiting, complete it in the local console before launching Codex.
+> **After saving integration, wait for the gateway's Ready message, then fully quit and reopen Codex, including background processes. Keep RCMAKER running. Opening a new chat is not a restart.**
 
-> **After saving integration, save your work, fully quit Codex—including background processes—and reopen it. Keep RCMAKER running. Opening another chat does not replace restarting Codex.**
-
-### 3. Run a first task
-
-Open a project in Codex and select an available model ending in **RC (Web)**, such as `GPT-6 · Thinking · RC (Web)`. Select the thinking effort. Pro, when available, is a separate entry.
-
-Start with a small, verifiable request:
+In Codex, open your project and choose an available model ending in **RC (Web)**. Thinking offers its detected effort choices; Pro has a separate entry when available. Try this first:
 
 ```text
-Inspect this project's directory structure and README. Explain how to run it and
-list any missing setup steps. Do not change files yet.
+Read this project's README and directory structure. Explain how to run the project
+and identify any missing setup steps. Do not modify files.
 ```
 
-Confirm that Codex displays actual tool results, **Browser workspace** shows a task page, and **Task center** records the interaction. Then submit a development task with the desired result and confirmation. See [first task](docs/user-guide.en.md#first-task).
+Check the answer against the real tool output. **Browser workspace** shows the task page; **Task center** records its messages and results. You can then submit a development task with a clear outcome.
 
-## Accounts, keys and usage
+<a id="troubleshooting"></a>
 
-Use a ChatGPT account with the needed models and custom MCP apps. Configure a Tunnel and ordinary runtime API key with access appropriate to the ChatGPT account/workspace used by the private browser. The desktop Codex account may be different. Follow the console and the [official Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+## Need help?
 
-Local usage covers this installation, not all devices. Estimated tokens and Pro remaining counts are **not an official bill or quota balance**. Official-model handoff summarization is off by default; enabling it can consume official Codex model quota. See [usage FAQ](docs/faq.en.md#usage).
+| What you see | Start here |
+| --- | --- |
+| Cannot start, open the console, or download Chrome | [Startup and network](docs/faq.en.md#network) |
+| Connector check fails or local tools return 502/404 | [Connection checks](docs/user-guide.en.md#troubleshooting) |
+| Web models or Pro are missing from Codex | [Models and restart checks](docs/faq.en.md#models) |
+| Repeated compaction, interrupted output or a 409 conflict | [Task recovery](docs/faq.en.md#recovery) |
+| Questions about context limits or estimated usage | [Context](docs/faq.en.md#history) · [Usage](docs/faq.en.md#usage) |
 
-## Upgrades and persistent data
+Model access and limits depend on your account. The default **3× history intake / six-part maximum** helps transport longer history; it does not enlarge a model's context window. Local token and Pro estimates are not official balances. See [settings and usage](docs/user-guide.en.md#settings).
 
-Keep the external `data` directory and actual `.env`. Finish running tasks before replacing/restarting the application. Never ship development data, cookies, credentials or a real `.env` in a release.
+## Updates and documentation
 
-```text
-application/
-  rcmaker-codex-gateway.exe
-  .env             # optional deployment settings
-  data/            # created on first use; preserve during upgrades
-  runtime/         # rebuildable operating files
-```
+To update a binary installation, finish active tasks, stop RCMAKER, enter the **existing installation folder**, and rerun the installer. Preserve `.env` and `data/`; the latter is created on first use beside the executable. Full instructions: [upgrade and recovery](docs/user-guide.en.md#upgrade).
 
-See the [upgrade guide](docs/user-guide.en.md#upgrade). Public user manuals and screenshots are in `docs/`; keep runtime `data/` private and out of release packages.
+| Documentation | Purpose |
+| --- | --- |
+| [User guide](docs/user-guide.en.md) | Installation, illustrated setup, everyday use, settings and upgrades |
+| [FAQ](docs/faq.en.md) | Symptom-based troubleshooting and explanations |
+| [Deployment settings](.env.example) | Optional ports, data directory name and startup language |
 
-## Development and release
+## License and notices
 
-Use the maintained framework builder:
+[Apache-2.0](LICENSE) · [NOTICE](NOTICE) · [Third-party notices](THIRD_PARTY_NOTICES). The console also uses Pear Admin/Layui.
 
-```sh
-php -d phar.readonly=0 index.php interact
-```
-
-Exclude the real `.env` and external data directories. Keep attribution and license files with source and binary distributions. The public `docs/` directory contains user-facing manuals, FAQs and screenshots only.
-
-## Notice
-
-This project is provided for research and learning purposes only. Users are responsible for ensuring that their use complies with applicable laws, service terms and the rights of third parties. The authors do not authorize any use that infringes the rights of any third-party rights holder.
-
-The maintainers do not guarantee timely responses to issues, feature requests or support questions.
-
-## License and acknowledgements
-
-**Apache-2.0**: [LICENSE](LICENSE), [NOTICE](NOTICE) and [third-party notices](THIRD_PARTY_NOTICES).
-
-Built with [RCMAKER](https://github.com/runchance/rcmaker), Pear Admin/Layui and native Codex tools. 
+This project is provided for research and learning purposes only. Users are responsible for ensuring that their use complies with applicable laws, service terms and the rights of third parties. The authors do not authorize any use that infringes the rights of any third-party rights holder. The maintainers do not guarantee timely responses to issues, feature requests or support questions.
 
 This is an independent project, not an official OpenAI product. ChatGPT, Codex and Chrome names belong to their respective owners.
-

@@ -1,289 +1,466 @@
-# rcmaker-codex-gateway — Illustrated User Guide
+# RCMAKER Codex Gateway · User Guide
 
-**English** · [简体中文](user-guide.zh-CN.md) · [Project README](../README.md) · [FAQ](faq.en.md)
+**English** · [简体中文](user-guide.zh-CN.md) · [Project overview](../README.md) · [FAQ](faq.en.md)
 
-This guide takes you from a fresh installation to a verified Codex task. The console controls and examples were checked against the project on **9 October 2026**. Website labels, available models and account permissions can change; use your account's current controls.
+First-time setup: **choose an installation method → prepare the gateway → connect and restart Codex → run a task**. Already configured? Jump to everyday use or troubleshooting.
 
-**About the screenshots:** these are browser screenshots rendered from the application's current console templates, with sample values and no live service connection. Setup dialogs are shown as focused regions. They explain where to click and what to enter; they do not claim that a sample account, connection or task has been verified. No real API key, cookie or private conversation is included.
+| What you need | Start here |
+| --- | --- |
+| Check the requirements | [1. Before you start](#before-start) |
+| Download a ready-to-run application | [2. Binary installation](#binary-install) |
+| Run the PHP source | [3. Source installation](#source-install) |
+| Configure network, components and sign-in | [4. Setup](#setup) |
+| Create the connector and enable Codex models | [5. Tool connection and Codex integration](#connect-tools) |
+| Start work and inspect its progress | [6. First task](#first-task) · [7. Everyday use](#daily-use) |
+| Change language, context or usage settings | [8. Settings](#settings) |
+| Update, restore or resolve a problem | [9. Upgrades and recovery](#upgrade) · [10. Troubleshooting](#troubleshooting) |
 
-## Contents
-
-- [Before you start](#before-start)
-- [Install and open the console](#install)
-- [Configure network, components and sign-in](#setup)
-- [Connect the tools and ChatGPT plugin](#connect-tools)
-- [Enable Web models in Codex](#codex-integration)
-- [Run and verify a first task](#first-task)
-- [Daily operation, settings and usage](#daily-use)
-- [Upgrade, restore and troubleshoot](#upgrade)
+Controls were checked against the project files on **10 October 2026**. Configuration screenshots use console templates and sample data to illustrate the controls. Use your own interface for actual connection status, account permissions and available models.
 
 <a id="before-start"></a>
+
 ## 1. Before you start
 
-You will use three interfaces:
+### Understand the three windows
 
-| Interface | What you do there |
+| Window | What you do there |
 | --- | --- |
-| **Codex** | Open the project, choose a model, submit work, review approvals and file changes |
-| **RCMAKER console** | Configure the connection, inspect browser activity, tasks and local usage |
-| **Private ChatGPT browser** | Sign in and create the custom plugin used by the Web model |
+| **Codex** | Open the project, submit requests, handle approvals, review changes and results |
+| **RCMAKER local console** | Configure the gateway and inspect readiness, task records and browser activity |
+| **RCMAKER private Chrome** | Sign in to ChatGPT and create its plugin; the gateway manages task pages |
 
-Install Codex first. Use a ChatGPT account that can access the models and custom MCP apps you need, and a Platform account/workspace with the required Tunnel access. The console guides you through a Tunnel and ordinary runtime API key. It expects these to correspond to the private browser's ChatGPT account; the desktop Codex login can differ. Workspace permissions still apply.
+The embedded view and **Open native browser** window share the private browser profile. They are separate from your regular system Chrome. **Signing in through system Chrome alone does not sign the gateway in.**
 
-Do not assume a subscription alone guarantees every feature. When a Tunnel or custom-app option is absent, check the current [OpenAI custom MCP app instructions](https://developers.openai.com/api/docs/guides/custom-mcp-server) and [Secure MCP Tunnel documentation](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), including workspace permissions.
+### Prepare access, networking and a folder
+
+Use the computer where Codex is installed and choose a folder you can write to. Initial setup needs network access to download components, sign in to ChatGPT and connect the tool tunnel. The binary includes PHP; it does not make the gateway an offline application.
+
+Use a ChatGPT account with the required Web models and custom MCP plugin access, plus a Platform account/workspace with the necessary Tunnel permissions. Follow the console's account-matching guidance for the private ChatGPT login, Tunnel and ordinary runtime API key; the desktop Codex login can differ. **The same email address does not establish all workspace permissions.** Check Tunnel organization/workspace associations and the separate create/use permissions in [OpenAI's guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
 
 <a id="install"></a>
-## 2. Install and open the console
 
-### Packaged application
+| Installation | Best for | Install PHP / Composer yourself? |
+| --- | --- | --- |
+| [Binary](#binary-install) | Using the gateway directly | No |
+| [Source](#source-install) | Contributing or maintaining a PHP environment | Yes |
 
-For automatic installation or updates, run the appropriate [latest-Release installer](../README.md#1-start-the-application) from PowerShell (Windows) or Bash (Linux). Reuse the same installation directory when upgrading; set `RCMAKER_INSTALL_DIR` before running the command if it differs from the default. The script verifies SHA-256 and preserves `data/` and `.env`. **Stop the gateway after current tasks finish before updating.**
+**Choose one.** Both continue with [Setup](#setup) after startup.
 
-Put the downloaded executable in a writable folder, such as `D:\Apps\RCMAKER-Gateway`, and **double-click the `.exe` to start it**. No `start` parameter is needed. PowerShell is optional:
+<a id="binary-install"></a>
+
+## 2. Binary installation
+
+### 2.1 Automatic installation
+
+**Windows x64:** run in PowerShell.
 
 ```powershell
-cd D:\Apps\RCMAKER-Gateway
-.\rcmaker-codex-gateway.exe
+irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
 ```
 
-Keep the running console window open. The program creates external persistent storage on first use; you do not need to copy another installation's `data` folder. Open **http://127.0.0.1:28910/** on the same machine. When you changed `console_port` in `.env`, use that port instead.
+**Linux / macOS:** run in Bash. Both x64 and ARM64 are supported by the installer.
 
-The application supports multiple platforms. Use a release built for your operating system and architecture.
+```bash
+curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
+```
 
-### Source installation
+The installer downloads the latest stable release and verifies SHA-256 checksums for the archive and executable. Windows needs system `tar.exe`; the Linux/macOS installer checks its download, extraction and checksum tools. Install any missing prerequisite identified in an error before retrying. Script sources: [Windows](../.github/scripts/install.ps1) · [Linux/macOS](../.github/scripts/install.sh).
 
-Source installation supports **PHP 8.1–8.5 (inclusive)** on Windows, macOS and Linux. First follow the [RCMAKER official quick start — prepare your environment](https://rcmaker.runchance.com/doc/#/md/quick-start?id=_1-%E5%87%86%E5%A4%87%E7%8E%AF%E5%A2%83) to install PHP, required extensions and Composer. Then, from the application's source directory:
+**Destination:** an executable in the current folder is upgraded there; otherwise the default is `./rcmaker-codex-gateway/`. A first interactive installation lets you enter a different directory. Non-interactive installation uses the default. Check the script's final output for the actual location.
 
-```sh
+<details>
+<summary>Choose a custom installation directory</summary>
+
+Set the directory before running the installer. Replace the example path with your preferred location.
+
+Windows:
+
+```powershell
+$env:RCMAKER_INSTALL_DIR = 'D:\Apps\RCMAKER-Gateway'
+irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
+```
+
+Linux / macOS:
+
+```bash
+export RCMAKER_INSTALL_DIR="$HOME/Apps/rcmaker-codex-gateway"
+curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
+```
+
+To install into the current directory, set the variable to `.`. Relative paths resolve from the directory where you run the command. In Bash, `export` the variable first; assigning it only to `curl` on the left of the pipe does not pass it to `bash`.
+
+</details>
+
+### 2.2 Manual installation
+
+Open [Releases](https://github.com/runchance/rcmaker-codex-gateway/releases/latest) and choose the matching release archive. For the ready-to-run application, do not choose GitHub's automatically generated **Source code** archives.
+
+| Computer | Archive filename ending |
+| --- | --- |
+| Windows x64 | `windows-x86_64.zip` |
+| Linux x64 | `linux-x86_64.tar.gz` |
+| Linux ARM64 | `linux-aarch64.tar.gz` |
+| macOS Intel | `macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `macos-aarch64.tar.gz` |
+
+Extract the archive into a writable folder and keep its license files and configuration example. You do not need an existing `data/` directory or another user's browser profile. Available downloads are those attached to the selected Release.
+
+### 2.3 Start the application
+
+The installer **does not start** the gateway. Open the installation or extraction directory:
+
+| System | Start command or action |
+| --- | --- |
+| Windows | Double-click `rcmaker-codex-gateway.exe`, or run `.\rcmaker-codex-gateway.exe` in PowerShell |
+| Linux / macOS | Run `./rcmaker-codex-gateway` in a terminal |
+
+If a manually extracted executable lacks execute permission, run `chmod +x ./rcmaker-codex-gateway` first. Resolve missing browser libraries or graphical-session requirements from the actual error; a platform-specific binary does not include every operating-system component.
+
+Keep the process running, open the **[local console](http://127.0.0.1:28910/)** on the same computer, and continue with [section 4](#setup). The default `data/` directory is created beside the executable on first use.
+
+<a id="source-install"></a>
+
+## 3. Source installation
+
+**Skip this section if you installed a binary.**
+
+### 3.1 Prepare PHP
+
+Install Git, Composer and PHP 8.1–8.5 for CLI use. The release build uses PHP 8.5 with `curl`, `openssl`, `zip`, `mbstring`, `pdo_sqlite`, `sqlite3`, `sockets` and `sodium`; see the [build configuration](../.github/workflows/release.yml). Enable the runtime framework's required Unix process extensions as well.
+
+The [RCMAKER environment guide](https://rcmaker.runchance.com/doc/#/md/quick-start?id=_1-%E5%87%86%E5%A4%87%E7%8E%AF%E5%A2%83) covers environment preparation. Check the terminal you will use to run the gateway:
+
+```bash
+php -v
+php -m
+composer --version
+```
+
+The CLI PHP must have the required extensions. Enabling them only in a different web-server/FPM PHP installation is not sufficient.
+
+### 3.2 Get the source and start
+
+```bash
+git clone https://github.com/runchance/rcmaker-codex-gateway.git
+cd rcmaker-codex-gateway
 composer install
 php index.php start
 ```
 
-The root `.env.example` shows optional INI-style deployment settings. Keep your existing `.env` when upgrading.
+If you already downloaded the source, start with `composer install` in its root directory. Do not skip Composer's install scripts: this project uses them to apply its framework compatibility patch.
 
-### Find your way around
+Default configuration can start as supplied. For deployment overrides, create `.env` using [`.env.example`](../.env.example); do not overwrite an existing `.env`. The default `data/` directory is inside the project root, not beside the PHP executable.
 
-The console has four main destinations: **Setup**, **Browser workspace**, **Task center** and **Settings**. A fresh installation uses English; the language selector switches the console without translating user conversations or model contracts.
-
-![Setup overview with the four preparation steps and local usage panel](images/user-guide/en/setup.jpg)
-
-*Figure 1. Work through the numbered setup cards. Their status, not the example screenshot, tells you whether your installation is ready.*
+Keep the process running and open the **[local console](http://127.0.0.1:28910/)**. The remaining setup is the same as for a binary installation.
 
 <a id="setup"></a>
-## 3. Configure network, components and sign-in
 
-### Step 1 — Network
+## 4. Setup: network → components → sign-in
 
-Open **Setup → Configure network**. Choose **Direct connection** when the application can reach the required services directly. Otherwise choose **Use HTTP proxy**, enter the proxy host and port, then select **Save and test**.
+A fresh installation uses English. Change it in **Settings → Console language**; the preference is saved immediately without a restart.
 
-![HTTP proxy fields and Save and test](images/user-guide/en/network.jpg)
+Open **Setup** and complete the numbered cards. A fresh installation waits at an unfinished step; complete that step rather than waiting indefinitely for Ready.
 
-*Figure 2. `127.0.0.1:7890` is only an example. Use the HTTP listening port configured by your own proxy software.*
+![Setup cards for network, components, sign-in and tool connection](images/user-guide/en/setup.jpg)
 
-| Field | Enter |
+### 4.1 Configure the network
+
+Select **Configure network**. Choose **Direct connection** when the services are reachable directly, or **Use HTTP proxy** and enter its host and port. Select **Save and test**.
+
+| Field | What to enter |
 | --- | --- |
-| Proxy IP/host | A host or IP, such as `127.0.0.1`; no `http://`, path or embedded username |
-| Port | Your proxy's HTTP CONNECT listening port |
-| Authentication, when required | Configure it in the detailed **Network and proxy** settings |
+| Proxy IP / host | For example `127.0.0.1`, without `http://`, a username or a path |
+| Port | The HTTP CONNECT port actually provided by your proxy software |
+| Proxy authentication | Configure it in the detailed **Network and proxy** page when needed |
 
-The supported proxy mode here is **HTTP CONNECT**. A SOCKS-only port is not interchangeable with it. This configuration belongs to RCMAKER; it does not change the system proxy. Browser traffic, runtime downloads and the tool tunnel reuse the selected route.
+The saved route is used by the application browser, component downloads and tool tunnel. It does not change your system proxy. A SOCKS-only port cannot be entered as an HTTP port.
 
-**Success:** the console confirms network connectivity. An HTTP 403 from the target can still demonstrate a successful network/TLS connection; ChatGPT sign-in and model access are checked separately. A 403 rejecting the proxy's CONNECT tunnel is a different failure. See [network FAQ](faq.en.md#network).
+**Success:** the network check passes. A target website returning HTTP 403 differs from a proxy refusing the tunnel; connectivity also does not establish sign-in. See the [network FAQ](faq.en.md#network).
 
-### Step 2 — Runtime components
+<details>
+<summary>Show network configuration screenshot</summary>
 
-Open **Prepare runtime components**, then **Start preparation**. Wait for the private Chrome and tunnel components to finish preparation.
+![Network dialog with proxy fields and Save and test](images/user-guide/en/network.jpg)
 
-![Runtime component preparation dialog](images/user-guide/en/runtime.jpg)
+The screenshot port is illustrative. Use your own proxy's port.
 
-*Figure 3. Prepare components after saving the network route, so downloads use the intended connection.*
+</details>
 
-**Success:** the Runtime card reports readiness. Components belong to this application's data directory. A failed download should be diagnosed before proceeding; repeatedly recreating a connector will not repair a missing browser runtime.
+### 4.2 Prepare runtime components
 
-### Step 3 — Sign in to ChatGPT
+Select **Prepare runtime components → Start preparation** and wait for private Chrome and the tool tunnel components. Configure networking before downloading components.
 
-Open **Sign in to ChatGPT → Open sign-in page**. Complete sign-in using the account intended for the Web model.
+**Success:** the Runtime card reports ready. If a download fails, inspect networking, disk space and the exact error before continuing; creating another connector does not repair missing components.
 
-![Private ChatGPT sign-in controls, including native browser access](images/user-guide/en/login.jpg)
+<details>
+<summary>Show runtime preparation screenshot</summary>
 
-*Figure 4. The embedded view and native browser window share RCMAKER's private browser profile.*
+![Runtime preparation dialog](images/user-guide/en/runtime.jpg)
 
-For direct typing, scrolling and pasting, choose **Open native browser**. This opens the project's private Chrome in its own window—not your regular system Chrome profile. After signing in, return to the console and wait for account/model detection. **Hide native browser** hides the visible setup window while preserving the private login. When the panel looks stale, use **Reload page** or **Refresh status** before attempting another sign-in.
+</details>
 
-**Success:** account and model checks pass. Simply seeing the ChatGPT homepage is not proof that tool access works; connector confirmation comes next.
+### 4.3 Sign in to ChatGPT
 
-**Clear private Chrome sign-in data** removes RCMAKER's saved ChatGPT/Google login state and profiles. It is a deliberate account-reset action, not a routine refresh. Finish active work first. It does not target system Chrome or project source files.
+Select **Sign in to ChatGPT → Open sign-in page** and complete sign-in. For easier typing or scrolling, choose **Open native browser** and use the separate private Chrome window.
+
+Return to the console and let account/model detection finish. **Hide native browser** hides the window; use **Reload page** or **Refresh status** if the display has not updated.
+
+**Success:** the account is recognized and model checks finish. Continue to the tool connection.
+
+<details>
+<summary>Show sign-in and native browser controls</summary>
+
+![Sign-in controls: open page, native browser and refresh](images/user-guide/en/login.jpg)
+
+</details>
+
+**Clear private Chrome sign-in data is a reset.** It removes the application's saved ChatGPT/Google login state and profiles, requiring another sign-in. Do not use it for a routine refresh. Finish active tasks before deliberately resetting an account.
 
 <a id="connect-tools"></a>
-## 4. Connect the tools and ChatGPT plugin
 
-Open **Setup → Configure tool connection**. Complete the following sequence; the tunnel must be running before ChatGPT can discover its tools.
+## 5. Tool connection and Codex integration
 
-### 4.1 Create a Tunnel and save its connection
+Open **Setup → Configure tool connection**. Follow this order: **create a Tunnel → save the key and connect → create the ChatGPT plugin → check the connector → enable Codex models**.
 
-Use **Open tunnel creation** and create a Tunnel in the appropriate Platform organization. Copy its `tunnel_...` identifier. Then use **Open API key creation** to create an **ordinary runtime API key**, not an Admin key, with the required access.
+### 5.1 Create and connect the Tunnel
 
-![Tunnel ID, API key and connector name fields](images/user-guide/en/tools.jpg)
+Select **Open tunnel creation**, create a Tunnel and copy its `tunnel_...` identifier. Select **Open API key creation** and create an **ordinary runtime API key**, not an Admin key, with the required access.
 
-*Figure 5. The public screenshot contains placeholders. Enter your own values only in your local console.*
+These two buttons open tabs in the browser displaying the local console. Check its signed-in account so it matches the intended private ChatGPT account and workspace access.
 
-| Field | Requirement |
+| Local field | What to enter |
 | --- | --- |
-| Tunnel ID | The identifier of the Tunnel you created |
-| API Key | Ordinary runtime key with access to that Tunnel; an existing saved key is not displayed again |
-| Connector name | Fixed `RCMAKER` prefix plus your suffix; the fresh-install default is `RCMAKER Codex` |
+| Tunnel ID | The `tunnel_...` identifier you created |
+| API Key | An ordinary runtime key allowed to use the Tunnel; leave blank when the key is already saved |
+| Connector name | Fixed prefix `RCMAKER` plus your suffix; default `RCMAKER Codex` |
 
-Select **Save and connect tunnel**. Wait for the tunnel to report connected. Saving activates its configuration; a normal first-time connection should not require an RCMAKER restart.
+Select **Save and connect tunnel** and wait for Connected before proceeding. A normal first save activates the tunnel without a gateway restart.
 
-The Tunnel/API-key buttons open in the browser displaying the console. Check which account that browser uses. Plugin creation uses the private ChatGPT account. Keep the identities and workspace access consistent; do not paste a key from an unrelated account simply because its format looks correct.
+![Tool connection fields: Tunnel ID, API key and connector name](images/user-guide/en/tools.jpg)
 
-### 4.2 Create the matching ChatGPT plugin
+### 5.2 Create the ChatGPT plugin and verify it
 
-![Connector creation checklist and confirmation controls](images/user-guide/en/connector.jpg)
+Select **ChatGPT Connector settings**, or **Open native browser** in that area, to create the plugin using the private Chrome account.
 
-*Figure 6. The local checklist shows the expected connector name and the Check connector button.*
+The current official flow is **Plugins → + → Add custom MCP server**. If your account still uses Apps / Developer Mode, follow that interface and any developer-mode or workspace permission requirements. See the [official creation steps](https://developers.openai.com/api/docs/guides/custom-mcp-server).
 
-Open **ChatGPT Connector settings**, or its **Open native browser** option. In the account's current ChatGPT interface, open **Plugins → + → Add custom MCP server**. Accounts with an older layout may expose creation through Developer Mode or Apps settings. Follow the current [official creation flow](https://developers.openai.com/api/docs/guides/custom-mcp-server).
-
-Use these values:
-
-| ChatGPT field | Value |
+| ChatGPT field | Value for this integration |
 | --- | --- |
-| Name | Exactly the full name shown by RCMAKER, for example `RCMAKER Codex` |
-| Connection/source | **Tunnel**, then choose your created Tunnel |
-| Authentication | **No authentication / None**, as required by this local integration |
+| Name | The full value from **Copy connector name**, for example `RCMAKER Codex` |
+| Connection | **Tunnel**, then choose the Tunnel from the previous step |
+| Authentication | **No authentication / None** |
 
-Review the permissions and warnings shown by ChatGPT, create the plugin, and install/connect it when the current interface requires that step. Return to RCMAKER and select **Check connector**.
+Review the page's notices, create the plugin and complete its installation/connection steps. Return to RCMAKER and select **Check connector**.
 
-**Success:** both the tunnel and connector checks pass. This verifies the actual tool path; a saved plugin name alone does not establish connectivity.
+**Success:** both tunnel and connector checks pass. If the Tunnel is missing, check organization/workspace associations and permissions. If creation succeeds but the check fails, use the [connector FAQ](faq.en.md#connector).
 
-When updating tool definitions, ChatGPT's **Refresh tools / Refresh** refreshes its cached tool catalog. RCMAKER's **Check connector** verifies the connection; it does not perform that catalog refresh. Ordinary restarts do not require recreating the plugin. After changing the connector suffix, create a matching new plugin and verify it; see [connector FAQ](faq.en.md#connector).
+<details>
+<summary>Show the connector checklist</summary>
+
+![Connector name, creation checklist and verification controls](images/user-guide/en/connector.jpg)
+
+</details>
+
+An existing installation keeps its connector name; there is no need to change it to the default. After changing the suffix, create and verify a matching plugin. Ordinary restarts do not require a new plugin. When release notes require updated tool definitions, use **Refresh / Refresh tools** in ChatGPT, then check the connection locally. These are separate actions.
 
 <a id="codex-integration"></a>
-## 5. Enable Web models in Codex
 
-In the same configuration dialog, find **Enable Web models in Codex**. Choose **Detect available models**, then **Preview integration**. Review the proposed changes before selecting **Save integration**.
+### 5.3 Save the integration and restart Codex
 
-![Model detection, integration preview and the Codex restart reminder](images/user-guide/en/codex.jpg)
+In the same dialog, find **Enable Web models in Codex**:
 
-*Figure 7. The sample shows the restart reminder after saving. Model names are illustrative; your account's detection result is authoritative.*
+1. Select **Detect available models** and wait for account detection to complete.
+2. Select **Preview integration** and review the target configuration and routing changes.
+3. Select **Save integration**.
 
-The integration maintains its own routing and model metadata, with a backup for restoration. It preserves unrelated project, MCP and permission settings. Switching from another gateway can replace that gateway's model route, which is why you review the preview.
+Saving backs up and replaces model routing while preserving unrelated MCP, project and permission settings. When switching from another gateway, inspect the old route in the preview.
 
-> **After configuration, wait for the RCMAKER shell to display `Ready. Start Codex; if it is already open, fully quit and restart it.` Only then start Codex, or fully quit Codex (including background processes) and reopen it. Keep RCMAKER running.**
+![Model detection, integration preview, save and restart reminder](images/user-guide/en/codex.jpg)
 
-The readiness line confirms that network, browser, ChatGPT sign-in, model availability and connector checks have completed. If it is absent, return to **Setup** and finish the pending step. Opening another chat does not reload the model catalog.
+> **Wait for Ready in RCMAKER's startup window, then fully quit Codex, including background processes, and reopen it. Keep RCMAKER running. Closing a chat tab or opening a new chat is not a restart.**
 
-Available Web entries end in **RC (Web)**. The website's family name is followed by a mode, for example `GPT-6 · Thinking · RC (Web)`. Thinking offers its supported effort choices; Instant and Pro have separate fixed-mode entries because their context budgets can differ. Model examples are not promises of access. Choose the separate **Pro** entry to use Web Pro when detected; you do not need to enable Codex Ultra just to select it.
-
-**Success:** the new entries appear after restarting Codex, and the console's integration check succeeds.
+**Success:** Codex displays model names ending in **RC (Web)** and the local integration check passes. If Ready never appears, return to Setup and complete the waiting card.
 
 <a id="first-task"></a>
-## 6. Run and verify a first task
 
-Open the intended project in Codex. Choose a detected **RC (Web)** model and start with a small read-only request:
+## 6. Run and check your first task
+
+Open the intended project in Codex and choose a detected **RC (Web)** model. Thinking entries offer the available effort choices; Web Pro uses a separate **Pro · RC (Web)** entry when available. Family names follow the current detection result.
+
+Start with an easy-to-check read-only request:
 
 ```text
-Inspect this project's directory structure and README. Explain the startup command
-and missing configuration. Do not modify files yet. Base the answer on actual files.
+Read this project's README and directory structure. Explain how to run the project
+and identify any missing setup steps. Do not modify files. Use actual file contents.
 ```
 
-Confirm the full path:
-
-| Where to look | What should happen |
+| Where to look | What should appear |
 | --- | --- |
-| Codex | Native tool calls and actual results appear, followed by the answer |
-| Browser workspace | A task-owned ChatGPT page appears automatically |
-| Task center | The corresponding task records messages, receipts and status |
+| Codex | Real tool calls and file results, followed by the answer |
+| Browser workspace | An automatically created ChatGPT task page |
+| Task center | Messages, tool receipts and status for the task |
 
-Then submit a concrete development request:
-
-```text
-Fix the selected bug in this project. First inspect the relevant implementation and
-tests, make the required change, run the appropriate checks, and correct failures.
-Report the actual changes and verified results, plus anything still unverified.
-```
-
-Handle permission prompts in Codex when required. The gateway does not grant the model broader local access than Codex allows. A final success claim is not a substitute for file changes and test results; inspect the diff and relevant outputs.
-
-![Browser workspace before a first task](images/user-guide/en/browser.jpg)
-
-*Figure 8. An empty workspace is normal before a Web task starts. Real task pages are created by the gateway.*
+After this succeeds, submit a concrete development request and handle approvals in Codex. Review the diff for file changes and actual command output for verification; a final “done” message is not enough on its own.
 
 <a id="daily-use"></a>
-## 7. Daily operation
 
-### Browser workspace and multiple tasks
+## 7. Everyday use
 
-Start tasks from Codex. Do not type competing instructions directly into automation-owned ChatGPT pages. The workspace supports up to five task pages, distinguishes active/idle pages and prioritizes active work. Close only eligible idle pages or wait for capacity; do not close a running page to make room. Closing a page and deleting a task record are different operations.
+### Start, steer and stop
 
-For a mid-task correction, send the message in the **same Codex conversation**. The gateway forwards it as guidance for the active task. Related changes should be incorporated; an incidental question should not replace the original goal unless you explicitly request that. A fresh temporary browser page may be used for handoff while the Codex conversation continues.
+Start RCMAKER first and let it restore readiness before using Codex. Saved sign-in and connection settings are reused; you do not recreate the plugin each time. After integration or model catalog changes, fully restart Codex as instructed by the console.
 
-### Task center, original messages and cleanup
+While a task runs, send corrections or questions in the **same Codex conversation**. Related changes guide the task; explicitly say when you want to stop or replace the goal. A handoff may open a new temporary Web page, which does not by itself mean the Codex history was lost.
 
-![Task center filters and cleanup controls](images/user-guide/en/tasks.jpg)
+Stop a task in Codex and check its Task center status. Before closing the gateway, finish tasks and pending approvals, then use **Ctrl+C** in the startup terminal. Closing a running Web page is not a substitute for cancelling a task.
 
-*Figure 9. The empty example shows the status filters. Actual tasks populate the table after use.*
+### Browser workspace
 
-Use the task list's timeline action to inspect the Web interaction, tool results, context-delivery decisions and any unresolved status. Expand the full-message record to inspect the exact sent contract and context; use its **Copy** or **Download** action. A recorded send intent is distinct from a confirmed page receipt.
+The workspace retains up to five task pages, labeled active/idle and managed by the gateway. At capacity, wait for work to release a page or close an idle page the interface permits you to close. **Closing a page and deleting a task record are different actions.**
 
-Filters separate continuable tasks, tasks needing attention, completed tasks and cancelled tasks. **Clear all idle tasks** removes eligible non-working records; running, tool-executing and approval-waiting tasks are skipped. Read the confirmation before deleting. Project files are not cleanup targets, and some checkpoint/attachment proofs remain for continuity. Database space reclamation can be deferred while tasks work. See [cleanup FAQ](faq.en.md#cleanup).
+Do not enter a competing request directly into an automation-owned ChatGPT task page. Send it through Codex to keep it associated with the task.
 
-### Preferences, context and Pro
+<details>
+<summary>Show Browser workspace and Task center screenshots</summary>
 
-![Preferences: language, optional official handoff and context options](images/user-guide/en/settings.jpg)
+![Browser workspace; an empty view before the first task is normal](images/user-guide/en/browser.jpg)
 
-*Figure 10. The example shows the new-install 3× / six-part combination. Existing installations keep saved preferences.*
+![Task center status filters and cleanup controls](images/user-guide/en/tasks.jpg)
 
-| Setting | Practical meaning |
+</details>
+
+### Inspect the full sent messages
+
+Open **Task center → the task → Timeline** to inspect messages, tool results, context delivery and compaction decisions. Expand the full-message records to **copy or download** the sent contract and context, including evidence relevant to attachments or mid-task guidance.
+
+A recorded send intent is different from confirmed Web receipt. Compare it with receipts and subsequent status. Exports may contain project information; redact them before sharing.
+
+### Clear task records
+
+Use **Clear all idle tasks** in Task center and review its confirmation. Running tasks, executing tools and approval waits are skipped. Cleanup does not target project source files or Codex chats. Referenced checkpoints or attachments may remain, and database shrinking may be deferred; see the [cleanup FAQ](faq.en.md#cleanup).
+
+<a id="settings"></a>
+
+## 8. Settings, context and usage
+
+Keep the defaults for initial use. **Preferences** controls normal operation; **Model contracts** edits the templates sent to Web models and does not need adjustment for ordinary use.
+
+| Setting | Meaning and when to change it |
 | --- | --- |
-| Console language | Saves English/Chinese UI preference; conversation and contract text remain original |
-| Up to 3× history | Allows longer history intake; does not triple the model's memory window |
-| Maximum parts | An upper bound; the gateway chooses one message or the smallest suitable 2–6-part plan |
-| Official handoff summary | Off by default; enabling it may consume official Codex quota when encrypted history needs a readable handoff |
-| Upload skill files | Optional; selected skill files share the upload limit with recent images |
-| Weekly Pro tracking budget | Supplies a local estimate only; use your actual allowance, not an example from a screenshot |
+| Console language | English/Chinese changes save immediately; user messages and model contracts remain unchanged |
+| Up to 3× history (experimental) | On for fresh installations; requires a connector and the six-part ceiling; does not expand model capacity and is not used by every mode |
+| Maximum parts | Defaults to at most six; the actual count depends on context and budget, not a fixed six messages per request |
+| Model response wait | Applies to one model response and restarts after tool results; not the entire project's time limit |
+| Part acknowledgement / summary waits | Separate settings for context-part acknowledgements and compaction summaries |
+| Official-model handoff summary | Off by default; can obtain a readable summary of inaccessible official encrypted history and may use official quota |
+| Upload skill files | Skills normally travel as text; enabling file upload shares up to 10 slots with recent images |
+| Automatically confirm one-time ChatGPT tool calls | Applies only to single-use confirmation for this connector; Codex sandboxing and local approvals remain in effect |
+| Weekly Pro tracking budget | Used only for a local balance estimate; it does not limit submissions or represent the official balance |
 
-Keep defaults for an initial setup. The 3× option requires the six-part ceiling; lowering that ceiling is not equivalent to keeping 3× unchanged. Already-running work keeps its saved budget/settings snapshot. When model catalog metadata changes, fully reopen Codex.
+New requests use saved changes. Already-started work retains its budget and waiting settings. If the catalog has changed but Codex still shows old values, fully reopen Codex.
 
-Historical staging uses non-Pro Medium on the selected family; gateway summaries use non-Pro High; the actual execution submission uses the selected task model and effort, including Pro. Compaction is a handoff, not an automatic task failure. Review its decision evidence if it becomes unexpectedly frequent; do not solve it by arbitrarily raising every timeout or deleting history.
+<details>
+<summary>Show settings screenshot</summary>
 
-**Model contracts** are in a separate settings tab. New users should keep the defaults. If you change a template, preserve its required placeholders and never put real credentials into it.
+![Preferences for language, context and usage tracking](images/user-guide/en/settings.jpg)
 
-### Read usage correctly
+</details>
 
-**Setup → Account and usage** displays the detected account, model choices, recent Web submissions, Pro usage and estimated tokens. Statistics cover this installation over a rolling seven days; they exclude other devices and direct website conversations. An estimated Pro balance is not the provider's official remaining quota or reset time. See [usage FAQ](faq.en.md#usage).
+### Context parts, compaction and Pro
+
+**Multipart delivery** sends longer history in batches. **Compaction** creates a summary for subsequent work. Both can add waiting time without implying failure. History includes instructions, skills and tool results, not just the few messages you typed.
+
+Historical staging normally uses the selected family's non-Pro Medium mode; gateway summaries use non-Pro High. Actual tasks use your chosen model and effort. Inspect the recorded purpose and tier to confirm a submission. 3× does not triple memory, and a summary is not a verbatim copy of all previous records.
+
+**Setup → Account and usage** covers this installation's last seven days of Web submissions, Pro use and estimated tokens. Other devices and direct Web conversations are excluded. “Official balance unavailable” does not mean zero. See [context FAQ](faq.en.md#history) and [usage FAQ](faq.en.md#usage).
 
 <a id="upgrade"></a>
-## 8. Upgrade, restore and troubleshoot
 
-### Upgrade in place
+## 9. Upgrades, configuration and recovery
 
-If installed with the README's one-command installer, stop the gateway and run the same installation command again to fetch the latest stable GitHub Release. It does not start the gateway automatically.
+### 9.1 Update a binary in place
 
-1. Let active work and approvals finish. Save your Codex work and stop RCMAKER using your normal method.
-2. Keep a private backup of the existing `.env` and persistent `data` directory. Preserve the old executable for rollback. Do not copy an actively written SQLite file as though it were a consistent full backup.
-3. Put the new executable beside the same data directory. Keep the same `data_directory` and port configuration. Do not run old and new versions simultaneously on the same ports/storage.
-4. Start the new executable, check Setup, then fully restart Codex when model metadata or integration changes require it. Refresh the ChatGPT plugin's tools only when that release changes its tool definitions.
+1. Finish active tasks and approvals, stop RCMAKER, and privately back up `.env` and the full `data/` directory.
+2. **Enter the existing installation folder**, or set `RCMAKER_INSTALL_DIR` to it, then rerun the installer. For manual installations, replace the corresponding release files.
+3. Preserve the data directory and ports, start the new version and check Setup.
+4. Fully restart Codex after routing or model catalog changes. Refresh ChatGPT's tool catalog only when release notes require it.
 
-Changing `data_directory` selects different storage; it does not automatically migrate your login and tasks. A packaged binary does not include your development data. Documentation is delivered separately; never assemble a public documentation package by copying the entire application `data` directory.
+Do not open the same data with old and new executables simultaneously. Stop writes before backing up; a copy of one actively written SQLite file is not a complete backup. The installer attempts to retain a `.previous` executable, but keep a pre-upgrade data backup for rollback too.
 
-### Restore the Codex route
+### 9.2 Update a source installation
 
-In **Configure tool connection**, **Restore pre-integration configuration** restores the backed-up prior routing choice; that choice may be another gateway. **Restore Codex official route** clears the bridge route and Web defaults. Review the preview and save/confirm the intended operation, then fully restart Codex.
+Stop the gateway, back up data and inspect local changes. Obtain the desired source version, run `composer install` in the project root, and start with `php index.php start`. Do not use a forced reset over unpreserved local changes.
 
-Restoring routing is not deletion of your project files or chat history. Unreadable provider-encrypted context cannot be magically decrypted by the Web model; see [history FAQ](faq.en.md#history).
+### 9.3 Data and optional deployment settings
 
-### When something stops progressing
+The default layout is below; the Linux/macOS executable has no `.exe` suffix:
 
-Check **Setup**, then the affected task's timeline. Determine whether the task is generating, waiting for a tool/approval, handing off context, or explicitly failed. A lingering website connection message is not on its own proof that tool execution stopped. Do not repeatedly resend a possibly executed mutation.
+```text
+installation/
+  rcmaker-codex-gateway.exe
+  .env                   # optional deployment settings; beside index.php for source
+  data/                  # persistent login, credentials, tasks and attachments
+  runtime/               # rebuildable operating files
+```
 
-Use the [FAQ](faq.en.md) for connector failures, missing models, 409 conflicts, interrupted streams and JSON decoding failures. A useful issue report includes version, operating system, time, selected model/effort, exact error code and a redacted timeline excerpt. Remove keys, cookies, local tokens and private prompts before sharing.
+Use the console for preferences and credentials; ordinary operation does not require manual database edits. Deployment overrides use the **INI sections** shown in [`.env.example`](../.env.example):
 
-## Sources and further reading
+| `[gateway]` setting | Default / purpose |
+| --- | --- |
+| `console_port` | `28910`, local console |
+| `api_port` | `28911`, Codex integration |
+| `browser_debug_port` | `28912`, private browser control |
+| `data_directory` | `data`, a directory name beside the program, not an arbitrary absolute path |
+| `default_locale` | `en`, used before a language preference has been saved |
+| `codex_home` | Empty for automatic detection; can target another Codex configuration directory |
 
-Project resources: [README](../README.md), [FAQ](faq.en.md), and [deployment example](../.env.example).
+All three ports must differ. Restart RCMAKER after deployment changes. If the Codex endpoint changes, preview/save integration again and restart Codex. Changing `data_directory` selects another store; **it does not migrate existing login state or tasks**.
 
-External setup: [RCMAKER framework](https://github.com/runchance/rcmaker), [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), [Add a custom MCP server](https://developers.openai.com/api/docs/guides/custom-mcp-server), and [Developer mode](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+### 9.4 Restore previous or official routing
 
-[Back to README](../README.md) · [FAQ](faq.en.md) · [中文版](user-guide.zh-CN.md)
+In **Configure tool connection**, choose the appropriate action:
+
+| Action | Result |
+| --- | --- |
+| Restore pre-integration configuration | Restores the backed-up route, which may belong to another gateway |
+| Restore Codex official route | Clears gateway routing and Web defaults to restore official routing |
+
+Follow the confirmation/save flow and fully restart Codex. Restoring a route does not delete project files or chats, but encrypted history may not be readable across model providers. Supply a readable handoff or use the optional official summary when needed.
+
+<a id="troubleshooting"></a>
+
+## 10. Troubleshooting at a glance
+
+**Check Setup first, then the affected task's timeline.** Distinguish generation, tool/approval waiting, context handoff and explicit failure before choosing a retry.
+
+| Symptom | First check | Next step |
+| --- | --- | --- |
+| The console will not open | Confirm the process is running, ports are correct and unused, and the address is on this computer | [Startup and network FAQ](faq.en.md#network) |
+| Chrome download or component preparation fails | Save the correct network route; inspect the download error and disk space | Keep the component name and full error; do not recreate the plugin |
+| Private Chrome is signed in but status is stale | Return to Setup, allow detection, then refresh status/page | Confirm the login is in this application's private browser |
+| Connector failure, tool 502 or MCP SSE 404 | Check tunnel, plugin name/installation and the running Codex client | Compare the failing connection name with its timeline; the error alone does not prove project corruption |
+| Missing Web models or Pro in Codex | Detect models, preview/save and fully restart Codex | Check whether the Web account offers that mode; see [model FAQ](faq.en.md#models) |
+| Connection warning while tools still run | Compare both interfaces with the latest tool receipts; do not repeatedly regenerate | If the page has ended but Codex has not, record both states and timestamps |
+| Compaction takes longer than expected | Check context-part progress, summary receipts, approvals and actual continuing activity | Do not start another summary while one is unconfirmed; retain the full 409 message |
+| 409 for an unfinished turn or unknown result | Inspect real file changes, receipts and the old task's status | Resolve or end the old task before continuing; report persistent conflicts with redacted records |
+| Encrypted history, `context_json`, `SCHEMA_MISMATCH` or ID-prefix errors | Save the exact error and whether you switched from an official model or another gateway | [History and protocol checks](faq.en.md#recovery); do not edit history or delete the database to force recovery |
+
+Confirm the outcome of potentially executed writes before retrying. Clearing sign-in data, deleting a database or repeatedly recreating plugins is not a general recovery procedure.
+
+### Include this in a problem report
+
+```text
+RCMAKER version:
+Operating system / CPU architecture:
+Installation: binary / source
+Model and effort:
+Stage: startup / sign-in / tool call / compaction / completion
+Other concurrent tasks or a recent model switch:
+Timestamp and full error:
+Status and actual file results already checked:
+Redacted screenshots or task timeline:
+```
+
+Report through [GitHub Issues](https://github.com/runchance/rcmaker-codex-gateway/issues). Remove API keys, cookies, local tokens and private project content first. Do not upload the entire `data/` directory.
+
+[Back to README](../README.md) · [Full FAQ](faq.en.md) · [简体中文](user-guide.zh-CN.md)

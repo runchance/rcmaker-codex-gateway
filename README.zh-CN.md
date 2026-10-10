@@ -1,172 +1,140 @@
-# rcmaker-codex-gateway
+# RCMAKER Codex Gateway
+
+**在 Codex 中使用 ChatGPT 网页模型，完成本地项目任务。**
 
 **简体中文** · [English](README.md)
 
-把 ChatGPT 网页模型接入本机 Codex 开发流程。在 Codex 中提出需求，网关负责传递上下文、转发原生工具调用，并实时回传模型公开的进展和最终答案。
+[二进制安装](#binary-install) · [源码安装](#source-install) · [首次配置](#quick-start) · [操作手册](docs/user-guide.zh-CN.md) · [常见问题](docs/faq.zh-CN.md)
 
-**本应用基于 [RCMAKER PHP 框架](https://github.com/runchance/rcmaker) 开发。** 文件修改、命令执行、浏览器操作、技能及已配置的 MCP 工具由现有 Codex 运行时执行，遵守其自身的权限与审批规则。
+RCMAKER Codex Gateway 连接本机 Codex 与 ChatGPT 网页模型。你在 Codex 中提出需求，网关负责传递上下文、将工具调用交给 Codex 执行，再把进展和答案实时返回同一条对话。文件访问、命令执行和权限审批仍由现有 Codex 运行时负责。
 
-## 文档入口
+本项目基于 [RCMAKER PHP 框架](https://github.com/runchance/rcmaker) 开发。
 
-| 从这里开始 | 内容 |
+## 你可以用它做什么
+
+| 能力 | 使用体验 |
 | --- | --- |
-| **[图文操作手册](docs/user-guide.zh-CN.md)** | 安装、逐步配置截图、首次任务、日常操作和升级 |
-| **[常见问题 FAQ](docs/faq.zh-CN.md)** | 连接失败、模型选择、上下文压缩、用量与恢复 |
+| 网页模型与本地工具协作 | 使用 Codex 已有的工具、技能与 MCP 集成处理项目文件 |
+| 持续推进任务 | 在工具调用和上下文交接之间继续工作，也能从同一条 Codex 对话补充要求 |
+| 看得见的执行过程 | 查看最多五个任务页面、任务时间线，复制或下载完整发送原文 |
+| 按账号识别模型 | 检测可用网页模型与档位，通过 **RC (Web)** 后缀区分网关模型 |
+| 本机可视化控制台 | 管理登录、网络、上下文设置、界面语言与本机用量记录 |
+| 二进制或源码部署 | 直接运行独立程序，或使用 PHP 源码；持久数据保存在程序外部 |
 
-| [English documentation](README.md) | 独立的英文 README、操作手册与 FAQ |
+![RCMAKER 启动控制台：逐项检查运行条件](docs/images/user-guide/zh-CN/rcmaker-console.png)
 
-![运行准备：从网络配置到 Codex 接入的四个步骤](docs/images/user-guide/zh-CN/setup.jpg)
+*启动时逐项显示检查进度，准备就绪后提示启动或重启 Codex。*
 
-*截图使用当前控制台模板和明确标注的示例数据，不包含真实账号凭据或私有项目对话。*
+## 安装前准备
 
-## 为什么采用 RCMAKER
+在运行网关的电脑上安装 Codex，准备具有所需网页模型和自定义 MCP 插件权限的 ChatGPT 账号，以及可使用 Secure MCP Tunnel 的权限。控制台会引导创建 Tunnel 和普通运行 API Key；账号与工作区权限请核对 [OpenAI Tunnel 官方说明](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。
 
-[RCMAKER](https://github.com/runchance/rcmaker) 面向 PHP 应用的快速开发与独立交付：
+下面两种安装方式**选择一种即可**。二进制已包含 PHP 运行环境；源码安装需要自行准备 PHP 和 Composer。
 
-| 框架能力 | 对本应用的价值 |
-| --- | --- |
-| PHP 与 Composer 生态 | 延续熟悉的开发方式，复用成熟组件 |
-| CLI 常驻服务 | 减少持续运行网关的重复初始化开销 |
-| 多应用与进程组 | 分离控制台、API 与后台运行职责 |
-| 独立可执行程序打包 | 将 PHP、应用代码与依赖一起交付 |
+<a id="binary-install"></a>
 
-框架源码：**https://github.com/runchance/rcmaker**。框架文档：[rcmaker.runchance.com](https://rcmaker.runchance.com/)。
+## 二进制安装
 
-## 主要功能
+**适合直接使用，无需自行配置 PHP。** 安装脚本从 [Releases 最新正式版](https://github.com/runchance/rcmaker-codex-gateway/releases/latest) 下载对应平台的发行包，并校验 SHA-256。
 
-- 原生 Codex 工具调用、并行调用和长时间运行的命令会话，保留真实执行回执。
-- 流式显示公开进展、推理状态摘要和 Markdown 答案，提供任务浏览器工作区与历史记录。
-- 最多五个任务页面，支持中途追加引导、模型切换、附件传输和上下文交接。
-- 新安装默认开启 **3× 历史接入与最多六段自动传输**：历史分段用非 Pro 中档，摘要用非 Pro 高档，实际任务用所选模型与强度。
-- 独立于系统 Chrome 的私有 Chrome for Testing，同时提供内嵌界面和原生窗口登录。
-- 中英双语控制台，日常设置与模型契约分开，支持发送原文复制/下载及本机用量估算。
-- 独立程序部署，持久数据保存在可执行文件外部。
+### Windows · x64
 
-可用模型、档位和账号功能以当前 ChatGPT 检测结果为准。任务时长取决于需求范围，不保证最低运行时间，也不会扩大模型本身的上下文窗口。
-
-## 工作原理
-
-Codex 通过兼容 Responses 的本地接口将任务交给网关；网关使用私有 Chrome 向 ChatGPT 网页模型传递上下文，并把进展与回答流式返回 Codex。网页模型需要工具时，通过 Secure MCP Tunnel 将调用送回网关，再交由 Codex 原生工具按原有权限执行，真实执行结果沿原路返回。
-
-```mermaid
-flowchart LR
-    C["Codex<br/>任务与本地工具"] <-->|"Responses / SSE"| G["rcmaker-codex-gateway"]
-    G <-->|"CDP"| B["私有 Chrome"]
-    B <-->|"网页交互"| W["ChatGPT 网页模型"]
-    W <-->|"MCP 工具调用与结果<br/>经 Secure Tunnel"| G
-```
-
-## 快速开始
-
-### 1. 启动应用
-
-**一键安装或更新**，自动获取 [GitHub Releases 最新正式版](https://github.com/runchance/rcmaker-codex-gateway/releases/latest)：
-
-Windows（PowerShell）：
+在 PowerShell 执行：
 
 ```powershell
 irm https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.ps1 | iex
 ```
 
-Linux / macOS（Bash；Linux 支持 x64 / ARM64，macOS 支持 Intel / Apple Silicon）：
+打开脚本提示的安装目录，双击 **`rcmaker-codex-gateway.exe`** 启动。
+
+### Linux / macOS · x64 与 ARM64
+
+在 Bash 执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runchance/rcmaker-codex-gateway/master/.github/scripts/install.sh | bash
 ```
 
-脚本自动识别平台、下载对应发行包并校验 SHA-256。**先在当前终端设置 `RCMAKER_INSTALL_DIR`** 可指定安装目录；没有指定时，当前目录已有程序就原位升级，否则默认安装到 `当前目录/rcmaker-codex-gateway/`。首次在交互终端安装时可以输入其他目录；非交互安装直接使用默认值，不等待输入。相对路径按当前目录解析。
+进入安装目录后启动：
 
-更新前等待任务结束并关闭网关，**进入已有安装目录**（或设置 `RCMAKER_INSTALL_DIR`）后再次执行同一条命令。旧脚本安装在 `%LOCALAPPDATA%\rcmaker-codex-gateway` 或 `~/.local/share/rcmaker-codex-gateway` 的用户也按此方式升级。原有 `.env`、`data/`、`runtime/` 保留，脚本不会自动启动或重启程序。安装后双击 Windows 目录内的 `rcmaker-codex-gateway.exe`，或在 Linux / macOS 的安装目录执行 `./rcmaker-codex-gateway` 启动。需要 GitHub 已发布正式版且网络可达。执行前可查阅 [Windows 安装脚本](.github/scripts/install.ps1)和 [Linux / macOS 安装脚本](.github/scripts/install.sh)。
-
-也可以手动安装：
-
-将下载的 Windows 程序放入有写入权限的文件夹，**双击 `.exe` 即可启动**，无需添加 `start` 参数。也可以在 PowerShell 中运行（文件名以实际下载的为准）：
-
-```powershell
-.\rcmaker-codex-gateway.exe
+```bash
+./rcmaker-codex-gateway
 ```
 
-首次运行无需提前准备 `data`，程序会在可执行文件旁创建持久数据目录。随后打开[本机控制台](http://127.0.0.1:28910/)。
+全新安装默认放在 `当前目录/rcmaker-codex-gateway/`；当前目录已有程序时原位更新。首次交互式安装可以选择其他目录，也可在执行命令**之前**设置 `RCMAKER_INSTALL_DIR`。脚本完成后不会自动启动程序。
 
-源码运行支持 **PHP 8.1–8.5（含）**，适用于 Windows、macOS 和 Linux。推荐先按 [RCMAKER 官网快速入门：准备环境](https://rcmaker.runchance.com/doc/#/md/quick-start?id=_1-%E5%87%86%E5%A4%87%E7%8E%AF%E5%A2%83) 安装和配置 PHP、所需扩展及 Composer，再进入本项目源码目录执行：
+也可手动下载：从 Releases 选择对应系统和架构的压缩包，解压到有写入权限的目录，再运行其中的程序。详见[指定目录与手动安装](docs/user-guide.zh-CN.md#binary-install)。安装脚本：[PowerShell](.github/scripts/install.ps1) · [Bash](.github/scripts/install.sh)。
 
-```sh
+<a id="source-install"></a>
+
+## 源码安装
+
+**适合参与开发，或自行维护 PHP 环境的用户。** 先准备 PHP 8.1–8.5 与 Composer；扩展和环境检查见[源码安装手册](docs/user-guide.zh-CN.md#source-install)。
+
+```bash
+git clone https://github.com/runchance/rcmaker-codex-gateway.git
+cd rcmaker-codex-gateway
 composer install
 php index.php start
 ```
 
-使用独立程序时，请下载与自己的操作系统和处理器架构匹配的版本。
+部署参数可按需参照 [`.env.example`](.env.example) 配置。源码与二进制启动后，均按下面的流程接入 Codex。
 
-### 2. 按顺序完成运行准备
+<a id="quick-start"></a>
+
+## 首次配置
+
+保持网关运行，打开 **[本机控制台](http://127.0.0.1:28910/)**。默认界面为英文，可在 **Settings → Console language** 中切换为简体中文。
 
 | 步骤 | 操作 | 完成标志 |
 | --- | --- | --- |
-| 1 · 网络 | 选择直连或填写 HTTP CONNECT 代理，点击“保存并测试” | 网络连接确认 |
-| 2 · 运行组件 | 准备私有 Chrome 与工具隧道组件 | 组件就绪 |
-| 3 · ChatGPT | 在私有登录页面或其原生窗口登录 | 账号与模型检查通过 |
-| 4 · Codex 工具 | 保存 Tunnel ID、普通运行 API Key 和连接器名称，创建名称匹配的 ChatGPT 插件 | “检查连接器”通过 |
-| Codex 接入 | 检测模型、预览并保存接入配置 | 配置已保存，且已完整重启 Codex |
+| 1. 网络 | 选择直连，或填写 HTTP 代理，点击“保存并测试” | 网络检查通过 |
+| 2. 运行组件 | 点击“准备运行组件 → 开始准备” | 私有 Chrome 与隧道组件就绪 |
+| 3. ChatGPT | 打开登录页面；需要直接操作时使用“打开原生浏览器” | 账号与可用模型识别完成 |
+| 4. 工具连接 | 保存 Tunnel ID、普通 API Key 和连接器名称，再创建对应的 ChatGPT 插件 | “检查连接器”通过 |
+| 5. 接入 Codex | “检测可用模型 → 预览接入配置 → 保存接入配置” | 接入配置保存成功 |
 
-[图文手册](docs/user-guide.zh-CN.md#connect-tools) 提供字段说明、截图和准确顺序。新安装默认连接器名为 **RCMAKER Codex**，后缀可自定义；控制台与 ChatGPT 中的完整名称必须一致。
+连接器默认名为 **RCMAKER Codex**，后缀可以自定义；ChatGPT 中必须填写相同的完整名称。**先连接隧道，再创建插件。** 字段填写和截图见[连接操作手册](docs/user-guide.zh-CN.md#connect-tools)。
 
-**请等待 Shell 控制台明确显示** `准备就绪。请启动 Codex；如果已经打开，请完整退出后重新启动。` 此时网络、浏览器、ChatGPT 登录、模型检测和连接器均已就绪。如果仍提示某一步正在等待，请先返回本机控制台完成配置。
+> **保存接入配置后，等待网关显示“准备就绪”，再完全退出并重新打开 Codex，包括后台进程。RCMAKER 保持运行。新建聊天不能代替重启。**
 
-> **保存接入配置后，请先保存工作，完全退出 Codex（包括后台进程），再重新打开。RCMAKER 保持运行。新建聊天不能代替重启 Codex。**
-
-### 3. 发起首次任务
-
-在 Codex 打开项目，选择名称以 **RC (Web)** 结尾的可用模型，例如 `GPT-6 · Thinking · RC (Web)`，再选择推理强度。Pro 可用时单独列出。
-
-先做一个范围明确、容易核对的任务：
+在 Codex 中打开项目，选择名称以 **RC (Web)** 结尾的可用模型。Thinking 使用检测到的推理档位，Pro 可用时单独列出。首次可以发送：
 
 ```text
-检查这个项目的目录结构和 README，说明如何启动，并列出缺少的配置步骤。
+读取这个项目的 README 和目录结构，说明如何启动，以及缺少哪些配置。
 这次先不要修改文件。
 ```
 
-确认 Codex 显示真实工具结果，“浏览器工作区”出现任务页面，“任务中心”记录交互，再提出带目标和使用要求的开发需求。详见[首次任务使用](docs/user-guide.zh-CN.md#first-task)。
+核对回答与真实工具结果。“浏览器工作区”显示对应网页，“任务中心”记录消息与执行结果。通过后即可提交具有明确目标的开发任务。
 
-## 账号、密钥与用量
+<a id="troubleshooting"></a>
 
-ChatGPT 账号应具有所需模型和自定义 MCP 应用权限。为私有浏览器使用的 ChatGPT 账号/工作区配置有访问权限的 Tunnel 和普通运行 API Key；Codex 桌面端可以登录不同账号。按控制台引导及 [OpenAI Secure MCP Tunnel 官方说明](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) 配置。
+## 遇到问题，从这里查
 
-用量统计仅覆盖本机安装，不包含其他设备。Token 与 Pro 剩余次数属于**本机估算，不是官方账单或官方余额**。“用官方模型生成交接摘要”默认关闭，开启后可能消耗官方 Codex 模型额度。详见[用量 FAQ](docs/faq.zh-CN.md#usage)。
+| 现象 | 查看位置 |
+| --- | --- |
+| 程序启动失败、控制台打不开、Chrome 下载失败 | [启动与网络](docs/faq.zh-CN.md#network) |
+| 连接器检查失败，本地工具返回 502/404 | [连接排查](docs/user-guide.zh-CN.md#troubleshooting) |
+| Codex 没有网页模型或缺少 Pro | [模型与重启检查](docs/faq.zh-CN.md#models) |
+| 反复压缩、连接中断或 409 冲突 | [任务恢复](docs/faq.zh-CN.md#recovery) |
+| 不明白上下文限制或用量估算 | [上下文](docs/faq.zh-CN.md#history) · [用量](docs/faq.zh-CN.md#usage) |
 
-## 升级与持久数据
+模型权限和限额取决于账号。默认的 **3× 历史接入 / 最多六段**用于传输较长历史，不会扩大模型自身的上下文窗口。本机 Token 与 Pro 次数估算不是官方余额。详见[设置与用量](docs/user-guide.zh-CN.md#settings)。
 
-保留外置 `data` 和实际使用的 `.env`，等待任务结束后再替换程序、重启。发行包中不得包含开发机的数据、Cookie、密钥或真实 `.env`。
+## 更新与文档
 
-```text
-application/
-  rcmaker-codex-gateway.exe
-  .env             # 可选的部署配置
-  data/            # 首次使用创建，升级时保留
-  runtime/         # 可重建的运行文件
-```
+二进制升级前先结束任务、关闭 RCMAKER，进入**原安装目录**后重新执行安装命令。保留 `.env` 和 `data/`；`data/` 会在首次使用时自动创建于程序旁。完整步骤见[升级与恢复](docs/user-guide.zh-CN.md#upgrade)。
 
-详见[升级操作](docs/user-guide.zh-CN.md#upgrade)。公开的操作手册和截图放在 `docs/`；运行数据 `data/` 属于私有目录，不应打包发布。
+| 文档 | 用途 |
+| --- | --- |
+| [用户操作手册](docs/user-guide.zh-CN.md) | 安装、配置截图、日常使用、设置和升级 |
+| [常见问题 FAQ](docs/faq.zh-CN.md) | 按现象定位故障，解释常见疑问 |
+| [部署配置示例](.env.example) | 按需修改端口、数据目录名称与启动语言 |
 
-## 开发与发布
+## 协议与声明
 
-使用框架维护的交互式构建入口：
+[Apache-2.0](LICENSE) · [NOTICE](NOTICE) · [第三方声明](THIRD_PARTY_NOTICES)。控制台使用 Pear Admin/Layui。
 
-```sh
-php -d phar.readonly=0 index.php interact
-```
-
-排除真实 `.env` 和外置数据目录，源码及二进制分发均保留许可证与归属声明。公开的 `docs/` 仅收录面向用户的操作手册、常见问题和截图。
-
-## 使用声明
-
-本项目仅供研究和学习使用。用户应自行确保使用方式符合相关法律、服务条款以及第三方权利要求。作者不授权任何以本项目侵犯第三方权利人权益的行为。
-
-作者不承诺能够及时处理所有 Issue、功能请求或支持问题。
-
-## 协议与致谢
-
-**Apache-2.0**：[LICENSE](LICENSE)、[NOTICE](NOTICE)、[第三方声明](THIRD_PARTY_NOTICES)。
-
-基于 [RCMAKER](https://github.com/runchance/rcmaker)、Pear Admin/Layui 与原生 Codex 工具开发。
+本项目仅供研究和学习使用。用户应自行确保使用方式符合相关法律、服务条款以及第三方权利要求。作者不授权任何以本项目侵犯第三方权利人权益的行为，也不承诺能够及时处理所有 Issue、功能请求或支持问题。
 
 本项目不是 OpenAI 官方产品。ChatGPT、Codex、Chrome 名称属于各自权利人。
-
