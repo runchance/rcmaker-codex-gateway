@@ -15,6 +15,8 @@ final class NativeTransport
 {
     private const ENDPOINTS = ['models', 'responses', 'responses/compact', 'alpha/search', 'images/generations', 'images/edits'];
     private const MAX_SSE_LINE_BYTES = 8388608;
+    private const PAUSE_QUEUE_BYTES = 1048576;
+    private const RESUME_QUEUE_BYTES = 262144;
 
     /**
      * Forward only fixed Codex endpoints. Credentials stay in this request and never enter SQLite/logs.
@@ -55,6 +57,7 @@ final class NativeTransport
         if ($method === 'POST') $client->setOpt(CURLOPT_POSTFIELDS, $body);
         $client->childOfMultiCurl = true;
         $started = false; $stream = false; $buffer = ''; $lineBuffer = ''; $terminated = false; $bytes = 0;
+        $paused = false; $pauseCount = 0; $resumeCount = 0; $queuePeak = 0; $terminalType = ''; $abortReason = '';
         $responseHeaders = []; $status = 0;
         $client->setOpt(CURLOPT_HEADERFUNCTION, static function ($handle, string $line) use (&$status, &$responseHeaders): int {
             if (preg_match('~^HTTP/\S+\s+(\d+)~', $line, $match)) { $status = (int) $match[1]; $responseHeaders = []; }
@@ -65,12 +68,23 @@ final class NativeTransport
             return strlen($line);
         });
         $client->setOpt(CURLOPT_WRITEFUNCTION, static function ($handle, string $chunk) use ($connection, $endpoint, $onResponse,
-            &$status, &$responseHeaders, &$started, &$stream, &$buffer, &$lineBuffer, &$terminated, &$bytes): int {
+            &$status, &$responseHeaders, &$started, &$stream, &$buffer, &$lineBuffer, &$terminated, &$bytes,
+            &$paused, &$pauseCount, &$queuePeak, &$terminalType, &$abortReason): int {
+            if (!self::open($connection)) { $abortReason = 'client_closed'; return 0; }
+            $queued = $connection->getSendBufferQueueSize();
+            $queuePeak = max($queuePeak, $queued);
+            // Returning zero aborts libcurl. Pause an entirely unconsumed chunk instead:
+            // libcurl re-delivers these exact bytes when the downstream queue drains.
+            if ($onResponse === null && $queued >= min(self::PAUSE_QUEUE_BYTES, $connection->maxSendBufferSize)) {
+                $paused = true;
+                ++$pauseCount;
+                return CURL_WRITEFUNC_PAUSE;
+            }
             $size = strlen($chunk); $bytes += $size;
             // The aggregate limit bounds bodies retained for JSON/catalog/handoff processing.
             // Once SSE is forwarding, only its pending line and downstream queue consume memory;
             // applying the body limit there cuts a valid long stream before its terminal frame.
-            if ((!$stream && $bytes > 33554432) || !self::open($connection) || $connection->getSendBufferQueueSize() > 1048576) return 0;
+            if (!$stream && $bytes > 33554432) { $abortReason = 'buffered_body_limit'; return 0; }
             if ($onResponse !== null) { $buffer .= $chunk; return $size; }
             if (!$started) {
                 $buffer .= $chunk;
@@ -89,9 +103,15 @@ final class NativeTransport
                 $line = rtrim(substr($lineBuffer, 0, $position), "\r");
                 $lineBuffer = substr($lineBuffer, $position + 1);
                 if ($line === 'data: [DONE]') $terminated = true;
+                if (str_starts_with($line, 'data:')) {
+                    $event = json_decode(ltrim(substr($line, 5)), true);
+                    if (is_array($event) && in_array($event['type'] ?? '',
+                        ['response.completed', 'response.failed', 'response.incomplete'], true)) $terminalType = $event['type'];
+                }
             }
-            if (strlen($lineBuffer) > self::MAX_SSE_LINE_BYTES) return 0;
-            return $connection->send($chunk, true) === false ? 0 : $size;
+            if (strlen($lineBuffer) > self::MAX_SSE_LINE_BYTES) { $abortReason = 'sse_line_limit'; return 0; }
+            if ($connection->send($chunk, true) === false) { $abortReason = 'downstream_write_failed'; return 0; }
+            return $size;
         });
         // Framework MultiCurl has no nonblocking tick. Only handle scheduling is adapted here;
         // framework Curl owns HTTP configuration and decoding. No curl_init / alternative client.
@@ -102,8 +122,20 @@ final class NativeTransport
         }
         $timer = null;
         $timer = Timer::add(0.02, static function () use ($client, $multi, $connection, $endpoint, $onCatalog, $onResponse,
-            &$timer, &$started, &$stream, &$buffer, &$status, &$responseHeaders, &$terminated, &$lineBuffer): void {
+            &$timer, &$started, &$stream, &$buffer, &$status, &$responseHeaders, &$terminated, &$lineBuffer,
+            &$paused, &$pauseCount, &$resumeCount, &$queuePeak, &$terminalType, &$abortReason, &$bytes): void {
             $finished = !self::open($connection); $error = 0;
+            $queuePeak = max($queuePeak, $connection->getSendBufferQueueSize());
+            if (!$finished && $paused && $connection->getSendBufferQueueSize()
+                <= min(self::RESUME_QUEUE_BYTES, intdiv($connection->maxSendBufferSize, 4))) {
+                // Resuming may invoke WRITEFUNCTION synchronously and pause again.
+                // Clear first; never overwrite the reentrant callback's new state.
+                $paused = false;
+                ++$resumeCount;
+                $error = curl_pause($client->curl, CURLPAUSE_CONT);
+                $finished = $error !== CURLE_OK || !self::open($connection);
+                if ($error !== CURLE_OK) $abortReason = 'pause_resume_failed';
+            }
             if (!$finished) {
                 $code = curl_multi_exec($multi, $active);
                 if ($code !== CURLM_OK) { $finished = true; $error = $code; }
@@ -113,6 +145,13 @@ final class NativeTransport
             Timer::del($timer);
             curl_multi_remove_handle($multi, $client->curl);
             $client->close(); curl_multi_close($multi);
+            if ($error !== 0 || !self::open($connection) || $pauseCount > 0
+                || ($stream && $started && $terminalType === '' && !$terminated)) {
+                self::trace($endpoint, ['http_status'=>$status, 'curl_result'=>$error, 'body_bytes'=>$bytes,
+                    'stream_started'=>$stream && $started, 'terminal_type'=>$terminalType, 'done_seen'=>$terminated,
+                    'pause_count'=>$pauseCount, 'resume_count'=>$resumeCount, 'queue_peak'=>$queuePeak,
+                    'client_open'=>self::open($connection), 'abort_reason'=>$abortReason]);
+            }
             if (!self::open($connection)) return;
             if ($stream && $started) {
                 // A real terminator remains complete after an unclean close. Never invent one.
@@ -178,6 +217,34 @@ final class NativeTransport
     {
         unset($upstream['content-type']);
         return array_merge(ResponseTransport::headers($contentType), $upstream);
+    }
+
+    /** Bounded structural diagnostics only: never request headers, payloads, ciphertext or credentials. */
+    private static function trace(string $endpoint, array $detail): void
+    {
+        $lock = null;
+        try {
+            $root = rtrim(str_replace('\\', '/', (string) \RC\Config::get('gateway', 'tunnel_runtime_root')), '/');
+            if ($root === '') return;
+            $dir = $root . '/logs';
+            if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) return;
+            $path = $dir . '/native-events.jsonl';
+            // The stable sidecar guards rotation as well as append across Linux workers.
+            // Diagnostics are best effort: competing writers never block the HTTP worker.
+            $lock = @fopen($path . '.lock', 'c');
+            if (!is_resource($lock) || !@flock($lock, LOCK_EX | LOCK_NB)) return;
+            clearstatcache(true, $path);
+            if (is_file($path) && (int) @filesize($path) > 1048576) {
+                @unlink($path . '.1');
+                @rename($path, $path . '.1');
+            }
+            @file_put_contents($path, json_encode(['at'=>time(), 'pid'=>getmypid(), 'endpoint'=>$endpoint] + $detail,
+                JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n", FILE_APPEND | LOCK_EX);
+        } catch (\Throwable) {
+            // Diagnostics cannot alter the native response or libcurl lifecycle.
+        } finally {
+            if (is_resource($lock)) { @flock($lock, LOCK_UN); @fclose($lock); }
+        }
     }
 
     /** Whether this subscriber is still writable; a closed subscriber never cancels Web jobs. */

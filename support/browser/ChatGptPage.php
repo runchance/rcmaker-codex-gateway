@@ -633,26 +633,69 @@ JS);
 JS;
     }
 
-    /** Verify exact composer filenames and finished upload indicators; names alone do not prove readiness. */
-    public static function attachmentStateExpression(array $filenames, bool $imageOnly = true): string
+    /**
+     * Select a compatible file input owned by the active composer and verify exact finished uploads.
+     * Hidden inputs remain eligible; attachment count, accept types and form ownership must agree.
+     * @param list<string> $filenames Exact attachment basenames expected in the composer.
+     * @param bool $imageOnly Require decoded image previews instead of document cards.
+     * @param list<string> $mimeTypes Optional validated MIME types, in filename order.
+     * @return string Read-only DOM expression; names alone never prove upload completion.
+     */
+    public static function attachmentStateExpression(array $filenames, bool $imageOnly = true, array $mimeTypes = []): string
     {
         $expected = json_encode(array_values($filenames), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        return self::wrap(str_replace(['__EXPECTED__', '__IMAGE_ONLY__'], [$expected, $imageOnly ? 'true' : 'false'], <<<'JS'
+        $mimes = json_encode(array_values($mimeTypes), JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        return self::wrap(str_replace(['__EXPECTED__', '__IMAGE_ONLY__', '__MIME_TYPES__'], [$expected, $imageOnly ? 'true' : 'false', $mimes], <<<'JS'
 const expected=__EXPECTED__;
 const imageOnly=__IMAGE_ONLY__;
+const mimeTypes=__MIME_TYPES__;
 const composer=visibleOne(COMPOSER);if(!composer)return {ok:false,code:'CHATGPT_EDITOR_MISSING',input_count:0,matched_count:0,names:[]};
 const form=composer.closest('form');if(!form)return {ok:false,code:'CHATGPT_EDITOR_FORM_MISSING',input_count:0,matched_count:0,names:[]};
 const selectors=imageOnly
     ? ['input[type="file"][accept="image/*"]','input[data-testid="upload-photos-input"]','input[type="file"][accept*="image/"][accept*="video/"]']
     : ['input[type="file"]:not([accept])','input[type="file"][accept=""]','input[data-testid="upload-photos-input"]'];
+const suffix=expected.length>1?'[multiple]':'';
+const mimeByExtension={jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',gif:'image/gif',webp:'image/webp',avif:'image/avif',svg:'image/svg+xml',bmp:'image/bmp',pdf:'application/pdf',txt:'text/plain',md:'text/markdown',json:'application/json',csv:'text/csv'};
+const compatible=input=>{
+    if(input.disabled||input.closest('fieldset[disabled]')||(expected.length>1&&!input.hasAttribute('multiple')))return false;
+    const accepts=String(input.getAttribute('accept')||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean);
+    return !accepts.length||expected.every((name,index)=>{
+        const lower=String(name).toLowerCase(),extension=lower.split('.').pop();
+        const mime=String(mimeTypes[index]||mimeByExtension[extension]||'').toLowerCase();
+        return accepts.some(type=>type==='*/*'||(type.startsWith('.')?lower.endsWith(type)
+            :type.endsWith('/*')?mime.startsWith(type.slice(0,-1)):mime===type));
+    });
+};
+const ownedInputs=[...document.querySelectorAll('input[type="file"]')].filter(input=>input.form===form);
+const eligible=ownedInputs.filter(compatible);
+const formSelector=form.id&&document.querySelectorAll('form[id="'+CSS.escape(form.id)+'"]').length===1
+    ?'form[id="'+CSS.escape(form.id)+'"]':form.matches('[data-chatgpt-composer]')?'form[data-chatgpt-composer]':null;
+const uniqueSelector=(input,selector)=>{
+    const scoped=form.contains(input)&&formSelector?formSelector+' '+selector:selector;
+    for(const query of [scoped,scoped+':not([disabled])']){
+        const all=[...document.querySelectorAll(query)];
+        if(all.length===1&&all[0]===input)return query;
+    }
+    return null;
+};
 let inputSelector=null,inputCount=0;
 for(const selector of selectors){
-    const owned=[...form.querySelectorAll(selector)];if(!owned.length)continue;
-    const scoped=form.matches('[data-chatgpt-composer]')?'form[data-chatgpt-composer] '+selector:selector;
-    const all=[...document.querySelectorAll(scoped)];inputCount=all.length;
-    if(owned.length===1&&all.length===1&&owned[0]===all[0])inputSelector=scoped;
-    break;
+    const query=selector+suffix;
+    const owned=eligible.filter(input=>input.matches(query));if(!owned.length)continue;
+    inputCount=Math.max(inputCount,owned.length);
+    if(owned.length===1)inputSelector=uniqueSelector(owned[0],query);
+    if(inputSelector){inputCount=1;break;}
 }
+// Accept lists can change without changing the native upload capability. A fallback
+// still requires one compatible owned input and a globally unique exact selector.
+if(!inputSelector&&eligible.length===1){
+    const input=eligible[0],accept=input.getAttribute('accept');
+    let query='input[type="file"]'+suffix+(accept===null?':not([accept])':'[accept="'+CSS.escape(accept)+'"]');
+    if(!form.contains(input)&&form.id)query+='[form="'+CSS.escape(form.id)+'"]';
+    inputSelector=uniqueSelector(input,query);
+    if(inputSelector)inputCount=1;
+}
+if(!inputSelector)inputCount=Math.max(inputCount,eligible.length);
 const norm=value=>String(value||'').replace(/\s+/g,' ').trim();
 const accessibleName=el=>{
     const aria=norm(el.getAttribute('aria-label'));if(aria)return aria;
@@ -683,6 +726,7 @@ const pending=proofs.filter(row=>expected.includes(accessibleName(row))).some(ro
 const uploadError=!!attachmentTray&&[...attachmentTray.querySelectorAll('[role="alert"],[aria-invalid="true"],[data-upload-error="true"]')].some(visible);
 const alerts=[...document.querySelectorAll('[role="alert"]')].filter(visible).map(el=>norm(el.innerText||el.textContent)).filter(Boolean).slice(-5);
 return {ok:matched===expected.length&&!duplicate&&!pending&&!uploadError,input_count:inputCount,input_selector:inputSelector,
+    owned_input_count:ownedInputs.length,compatible_input_count:eligible.length,
     matched_count:matched,expected_count:expected.length,duplicate,upload_pending:pending,upload_error:uploadError,names:names.slice(-20),alerts};
 JS));
     }

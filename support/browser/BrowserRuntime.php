@@ -4350,6 +4350,7 @@ JS;
         }
         $expected = [];
         $files = [];
+        $mimeTypes = [];
         $imageOnly = true;
         foreach ($attachments as $attachment) {
             if (!is_array($attachment) || !is_string($attachment['filename'] ?? null) || !is_string($attachment['path'] ?? null)) {
@@ -4358,17 +4359,21 @@ JS;
             }
             $expected[] = (string) $attachment['filename'];
             $files[] = (string) $attachment['path'];
+            $mimeTypes[] = (string) ($attachment['mime_type'] ?? '');
             if (($attachment['kind'] ?? null) !== 'image') $imageOnly = false;
         }
         $deadline ??= min((float) $turn['deadline'], microtime(true) + 20.0);
-        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly),
+        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly, $mimeTypes),
             function ($stateError, $state) use ($responseId, $expected, $files, $imageOnly, $deadline): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if ($stateError === null && is_array($state) && !empty($state['ok'])) {
                     $this->waitTaskSendReady($responseId, min((float)$this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0));
                     return;
                 }
-                if ($stateError === null && is_array($state) && (int) ($state['matched_count'] ?? 0) > 0) {
+                // An existing or pending upload must be observed, never assigned again.
+                // Duplicate/error chips can have matched_count=0 without an empty tray.
+                if ($stateError === null && is_array($state) && ((int) ($state['matched_count'] ?? 0) > 0
+                    || !empty($state['duplicate']) || !empty($state['upload_pending']) || !empty($state['upload_error']))) {
                     $this->waitTaskAttachmentsAccepted($responseId, $expected, $imageOnly,
                         min((float) $this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0));
                     return;
@@ -4379,7 +4384,11 @@ JS;
                         Timer::add(0.10, fn() => $this->prepareTaskAttachments($responseId, $deadline), null, false);
                         return;
                     }
-                    $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', 'ChatGPT 没有提供唯一可验证的附件输入控件。');
+                    $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', 'ChatGPT 没有提供唯一可验证的附件输入控件。'
+                        . ' [owned=' . (int) ($state['owned_input_count'] ?? 0)
+                        . ', compatible=' . (int) ($state['compatible_input_count'] ?? 0)
+                        . ', candidates=' . (int) ($state['input_count'] ?? 0)
+                        . ', attachments=' . count($expected) . ']');
                     return;
                 }
                 $this->setTaskAttachmentFiles($responseId, $files, $expected, $imageOnly, (string) $state['input_selector']);
