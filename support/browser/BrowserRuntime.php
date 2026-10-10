@@ -6338,6 +6338,19 @@ JS;
             && trim((string)($snapshot['markdown'] ?? '')) !== '';
     }
 
+    /**
+     * Bound full-context retransmission after a definitive no-tool final. Fresh checkpoints
+     * may retry once; repeated Connector failures must not repeatedly upload every stage.
+     * Retained checkpoint handoffs and ordinary task recovery keep their existing limits.
+     * The ledger still independently fences active RPCs and all possible host execution.
+     */
+    private static function connectorNoStartRetryLimit(array $job): int
+    {
+        return in_array((string) ($job['operation_kind'] ?? ''), ['compact_v1', 'compact_v2'], true)
+            && empty($job['previous_response_id']) ? 1 : self::CONNECTOR_NO_START_MAX_RETRIES;
+    }
+
+    /** Retry an owned no-start page only while the durable broker can prove no host execution. */
     private function retryConnectorNoStart(string $responseId, string $logicalResponseId): string
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -6349,7 +6362,7 @@ JS;
                 (string) $job['prompt'],
                 (string) $turn['owner_incarnation'],
                 (int) $turn['fencing_version'],
-                self::CONNECTOR_NO_START_MAX_RETRIES
+                self::connectorNoStartRetryLimit($job)
             );
         } catch (GatewayError $error) {
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);

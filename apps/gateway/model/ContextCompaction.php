@@ -13,7 +13,8 @@ final class ContextCompaction
     /**
      * Turn native v1/v2 compaction into a read-only checkpoint. An active v2 tool batch first
      * resumes its exact source response and fences later host calls. An exact replay of a proven
-     * unsent failure receives one stable recovery identity; unknown sends never do.
+     * unsent failure or a terminal read-only archive failure without an accepted summary receives
+     * one stable recovery identity; unknown sends and possible host effects never do.
      */
     public static function create(array $spec, ?string $idempotencyKey): array
     {
@@ -131,9 +132,9 @@ final class ContextCompaction
     }
 
     /**
-     * Cross ResponseJob's exact-request replay fence only after a failed checkpoint has
-     * authoritative no-send evidence. The derived identity is deterministic, so every
-     * repeated client request observes the same bounded second attempt.
+     * Cross ResponseJob's replay fence after authoritative no-send evidence or a
+     * conclusively terminal read-only archive failure without an accepted summary.
+     * A deterministic identity keeps repeated clients on the same bounded second attempt.
      * @param array $spec Normalized original compaction request.
      * @param string|null $idempotencyKey Client idempotency key, if supplied.
      * @param array $job Existing or newly reserved response returned by ResponseJob.
@@ -157,6 +158,22 @@ final class ContextCompaction
         if (is_array($recovered) && hash_equals((string) $recovered['request_hash'], $sourceHash)) {
             return ResponseJob::get((string) $recovered['id']);
         }
+        // A required archive read can fail after the read-only message was accepted.
+        // That known terminal is different from an unknown browser send: its revoked
+        // capability cannot submit a summary or execute a host action. Keep one stable
+        // recovery identity even after its original checkpoint has been abandoned.
+        $readonlyHash = hash('sha256', (string) $spec['request_hash'] . '|known_readonly_failure_retry|' . $job['id']);
+        $readonlySpec = $spec;
+        $readonlySpec['request_hash'] = $readonlyHash;
+        $readonlySpec['turn_id'] = 'compact_' . substr($readonlyHash, 0, 32);
+        $readonlySpec['repair_count'] = 1;
+        $readonlyKey = $idempotencyKey === null ? null
+            : hash('sha256', 'compact-known-readonly|' . $idempotencyKey . '|' . $job['id']);
+        $readonlyIdentity = hash('sha256', $readonlySpec['task_key'] . '|' . $readonlySpec['turn_id'] . '|' . $readonlyHash);
+        $recovered = $db->table('gateway_response_jobs')->where('request_identity', $readonlyIdentity)->find();
+        if (is_array($recovered) && hash_equals((string) $recovered['request_hash'], $readonlyHash)) {
+            return ResponseJob::get((string) $recovered['id']);
+        }
         $baseTaskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $link = $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->find();
         $taskId = is_array($link) ? (string) $link['current_task_id'] : $baseTaskId;
@@ -165,6 +182,26 @@ final class ContextCompaction
         if (!is_array($checkpoint) || $checkpoint['task_id'] !== $taskId) return $job;
         $routedSpec = $spec;
         if (is_array($link)) $routedSpec['browser_owner_key'] = (string) $link['current_owner_key'];
+        $persistedFailure = $db->table('gateway_response_jobs')->where('id', (string) $job['id'])->find();
+        if ($checkpoint['state'] === 'abandoned' && is_array($persistedFailure)
+            && (json_decode((string) $persistedFailure['error_json'], true)['error']['code'] ?? '') === 'CHATGPT_CONTEXT_READ_REQUIRED') {
+            // A metadata retry may have reserved the repair before the exact original
+            // HTTP request reappeared. Observe that actual producer instead of returning
+            // the superseded error or reserving another summary.
+            $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+            $latest = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
+                ->where('state', 'IN', ['generating', 'committed'])->order([['rowid', 'DESC']])->limit(1)->find();
+            $candidate = is_array($latest)
+                ? $db->table('gateway_response_jobs')->where('id', (string) $latest['response_id'])->find() : null;
+            if (is_array($candidate) && (int) $candidate['repair_count'] === 1
+                && self::matchesCheckpointRequestUnlocked($latest, $candidate, $routedSpec, $task)) {
+                return ResponseJob::get((string) $candidate['id']);
+            }
+        }
+        if ((int) $job['repair_count'] === 0
+            && self::safeFailedReadonlyCheckpointUnlocked($checkpoint, $persistedFailure, $routedSpec, $taskId)) {
+            return ResponseJob::createOrReuse($readonlySpec, $readonlyKey);
+        }
         if (self::sourceWaitingStateUnlocked($taskId, $routedSpec) !== null) {
             return ResponseJob::createOrReuse($sourceSpec, $sourceKey);
         }
@@ -1621,18 +1658,41 @@ final class ContextCompaction
         }
     }
 
-    /** New Codex turns may append history after a failed compact; the uncommitted old checkpoint is inert. */
+    /**
+     * New Codex turns can replace a proven inert failure while retaining all source records.
+     * A known archive-read failure receives only one same-history repair; later explicit
+     * human work may extend that source. Unknown sends and active capabilities stay fenced.
+     */
     private static function canSupersedeFailedCheckpointUnlocked(array $checkpoint, ?array $old,
-        array $spec, string $taskId): bool
+        array &$spec, string $taskId): bool
     {
         if (!is_array($old) || $checkpoint['state'] !== 'generating'
             || (string) $checkpoint['task_id'] !== $taskId
-            || (string) $checkpoint['response_id'] !== (string) $old['id']
-            || !ContextRecovery::canRetryFailedBeforeCommitUnlocked((string) $old['id'])) return false;
+            || (string) $checkpoint['response_id'] !== (string) $old['id']) return false;
+        $readonlyFailure = self::safeFailedReadonlyCheckpointUnlocked($checkpoint, $old, $spec, $taskId);
+        if (!$readonlyFailure && !ContextRecovery::canRetryFailedBeforeCommitUnlocked((string) $old['id'])) return false;
         $before = json_decode((string) $old['context_json'], true);
         $after = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true);
         if (!is_array($before) || !is_array($after)
             || ($before['version'] ?? null) !== ($after['version'] ?? null)) return false;
+        if ($readonlyFailure) {
+            if (!self::hasCompleteSourcePrefix($before, $after, !empty($spec['native_responses_lite']))) return false;
+            $records = (array) $after['messages'];
+            $known = (array) $before['messages'];
+            $base = $before['system'][0] ?? null;
+            $offset = !empty($spec['native_responses_lite']) && is_string($base) && $base !== ''
+                && ($records[0]['role'] ?? '') === 'developer' && ($records[0]['content'] ?? null) === $base
+                && ContextHistory::canonical($known[0] ?? null) !== ContextHistory::canonical($records[0] ?? null) ? 1 : 0;
+            // hasCompleteSourcePrefix already proved every native ID, content and tool
+            // record; count only after its exact Lite preamble adjustment.
+            $sameHistory = count($records) === count($known) + $offset;
+            if ($sameHistory) {
+                if ((int) $old['repair_count'] !== 0) return false;
+                $spec['repair_count'] = 1;
+                return true;
+            }
+            return self::hasNewHumanAfterExactSource($before, $after);
+        }
         // The caller's system/developer envelope may change between Codex turns.
         // It has no committed checkpoint to inherit; the new request carries its own.
         $oldMessages = $before['messages'] ?? null;
@@ -1643,6 +1703,83 @@ final class ContextCompaction
             if (ContextHistory::canonical($message) !== ContextHistory::canonical($newMessages[$index])) return false;
         }
         return true;
+    }
+
+    /**
+     * Verify a terminal, read-only archive failure independently of browser send status.
+     * This proof authorizes a new summary, never a replay of a historical host effect.
+     * An accepted/consumed handoff, unresolved invocation or active MCP activity prevents it.
+     * @param array $checkpoint The uncommitted generating checkpoint owned by the failed job.
+     * @param array|null $job Persisted producer; no browser-authored evidence is trusted.
+     * @param array $spec New normalized checkpoint request for the same owner and model.
+     * @param string $taskId Routed durable task identity.
+     * @return bool Whether the failure has conclusively stopped without committing a summary.
+     */
+    private static function safeFailedReadonlyCheckpointUnlocked(array $checkpoint, ?array $job,
+        array $spec, string $taskId): bool
+    {
+        if (!is_array($job) || $checkpoint['state'] !== 'generating'
+            || ($checkpoint['task_id'] ?? '') !== $taskId || ($job['task_id'] ?? '') !== $taskId
+            || ($checkpoint['response_id'] ?? null) !== $job['id'] || ($job['compact_id'] ?? null) !== $checkpoint['id']
+            || !hash_equals((string) $checkpoint['request_hash'], (string) $job['request_hash'])
+            || $checkpoint['summary'] !== null || $checkpoint['response_json'] !== null
+            || $checkpoint['committed_at'] !== null || $checkpoint['consumed_at'] !== null
+            || !in_array($job['operation_kind'], ['compact_v1', 'compact_v2'], true)
+            || $job['operation_kind'] !== ($spec['operation_kind'] ?? null)
+            || $checkpoint['protocol'] !== $job['operation_kind']
+            || $job['status'] !== 'failed' || $job['terminal_type'] !== 'response.failed' || $job['finished_at'] === null
+            || $job['round_kind'] !== 'text' || !empty($job['previous_response_id'])
+            || (int) $job['output_started'] !== 0 || (string) $job['output_text'] !== ''
+            || $job['model'] !== $spec['model'] || $job['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)
+            || $job['compaction_epoch'] !== ($spec['compaction_epoch'] ?? 'base')) return false;
+        $error = json_decode((string) $job['error_json'], true);
+        $environment = json_decode((string) $job['tool_environment_json'], true);
+        if (($error['error']['code'] ?? '') !== 'CHATGPT_CONTEXT_READ_REQUIRED'
+            || !is_array($environment) || ($environment['tools'] ?? null) !== []
+            || !hash_equals((string) $job['tool_environment_hash'], hash('sha256', (string) $job['tool_environment_json']))) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+        $turn = $db->table('gateway_task_turns')->where('id', $job['durable_turn_id'])->find();
+        $surface = $db->table('gateway_browser_surfaces')->where('id', $job['surface_id'])->find();
+        if (!is_array($task) || !is_array($turn) || !is_array($surface) || $task['status'] !== 'active'
+            || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
+            || $task['thread_id'] !== ($spec['thread_id'] ?? null) || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')
+            || $task['owner_key'] !== ($spec['browser_owner_key'] ?? '')
+            || $task['current_epoch_id'] !== $job['epoch_id']
+            || $turn['task_id'] !== $taskId || $turn['response_id'] !== $job['id']
+            || $turn['status'] !== 'failed' || $turn['error_code'] !== 'CHATGPT_CONTEXT_READ_REQUIRED'
+            || $turn['epoch_id'] !== $job['epoch_id'] || $turn['surface_id'] !== $job['surface_id']
+            || $turn['generation_id'] !== $job['generation_id'] || $turn['committed_at'] !== null
+            || $surface['task_id'] !== $taskId || $surface['epoch_id'] !== $job['epoch_id']
+            || !in_array($surface['status'], ['ready', 'retired'], true)) return false;
+        $activeJobs = $db->table('gateway_response_jobs')->where('task_id', $taskId)
+            ->where('status', 'IN', ['queued', 'running'])->count();
+        $activeTurns = $db->table('gateway_task_turns')->where('task_id', $taskId)
+            ->where('status', 'IN', ['queued', 'submit_intent', 'submitted', 'running', 'needs_attention'])->count();
+        $handoffs = $db->table('gateway_compaction_handoffs')->where('compact_response_id', $job['id'])->count();
+        if (!is_numeric($activeJobs) || (int) $activeJobs !== 0 || !is_numeric($activeTurns) || (int) $activeTurns !== 0
+            || !is_numeric($handoffs) || (int) $handoffs !== 0) return false;
+        $calls = $db->table('gateway_tool_invocations')->where('task_id', $taskId)->select();
+        $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)->select();
+        if (!is_array($calls) || !is_array($bindings)) return false;
+        foreach ($calls as $call) {
+            if ($call['response_id'] === $job['id'] || $call['status'] !== 'completed' || $call['result_delivered_at'] === null) return false;
+        }
+        $ownBinding = empty($job['mcp_binding_id']);
+        foreach ($bindings as $binding) {
+            if (!in_array($binding['status'], ['completed', 'revoked'], true)) return false;
+            if ($binding['id'] === ($job['mcp_binding_id'] ?? null)) {
+                $boundEnvironment = json_decode((string) $binding['tool_environment_json'], true);
+                if ($binding['status'] !== 'revoked' || $binding['turn_id'] !== $turn['id']
+                    || $binding['current_response_id'] !== $job['id'] || ($boundEnvironment['tools'] ?? null) !== []
+                    || $binding['tool_environment_hash'] !== $job['tool_environment_hash']
+                    || !empty($binding['requires_tool_call'])) return false;
+                $ownBinding = true;
+            }
+            $active = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])->where('status', 'active')->count();
+            if (!is_numeric($active) || (int) $active !== 0) return false;
+        }
+        return $ownBinding;
     }
 
     private static function supersedeFailedCheckpointUnlocked(array $checkpoint, array $old): void
@@ -1657,7 +1794,10 @@ final class ContextCompaction
             'task_id'=>$checkpoint['task_id'], 'turn_id'=>$old['durable_turn_id'],
             'response_id'=>$old['id'], 'surface_id'=>$old['surface_id'],
             'event_type'=>'inert_checkpoint_superseded',
-            'data_json'=>json_encode(['checkpoint_id'=>$checkpoint['id'],'final_commit_sent'=>false], JSON_THROW_ON_ERROR),
+            'data_json'=>json_encode(['checkpoint_id'=>$checkpoint['id'],
+                'final_commit_sent'=>$old['submit_intent_at'] !== null,
+                'known_readonly_failure'=>($old['error_json'] !== null
+                    && (json_decode((string) $old['error_json'], true)['error']['code'] ?? '') === 'CHATGPT_CONTEXT_READ_REQUIRED')], JSON_THROW_ON_ERROR),
             'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', '旧摘要检查点状态无法保存。', 503);
     }

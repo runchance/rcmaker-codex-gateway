@@ -9,6 +9,8 @@ use app\gateway\model\GatewayError;
 final class Schema
 {
     private static bool $ready = false;
+    private const WRITER_WAIT_MILLISECONDS = 5000;
+    private const WRITER_LOCK_ATTEMPTS = 3;
 
     /** @return array<int,string> Immutable migration SQL; hashes cover logical SQL, not package bytes. */
     public static function migrationOne(): array
@@ -509,34 +511,31 @@ final class Schema
             }
             $db = DB('medoo', 'sqlite');
             // SQLite-specific PRAGMAs and DDL are intentionally below AutoForm/SDB.
-            $db->query('PRAGMA busy_timeout=800');
+            // Several independent task workers share this connection-managed WAL store.
+            // Wait for short competing writes before entering a transaction; never replay
+            // the transaction body or its potentially external effects after an error.
+            $db->query('PRAGMA busy_timeout=' . self::WRITER_WAIT_MILLISECONDS);
             $db->query('PRAGMA foreign_keys=ON');
-            if (strtolower((string) $db->query('PRAGMA journal_mode=WAL')->fetchColumn()) !== 'wal') {
+            $journalMode = strtolower((string) $db->query('PRAGMA journal_mode')->fetchColumn());
+            if ($journalMode !== 'wal'
+                && strtolower((string) $db->query('PRAGMA journal_mode=WAL')->fetchColumn()) !== 'wal') {
                 throw new \RuntimeException('WAL unavailable');
             }
             $db->query('PRAGMA synchronous=FULL');
-            self::transaction(function () use ($db): void {
+            $migrations = self::migrations();
+            // Every MCP tool call has a fresh PHP child. An already-current schema needs
+            // checksum/state validation, not another writer transaction or CREATE TABLE.
+            // The initialization file lock still serializes migration checks/upgrades.
+            $hasSchema = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_schema'")->fetchColumn() !== false;
+            if ($hasSchema && self::validatedVersion($db, $migrations) === count($migrations)) {
+                self::validateInitializedState($db);
+                self::$ready = true;
+                return;
+            }
+            self::transaction(function () use ($db, $migrations): void {
                 $db->query('CREATE TABLE IF NOT EXISTS gateway_schema (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)');
-                $versions = $db->query('SELECT version,checksum FROM gateway_schema ORDER BY version')->fetchAll(\PDO::FETCH_ASSOC);
-                $freshInstallation = $versions === [];
-                $migrations = self::migrations();
-                $current = 0;
-                foreach ($versions as $index => $version) {
-                    $number = (int) $version['version'];
-                    $expected = $index + 1;
-                    if ($number !== $expected || !isset($migrations[$number])) {
-                        throw new GatewayError('SCHEMA_MISMATCH', '数据库版本或迁移校验不匹配；已保留原数据，请使用兼容版本。', 503);
-                    }
-                    $hash = hash('sha256', json_encode($migrations[$number], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
-                    if (!hash_equals($hash, (string) $version['checksum'])) {
-                        throw new GatewayError('SCHEMA_MISMATCH', '数据库版本或迁移校验不匹配；已保留原数据，请使用兼容版本。', 503);
-                    }
-                    $current = $number;
-                }
-                $userVersion = (int) $db->query('PRAGMA user_version')->fetchColumn();
-                if ($userVersion !== $current) {
-                    throw new GatewayError('SCHEMA_MISMATCH', '数据库版本标记不一致，已停止写入。', 503);
-                }
+                $current = self::validatedVersion($db, $migrations);
+                $freshInstallation = $current === 0;
                 foreach ($migrations as $version => $statements) {
                     if ($version <= $current) {
                         continue;
@@ -563,14 +562,7 @@ final class Schema
                         'connector_name' => (string) Config::get('gateway', 'default_connector_name'),
                     ]);
                 }
-                $state = $db->query('SELECT id,saved_revision FROM gateway_network_state WHERE id=1')->fetch(\PDO::FETCH_ASSOC);
-                if (!$state || (int) $state['saved_revision'] < 1) {
-                    throw new GatewayError('SCHEMA_MISMATCH', '数据库初始化记录不完整，已停止写入。', 503);
-                }
-                $browser = $db->query('SELECT id,status FROM gateway_browser_state WHERE id=1')->fetch(\PDO::FETCH_ASSOC);
-                if (!$browser || (int) $browser['id'] !== 1) {
-                    throw new GatewayError('SCHEMA_MISMATCH', '浏览器工作区初始化记录不完整，已停止写入。', 503);
-                }
+                self::validateInitializedState($db);
             });
             self::$ready = true;
         } catch (GatewayError $error) {
@@ -585,14 +577,59 @@ final class Schema
         }
     }
 
-    /** Execute a short writer transaction. BEGIN IMMEDIATE avoids read-to-write lock upgrades. @param callable $operation No network/process calls inside. @return mixed @throws \Throwable */
+    /** Validate all immutable migration checksums and the matching SQLite version marker without a write. */
+    private static function validatedVersion(object $db, array $migrations): int
+    {
+        $versions = $db->query('SELECT version,checksum FROM gateway_schema ORDER BY version')->fetchAll(\PDO::FETCH_ASSOC);
+        $current = 0;
+        foreach ($versions as $index => $version) {
+            $number = (int) $version['version'];
+            if ($number !== $index + 1 || !isset($migrations[$number])) {
+                throw new GatewayError('SCHEMA_MISMATCH', '数据库版本或迁移校验不匹配；已保留原数据，请使用兼容版本。', 503);
+            }
+            $hash = hash('sha256', json_encode($migrations[$number], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+            if (!hash_equals($hash, (string) $version['checksum'])) {
+                throw new GatewayError('SCHEMA_MISMATCH', '数据库版本或迁移校验不匹配；已保留原数据，请使用兼容版本。', 503);
+            }
+            $current = $number;
+        }
+        if ((int) $db->query('PRAGMA user_version')->fetchColumn() !== $current) {
+            throw new GatewayError('SCHEMA_MISMATCH', '数据库版本标记不一致，已停止写入。', 503);
+        }
+        return $current;
+    }
+
+    /** Verify singleton seed records on both the current-schema read path and a newly applied migration. */
+    private static function validateInitializedState(object $db): void
+    {
+        $state = $db->query('SELECT id,saved_revision FROM gateway_network_state WHERE id=1')->fetch(\PDO::FETCH_ASSOC);
+        if (!$state || (int) $state['saved_revision'] < 1) {
+            throw new GatewayError('SCHEMA_MISMATCH', '数据库初始化记录不完整，已停止写入。', 503);
+        }
+        $browser = $db->query('SELECT id,status FROM gateway_browser_state WHERE id=1')->fetch(\PDO::FETCH_ASSOC);
+        if (!$browser || (int) $browser['id'] !== 1) {
+            throw new GatewayError('SCHEMA_MISMATCH', '浏览器工作区初始化记录不完整，已停止写入。', 503);
+        }
+    }
+
+    /**
+     * Execute a writer transaction once after bounded, contention-only lock acquisition.
+     * BEGIN IMMEDIATE avoids read-to-write upgrades; lock failure before BEGIN is typed
+     * separately from errors after the callback starts, which are never retried here.
+     * @param callable $operation No network/process calls inside.
+     * @return mixed
+     * @throws GatewayError STORAGE_BUSY only when no transaction body has run.
+     * @throws \Throwable Original operation/commit failure; never replayed.
+     */
     public static function transaction(callable $operation): mixed
     {
         $db = DB('medoo', 'sqlite');
         $begun = false;
         try {
-            $db->query('BEGIN IMMEDIATE');
+            $beginStatement = self::beginWriter($db);
             $begun = true;
+            $beginStatement->closeCursor();
+            unset($beginStatement);
             $result = $operation();
             $db->query('COMMIT');
             return $result;
@@ -601,6 +638,37 @@ final class Schema
                 $db->query('ROLLBACK');
             }
             throw $error;
+        }
+    }
+
+    /**
+     * Acquire a writer before any callback can run. SQLite's busy handler is not a fair
+     * queue, so competing workers get at most three five-second waits with jitter between
+     * them. A failed BEGIN has no effects to replay; every later failure remains final.
+     * @throws GatewayError When no transaction can be acquired or the driver fails silently.
+     * @throws \PDOException For non-contention errors, including an invalid nested BEGIN.
+     */
+    private static function beginWriter(object $db): \PDOStatement
+    {
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                $statement = $db->query('BEGIN IMMEDIATE');
+            } catch (\PDOException $error) {
+                $sqliteCode = (int) ($error->errorInfo[1] ?? 0) & 0xff;
+                if (!in_array($sqliteCode, [5, 6], true)) throw $error;
+                if ($attempt >= self::WRITER_LOCK_ATTEMPTS) {
+                    throw new GatewayError('STORAGE_BUSY', '本地数据库写入繁忙，请稍后重试。', 503);
+                }
+                // Release the failed driver's exception/statement references before another
+                // BEGIN. No operation or COMMIT is retried by this loop.
+                unset($error);
+                usleep(random_int(20000, 60000));
+                continue;
+            }
+            if (!$statement instanceof \PDOStatement) {
+                throw new GatewayError('STORAGE_UNAVAILABLE', '本地数据库无法开始写入，请检查运行状态。', 503);
+            }
+            return $statement;
         }
     }
 }

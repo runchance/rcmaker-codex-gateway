@@ -156,11 +156,19 @@ final class BrowserState
      * Claim a command, fencing manual UI actions to their original surface.
      * Task-owned turns use TaskLedger's own surface/epoch fences in the browser worker, so an
      * unrelated console-tab or browser-generation change must not strand an unsent response.
+     * Empty ticks use a read-only preflight; any candidate is reselected and fenced inside the
+     * original writer transaction. An enqueue racing an empty sample is picked up next tick.
      * @return array|null Claimed command, or null when no command is ready.
      * @throws GatewayError When durable queue state cannot be read or updated.
      */
     public static function claim(): ?array
     {
+        $candidate = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')
+            ->where('status', 'queued')->limit(1)->find('id');
+        if ($candidate === false) {
+            throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作队列暂不可读取。', 503);
+        }
+        if ($candidate === null) return null;
         $rejected = null;
         $claimedCommand = Schema::transaction(function () use (&$rejected): ?array {
             $db = SDB(null, 'medoo', 'sqlite');

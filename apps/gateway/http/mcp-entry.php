@@ -85,13 +85,27 @@ function gatewayMcpBindingTrace(array $request): array
     }
 }
 
-/** Initialize the framework capabilities needed by either stdio process. */
+/**
+ * Initialize either stdio process, tolerating bounded initialization/SQLite lock contention.
+ * No tool has been dispatched at this point; retrying initialization cannot replay a host action.
+ * STORAGE_BUSY means the operation never entered its transaction body. Schema validation,
+ * other SQL failures, permissions and failures after a write remain final.
+ */
 function gatewayMcpBootstrap(): void
 {
     foreach ((array) RC\Config::get('process')['RC_GATEWAY_API']['bootstrap'] as $bootstrap) {
         if ($bootstrap !== app\gateway\bootstrap\Initialize::class) $bootstrap::start();
     }
-    Schema::initialize();
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            Schema::initialize();
+            return;
+        } catch (app\gateway\model\GatewayError $error) {
+            if ($error->errorCode !== 'STORAGE_BUSY' || $attempt >= 3) throw $error;
+            gatewayMcpTrace('bootstrap_wait', ['attempt' => $attempt, 'error_code' => $error->errorCode]);
+            usleep(50000);
+        }
+    }
 }
 
 /**
@@ -165,22 +179,61 @@ function gatewayMcpEmit(array $response, ?array $request, int $sequence, float $
 /** Run one potentially blocking tool call in its own PHP process; return an exit status. */
 function gatewayMcpToolWorker(string $lockPath, int $sequence, float $started, ?string $sessionScope): int
 {
+    $request = null;
+    $phase = 'input';
+    $inputBytes = 0;
+    $emitStarted = false;
     try {
+        // Consume the complete pipe before initialization can wait on another process's lock.
+        // Otherwise a child that expires during bootstrap closes stdin while its parent is
+        // still writing a large request; that request receives no JSON-RPC response at all.
+        $line = fgets(STDIN, 10 * 1024 * 1024 + 2);
+        if (!is_string($line)) return 1;
+        $inputBytes = strlen($line);
+        if (!str_ends_with($line, "\n")) throw new UnexpectedValueException('Incomplete MCP input frame');
+        $decoded = json_decode($line, true, 64, JSON_THROW_ON_ERROR);
+        if (!is_array($decoded)) throw new UnexpectedValueException('Invalid MCP request');
+        $request = $decoded;
+        $phase = 'bootstrap';
         // An already-running parent may still launch workers with the older four-argument
         // command until its normal reload. Keep those in-flight connections usable.
         McpProtocol::setSessionScope($sessionScope === '' ? null : $sessionScope);
         gatewayMcpBootstrap();
-        $line = fgets(STDIN, 10 * 1024 * 1024 + 2);
-        if (!is_string($line)) return 1;
-        $request = json_decode($line, true, 64, JSON_THROW_ON_ERROR);
-        $response = is_array($request) ? McpProtocol::handle($request) : null;
+        $phase = 'handle';
+        $response = McpProtocol::handle($request);
         $receipt = McpProtocol::takeHostReceipt();
-        if (is_array($response)) gatewayMcpEmit($response, is_array($request) ? $request : null,
-            $sequence, $started, $lockPath, $receipt);
+        if (is_array($response)) {
+            $phase = 'emit';
+            $emitStarted = true;
+            gatewayMcpEmit($response, $request, $sequence, $started, $lockPath, $receipt);
+        }
         return 0;
-    } catch (Throwable) {
-        gatewayMcpTrace('worker_error', ['sequence' => $sequence]);
-        // The host may already have executed the call; never replay it here.
+    } catch (Throwable $error) {
+        $errorCode = $error instanceof app\gateway\model\GatewayError ? $error->errorCode : null;
+        gatewayMcpTrace('worker_error', ['sequence' => $sequence, 'phase' => $phase,
+            'exception_class' => get_class($error), 'error_code' => $errorCode, 'input_bytes' => $inputBytes]);
+        // Report once when the request is known and no stdout emission has begun. A partial
+        // stdout frame must never be followed by another frame or claimed as a native receipt.
+        if (!$emitStarted && is_array($request) && array_key_exists('id', $request)) {
+            $notDispatched = $phase === 'bootstrap';
+            $code = $notDispatched ? ($errorCode ?? 'MCP_WORKER_INITIALIZATION_FAILED') : 'MCP_WORKER_OUTCOME_UNCONFIRMED';
+            $message = $notDispatched
+                ? 'The local MCP worker could not initialize. This request was not dispatched to Codex; retry after the local tool connection recovers.'
+                : 'The local MCP worker failed before returning a complete result. The execution outcome is unconfirmed; check the existing call in the task timeline and do not replay the action.';
+            $failure = ['jsonrpc' => '2.0', 'id' => $request['id'], 'result' => [
+                'content' => [['type' => 'text', 'text' => $message]],
+                'structuredContent' => ['ok' => false, 'code' => $code,
+                    'execution_status' => $notDispatched ? 'not_dispatched' : 'unconfirmed', 'message' => $message],
+                'isError' => true,
+            ]];
+            try {
+                gatewayMcpEmit($failure, $request, $sequence, $started, $lockPath);
+            } catch (Throwable $emitError) {
+                gatewayMcpTrace('worker_failure_emit_error', ['sequence' => $sequence,
+                    'exception_class' => get_class($emitError)]);
+            }
+        }
+        // The host may already have executed a call; never replay it here.
         return 1;
     }
 }
