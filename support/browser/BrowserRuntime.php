@@ -3742,6 +3742,10 @@ JS;
         });
     }
 
+    /**
+     * Accept only the exact durable stage ACK; one single-field typo may request a correction.
+     * Recovery observations never issue correction messages, and no correction repeats payload.
+     */
     private function waitMultipartStageAcknowledgement(string $responseId, int $stage, float $deadline, bool $recover): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -3752,7 +3756,7 @@ JS;
             return;
         }
         $this->evaluateTask($responseId, WebModelPage::acknowledgementExpression((string) $entry['ack']),
-            function ($error, $state) use ($responseId, $stage, $deadline, $recover): void {
+            function ($error, $state) use ($responseId, $stage, $deadline, $recover, $entry): void {
                 if ($error === null && is_array($state) && !empty($state['matched']) && empty($state['generation_running'])) {
                     try {
                         ResponseJob::multipartStageAcknowledged($responseId, $stage);
@@ -3802,12 +3806,10 @@ JS;
                         $this->chatGptTurns[$responseId]['multipart_mismatch_signature'] = $signature;
                         $this->chatGptTurns[$responseId]['multipart_mismatch_since'] = microtime(true);
                     } elseif (microtime(true) - (float) ($this->chatGptTurns[$responseId]['multipart_mismatch_since'] ?? 0.0) >= 3.0) {
-                        $checksumOnlyMismatch = !empty($state['last_has_prefix'])
-                            && !empty($state['last_has_transaction'])
-                            && !empty($state['last_has_part'])
-                            && empty($state['last_has_hash']);
+                        $repairableMismatch = ChatGptTransport::acknowledgementRepairable(
+                            (string) $entry['ack'], (string) ($state['last_raw'] ?? ''));
                         $repairStage = (int) ($this->chatGptTurns[$responseId]['multipart_ack_repair_stage'] ?? 0);
-                        if (!$recover && $checksumOnlyMismatch && $repairStage !== $stage) {
+                        if (!$recover && $repairableMismatch && $repairStage !== $stage) {
                             $this->chatGptTurns[$responseId]['multipart_ack_repair_stage'] = $stage;
                             $this->chatGptTurns[$responseId]['multipart_mismatch_signature'] = null;
                             $this->chatGptTurns[$responseId]['multipart_mismatch_since'] = 0.0;
@@ -3842,7 +3844,7 @@ JS;
     }
 
     /**
-     * Ask ChatGPT to correct only the acknowledgement checksum once.
+     * Ask ChatGPT to correct only one mismatched acknowledgement field once.
      * The staged payload is deliberately not repeated, so a model typo cannot duplicate context.
      */
     private function repairMultipartStageAcknowledgement(string $responseId, int $stage, float $deadline): void
@@ -5223,6 +5225,7 @@ JS;
             if (!is_array($turn)) return;
             if ($error !== null || !is_array($snapshot)) {
                 $this->chatGptTurns[$responseId]['empty_response_health'] = null;
+                $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = null;
                 $errors = (int) ($turn['poll_errors'] ?? 0) + 1;
                 $this->chatGptTurns[$responseId]['poll_errors'] = $errors;
                 if ($errors >= 2) {
@@ -5287,6 +5290,7 @@ JS;
                 return;
             }
             if (is_array($snapshot['error'] ?? null)) {
+                $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = null;
                 $networkError = ($snapshot['error']['code'] ?? '') === 'CHATGPT_NETWORK_ERROR';
                 $failedMessageStream = $networkError
                     || ($snapshot['error']['code'] ?? '') === 'CHATGPT_MESSAGE_STREAM_ERROR';
@@ -5699,6 +5703,24 @@ JS;
                 $this->chatGptTurns[$responseId]['source_tool_only_since'] = 0.0;
             }
             $terminalSession = $this->taskSessions[(string) $turn['session_id']] ?? [];
+            // An early-ended original answer stream can coexist with continuing backend tools.
+            // Observe a fresh same-page generation after its latest exact receipt rather than
+            // wait forever for the old stream to finish. The normal stable-text and drained
+            // transactional MCP fence below remain responsible for actual completion.
+            $uiSettlement = ChatGptTransport::postReceiptUiSettlement(
+                $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] ?? null, $snapshot, [
+                    'response_id'=>$logicalResponseId, 'session_id'=>(string)$turn['session_id'],
+                    'document_nonce'=>(string)$turn['document_nonce'],
+                    'owner_incarnation'=>(string)$turn['owner_incarnation'],
+                    'fencing_version'=>(int)$turn['fencing_version'],
+                    'assistant_id'=>(string)($this->chatGptTurns[$responseId]['bound_assistant_id'] ?? ''),
+                    'request_id'=>(string)($terminalSession['submission_request_id'] ?? ''),
+                    'receipt_signature'=>$deliverySignature, 'receipt_at_us'=>$deliveredAtUs,
+                    'post_tool_baseline'=>$postToolBaseline,
+                    'source_transport_unsettled'=>$toolCapable && !empty($terminalSession['submission_finished'])
+                        && !$sourceTransportSettled,
+                ], $now);
+            $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = $uiSettlement['observation'];
             $answerTransportSettled = !empty($terminalSession['submission_request_id'])
                 && !empty($terminalSession['submission_finished']) && empty($terminalSession['submission_failed'])
                 && (!is_string($postToolBaseline) || $sourceTransportSettled);
@@ -5706,7 +5728,7 @@ JS;
                 ($activeCompact && $sourceTransportSettled
                     && ((is_array($streamCompletion) && ($streamCompletion['status'] ?? null) === 'completed')
                         || $sourceToolOnlyStable))
-                || (ChatGptTransport::hasTerminalAnswer($snapshot, $answerTransportSettled)
+                || (ChatGptTransport::hasTerminalAnswer($snapshot, $answerTransportSettled || $uiSettlement['settled'])
                     && (!$activeCompact || $freshPostToolText) && ($rawMarkdown !== '' || $hasArtifacts))
             );
             if (!$activeCompact && $toolCapable && is_string($postToolBaseline) && $markdown === $postToolBaseline) {
@@ -5781,6 +5803,22 @@ JS;
                     // A settled Web final is the end of this Web assistant response.
                     // Never manufacture another user message to keep a Codex turn alive;
                     // all genuine tool calls and results above already share this response.
+                    $waitFailure = !$activeCompact
+                        ? ToolBroker::settledWaitTransportFailureForResponse($logicalResponseId) : null;
+                    if ($waitFailure !== null) {
+                        // All native effects are known, but a typed failed RPC never
+                        // delivered their last result. Preserve the Web model's final
+                        // as visible commentary and end the broken transport explicitly;
+                        // do not fabricate a delivery receipt or successful completion.
+                        if (ToolBroker::failSettledWaitTransportForResponse($logicalResponseId, $roundMarkdown,
+                            (string)$turn['owner_incarnation'], (int)$turn['fencing_version'])) {
+                            $this->taskFailTurn($responseId, 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED',
+                                '工具等待连接提前结束，真实结果已保留。', false);
+                        } else {
+                            $this->scheduleTaskPoll($responseId, 0.10);
+                        }
+                        return;
+                    }
                     try {
                         $fenceRevision = $this->chatGptTurns[$responseId]['completion_fence_revision'] ?? null;
                         $fenceSignature = $this->chatGptTurns[$responseId]['completion_fence_signature'] ?? null;

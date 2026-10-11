@@ -18,10 +18,10 @@ final class ChatGptTransport
 
     /**
      * Recognize a bound stopped answer, including a returned Send button when Copy is delayed.
-     * Send requires the exact transport to have settled after its host receipts; the caller
+     * Send requires settled transport or verified same-page generation after host receipts; the caller
      * still applies stable text, drained MCP revision and transactional completion fencing.
      * @param array $snapshot Current owned response DOM metadata.
-     * @param bool $transportSettled True only for this response's settled request after receipts.
+     * @param bool $transportSettled Exact post-receipt request settlement or verified UI generation.
      * @return bool Whether UI evidence permits beginning the existing completion settlement.
      */
     public static function hasTerminalAnswer(array $snapshot, bool $transportSettled): bool
@@ -31,6 +31,54 @@ final class ChatGptTransport
             && !is_array($snapshot['error'] ?? null)
             && (!empty($snapshot['completion_action_visible'])
                 || ($transportSettled && ($snapshot['send_button_visible'] ?? null) === true));
+    }
+
+    /**
+     * Observe UI generation after an exact host receipt when the original HTTP stream ended early.
+     * This permits only the existing stable-answer/MCP completion fence, never a new prompt,
+     * receipt acknowledgement or completion by itself. A returned Send button alone is stale
+     * evidence: the same owned assistant must have been generating after this receipt first.
+     * @param array|null $previous Private witness from the preceding observation of this page.
+     * @param array $snapshot Owned response DOM; ordinary public status text is not an error.
+     * @param array $evidence Exact response/session/document/owner/fence/assistant/request identity,
+     *     receipt_signature, receipt_at_us, source_transport_unsettled and post_tool_baseline.
+     * @param float $now Current observation time in seconds.
+     * @return array{observation:?array,settled:bool} Updated witness and optional terminal UI evidence.
+     * @throws \JsonException When the exact observation identity cannot be encoded.
+     */
+    public static function postReceiptUiSettlement(?array $previous, array $snapshot,
+        array $evidence, float $now): array
+    {
+        $empty = ['observation'=>null, 'settled'=>false];
+        if (!is_finite($now) || $now < 0.0 || ($evidence['source_transport_unsettled'] ?? null) !== true
+            || !is_int($evidence['receipt_at_us'] ?? null) || $evidence['receipt_at_us'] <= 0
+            || $evidence['receipt_at_us'] / 1000000 > $now
+            || !is_string($evidence['post_tool_baseline'] ?? null)
+            || !is_int($evidence['fencing_version'] ?? null) || $evidence['fencing_version'] < 1
+            || ($snapshot['response_present'] ?? null) !== true
+            || ($snapshot['new_user'] ?? null) !== true || is_array($snapshot['error'] ?? null)
+            || !is_bool($snapshot['generation_running'] ?? null)) return $empty;
+        $identity = [];
+        foreach (['response_id','session_id','document_nonce','owner_incarnation','assistant_id',
+            'request_id','receipt_signature'] as $key) {
+            $value = $evidence[$key] ?? null;
+            if (!is_string($value) || $value === '') return $empty;
+            $identity[$key] = $value;
+        }
+        if (($snapshot['response_id'] ?? null) !== $identity['assistant_id']
+            || !is_string($snapshot['new_user_id'] ?? null) || $snapshot['new_user_id'] === '') return $empty;
+        $identity['user_id'] = $snapshot['new_user_id'];
+        $signature = hash('sha256', json_encode([$identity, $evidence['fencing_version'],
+            $evidence['receipt_at_us'], hash('sha256', $evidence['post_tool_baseline'])], JSON_THROW_ON_ERROR));
+        $witness = ['signature'=>$signature, 'observed_at'=>$now];
+        if ($snapshot['generation_running']) return ['observation'=>$witness, 'settled'=>false];
+        if (!is_array($previous) || ($previous['signature'] ?? null) !== $signature
+            || !is_numeric($previous['observed_at'] ?? null) || (float)$previous['observed_at'] > $now
+            || $now - (float)$previous['observed_at'] > self::EMPTY_RESPONSE_MAX_OBSERVATION_GAP_SECONDS
+            || ($snapshot['send_button_visible'] ?? null) !== true
+            || !is_string($snapshot['markdown'] ?? null) || trim($snapshot['markdown']) === ''
+            || $snapshot['markdown'] === $evidence['post_tool_baseline']) return $empty;
+        return ['observation'=>$witness, 'settled'=>true];
     }
 
     /**
@@ -993,18 +1041,37 @@ final class ChatGptTransport
         return hash_equals(trim($expected), trim($actual));
     }
 
+    /**
+     * Permit one exact-literal correction when only the transaction or checksum differs.
+     * This never acknowledges a part: the browser must still receive the full exact ACK.
+     * Part/total changes, prose, malformed IDs and two conflicting fields cannot be repaired.
+     * @param string $expected Durable ACK for the current inert part on the owned page.
+     * @param string $actual Latest stopped assistant acknowledgement, without Markdown rendering.
+     * @return bool Whether a bounded correction request may be sent without repeating payload.
+     */
+    public static function acknowledgementRepairable(string $expected, string $actual): bool
+    {
+        $pattern = '/\ACODEX_MULTIPART_ACK (ctx_[a-f0-9]{32}) ([1-9][0-9]*\/[1-9][0-9]*) ([a-f0-9]{64})\z/D';
+        if (preg_match($pattern, trim($expected), $required) !== 1
+            || preg_match($pattern, trim($actual), $observed) !== 1
+            || $required[2] !== $observed[2]) return false;
+        $sameTransaction = hash_equals($required[1], $observed[1]);
+        $sameChecksum = hash_equals($required[3], $observed[3]);
+        return $sameTransaction !== $sameChecksum;
+    }
+
     public static function ack(string $transactionId, int $part, int $total, string $sha256): string
     {
         return 'CODEX_MULTIPART_ACK ' . $transactionId . ' ' . $part . '/' . $total . ' ' . strtolower($sha256);
     }
 
-    /** One bounded checksum-correction turn. It never repeats the staged payload. */
+    /** One bounded acknowledgement-correction turn. It never repeats the staged payload. */
     public static function ackRepairText(string $ack): string
     {
         $ack = trim($ack);
         return implode("\n", [
             '<codex_multipart_ack_repair>',
-            'The previous acknowledgement for this already-received inert context part did not exactly match its required checksum.',
+            'The previous acknowledgement for this already-received inert context part did not exactly match its required transaction identity or checksum.',
             'Do not resend, reinterpret, summarize, execute, or otherwise alter the payload. The payload was already sent and must remain exactly as stored.',
             'Reply with exactly ' . $ack . ' and nothing else.',
             '</codex_multipart_ack_repair>',

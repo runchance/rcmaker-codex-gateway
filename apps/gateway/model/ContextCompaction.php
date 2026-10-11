@@ -1507,17 +1507,25 @@ final class ContextCompaction
         if (is_array($attentionTurn) || is_array($attentionSurface)) {
             throw new GatewayError('compaction_source_unavailable', '任务页面或回合存在未确认结果，不能压缩当前任务。', 409);
         }
-        // A retired page is safe to replace only after every host effect has a
-        // delivered receipt. Unknown or unfinished effects cannot be summarized
-        // as if the task were settled, even though this request itself is read-only.
+        // Unknown and unfinished effects still block compaction. A conclusively closed
+        // wait transport may retain a known native receipt without an old-page delivery;
+        // prove that exact receipt is in this compact or its verified checkpoint instead.
         $pendingCall = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
             ->where('status', 'IN', ['registered', 'delivered', 'unknown'])->find();
         $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
-            ->where('status', 'completed')->where('result_delivered_at', null)->find();
+            ->where('status', 'completed')->where('result_delivered_at', null)->select();
         $pendingBinding = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)
             ->where('status', 'IN', ['awaiting_start', 'running'])->find();
-        if (!is_array($activeSource) && (is_array($pendingCall) || is_array($undelivered) || is_array($pendingBinding))) {
+        if (!is_array($undelivered)) throw new GatewayError('storage_unavailable', '工具回执状态暂不可读取。', 503);
+        if (!is_array($activeSource) && (is_array($pendingCall) || is_array($pendingBinding))) {
             throw new GatewayError('compaction_source_unavailable', '工具执行或回执尚未确认，不能压缩当前任务。', 409);
+        }
+        if (!is_array($activeSource)) {
+            foreach ($undelivered as $call) {
+                if (!ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)) {
+                    throw new GatewayError('compaction_source_unavailable', '工具执行或回执尚未确认，不能压缩当前任务。', 409);
+                }
+            }
         }
         if (is_array($epoch)) {
             if ($epoch['status'] === 'active') {
@@ -1872,6 +1880,43 @@ final class ContextCompaction
     }
 
     /**
+     * Preserve a completed native receipt even though its old Web wait RPC failed.
+     * The compact must contain its exact persisted output, or the same verified v2 checkpoint
+     * already used by the current stored source and covering the receipt's completion time.
+     * @param array $spec Normalized compact request containing complete readable history.
+     * @param array $call Known completed invocation from a conclusively closed wait transport.
+     * @param string $taskId Exact routed task owning the call and any committed checkpoint.
+     * @return void No receipt, capability or checkpoint state is changed.
+     * @throws GatewayError When the native result or requested coverage cannot be verified.
+     */
+    public static function assertClosedWaitReceiptCoverageUnlocked(array $spec, array $call, string $taskId): void
+    {
+        $result = json_decode((string)($call['result_json'] ?? ''), true);
+        $hash = (string)($call['result_hash'] ?? '');
+        if (($call['task_id'] ?? '') !== $taskId || !is_string($result['output'] ?? null)
+            || $hash === '' || !hash_equals($hash, hash('sha256', $result['output']))) {
+            throw new GatewayError('compaction_context_incomplete', '已结束工具连接的持久回执无法验证，原记录已保留。', 409);
+        }
+        $requested = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $receipts = self::receiptOutputs($requested);
+        if (array_key_exists($call['call_id'], $receipts)) {
+            if (self::matchesPersistedReceipt($receipts[$call['call_id']], $result['output'], $hash,
+                !empty($result['output_is_content_parts']))) return;
+            throw new GatewayError('compaction_context_incomplete', '压缩请求中的旧工具回执与真实结果不一致，原记录已保留。', 409);
+        }
+        $sources = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('task_id', $taskId)
+            ->where('operation_kind', 'response')->order([['rowid', 'DESC']])->limit(1)
+            ->select('id,context_json,compaction_epoch');
+        $source = $sources[0] ?? null;
+        if (is_array($source) && (int)($call['completed_at'] ?? 0) > 0) {
+            $known = json_decode($source['context_json'], true, 128, JSON_THROW_ON_ERROR);
+            $checkpointAt = self::verifiedCheckpointTimeUnlocked($taskId, $spec, $source, $known, $requested, $call);
+            if ($checkpointAt > 0 && $checkpointAt >= (int)$call['completed_at']) return;
+        }
+        throw new GatewayError('compaction_context_incomplete', '压缩请求缺少已结束工具连接的真实回执或已验证检查点，原记录已保留。', 409);
+    }
+
+    /**
      * Check a receipt against the byte-verified durable result. JSON object member order
      * is transport formatting, so structured outputs are compared by their parsed values;
      * text outputs still require exact bytes. List order and scalar types stay significant.
@@ -1914,10 +1959,12 @@ final class ContextCompaction
     /**
      * Prove that omitted older receipts were replaced by this gateway's exact v2 envelope.
      * A plain SUMMARY_PREFIX message is readable history, not a checkpoint ownership proof.
+     * When a closed receipt shares the commit second, also verify its exact bytes in the
+     * committed producer's source; timestamp resolution alone is not an ordering proof.
      * @return int Committed Unix timestamp, or zero when no matching checkpoint exists.
      */
     private static function verifiedCheckpointTimeUnlocked(string $taskId, array $spec, array $sourceLast,
-        array $sourceContext, array $requestedContext): int
+        array $sourceContext, array $requestedContext, ?array $sameSecondReceipt = null): int
     {
         $epoch = (string) ($sourceLast['compaction_epoch'] ?? 'base');
         if ($epoch === 'base' || $epoch !== (string) ($spec['compaction_epoch'] ?? 'base')) return 0;
@@ -1952,7 +1999,20 @@ final class ContextCompaction
             foreach ((array) ($requestedContext['messages'] ?? []) as $message) {
                 if (($message['role'] ?? '') === 'user' && ($message['content'] ?? null) === $summary) $inRequest = true;
             }
-            if ($inSource && $inRequest) return (int) ($row['committed_at'] ?? 0);
+            if (!$inSource || !$inRequest) continue;
+            $committedAt = (int)($row['committed_at'] ?? 0);
+            if ($sameSecondReceipt !== null && $committedAt === (int)($sameSecondReceipt['completed_at'] ?? 0)) {
+                $producers = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $row['response_id'])
+                    ->where('task_id', $taskId)->where('status', 'completed')->where('compact_id', $row['id'])->select('context_json');
+                $producer = $producers[0]['context_json'] ?? null;
+                if (!is_string($producer)) return 0;
+                $outputs = self::receiptOutputs(json_decode($producer, true, 128, JSON_THROW_ON_ERROR));
+                $result = json_decode((string)$sameSecondReceipt['result_json'], true);
+                if (!array_key_exists($sameSecondReceipt['call_id'], $outputs)
+                    || !self::matchesPersistedReceipt($outputs[$sameSecondReceipt['call_id']], $result['output'],
+                        $sameSecondReceipt['result_hash'], !empty($result['output_is_content_parts']))) return 0;
+            }
+            return $committedAt;
         }
         return 0;
     }

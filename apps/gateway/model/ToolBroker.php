@@ -183,6 +183,7 @@ final class ToolBroker
             $current = (string) $call['binding_id'] === (string) $binding['id']
                 && (string) ($call['response_id'] ?? '') === $sourceId
                 && isset($ids[(string) $call['call_id']]);
+            if (!$current && self::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)) continue;
             if ($current && ((string) $call['status'] === 'delivered'
                 || ((string) $call['status'] === 'completed' && $call['result_delivered_at'] === null))) {
                 $hasWaitingSourceResult = true;
@@ -1344,15 +1345,13 @@ final class ToolBroker
                 // it is running or waiting for the human. Observe the existing turn lifetime,
                 // rather than revoking its capability at the short MCP dispatch deadline.
                 $turn = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
-                if ($transportDeadline !== null && ((string) $binding['status'] !== 'running'
-                    || !is_array($turn) || !in_array($turn['status'], ['submitted', 'running'], true)
-                    || $turn['response_id'] !== $binding['current_response_id'])) {
+                $liveTurn = self::nativeWaitTurnIsLive($binding, $turn);
+                if ($transportDeadline !== null && !$liveTurn) {
                     // A receipt already settled above remains readable. Pending work must
                     // still belong to the exact active turn; polling never revives a closed one.
                     throw new GatewayError('tool_wait_scope_changed', '工具等待所属回合已结束或发生变化，未重新发起调用。', 409);
                 }
-                if (is_array($turn) && in_array($turn['status'], ['submitted', 'running'], true)
-                    && $turn['response_id'] === $binding['current_response_id']) {
+                if ($liveTurn) {
                     $deadline = (float) min((int) $turn['deadline_at'], (int) $binding['expires_at']);
                     if ((string) $row['status'] === 'registered') {
                         // Polling the same queued call must not restart its dispatch timeout.
@@ -1401,6 +1400,195 @@ final class ToolBroker
             }
         }
         throw new GatewayError('tool_call_timeout', '等待 Codex 工具结果超时，本回合能力已撤销。', 504);
+    }
+
+    /**
+     * Preserve the exact observed-POST claim while the independent DOM acknowledgement is late.
+     * Accepted turns retain their existing check. A submit intent additionally requires the
+     * already claimed binding and its exact busy document/session/fence; intent alone is not proof.
+     */
+    private static function nativeWaitTurnIsLive(array $binding, ?array $turn): bool
+    {
+        if ((string) $binding['status'] !== 'running' || !is_array($turn)
+            || $turn['response_id'] !== $binding['current_response_id']) return false;
+        if (in_array($turn['status'], ['submitted', 'running'], true)) return true;
+        if ($turn['status'] !== 'submit_intent' || empty($turn['submit_intent_at'])
+            || empty($binding['sent_at']) || empty($binding['started_at'])) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $jobs = $db->table('gateway_response_jobs')->where('id', (string)$binding['current_response_id'])
+            ->select('id,task_id,durable_turn_id,epoch_id,generation_id,surface_id,mcp_binding_id,status,round_kind,submit_intent_at,submitted_document_nonce');
+        $job = $jobs[0] ?? null;
+        $surface = $db->table('gateway_browser_surfaces')->where('id', (string)$turn['surface_id'])->find();
+        return is_array($job) && is_array($surface)
+            && ($job['status'] === 'running' || ($job['status'] === 'completed' && $job['round_kind'] === 'tool_call'))
+            && !empty($job['submit_intent_at']) && !empty($job['submitted_document_nonce'])
+            && $job['task_id'] === $binding['task_id'] && $turn['task_id'] === $binding['task_id']
+            && $job['durable_turn_id'] === $binding['turn_id'] && $turn['id'] === $binding['turn_id']
+            && $job['mcp_binding_id'] === $binding['id'] && $job['surface_id'] === $turn['surface_id']
+            && $job['epoch_id'] === $turn['epoch_id'] && $job['generation_id'] === $turn['generation_id']
+            && $surface['task_id'] === $binding['task_id'] && $surface['epoch_id'] === $turn['epoch_id']
+            && $surface['status'] === 'busy' && !empty($surface['target_id']) && !empty($surface['session_id'])
+            && $surface['document_nonce'] === $job['submitted_document_nonce']
+            && $surface['owner_incarnation'] === $turn['owner_incarnation']
+            && (int)$surface['fencing_version'] === (int)$turn['fencing_version'];
+    }
+
+    /**
+     * Record a typed wait RPC failure without inventing delivery or changing host execution.
+     * @param string $token Exact capability used by the failed RPC.
+     * @param string $callId Its already issued native call.
+     * @param string $code Explicit transport error; currently only lost wait scope is eligible.
+     * @return void Repeated observations of the same failed wait are idempotent.
+     * @throws GatewayError If the token or issued call cannot be verified.
+     */
+    public static function recordWaitTransportFailure(string $token, string $callId, string $code): void
+    {
+        if ($code !== 'tool_wait_scope_changed') return;
+        Schema::transaction(function () use ($token, $callId, $code): void {
+            [$binding, $call] = self::receiptForTokenUnlocked($token, $callId);
+            $events = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+                ->where('event_type', 'tool_result_transport_failed')->select('data_json');
+            foreach (is_array($events) ? $events : [] as $event) {
+                if ((json_decode($event['data_json'], true)['invocation_id'] ?? null) === $call['id']) return;
+            }
+            self::eventUnlocked((string)$call['task_id'], (string)$call['turn_id'], (string)$call['response_id'],
+                'tool_result_transport_failed', ['invocation_id'=>(string)$call['id'], 'code'=>$code]);
+        });
+    }
+
+    /**
+     * Distinguish a proven failed RPC from host work still pending execution, approval or delivery.
+     * The browser caller must separately prove a stable stopped final before ending this transport.
+     * @param string $responseId Exact current ordinary text round.
+     * @return string|null Typed failed wait code only after every host result is known and no RPC is active.
+     */
+    public static function settledWaitTransportFailureForResponse(string $responseId): ?string
+    {
+        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
+        if (!is_array($binding) || !in_array($binding['status'], ['running','revoked'], true)) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        if ($binding['status'] === 'revoked') {
+            $revocations = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+                ->where('event_type', 'mcp_capability_revoked')->order([['id','DESC']])->limit(1)->select('data_json');
+            if ((json_decode($revocations[0]['data_json'] ?? '{}', true)['reason'] ?? '') !== 'closed_result_transport') return null;
+        }
+        $jobs = $db->table('gateway_response_jobs')->where('id', $responseId)->select('status,round_kind,operation_kind');
+        $job = $jobs[0] ?? null;
+        if (!is_array($job) || $job['status'] !== 'running' || $job['round_kind'] !== 'text'
+            || $job['operation_kind'] !== 'response' || self::activeCountUnlocked((string)$binding['id']) !== 0) return null;
+        $calls = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status', '<>', 'completed')->count();
+        if (!is_numeric($calls) || (int)$calls !== 0) return null;
+        $undelivered = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status', 'completed')->where('result_delivered_at', null)->select('id,result_json');
+        if (!is_array($undelivered) || $undelivered === []) return null;
+        $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+            ->where('event_type', 'tool_result_transport_failed')->select('data_json');
+        $failed = [];
+        foreach (is_array($events) ? $events : [] as $event) {
+            $data = json_decode($event['data_json'], true);
+            if (($data['code'] ?? null) === 'tool_wait_scope_changed') $failed[$data['invocation_id'] ?? ''] = true;
+        }
+        foreach ($undelivered as $call) {
+            if (!isset($failed[$call['id']]) || !is_string($call['result_json'])
+                || !is_array(json_decode($call['result_json'], true))) return null;
+        }
+        return 'tool_wait_scope_changed';
+    }
+
+    /**
+     * Distinguish a known native result from live work after its Web wait transport ended.
+     * Only the exact failed and revoked capability is eligible. The compaction request must
+     * still carry the real receipt, or a verified checkpoint already covering it. This is a
+     * read-only proof: it never acknowledges delivery to the old Web page or replays a call.
+     * @param array $call Persisted completed invocation examined by the compact reservation.
+     * @param array $spec Normalized compact request with its complete readable context.
+     * @param string $taskId Exact routed task owning the reservation.
+     * @return bool Whether the closed wait receipt is safe to include in this compaction.
+     * @throws GatewayError When an eligible receipt is missing, altered or cannot be read.
+     */
+    public static function closedWaitReceiptForCompactionUnlocked(array $call, array $spec, string $taskId): bool
+    {
+        if (($call['task_id'] ?? '') !== $taskId || ($call['status'] ?? '') !== 'completed'
+            || ($call['result_delivered_at'] ?? null) !== null || empty($call['binding_id'])
+            || empty($call['turn_id']) || empty($call['response_id'])
+            || empty($call['delivered_at']) || empty($call['completed_at'])) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $call['binding_id'])->find();
+        $turn = $db->table('gateway_task_turns')->where('id', $call['turn_id'])->find();
+        if (!is_array($binding) || !is_array($turn) || $binding['status'] !== 'revoked'
+            || $binding['task_id'] !== $taskId || $binding['turn_id'] !== $call['turn_id']
+            || $turn['task_id'] !== $taskId || $turn['status'] !== 'failed'
+            || $turn['error_code'] !== 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED'
+            || $turn['response_id'] !== $binding['current_response_id']) return false;
+        $sources = $db->table('gateway_response_jobs')->where('id', $call['response_id'])
+            ->select('task_id,durable_turn_id,mcp_binding_id,status,round_kind');
+        $source = $sources[0] ?? null;
+        if (!is_array($source) || $source['task_id'] !== $taskId || $source['durable_turn_id'] !== $call['turn_id']
+            || $source['mcp_binding_id'] !== $call['binding_id'] || $source['status'] !== 'completed'
+            || $source['round_kind'] !== 'tool_call') return false;
+        $jobs = $db->table('gateway_response_jobs')->where('id', $binding['current_response_id'])
+            ->select('id,task_id,durable_turn_id,mcp_binding_id,status,error_json');
+        $job = $jobs[0] ?? null;
+        $error = is_array($job) ? json_decode((string)$job['error_json'], true) : null;
+        if (!is_array($job) || $job['status'] !== 'failed' || $job['task_id'] !== $taskId
+            || $job['durable_turn_id'] !== $call['turn_id'] || $job['mcp_binding_id'] !== $call['binding_id']
+            || ($error['error']['code'] ?? '') !== 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED') return false;
+        $revocations = $db->table('gateway_task_events')->where('turn_id', $call['turn_id'])
+            ->where('event_type', 'mcp_capability_revoked')->order([['id', 'DESC']])->limit(1)->select('data_json');
+        if ((json_decode($revocations[0]['data_json'] ?? '{}', true)['reason'] ?? '') !== 'closed_result_transport') return false;
+        $pending = $db->table('gateway_tool_invocations')->where('binding_id', $call['binding_id'])
+            ->where('status', '<>', 'completed')->count();
+        $liveJobs = $db->table('gateway_response_jobs')->where('mcp_binding_id', $call['binding_id'])
+            ->where('status', 'IN', ['queued', 'running'])->count();
+        if (!is_numeric($pending) || !is_numeric($liveJobs)) {
+            throw new GatewayError('storage_unavailable', '已结束工具连接的状态暂不可读取。', 503);
+        }
+        if ((int)$pending !== 0 || (int)$liveJobs !== 0 || self::activeCountUnlocked($call['binding_id']) !== 0) return false;
+        $events = $db->table('gateway_task_events')->where('turn_id', $call['turn_id'])
+            ->where('event_type', 'tool_result_transport_failed')->select('data_json');
+        if (!is_array($events)) throw new GatewayError('storage_unavailable', '工具等待失败记录暂不可读取。', 503);
+        foreach ($events as $event) {
+            $data = json_decode($event['data_json'], true);
+            if (($data['invocation_id'] ?? '') !== $call['id'] || ($data['code'] ?? '') !== 'tool_wait_scope_changed') continue;
+            ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($spec, $call, $taskId);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * End only the failed result transport after its browser owner proves a stable stopped final.
+     * Native results stay completed and unacknowledged; no success or unknown effect is invented.
+     * @param string $responseId Exact current ordinary text response.
+     * @param string $answer Observed Web final; preserved verbatim as commentary and audit evidence.
+     * @param string $incarnation Current browser owner verified by the caller.
+     * @param int $fence Exact surface ownership fence verified with the stopped DOM.
+     * @return bool False if the scope changed, a receipt arrived or any work became active.
+     */
+    public static function failSettledWaitTransportForResponse(string $responseId, string $answer,
+        string $incarnation, int $fence): bool
+    {
+        if (trim($answer) === '') return false;
+        $frozen = Schema::transaction(function () use ($responseId, $incarnation, $fence): bool {
+            $ledger = TaskLedger::execution($responseId);
+            if ($ledger['turn']['response_id'] !== $responseId || $ledger['surface']['status'] !== 'busy'
+                || $ledger['surface']['owner_incarnation'] !== $incarnation
+                || (int)$ledger['surface']['fencing_version'] !== $fence
+                || !in_array($ledger['turn']['status'], ['submitted','running'], true)
+                || self::settledWaitTransportFailureForResponse($responseId) === null) return false;
+            $binding = self::bindingByResponseUnlocked($responseId);
+            // Freeze only this closed capability before the separate idempotent
+            // response writers. Those own their transactions; do not nest them.
+            self::revokeBindingUnlocked($binding, 'closed_result_transport');
+            return true;
+        });
+        if (!$frozen) return false;
+        ResponseJob::appendCommentary($responseId, $answer, 'failed-wait-final:' . hash('sha256',$answer));
+        WebMessageAudit::recordIncoming($responseId, 'transport_failed_final', $answer);
+        ResponseJob::fail($responseId, 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED',
+            '网页回答已结束，但工具结果等待连接提前失败（tool_wait_scope_changed）。本机执行结果和网页答复已保留，未重发或重复执行工具。', false);
+        return true;
     }
 
     /** Mark the completed Codex result as durably handed back to the MCP client. */

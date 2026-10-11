@@ -26,6 +26,7 @@ final class NativeTransport
      * When set, upstream bytes stay private and this callback owns the downstream response.
      * It must reject incomplete output: a known HTTP response is delivered even when the
      * upstream resets after its terminal SSE event, which is a normal native backend close.
+     * Response endpoints select HTTP/1.1 before sending to avoid observed HTTP/2 stream resets.
      * @throws GatewayError Before any response bytes if transport setup is invalid.
      */
     public static function start(TcpConnection $connection, string $endpoint, string $method, string $query,
@@ -43,6 +44,12 @@ final class NativeTransport
         $state = NetworkSettings::state();
         $revision = NetworkSettings::revision((int) $state['saved_revision']);
         NetworkTransport::configure($client, $revision, $url, $onResponse !== null ? 180 : ($endpoint === 'models' ? 30 : 900));
+        // Native long responses have produced CURLE_HTTP2_STREAM before their terminal event.
+        // Select HTTP/1.1 before sending, avoiding HTTP/2 stream resets without replaying a POST.
+        // Browser/MCP traffic and other native endpoints retain their existing transport.
+        if (in_array($endpoint, ['responses', 'responses/compact'], true)) {
+            $client->setOpt(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+        }
         foreach ($headers as $name => $value) {
             if (in_array(strtolower($name), ['authorization', 'chatgpt-account-id', 'openai-beta', 'originator',
                 'user-agent', 'accept', 'content-type', 'content-encoding', 'x-codex-turn-metadata', 'x-codex-beta-features',

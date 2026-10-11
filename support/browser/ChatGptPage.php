@@ -1065,7 +1065,7 @@ if(answer){
         if(filename===''||filename.length>180)continue;
         pushArtifact('',filename,'file_card');
     }
-    contentPresent=visibleText!=='';
+    contentPresent=visibleText!==''||(markdown!==''&&roots.some(hasNonTextContent));
     const rendered=roots.length>0?roots[roots.length-1]:null;
     // The modern action bar may follow the answer search unit, but remains inside
     // the same stable assistant turn container. Never climb into another turn's controls.
@@ -1504,7 +1504,8 @@ const networkErrorCard=(user,answer)=>{
 };
 const composerText=el=>('value'in el?String(el.value||''):[...el.childNodes].map(node=>String(node.textContent||'')).join('\n')).replace(/\u00a0/g,' ');
 const artifactAnchor=el=>{if(!el||String(el.tagName||'').toLowerCase()!=='a')return false;const raw=String(el.getAttribute('href')||'').trim(),download=String(el.getAttribute('download')||'').trim();return raw!==''&&(download!==''||/^sandbox:\/+(?:mnt\/data)\//i.test(raw)||/\/mnt\/data\//i.test(raw)||/\/backend-api\/(?:files|estuary\/content)(?:\/|\?|$)/i.test(raw));};
-const ignored=el=>['BUTTON','SCRIPT','STYLE','SVG','IMG','PICTURE','SOURCE'].includes(el.nodeName)
+const ignored=el=>['BUTTON','SCRIPT','STYLE','SVG','SOURCE'].includes(el.nodeName)
+    ||el.hasAttribute?.('data-footnote-backref')
     ||el.getAttribute?.('aria-hidden')==='true'||el.hasAttribute?.('hidden')||el.hasAttribute?.('inert')
     ||(el.nodeType===Node.ELEMENT_NODE&&getComputedStyle(el).display==='none')
     ||(el.nodeType===Node.ELEMENT_NODE&&getComputedStyle(el).visibility==='hidden')
@@ -1512,56 +1513,166 @@ const ignored=el=>['BUTTON','SCRIPT','STYLE','SVG','IMG','PICTURE','SOURCE'].inc
 let markdownRunning=false;
 const children=el=>[...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE?String(n.nodeValue||'').length>0:(n.nodeType===Node.ELEMENT_NODE&&!ignored(n)));
 const inline=(el,tail)=>{const cs=children(el);let out='';for(let i=0;i<cs.length;i++)out+=md(cs[i],tail&&i===cs.length-1);return out};
-const listItem=(el,ordered,index,tail)=>{
+// Escape rendered prose, not authored code or math: literal Markdown punctuation is visible text.
+const markdownLiteral=(value,inTable=false)=>{
+    let text=String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/[\\`*_~\[\]$]/g,'\\$&')
+        .replace(/(^|\n)([ \t]*)(#{1,6}(?=\s|$)|[+-](?=\s)|-{3,}(?=[ \t]*(?:\n|$))|=+(?=[ \t]*(?:\n|$)))/g,'$1$2\\$3')
+        .replace(/(^|\n)([ \t]*)(\d+)([.)])(?=\s)/g,'$1$2$3\\$4');
+    return inTable?text:text.replace(/\|/g,'\\|');
+};
+const markdownTarget=value=>String(value).replace(/[\s<>\\()]/g,char=>char==='('?'%28':char===')'?'%29':encodeURIComponent(char));
+const markdownTitle=el=>{const title=el.getAttribute('title');return title?' "'+String(title).replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/[\r\n]/g,' ')+'"':'';};
+// Blank lines are meaningful in code. Normalize block spacing only outside fenced regions,
+// including fences nested in lists/quotes and an unfinished streaming code block.
+const normalizeMarkdown=value=>{
+    const lines=String(value).split('\n'),out=[];let fence=null,empty=0;
+    for(const line of lines){
+        const match=line.replace(/^(?:[ \t]*>[ \t]?)+/,'').trimStart().match(/^(`{3,}|~{3,})(.*)$/);
+        const wasFenced=fence!==null;
+        if(match){
+            if(fence&&match[1][0]===fence[0]&&match[1].length>=fence.length&&match[2].trim()==='')fence=null;
+            else if(!fence)fence=match[1];
+        }
+        if(!wasFenced&&!fence&&line.trim()===''){if(++empty>1)continue;}else empty=0;
+        out.push(line);
+    }
+    return out.join('\n');
+};
+const fencedMarkdown=(value,language,tail)=>{
+    const code=String(value);let length=3;
+    for(const match of code.matchAll(/`+/g))length=Math.max(length,match[0].length+1);
+    const fence='`'.repeat(length);
+    return '\n\n'+fence+language+'\n'+code+(tail?'':'\n'+fence+'\n\n');
+};
+const inlineCode=(el,tail)=>{
+    let value=String(el.textContent||'').replace(/[\r\n]+/g,' ');
+    if(markdownRunning&&tail)value=value.replace(/[A-Za-z0-9_$]+$/,'');
+    let length=1;for(const match of value.matchAll(/`+/g))length=Math.max(length,match[0].length+1);
+    const fence='`'.repeat(length),pad=/^`|`$/.test(value)||(/^ | $/.test(value)&&/[^ ]/.test(value))?' ':'';
+    return fence+pad+value+(tail?'':pad+fence);
+};
+const listNumbers=(list,items)=>{
+    const parse=value=>/^-?\d+$/.test(String(value||''))&&Number.isSafeInteger(Number(value))?Number(value):null;
+    let current=parse(list.getAttribute('start'))??1;
+    return items.map(item=>{current=parse(item.getAttribute('value'))??current;return current++;});
+};
+const imageTarget=el=>{const src=String(el.getAttribute('src')||'').trim();return /^https?:\/\//i.test(src)&&!/\/backend-api\//i.test(src)?src:'';};
+// Image/divider-only answers have no innerText. Require an actual visible content node;
+// empty emphasis/code shells must not become completion evidence merely from delimiters.
+const hasNonTextContent=root=>[root,...root.querySelectorAll('img'),...root.querySelectorAll('hr')].some(node=>{
+    if(!['img','hr'].includes(node.tagName.toLowerCase()))return false;
+    for(let parent=node;parent;parent=parent.parentElement){if(ignored(parent)||artifactAnchor(parent))return false;if(parent===root)break;}
+    return true;
+});
+// KaTeX retains the author's TeX in MathML annotations. Read it only from a visible formula
+// container so the visual/math-accessibility copies do not appear twice in the response.
+const mathSource=el=>{
+    const classes=[...el.classList];
+    if(el.tagName.toLowerCase()!=='math'&&!classes.includes('katex')&&!classes.includes('katex-display'))return null;
+    const annotation=[...el.querySelectorAll('annotation')].find(node=>node.getAttribute('encoding')==='application/x-tex');
+    const value=String(annotation?.textContent||'').trim();
+    return value?{value,display:classes.includes('katex-display')||el.getAttribute('display')==='block'}:null;
+};
+const footnoteLabel=value=>{let label=String(value);try{label=decodeURIComponent(label);}catch(_error){}return label.replace(/^#?user-content-fn-/,'').replace(/[\\\[\]\r\n]/g,'_');};
+const listItem=(el,ordered,ordinal,tail)=>{
     // ChatGPT wraps code cards in several block containers. Collapse their repeated blank
     // boundaries before indenting, or the indentation prevents the final cleanup from seeing them.
-    const value=inline(el,tail).trim().replace(/\n(?:[ \t]*\n){2,}/g,'\n\n');
-    return (ordered?String(index+1)+'. ':'- ')+value.replace(/\n/g,'\n  ');
+    const value=normalizeMarkdown(inline(el,tail)).trim();
+    const marker=ordered?String(ordinal)+'. ':'- ';
+    const checkbox=[...el.querySelectorAll('input')].find(input=>input.getAttribute('type')==='checkbox'&&input.closest('li')===el&&!ignored(input));
+    return marker+(checkbox?(checkbox.checked?'[x] ':'[ ] '):'')+value.replace(/\n/g,'\n'+' '.repeat(marker.length));
+};
+// HTML tables need explicit row/column boundaries; recursive cell text loses that structure.
+// Keep one physical Markdown line per row, retaining inline formatting inside each cell.
+const markdownTable=el=>{
+    const rows=[...el.querySelectorAll('tr')].filter(row=>{
+        if(row.closest('table')!==el)return false;
+        for(let parent=row;parent&&parent!==el;parent=parent.parentElement)if(ignored(parent))return false;
+        return true;
+    }).map(row=>[...row.children].filter(cell=>['td','th'].includes(cell.tagName.toLowerCase())&&!ignored(cell)))
+        .filter(cells=>cells.length>0);
+    if(rows.length===0)return '';
+    const width=Math.max(...rows.map(cells=>cells.length));
+    const cellValue=cell=>inline(cell,false).trim().replace(/\r\n?/g,'\n').replace(/[ \t]*\n(?:[ \t]*\n)*[ \t]*/g,'<br>')
+        .replace(/(\\*)\|/g,(_,slashes)=>slashes+(slashes.length%2===0?'\\':'\\\\')+'|');
+    const line=values=>'| '+Array.from({length:width},(_,index)=>values[index]||'').join(' | ')+' |';
+    const alignment=Array.from({length:width},(_,index)=>{
+        const cell=rows[0][index];
+        const align=cell?String(cell.getAttribute('align')||getComputedStyle(cell).textAlign||'').toLowerCase():'';
+        return align==='center'?':---:':align==='right'?'---:':align==='left'?':---':'---';
+    });
+    const values=rows.map(cells=>line(cells.map(cellValue)));
+    values.splice(1,0,line(alignment));
+    const caption=[...el.children].find(child=>child.tagName.toLowerCase()==='caption'&&!ignored(child));
+    return '\n\n'+(caption?inline(caption,false).trim()+'\n\n':'')+values.join('\n')+'\n\n';
 };
 const md=(node,tail=false)=>{
     if(node.nodeType===Node.TEXT_NODE){
         const text=String(node.nodeValue||'').replace(/\u00a0/g,' ');
-        if(!markdownRunning||!tail||node.parentElement?.closest('pre,code,a'))return text;
+        const inTable=!!node.parentElement?.closest('td,th');
+        if(!markdownRunning||!tail||node.parentElement?.closest('pre,code,a'))return markdownLiteral(text,inTable);
         // A trailing raw link/autolink can hydrate into a download card and disappear from
         // Markdown. Hold that ambiguous suffix, rather than buffering the whole paragraph/list.
         const marker=/(?:^|[^\\])(!?\[|`+|\*+|<(?=[A-Za-z/])|https?:\/\/)/.exec(text);
-        return marker?text.slice(0,marker.index+marker[0].length-marker[1].length):text;
+        return markdownLiteral(marker?text.slice(0,marker.index+marker[0].length-marker[1].length):text,inTable);
     }
     if(node.nodeType!==Node.ELEMENT_NODE)return '';
     const el=node;
     if(ignored(el))return '';
     const tag=el.tagName.toLowerCase();
-    if(tag==='br')return '\n';
+    if(tag==='br')return '  \n';
+    if(tag==='hr')return '\n\n---\n\n';
+    const formula=mathSource(el);
+    if(formula)return formula.display?'\n\n$$\n'+formula.value+'\n$$\n\n':'$'+formula.value+'$';
+    if(tag==='img'){
+        if(markdownRunning&&tail)return '';
+        const alt=markdownLiteral(String(el.getAttribute('alt')||''),!!el.closest('td,th')),src=imageTarget(el);
+        return src?'!['+alt+']('+markdownTarget(src)+markdownTitle(el)+')':alt;
+    }
+    // A growing table can add columns and replace its header. Commit it only once the block
+    // settles, as the semantic streaming ledger already does for the current draft tail.
+    if(tag==='table')return markdownRunning&&tail?'':markdownTable(el);
     if(tag==='pre'){
         const code=el.querySelector('code')||el;
         const m=String(code.className||'').match(/(?:^|\s)language-([^\s]+)/);
-        return '\n\n```'+(m?m[1]:'')+'\n'+String(code.textContent||'').replace(/\u00a0/g,' ')+(tail?'':'\n```')+'\n\n';
+        return fencedMarkdown(code.textContent,m?m[1]:'',tail);
     }
     // The streaming renderer can replace a partially typed identifier (e.g. q_ -> quantity).
     // Keep completed code words flowing, but hold the last identifier until its boundary settles.
     // Current ChatGPT code cards render a block-level CodeContent element without <pre>.
     // Treat that renderer as a fenced block so multiline snippets remain valid Markdown.
     if(tag==='code'&&[...el.classList].some(name=>name.startsWith('CodeContent-'))){
-        const code=String(el.textContent||'').replace(/\u00a0/g,' ');
-        const longest=Math.max(0,...[...code.matchAll(/`+/g)].map(match=>match[0].length));
-        const fence='`'.repeat(Math.max(3,longest+1));
-        return '\n\n'+fence+'\n'+code+(tail?'':'\n'+fence+'\n\n');
+        return fencedMarkdown(el.textContent,'',tail);
     }
-    if(tag==='code')return '`'+(markdownRunning&&tail?inline(el,tail).replace(/[A-Za-z0-9_$]+$/,''):inline(el,tail))+(tail?'':'`');
+    if(tag==='code')return inlineCode(el,tail);
     if(tag==='strong'||tag==='b')return '**'+inline(el,tail)+(tail?'':'**');
     if(tag==='em'||tag==='i')return '*'+inline(el,tail)+(tail?'':'*');
+    if(tag==='del'||tag==='s'||tag==='strike')return '~~'+inline(el,tail)+(tail?'':'~~');
+    if(tag==='sup'&&[...el.querySelectorAll('a')].some(anchor=>anchor.hasAttribute('data-footnote-ref')))return inline(el,tail);
+    if(tag==='sub'||tag==='sup'||tag==='u'||tag==='mark'){const value=inline(el,tail);return value?'<'+tag+'>'+value+(tail?'':'</'+tag+'>'):'';}
     if(tag==='a'){
         if(artifactAnchor(el))return '';
         if(markdownRunning&&tail)return '';
-        return '['+inline(el,tail)+(tail?'':']('+String(el.getAttribute('href')||'')+')');
+        const href=String(el.getAttribute('href')||'');
+        if(el.hasAttribute('data-footnote-ref')&&/^#user-content-fn-/.test(href))return '[^'+footnoteLabel(href)+']';
+        return href?'['+inline(el,tail)+']('+markdownTarget(href)+markdownTitle(el)+')':inline(el,tail);
     }
     if(/^h[1-6]$/.test(tag))return '#'.repeat(Number(tag[1]))+' '+inline(el,tail)+'\n\n';
-    if(tag==='blockquote')return inline(el,tail).split('\n').map(v=>'> '+v).join('\n')+'\n\n';
+    if(tag==='blockquote')return normalizeMarkdown(inline(el,tail)).trim().split('\n').map(v=>v?'> '+v:'>').join('\n')+'\n\n';
+    if(tag==='section'&&el.hasAttribute('data-footnotes')){
+        return '\n\n'+[...el.querySelectorAll('li')].filter(item=>/^user-content-fn-/.test(String(item.getAttribute('id')||'')))
+            .map(item=>'[^'+footnoteLabel(item.getAttribute('id'))+']: '+normalizeMarkdown(inline(item,false)).trim().replace(/\n/g,'\n    ')).join('\n\n')+'\n\n';
+    }
     if(tag==='ul'||tag==='ol'){
         const items=[...el.children].filter(c=>c.tagName.toLowerCase()==='li');
         // A nested list may follow text directly inside <li>; it still starts a new Markdown line.
         const boundary=el.closest('li')?'\n':'';
-        return boundary+items.map((li,i)=>listItem(li,tag==='ol',i,tail&&i===items.length-1)).join('\n')+'\n\n';
+        const numbers=listNumbers(el,items);
+        // Markdown renderers ignore later explicit numbers within one list. Split a reset
+        // into a new list so HTML <li value> retains its visible numbering too.
+        return boundary+items.map((li,i)=>(i?(tag==='ol'&&numbers[i]!==numbers[i-1]+1?'\n\n<!-- -->\n\n':'\n'):'')
+            +listItem(li,tag==='ol',numbers[i],tail&&i===items.length-1)).join('')+'\n\n';
     }
     if(tag==='li')return inline(el,tail);
     const content=inline(el,tail);
@@ -1572,7 +1683,7 @@ const toMarkdown=(root,running)=>{
     // data-start/data-end and *_streamingTextBlock mark the growing source block, often a
     // whole multi-item list. Its visible prefix must stream while it is still growing.
     // md keeps unfinished delimiters open and buffers only ambiguous link/card tails.
-    let value=md(root,!!running).replace(/\n{3,}/g,'\n\n').trim();
+    let value=normalizeMarkdown(md(root,!!running)).trim();
     // The current renderer exposes a zero-padded ordinal (001, 008, ...) before
     // hydrating the next list item. That placeholder is replaced by "8. text"
     // rather than appended, so it cannot be committed to an append-only stream.
@@ -1596,6 +1707,8 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
         if(node.nodeType===Node.TEXT_NODE)return String(node.nodeValue||'').replace(/\u00a0/g,' ');
         if(node.nodeType!==Node.ELEMENT_NODE||ignored(node)||node.tagName?.toLowerCase()==='a'&&artifactAnchor(node))return '';
         if(node.tagName?.toLowerCase()==='br')return '\n';
+        if(node.tagName?.toLowerCase()==='img')return String(node.getAttribute('alt')||'');
+        const formula=mathSource(node);if(formula)return formula.value;
         const value=children(node).map(text).join('');
         return blockTags.has(String(node.tagName||'').toLowerCase())?'\n'+value+'\n':value;
     };
@@ -1606,8 +1719,13 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
                 for(let parent=anchor;parent;parent=parent.parentElement){if(ignored(parent))return false;if(parent===node)break;}
                 return true;
             });
+        const images=[...(node.tagName?.toLowerCase()==='img'?[node]:[]),...node.querySelectorAll('img')].filter(image=>{
+            if(!imageTarget(image))return false;
+            for(let parent=image;parent;parent=parent.parentElement){if(ignored(parent)||artifactAnchor(parent))return false;if(parent===node)break;}
+            return true;
+        });
         return {pending_links:anchors.some(anchor=>!String(anchor.getAttribute('href')||'').trim()),
-            link_targets:anchors.map(anchor=>String(anchor.getAttribute('href')||'')).filter(Boolean)};
+            link_targets:[...anchors.map(anchor=>String(anchor.getAttribute('href')||'')).filter(Boolean),...images.map(imageTarget)]};
     };
     const segments=[];
     const push=(node,tag,markdown,group=null)=>{
@@ -1615,6 +1733,11 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
             ...range(node),...linkState(node),...(group?{group}:{}),streamable:false});
     };
     const flatten=root=>{
+        // Only layout containers may be flattened. A root list/quote/math block owns its
+        // delimiters too; flattening its children would drop them from the streamed answer.
+        if(!['div','section','article'].includes(root.tagName.toLowerCase())||root.hasAttribute('data-footnotes')||mathSource(root)){
+            push(root,root.tagName.toLowerCase(),toMarkdown(root,false));return;
+        }
         const nodes=children(root);
         if(!nodes.some(node=>node.nodeType===Node.ELEMENT_NODE&&blockTags.has(node.tagName.toLowerCase()))){
             push(root,'root',toMarkdown(root,false));return;
@@ -1623,7 +1746,7 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
         const flush=()=>{
             if(inline.length===0)return;
             markdownRunning=false;
-            const value=inline.map(node=>md(node,false)).join('').replace(/\n{3,}/g,'\n\n').trim();
+            const value=normalizeMarkdown(inline.map(node=>md(node,false)).join('')).trim();
             if(value){
                 const first=inline[0],links=inline.filter(node=>node.nodeType===Node.ELEMENT_NODE).map(linkState);
                 const ranges=inline.filter(node=>node.nodeType===Node.ELEMENT_NODE)
@@ -1638,15 +1761,19 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
         for(const node of nodes){
             if(node.nodeType!==Node.ELEMENT_NODE||!blockTags.has(node.tagName.toLowerCase())){inline.push(node);continue;}
             flush();const tag=node.tagName.toLowerCase();
-            const wrapper=['div','section','article'].includes(tag)&&!('source_start' in range(node))
+            const wrapper=['div','section','article'].includes(tag)&&!node.hasAttribute('data-footnotes')&&!mathSource(node)&&!('source_start' in range(node))
                 &&children(node).some(child=>child.nodeType===Node.ELEMENT_NODE&&blockTags.has(child.tagName.toLowerCase()));
             if(wrapper){flatten(node);continue;}
             const items=tag==='ul'||tag==='ol'?[...node.children].filter(child=>child.tagName.toLowerCase()==='li'):[];
             if(items.length){
                 const group=key(node)+':list';
+                const numbers=listNumbers(node,items);
+                let reset=0;
                 items.forEach((item,index)=>{
                     markdownRunning=false;
-                    push(item,tag+':item',listItem(item,tag==='ol',index,false).trim(),group);
+                    const newList=tag==='ol'&&index>0&&numbers[index]!==numbers[index-1]+1;
+                    if(newList)reset++;
+                    push(item,tag+':item',(newList?'<!-- -->\n\n':'')+listItem(item,tag==='ol',numbers[index],false).trim(),group+(reset?':'+reset:''));
                 });
             }else push(node,tag,toMarkdown(node,false));
         }

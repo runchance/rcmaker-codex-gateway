@@ -766,8 +766,17 @@ final class McpProtocol
     {
         $remainingMs = self::$rpcDeadlineAt === null ? self::HOST_RPC_SLICE_MS
             : max(0, min(self::HOST_RPC_SLICE_MS, (int) floor((self::$rpcDeadlineAt - microtime(true)) * 1000)));
-        $result = ToolBroker::waitResult($token, $callId,
-            (int) GatewaySettings::internal()['mcp_invoke_timeout_ms'], true, $remainingMs);
+        try {
+            $result = ToolBroker::waitResult($token, $callId,
+                (int) GatewaySettings::internal()['mcp_invoke_timeout_ms'], true, $remainingMs);
+        } catch (GatewayError $error) {
+            // The RPC has failed, but its already-issued native call can still settle.
+            // Preserve the typed failure so a stopped Web final cannot wait forever
+            // for delivery through this closed RPC. Never mark its result delivered.
+            try { ToolBroker::recordWaitTransportFailure($token, $callId, $error->errorCode); }
+            catch (\Throwable) { /* Preserve the original transport error. */ }
+            throw $error;
+        }
         if (!empty($result['pending'])) {
             // Even a receipt settling while stdout is flushed must not be acknowledged
             // by this pending frame: the model has not received its real output yet.
