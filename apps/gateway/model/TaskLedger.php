@@ -1763,6 +1763,30 @@ final class TaskLedger
         });
     }
 
+    /**
+     * Persist a bounded task-session identity verification without changing task completion.
+     * @param string $responseId Current response owning this task session.
+     * @param bool $verified Whether the task document reflects the successfully applied native identity.
+     * @param string $code Gateway-authored verification phase, without browser/account content.
+     * @param int $attempt Bounded initialization attempt count.
+     * @param string $incarnation Observer incarnation claiming the surface.
+     * @param int $fence Exact ownership fence; stale callbacks cannot record against a newer owner.
+     * @throws GatewayError For a superseded response or changed ownership.
+     */
+    public static function browserIdentityObserved(string $responseId, bool $verified, string $code, int $attempt,
+        string $incarnation, int $fence): void
+    {
+        Schema::transaction(function () use ($responseId, $verified, $code, $attempt, $incarnation, $fence): void {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if (!self::ownsCurrentGeneration($job, $turn)) {
+                throw new GatewayError('response_superseded', '旧网页回合已被新的用户指令接管。', 409);
+            }
+            self::assertFence($surface, $incarnation, $fence);
+            self::eventUnlocked($job['task_id'], $turn['id'], $responseId, $surface['id'], 'browser_identity_observed',
+                ['ready'=>$verified, 'code'=>$code, 'attempt'=>$attempt]);
+        });
+    }
+
     /** Rotate document identity when the attached page performs a top-level document navigation. */
     public static function documentChanged(string $surfaceId, string $incarnation, int $fence, string $url): void
     {

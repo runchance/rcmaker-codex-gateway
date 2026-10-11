@@ -10,6 +10,64 @@ final class ResponsesProtocol
     // while allowing the full Step 08 per-turn payload without copying image bytes into the prompt.
     public const MAX_BODY_BYTES = 80000000;
 
+    /**
+     * Answer the desktop's explicitly app-generated composer prediction locally.
+     * This is not task continuation or intent classification: the native request
+     * declares that the human did not write it and permits a null suggestion.
+     * Returning that empty suggestion avoids uploading a finished task again or
+     * spending the user's selected Pro quota on an invisible background feature.
+     * @param string $raw Decoded native JSON after HTTP turn metadata was merged.
+     * @return ?array{stream:bool,response:array,events:array} Null for every ordinary request.
+     */
+    public static function localComposerSuggestion(string $raw): ?array
+    {
+        if ($raw === '' || strlen($raw) > self::MAX_BODY_BYTES) return null;
+        try { $body = json_decode($raw, false, 64, JSON_THROW_ON_ERROR); }
+        catch (\Throwable) { return null; }
+        if (!$body instanceof \stdClass || !is_string($body->model ?? null)
+            || !str_starts_with($body->model, 'chatgpt-web/') || !is_array($body->input ?? null)
+            || $body->input === [] || (isset($body->stream) && !is_bool($body->stream))) return null;
+        try { $metadata = self::turnMetadata($body->client_metadata ?? null); }
+        catch (GatewayError) { return null; }
+        if (empty($metadata['thread_id']) || empty($metadata['turn_id'])
+            || !in_array($metadata['client_id'] ?? 'codex', ['codex'], true)) return null;
+        $last = $body->input[array_key_last($body->input)];
+        if (!$last instanceof \stdClass || ($last->role ?? null) !== 'user'
+            || (isset($last->type) && $last->type !== 'message') || !is_array($last->content ?? null)
+            || count($last->content) !== 1) return null;
+        $part = $last->content[0];
+        if (!$part instanceof \stdClass || ($part->type ?? null) !== 'input_text'
+            || !is_string($part->text ?? null)) return null;
+        $text = $part->text;
+        if (!str_starts_with($text,
+            "This is an app-generated request for a suggested next user message. The user did not write this message.\n\n")
+            || !str_contains($text, "Your suggestion will appear in the user's empty message composer. They can accept it, edit it, or ignore it; it will not be sent automatically.")
+            || !preg_match('/Return (?:only )?JSON matching this schema:\s*(\{[^\n]+\})\.\s*$/D', $text, $match)) return null;
+        $schema = json_decode($match[1], true);
+        if (!is_array($schema) || ($schema['type'] ?? null) !== 'object'
+            || ($schema['required'] ?? null) !== ['suggestion'] || ($schema['additionalProperties'] ?? null) !== false
+            || !is_array($schema['properties'] ?? null)
+            || array_keys($schema['properties'] ?? []) !== ['suggestion']
+            || !is_array($schema['properties']['suggestion'])
+            || ($schema['properties']['suggestion']['anyOf'] ?? null) !== [['type'=>'string'], ['type'=>'null']]) return null;
+        $key = substr(hash('sha256', $raw), 0, 24);
+        $responseId = 'resp_' . $key;
+        $itemId = 'msg_' . $key;
+        $answer = '{"suggestion":null}';
+        $events = array_merge(self::initialEvents($responseId), self::openOutputEvents($itemId),
+            [self::deltaEvent($itemId, $answer)], self::completionEvents($responseId, $itemId, $answer));
+        foreach ($events as $sequence => &$event) {
+            $event['sequence_number'] = $sequence;
+            if (isset($event['response'])) {
+                $event['response']['model'] = $body->model;
+                $event['response']['usage'] = ['input_tokens'=>0, 'output_tokens'=>0, 'total_tokens'=>0];
+            }
+        }
+        unset($event);
+        return ['stream'=>($body->stream ?? false) === true,
+            'response'=>$events[array_key_last($events)]['response'], 'events'=>$events];
+    }
+
     /** Parse supported Codex wire fields while preserving history, host-tool permissions and browser identity. */
     public static function parse(string $raw): array
     {

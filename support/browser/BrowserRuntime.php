@@ -41,6 +41,8 @@ final class BrowserRuntime
 
     private CdpClient $cdp;
     private CdpClient $taskCdp;
+    /** Native Client Hints cached only with the actual owned browser's version identity. */
+    private ?array $taskBrowserIdentityCache = null;
     private ?array $ownedProcess = null;
     private bool $recovered = false;
     private bool $responsesRecovered = false;
@@ -2333,6 +2335,7 @@ JS;
         $profile = (string) Config::get('gateway', 'browser_profile_dir');
         if ($socket === '' || !BrowserProcess::endpointMatches($profile, $port, $socket)) return;
         $this->taskConnecting = true;
+        if ($this->taskBrowserSocket !== $socket) $this->taskBrowserIdentityCache = null;
         $this->taskBrowserSocket = $socket;
         try {
             $this->taskCdp->connect(
@@ -2520,7 +2523,7 @@ JS;
                                 function ($focusError) use ($responseId, $commandId, $sessionId, $recover): void {
                                     if ($focusError !== null) { $this->taskFailTurn($responseId,'CHATGPT_FOCUS_FAILED','任务页面无法保持交互焦点。',$recover); return; }
                                     $this->applyTaskBrowserIdentity($sessionId,
-                                        fn() => $this->prepareTaskTemporarySurface($responseId, $commandId, $sessionId, $recover));
+                                        fn() => $this->prepareTaskTemporarySurface($responseId, $commandId, $sessionId, $recover), $recover);
                                 }, 3.0);
                         }, 3.0);
                     }, 3.0);
@@ -2532,23 +2535,99 @@ JS;
      * Declare the same RCMAKER identity on every claimed task session, including retained turns
      * and reconnects. CDP overrides end when a session detaches, so fresh-page-only initialization
      * would lose the identity on the next user turn. This changes no document or navigation and
-     * does not resend work. Read native metadata from the controlled secure page; unsupported
-     * browsers keep their default identity. Login/setup pages are never overridden here.
+     * does not resend work. Prefer the task's secure document; a fresh about:blank page
+     * may reuse matching native metadata or read the secure setup page as a fallback.
+     * Every override is verified on the owned task session before an unsent task proceeds.
+     * Login/setup pages are never overridden here. Recovery preserves already submitted work.
      *
      * @param string $sessionId Claimed owned task session.
      * @param callable $after Continue the existing surface initialization after this bounded step.
+     * @param bool $recover Whether this session reconnects to work already submitted.
+     * @param int $attempt Internal bounded retry count; no navigation or submission is repeated.
      */
-    private function applyTaskBrowserIdentity(string $sessionId, callable $after): void
+    private function applyTaskBrowserIdentity(string $sessionId, callable $after, bool $recover = false, int $attempt = 1): void
     {
-        $continue = function () use ($sessionId, $after): void {
-            if (isset($this->taskSessions[$sessionId]) && $this->taskCdp->ready()) $after();
+        if (!isset($this->taskSessions[$sessionId]) || !$this->taskCdp->ready()) return;
+        $owner = $this->taskSessions[$sessionId];
+        $responseId = (string)$owner['response_id'];
+        $current = function () use ($sessionId, $owner): bool {
+            $session = $this->taskSessions[$sessionId] ?? [];
+            return $this->taskCdp->ready() && ($session['response_id'] ?? null) === $owner['response_id']
+                && ($session['owner_incarnation'] ?? null) === $owner['owner_incarnation']
+                && ($session['fencing_version'] ?? null) === $owner['fencing_version'];
         };
-        if (!$this->cdp->ready()) { $continue(); return; }
+        $continue = function () use ($current, $after): void {
+            if ($current()) $after();
+        };
+        $failed = function (string $code) use ($sessionId, $responseId, $after, $recover, $attempt, $continue, $current): void {
+            if (!$current()) return;
+            if ($attempt < 3) {
+                Timer::add(0.2, function () use ($current, $sessionId, $after, $recover, $attempt): void {
+                    if ($current()) $this->applyTaskBrowserIdentity($sessionId, $after, $recover, $attempt + 1);
+                }, null, false);
+                return;
+            }
+            $this->taskSessions[$sessionId]['browser_identity_applied'] = false;
+            if (!$this->recordTaskBrowserIdentity($sessionId, false, $code, $attempt)) {
+                unset($this->taskSessions[$sessionId]);
+                $this->detachTaskSessionRaw($sessionId);
+                return;
+            }
+            // A reconnect cannot cancel or replay previously submitted effects merely
+            // because identity initialization is temporarily unreadable. Keep observing it.
+            if ($recover) { $continue(); return; }
+            $this->taskFailTurn($responseId, 'CHATGPT_BROWSER_IDENTITY_UNVERIFIED',
+                '任务页产品标识初始化未能验证，任务尚未发送。');
+            if ($current()) {
+                unset($this->taskSessions[$sessionId]);
+                $this->detachTaskSessionRaw($sessionId);
+            }
+        };
         $this->taskCdp->send('Browser.getVersion', [], null,
-            function ($versionError, $version) use ($sessionId, $continue): void {
+            function ($versionError, $version) use ($sessionId, $continue, $failed, $attempt, $current): void {
+                if (!$current()) return;
                 $userAgent = (string) ($version['userAgent'] ?? '');
-                if ($versionError !== null || $userAgent === '') { $continue(); return; }
-                $expression = <<<'JS'
+                if ($versionError !== null || $userAgent === '') { $failed('version_unavailable'); return; }
+                $apply = function (?array $parameters) use ($sessionId, $userAgent, $continue, $failed, $attempt, $current): void {
+                    if (!$current()) return;
+                    if ($parameters === null) { $failed('native_metadata_unavailable'); return; }
+                    $this->taskBrowserIdentityCache = ['native_user_agent'=>$userAgent, 'parameters'=>$parameters];
+                    $this->taskCdp->send('Network.setUserAgentOverride', $parameters, $sessionId,
+                        function ($error) use ($sessionId, $parameters, $continue, $failed, $attempt, $current): void {
+                            if (!$current()) return;
+                            if ($error !== null) { $failed('override_failed'); return; }
+                            $expression = '(()=>({user_agent:navigator.userAgent,platform:navigator.platform}))()';
+                            $this->taskCdp->send('Runtime.evaluate', ['expression'=>$expression, 'returnByValue'=>true], $sessionId,
+                                function ($verifyError, $result) use ($sessionId, $parameters, $continue, $failed, $attempt, $current): void {
+                                    if (!$current()) return;
+                                    $actual = $result['result']['value'] ?? null;
+                                    if ($verifyError !== null || !is_array($actual)
+                                        || ($actual['user_agent'] ?? null) !== $parameters['userAgent']
+                                        || ($actual['platform'] ?? null) !== $parameters['platform']) {
+                                        $failed('verification_failed'); return;
+                                    }
+                                    $this->taskSessions[$sessionId]['browser_identity_applied'] = true;
+                                    if (!$this->recordTaskBrowserIdentity($sessionId, true, 'verified', $attempt)) {
+                                        unset($this->taskSessions[$sessionId]);
+                                        $this->detachTaskSessionRaw($sessionId);
+                                        return;
+                                    }
+                                    $continue();
+                                }, 3.0);
+                        }, 3.0);
+                };
+                if (($this->taskBrowserIdentityCache['native_user_agent'] ?? null) === $userAgent) {
+                    $apply($this->taskBrowserIdentityCache['parameters']);
+                    return;
+                }
+                $this->readTaskBrowserIdentity($sessionId, $userAgent, $apply);
+            }, 3.0);
+    }
+
+    /** Read native hints on the task; only a fresh/insecure page needs the unchanged secure setup fallback. */
+    private function readTaskBrowserIdentity(string $sessionId, string $userAgent, callable $after): void
+    {
+        $expression = <<<'JS'
 (async()=>{
   const data=navigator.userAgentData;
   if(!data||typeof data.getHighEntropyValues!=='function')return null;
@@ -2558,23 +2637,39 @@ JS;
   return {platform:navigator.platform,metadata:value};
 })()
 JS;
-                $this->cdp->send('Runtime.evaluate', ['expression' => $expression,
-                    'returnByValue' => true, 'awaitPromise' => true], null,
-                    function ($metadataError, $result) use ($sessionId, $userAgent, $continue): void {
+        $this->taskCdp->send('Runtime.evaluate', ['expression'=>$expression, 'returnByValue'=>true, 'awaitPromise'=>true], $sessionId,
+            function ($error, $result) use ($sessionId, $userAgent, $expression, $after): void {
+                if (!isset($this->taskSessions[$sessionId])) return;
+                $identity = $result['result']['value'] ?? null;
+                $parameters = $error === null && is_array($identity)
+                    ? BrowserProcess::taskIdentityParameters($userAgent, $identity) : null;
+                if ($parameters !== null || !$this->cdp->ready()) { $after($parameters); return; }
+                $this->cdp->send('Runtime.evaluate', ['expression'=>$expression, 'returnByValue'=>true, 'awaitPromise'=>true], null,
+                    function ($fallbackError, $fallback) use ($sessionId, $userAgent, $after): void {
                         if (!isset($this->taskSessions[$sessionId])) return;
-                        $identity = $result['result']['value'] ?? null;
-                        $parameters = $metadataError === null && is_array($identity)
-                            ? BrowserProcess::taskIdentityParameters($userAgent, $identity) : null;
-                        if ($parameters === null) { $continue(); return; }
-                        $this->taskCdp->send('Network.setUserAgentOverride', $parameters, $sessionId,
-                            function ($error) use ($sessionId, $continue): void {
-                                if (isset($this->taskSessions[$sessionId])) {
-                                    $this->taskSessions[$sessionId]['browser_identity_applied'] = $error === null;
-                                }
-                                $continue();
-                            }, 3.0);
+                        $identity = $fallback['result']['value'] ?? null;
+                        $after($fallbackError === null && is_array($identity)
+                            ? BrowserProcess::taskIdentityParameters($userAgent, $identity) : null);
                     }, 3.0);
             }, 3.0);
+    }
+
+    /** Diagnostics are best-effort; return false only for a missing session or authoritative ownership loss. */
+    private function recordTaskBrowserIdentity(string $sessionId, bool $verified, string $code, int $attempt): bool
+    {
+        $session = $this->taskSessions[$sessionId] ?? null;
+        if (!is_array($session)) return false;
+        try {
+            TaskLedger::browserIdentityObserved((string)$session['response_id'], $verified, $code, $attempt,
+                (string)$session['owner_incarnation'], (int)$session['fencing_version']);
+        } catch (\Throwable $error) {
+            $this->taskSessions[$sessionId]['browser_identity_audit_error'] = $error instanceof GatewayError
+                ? $error->errorCode : get_class($error);
+            if ($error instanceof GatewayError && in_array($error->errorCode, ['response_superseded', 'surface_fence_lost'], true)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Ensure a fresh task owns an isolated Temporary Chat before any prompt state is observed. */

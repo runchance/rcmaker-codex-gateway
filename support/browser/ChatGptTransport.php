@@ -809,9 +809,11 @@ final class ChatGptTransport
     }
 
     /**
-     * Partition whole ordered records with a smaller final-message envelope when needed.
+     * Partition whole indexed records with a smaller final-message envelope when needed.
      * Dynamic suffix feasibility takes O(parts * records), including empty transport parts;
-     * no record is truncated, split or silently omitted. Pinned limits make recovery deterministic.
+     * no record is truncated, split or silently omitted. Proven recovery may stage settled
+     * receipts after the active user record, leaving that intent in the commit; original
+     * message_index values still reconstruct the exact chronology. Pinned limits make recovery deterministic.
      */
     private static function partitionBoundedRecords(array $records, int $parts, string $contract, array $budget): array
     {
@@ -860,6 +862,23 @@ final class ChatGptTransport
             if ($strictFallback !== $makeLimits(false)) {
                 $strict = self::partitionIntentTail($records, $weights, $strictFallback, $finalStart);
                 if ($strict !== null) return $strict;
+            }
+            if (!empty($budget['recovery_receipt_staging'])) {
+                $finalLimit = $strictFallback[$parts - 1];
+                $tail = array_slice($weights, $finalStart);
+                if (array_sum(array_column($tail, 'tokens')) > $finalLimit['tokens']
+                    || array_sum(array_column($tail, 'chars')) > $finalLimit['chars']) {
+                    // Recovery has already proved these receipts settled. Their original
+                    // indices remain authoritative; moving only the active user record's
+                    // physical part does not reorder the reconstructed conversation.
+                    $stagedRecords = array_merge(array_slice($records, 0, $finalStart),
+                        array_slice($records, $finalStart + 1), [$records[$finalStart]]);
+                    $stagedWeights = array_merge(array_slice($weights, 0, $finalStart),
+                        array_slice($weights, $finalStart + 1), [$weights[$finalStart]]);
+                    $recovered = self::partitionIntentTail($stagedRecords, $stagedWeights,
+                        $strictFallback, count($stagedRecords) - 1);
+                    if ($recovered !== null) return $recovered;
+                }
             }
             // More Medium stages may be needed to keep all earlier records out of the
             // selected-effort commit. Preserve the old balanced fallback at the cap.

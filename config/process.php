@@ -10,7 +10,8 @@ return [
         'default_app' => 'console',
         'reusePort' => false,
         'memory_limit' => '128M',
-        'max_request' => 100000,
+        // Inherit the framework engine's configured recycling limit; polling must not
+        // silently replace the operator's long-running gateway setting with 100,000.
     ],
     'RC_GATEWAY_API' => [
         'type' => 'app',
@@ -21,7 +22,7 @@ return [
         // JSON decoding and native forwarding need room for the existing 80 MB envelope.
         'memory_limit' => '512M',
         'package_max_length' => app\gateway\model\ResponsesProtocol::MAX_BODY_BYTES + 16384 + 4,
-        'max_request' => 100000,
+        // Inherit max_request from config/worker.php (or the selected engine).
         'bootstrap' => [app\gateway\bootstrap\HttpLimits::class, RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_GATEWAY_PROBE' => [

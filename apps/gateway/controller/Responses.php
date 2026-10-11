@@ -75,6 +75,22 @@ final class Responses
             }
             $phase = 'metadata';
             $raw = $this->withMetadata($request, $raw);
+            $phase = 'composer_suggestion';
+            $suggestion = ResponsesProtocol::localComposerSuggestion($raw);
+            if ($suggestion !== null) {
+                if (!$suggestion['stream']) {
+                    return $request->json($suggestion['response']);
+                }
+                $frames = '';
+                foreach ($suggestion['events'] as $event) {
+                    $frames .= 'event: ' . $event['type'] . "\ndata: "
+                        . json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
+                        . "\n\n";
+                }
+                return $request->response($frames, 200, [
+                    'Content-Type' => 'text/event-stream', 'Cache-Control' => 'no-cache',
+                ]);
+            }
             $phase = 'portability';
             if ((int) GatewaySettings::internal()['official_handoff_summary'] === 1) {
                 $plan = ContextPortability::prepareNativeHandoff($raw, $this->nativeHeaders($request));
@@ -101,6 +117,12 @@ final class Responses
             ResponseTransport::nonStream($connection, $responseId);
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
+            // Codex replaces these details with its generic context-window message.
+            // Admission failures precede job creation, so keep structural evidence
+            // in the existing diagnostic sink without logging any request content.
+            if (in_array($error->errorCode, ['context_length_exceeded', 'CHATGPT_CONTEXT_TOO_LARGE', 'CHATGPT_MESSAGE_TOO_LARGE'], true)) {
+                $this->logUnexpectedCreateFailure($error, $phase . ':' . $error->errorCode);
+            }
             return $this->error($request, $error);
         } catch (\Throwable $error) {
             $diagnosticId = $this->logUnexpectedCreateFailure($error, $phase);

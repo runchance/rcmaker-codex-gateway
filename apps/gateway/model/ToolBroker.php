@@ -617,6 +617,12 @@ final class ToolBroker
         $transport = (string)$retrySpec['transport_context_json'];
         if ($missingSurface) {
             if (!self::hasCompleteReceiptHistory($binding, $job)) return null;
+            // A recovered turn may contain hundreds of settled receipts after its
+            // latest user message. They are immutable context, not new actions:
+            // allow staging them by their original indices instead of forcing all
+            // of them into the one executable commit. Persist this recovery-only
+            // policy so reconnects rebuild exactly the same multipart envelopes.
+            $budget['recovery_receipt_staging'] = true;
         }
         // Every retry retires the original page. Never carry its delta-only control prompt.
         $newPrompt = self::controlPrompt($newToken, $transport, $job['checkpoint_marker'] ?? null,
