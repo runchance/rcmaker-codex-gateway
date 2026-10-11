@@ -84,7 +84,7 @@ try {
         assert.ok(notes.compareVersions(notes.parseVersion('v9007199254740992.0.0'), notes.parseVersion('v9007199254740993.0.0')) < 0);
     });
 
-    test('fresh history produces complete bilingual first-release notes', () => {
+    test('fresh history produces English-only notes even with Chinese commit titles', () => {
         const repoRoot = fixture();
         const sha = commit(repoRoot, '初始提交：新的仓库', { 'apps/gateway/bridge.php': '<?php', 'config/app.php': '<?php' });
         git(repoRoot, ['tag', '-a', 'v1.0.0', '-m', 'first annotated release']);
@@ -95,24 +95,25 @@ try {
         assert.equal(result.metadata.prerelease, false);
         assert.equal(result.metadata.commit_count, 1);
         assert.equal(result.metadata.subsystem_counts.gateway, 1);
-        assert.match(result.files['release-notes.zh-CN.md'], /首个适用版本/);
         assert.match(result.files['release-notes.en.md'], /first applicable release/);
-        for (const language of ['zh-CN', 'en']) {
-            const text = result.files[`release-notes.${language}.md`];
-            for (const expected of ['PHP 8.5', 'Linux x86_64', 'Linux AArch64', 'macOS x86_64', 'macOS AArch64', 'Windows x86_64', 'SHA256SUMS', 'release-manifest.json', '`data/`', '`.env`']) assert.ok(text.includes(expected));
+        for (const name of ['release-notes.md', 'release-notes.en.md']) {
+            const text = result.files[name];
+            for (const expected of ['PHP 8.5', 'Linux x86_64', 'Linux AArch64', 'macOS x86_64', 'macOS AArch64', 'Windows x86_64 (ZIP only)', 'no standalone EXE is published', 'SHA256SUMS', 'release-manifest.json', '`data/`', '`.env`']) assert.ok(text.includes(expected));
             assert.ok(text.includes(`https://github.com/${repository}/releases/tag/v1.0.0`));
             assert.ok(text.includes(`https://github.com/${repository}/commits/${sha}`));
-            assert.ok(text.includes('初始提交：新的仓库'));
+            assert.doesNotMatch(text, /\p{Script=Han}/u);
+            assert.ok(text.includes('Other changes: see commit for details'));
+            assert.ok(text.includes(`/commit/${sha}`));
         }
-        assert.match(result.files['release-notes.md'], /## 简体中文/);
-        assert.match(result.files['release-notes.md'], /## English/);
+        assert.equal(result.files['release-notes.zh-CN.md'], undefined);
+        assert.equal(result.files['release-notes.md'], result.files['release-notes.en.md']);
     });
 
     test('later release classifies only its range and escapes untrusted original titles', () => {
         const repoRoot = fixture();
         commit(repoRoot, 'initial source', { 'index.php': '<?php' });
         git(repoRoot, ['tag', 'v1.0.0']);
-        commit(repoRoot, 'feat(gateway): 支持中英 [link](https://evil.invalid) <img src=x> `code` $(); touch marker',
+        commit(repoRoot, 'feat(gateway): English [link](https://evil.invalid) <img src=x> `code` $(); touch marker',
             { 'apps/gateway/bridge.php': '<?php changed' }, 'Private-Prompt: DO_NOT_LEAK_THE_PRIVATE_PROMPT');
         commit(repoRoot, 'fix(runtime)!: preserve upgrade data', { 'support/process/worker.php': '<?php worker' });
         commit(repoRoot, '普通中文提交', { 'public/app.js': 'console.log(1)' });
@@ -128,34 +129,37 @@ try {
         assert.equal(result.metadata.subsystem_counts.gateway, 1);
         assert.equal(result.metadata.subsystem_counts.runtime, 1);
         assert.equal(result.metadata.subsystem_counts.console, 1);
-        assert.match(result.files['release-notes.zh-CN.md'], /新增功能 1 条/);
         assert.match(result.files['release-notes.en.md'], /Features: 1/);
         assert.ok(result.files['release-notes.en.md'].includes('\\[link\\]\\(https://evil\\.invalid\\)'));
-        assert.ok(result.files['release-notes.zh-CN.md'].includes('&lt;img src\\=x&gt;'));
-        assert.ok(result.files['release-notes.zh-CN.md'].includes('\\`code\\`'));
+        assert.ok(result.files['release-notes.en.md'].includes('&lt;img src\\=x&gt;'));
+        assert.ok(result.files['release-notes.en.md'].includes('\\`code\\`'));
+        assert.doesNotMatch(result.files['release-notes.en.md'], /\p{Script=Han}/u);
         assert.ok(!JSON.stringify(result.files).includes('DO_NOT_LEAK_THE_PRIVATE_PROMPT'));
         assert.ok(!fs.existsSync(path.join(repoRoot, 'marker')));
         assert.ok(result.metadata.changelog_url.endsWith('/compare/v1.0.0...v1.1.0'));
     });
 
-    test('paired bilingual commit fields provide true descriptions and retain originals', () => {
+    test('English commit notes do not need a Chinese pair and never leak private bodies', () => {
         const repoRoot = fixture();
         commit(repoRoot, 'seed');
         git(repoRoot, ['tag', 'v2.0.0']);
-        commit(repoRoot, 'fix: original subject', { 'config/app.php': '<?php' },
+        commit(repoRoot, 'fix: 中文原始标题', { 'config/app.php': '<?php' },
             'Secret: PRIVATE_BODY_MUST_NOT_APPEAR\nRelease-Note-ZH: 修复升级时的配置保留。\nRelease-Note-EN: Preserve configuration during upgrades.\nBREAKING CHANGE: review configuration');
         commit(repoRoot, 'docs: partial bilingual field', {}, 'Release-Note-ZH: UNPAIRED_MUST_NOT_APPEAR');
+        commit(repoRoot, 'feat: 中文功能', {}, 'Release-Note-EN: Add English release notes.');
         git(repoRoot, ['tag', 'v2.0.1']);
         const result = generate(repoRoot, 'v2.0.1');
-        assert.ok(result.files['release-notes.zh-CN.md'].includes('修复升级时的配置保留。'));
         assert.ok(result.files['release-notes.en.md'].includes('Preserve configuration during upgrades\\.'));
-        for (const name of ['release-notes.zh-CN.md', 'release-notes.en.md']) {
-            assert.ok(result.files[name].includes('fix: original subject'));
+        assert.ok(result.files['release-notes.en.md'].includes('Add English release notes\\.'));
+        for (const name of ['release-notes.md', 'release-notes.en.md']) {
+            assert.doesNotMatch(result.files[name], /\p{Script=Han}/u);
             assert.ok(result.files[name].includes('docs: partial bilingual field'));
             assert.ok(!result.files[name].includes('PRIVATE_BODY_MUST_NOT_APPEAR'));
             assert.ok(!result.files[name].includes('UNPAIRED_MUST_NOT_APPEAR'));
         }
         assert.equal(result.metadata.breaking_change_count, 1);
+        assert.equal(notes.englishNote('Release-Note-EN: 中文'), null);
+        assert.equal(notes.englishNote('Release-Note-EN: first\nRelease-Note-EN: second'), null);
     });
 
     test('prereleases use earlier same-version prereleases and ignore another line', () => {
@@ -172,7 +176,6 @@ try {
         assert.equal(result.metadata.previous_tag, 'v1.1.0-beta.1');
         assert.equal(result.metadata.prerelease, true);
         assert.equal(result.metadata.commit_count, 2);
-        assert.match(result.files['release-notes.zh-CN.md'], /预发布版本/);
         assert.match(result.files['release-notes.en.md'], /Prerelease/);
     });
 
@@ -238,10 +241,9 @@ try {
         assert.equal(result.metadata.commit_count, 0);
         assert.equal(result.metadata.changed_file_count, 0);
         assert.match(result.files['release-notes.en.md'], /no additional commits/i);
-        assert.match(result.files['release-notes.zh-CN.md'], /没有新增提交/);
     });
 
-    test('paired committed manual overrides replace generated language bodies', () => {
+    test('committed English override wins and a legacy Chinese override is ignored', () => {
         const repoRoot = fixture();
         commit(repoRoot, 'docs: authored release notes', {
             '.github/release-notes/v4.0.0.zh-CN.md': '# 人工中文说明\r\n\r\n本次更新说明。\r\n',
@@ -250,22 +252,32 @@ try {
         git(repoRoot, ['tag', 'v4.0.0']);
         fs.writeFileSync(path.join(repoRoot, '.github/release-notes/v4.0.0.en.md'), 'UNCOMMITTED_MUST_NOT_APPEAR');
         const result = generate(repoRoot, 'v4.0.0');
-        assert.equal(result.metadata.notes_source, 'committed-bilingual-overrides');
-        assert.equal(result.files['release-notes.zh-CN.md'], '# 人工中文说明\n\n本次更新说明。\n');
+        assert.equal(result.metadata.notes_source, 'committed-english-override');
+        assert.equal(result.files['release-notes.zh-CN.md'], undefined);
         assert.equal(result.files['release-notes.en.md'], '# Authored English notes\n\nRelease details.\n');
         assert.ok(!result.files['release-notes.md'].includes('UNCOMMITTED_MUST_NOT_APPEAR'));
     });
 
-    test('one-sided or empty manual overrides fail clearly', () => {
+    test('English-only overrides work; legacy Chinese-only files do not block releases', () => {
         const repoRoot = fixture();
         commit(repoRoot, 'docs: incomplete overrides', { '.github/release-notes/v4.1.0.zh-CN.md': '只有中文' });
         git(repoRoot, ['tag', 'v4.1.0']);
-        assert.throws(() => generate(repoRoot, 'v4.1.0'), /must include both/);
+        assert.match(generate(repoRoot, 'v4.1.0').files['release-notes.en.md'], /first applicable release/);
+        commit(repoRoot, 'docs: English-only notes', { '.github/release-notes/v4.1.1.en.md': '# English only\n' });
+        git(repoRoot, ['tag', 'v4.1.1']);
+        assert.equal(generate(repoRoot, 'v4.1.1').files['release-notes.md'], '# English only\n');
+    });
+
+    test('empty or Chinese English overrides fail clearly', () => {
+        const repoRoot = fixture();
         commit(repoRoot, 'docs: empty English override', {
             '.github/release-notes/v4.1.1.zh-CN.md': '只有中文', '.github/release-notes/v4.1.1.en.md': ' \n\n',
         });
         git(repoRoot, ['tag', 'v4.1.1']);
         assert.throws(() => generate(repoRoot, 'v4.1.1'), /nonempty Markdown/);
+        commit(repoRoot, 'docs: wrong-language English override', { '.github/release-notes/v4.1.2.en.md': '# 中文\n' });
+        git(repoRoot, ['tag', 'v4.1.2']);
+        assert.throws(() => generate(repoRoot, 'v4.1.2'), /must not contain Chinese/);
     });
 
     test('100 detail entries cap preserves full counts and complete changelog', () => {
@@ -280,7 +292,6 @@ try {
         assert.equal(result.metadata.category_counts.fix, 105);
         assert.equal((result.files['release-notes.en.md'].match(/^- Original commit:/gm) || []).length, 100);
         assert.match(result.files['release-notes.en.md'], /latest 100 of 105 commits/);
-        assert.match(result.files['release-notes.zh-CN.md'], /最新 100 条提交，共有 105 条/);
         assert.ok(result.files['release-notes.en.md'].includes('/compare/v5.0.0...v5.0.1'));
     });
 

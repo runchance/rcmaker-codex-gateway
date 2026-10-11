@@ -5,7 +5,9 @@ const { test } = require('node:test');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
-const { run, configuration, TARGETS, targetNames } = require('../scripts/publish-release.cjs');
+const { deflateRawSync } = require('node:zlib');
+const { execFileSync } = require('node:child_process');
+const { run, configuration, TARGETS, targetNames, checksumText } = require('../scripts/publish-release.cjs');
 
 const TAG = 'v1.2.3';
 const COMMIT = 'a'.repeat(40);
@@ -36,8 +38,66 @@ function binary(target, salt = 'first') {
     return data;
 }
 
+/** Generate a real small ZIP fixture with stored/deflated entries and optional data descriptors. */
+function windowsZip(data, { stored = false, descriptor = false, binaryName = 'rcmaker-codex-gateway.exe' } = {}) {
+    const entries = [[binaryName, data], ...['LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES', '.env.example'].map(name => [name, Buffer.from(name)])];
+    const locals = [];
+    const central = [];
+    let offset = 0;
+    for (const [name, bytes] of entries) {
+        const filename = Buffer.from(name);
+        const compressed = stored ? bytes : deflateRawSync(bytes);
+        let crc = 0xffffffff;
+        for (const value of bytes) {
+            crc ^= value;
+            for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+        }
+        crc = (crc ^ 0xffffffff) >>> 0;
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50);
+        local.writeUInt16LE(20, 4);
+        local.writeUInt16LE(descriptor ? 8 : 0, 6);
+        local.writeUInt16LE(stored ? 0 : 8, 8);
+        if (!descriptor) {
+            local.writeUInt32LE(crc, 14);
+            local.writeUInt32LE(compressed.length, 18);
+            local.writeUInt32LE(bytes.length, 22);
+        }
+        local.writeUInt16LE(filename.length, 26);
+        const receipt = Buffer.alloc(descriptor ? 16 : 0);
+        if (descriptor) {
+            receipt.writeUInt32LE(0x08074b50);
+            receipt.writeUInt32LE(crc, 4);
+            receipt.writeUInt32LE(compressed.length, 8);
+            receipt.writeUInt32LE(bytes.length, 12);
+        }
+        locals.push(local, filename, compressed, receipt);
+        const record = Buffer.alloc(46);
+        record.writeUInt32LE(0x02014b50);
+        record.writeUInt16LE(20, 4);
+        record.writeUInt16LE(20, 6);
+        record.writeUInt16LE(descriptor ? 8 : 0, 8);
+        record.writeUInt16LE(stored ? 0 : 8, 10);
+        record.writeUInt32LE(crc, 16);
+        record.writeUInt32LE(compressed.length, 20);
+        record.writeUInt32LE(bytes.length, 24);
+        record.writeUInt16LE(filename.length, 28);
+        record.writeUInt32LE(offset, 42);
+        central.push(record, filename);
+        offset += local.length + filename.length + compressed.length + receipt.length;
+    }
+    const directory = Buffer.concat(central);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50);
+    end.writeUInt16LE(entries.length, 8);
+    end.writeUInt16LE(entries.length, 10);
+    end.writeUInt32LE(directory.length, 12);
+    end.writeUInt32LE(offset, 16);
+    return Buffer.concat([...locals, directory, end]);
+}
+
 /** Create all five signed-manifest fixtures, optionally nesting CI artifact folders. */
-async function fixture(t, { tag = TAG, salt = 'first', nested = true, prerelease = tag.includes('-') } = {}) {
+async function fixture(t, { tag = TAG, salt = 'first', nested = true, prerelease = tag.includes('-'), zipOptions = {} } = {}) {
     const fixtureBase = path.resolve(__dirname, '../../data/generated/release-publish-tests');
     await fsp.mkdir(fixtureBase, { recursive: true });
     const root = await fsp.mkdtemp(path.join(fixtureBase, 'fixture-'));
@@ -57,7 +117,8 @@ async function fixture(t, { tag = TAG, salt = 'first', nested = true, prerelease
         await fsp.mkdir(directory, { recursive: true });
         const names = targetNames(tag, target);
         const data = binary(target, salt);
-        const archive = Buffer.from(`Archive fixture ${tag} ${target.platform} ${target.arch} ${salt}`);
+        const archive = target.platform === 'windows' ? windowsZip(data, zipOptions)
+            : Buffer.from(`Archive fixture ${tag} ${target.platform} ${target.arch} ${salt}`);
         const manifest = {
             tag, commit: COMMIT, php: '8.5', encrypted: true, platform: target.platform, arch: target.arch,
             host_php: '8.5.1', format: target.format, payload: { files: 10, php_files: 8, signature: 'SHA-256' },
@@ -72,7 +133,6 @@ async function fixture(t, { tag = TAG, salt = 'first', nested = true, prerelease
         }
     }
     await fsp.writeFile(path.join(notesDir, 'release-metadata.json'), JSON.stringify({ tag, commit: COMMIT, previous_tag: 'v1.2.2', prerelease }));
-    await fsp.writeFile(path.join(notesDir, 'release-notes.zh-CN.md'), '# 更新\n\n修复。\n');
     await fsp.writeFile(path.join(notesDir, 'release-notes.en.md'), '# Changes\n\nFixed.\n');
     const env = { RELEASE_TAG: tag, RELEASE_COMMIT: COMMIT, GITHUB_REPOSITORY: 'example/gateway', GITHUB_TOKEN: 'fixture-token-never-log', RELEASE_OUTPUT_DIR: outputDir, RELEASE_NOTES_DIR: notesDir };
     return { root, outputDir, notesDir, locations, env };
@@ -107,11 +167,14 @@ class GitHubFixture {
         this.failCreate = null;
         this.failRecovery = null;
         this.creationAttempted = false;
+        this.otherReleases = [];
     }
 
     /** Produce public API release metadata, intentionally omitting inline assets. */
     releaseValue(draft) {
-        return { id: 1, tag_name: this.tag, draft, prerelease: this.tag.includes('-'), upload_url: `https://uploads.github.com/repos/example/gateway/releases/1/assets{?name,label}` };
+        return { id: 1, tag_name: this.tag, draft, prerelease: this.tag.includes('-'),
+            published_at: draft ? null : '2026-10-10T13:00:00Z',
+            upload_url: `https://uploads.github.com/repos/example/gateway/releases/1/assets{?name,label}` };
     }
 
     /** Store one remote asset and its server digest. */
@@ -179,9 +242,17 @@ class GitHubFixture {
             return this.response({ object: this.annotated ? { type: 'tag', sha: 'c'.repeat(40) } : { type: 'commit', sha: this.remoteCommit } });
         }
         if (endpoint === `/git/tags/${'c'.repeat(40)}`) return this.response({ object: { type: 'commit', sha: this.remoteCommit } });
-        if (endpoint === '/releases/latest') return this.latestTag ? this.response({ id: 2, tag_name: this.latestTag, draft: false, prerelease: false }) : this.response({}, 404);
+        if (endpoint === '/releases/latest') {
+            if (this.latestTag) return this.response(this.otherReleases.find(release => release.tag_name === this.latestTag)
+                || { id: 2, tag_name: this.latestTag, draft: false, prerelease: false });
+            return this.release && !this.release.draft && !this.release.prerelease
+                ? this.response(this.release) : this.response({}, 404);
+        }
         if (endpoint === `/releases/tags/${encodeURIComponent(this.tag)}`) return this.release && !this.release.draft ? this.response(this.release) : this.response({}, 404);
-        if (endpoint === '/releases' && method === 'GET') return this.response(this.release ? [this.release] : []);
+        const page = Number(url.searchParams.get('page') || 1);
+        if (endpoint === '/releases' && method === 'GET') {
+            return this.response([...(this.release ? [this.release] : []), ...this.otherReleases].slice((page - 1) * 100, page * 100));
+        }
         if (endpoint === '/releases' && method === 'POST') {
             assert.equal(JSON.parse(options.body).draft, true, 'Release must be created as a draft');
             this.creationAttempted = true;
@@ -210,14 +281,14 @@ class GitHubFixture {
         }
         if (endpoint === '/releases/1' && method === 'GET') return this.response(this.release);
         if (endpoint === '/releases/1' && method === 'PATCH') {
-            assert.equal(this.assets.length, 14, 'Publishing requires all fourteen assets');
+            assert.equal(this.assets.length, 12, 'Publishing requires all twelve English-only assets');
             const body = JSON.parse(options.body);
             assert.equal(body.draft, false);
             if (this.rejectExplicitTarget && Object.hasOwn(body, 'target_commitish')) {
                 return this.failure({ status: this.rejectExplicitTarget, body: { message: 'Resource not accessible by integration: target modifies workflows' } });
             }
             if (this.failPublish) return this.response({}, 502);
-            this.release = { ...this.release, ...body };
+            this.release = { ...this.release, ...body, published_at: '2026-10-10T13:00:00Z' };
             if (this.ambiguousPublish) { this.ambiguousPublish = false; throw new Error('lost publish response'); }
             return this.response(this.release);
         }
@@ -238,12 +309,65 @@ async function execute(fixture, server) {
     return { result, logs, delays };
 }
 
-test('five complete targets publish fourteen assets from a draft with SHA proofs', async t => {
+test('existing schema-1 English and bilingual releases remain verifiable without being rewritten', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    await execute(local, server);
+    const windows = TARGETS.find(target => target.platform === 'windows');
+    const raw = server.addAsset(targetNames(TAG, windows).binary, await fsp.readFile(local.locations.get(targetNames(TAG, windows).binary)));
+    const manifestAsset = server.assets.find(asset => asset.name === 'release-manifest.json');
+    const checksumAsset = server.assets.find(asset => asset.name === 'SHA256SUMS');
+    const manifest = JSON.parse(server.bytes.get(manifestAsset.id));
+    manifest.schema_version = 1;
+    manifest.assets.push({ name: raw.name, bytes: raw.size, sha256: raw.digest.slice(7) });
+    for (const bilingual of [false, true]) {
+        if (bilingual) {
+            const chinese = server.addAsset('release-notes.zh-CN.md', Buffer.from('# 历史说明\n'));
+            manifest.assets.push({ name: chinese.name, bytes: chinese.size, sha256: chinese.digest.slice(7) });
+        }
+        const proof = Buffer.from(JSON.stringify(manifest) + '\n');
+        server.bytes.set(manifestAsset.id, proof);
+        manifestAsset.size = proof.length;
+        manifestAsset.digest = `sha256:${hash(proof)}`;
+        const sums = Buffer.from(checksumText([...manifest.assets,
+            { name: manifestAsset.name, bytes: proof.length, sha256: hash(proof) }]));
+        server.bytes.set(checksumAsset.id, sums);
+        checksumAsset.size = sums.length;
+        checksumAsset.digest = `sha256:${hash(sums)}`;
+        const before = server.calls.length;
+        assert.equal((await execute(local, server)).result.status, 'already-published');
+        assert.equal(server.assets.length, bilingual ? 14 : 13);
+        assert.ok(server.calls.slice(before).every(call => call.method === 'GET'));
+    }
+});
+
+test('new publication ignores leftover Chinese files and rejects Chinese in English notes', async t => {
+    const local = await fixture(t);
+    await fsp.writeFile(path.join(local.notesDir, 'release-notes.zh-CN.md'), '# 旧文件\n');
+    const server = new GitHubFixture();
+    await execute(local, server);
+    assert.equal(server.assets.length, 12);
+    assert.ok(server.assets.every(asset => !asset.name.includes('zh-CN')));
+    await fsp.writeFile(path.join(local.notesDir, 'release-notes.en.md'), '# 中文\n');
+    const unused = new GitHubFixture();
+    await assert.rejects(execute(local, unused), /without Chinese text/);
+    assert.equal(unused.calls.length, 0);
+});
+
+test('workflow preserves releases and artifacts, excludes standalone EXEs after native smoke tests', async () => {
+    const workflow = await fsp.readFile(path.join(__dirname, '../workflows/release.yml'), 'utf8');
+    assert.doesNotMatch(workflow, /^  cleanup:|actions: write|cleanup-release-storage|retention-days:/m);
+    assert.match(workflow, /!\$\{\{ runner\.temp \}\}\/rcmaker-release-assets\/\*\.exe/);
+    assert.ok(workflow.indexOf('run: node .github/scripts/smoke-binary.cjs') < workflow.indexOf('!\$\{\{ runner.temp'));
+    assert.doesNotMatch(workflow, /bilingual|Chinese \/ English/);
+});
+
+test('five complete targets publish twelve English-only assets from a draft with SHA proofs', async t => {
     const local = await fixture(t);
     const server = new GitHubFixture({ annotated: true });
     const { result } = await execute(local, server);
     assert.equal(result.status, 'published');
-    assert.equal(server.assets.length, 14);
+    assert.equal(server.assets.length, 12);
     assert.equal(server.mutations('POST').filter(call => call.url.startsWith(ROOT)).length, 1);
     assert.equal(server.mutations('PATCH').length, 1);
     assert.equal(server.release.make_latest, 'legacy');
@@ -251,11 +375,102 @@ test('five complete targets publish fourteen assets from a draft with SHA proofs
     const summaryAsset = server.assets.find(asset => asset.name === 'release-manifest.json');
     const summary = JSON.parse(server.bytes.get(summaryAsset.id));
     assert.equal(summary.targets.length, 5);
-    assert.equal(summary.assets.length, 12);
+    assert.equal(summary.assets.length, 10);
+    assert.equal(summary.schema_version, 2);
+    assert.ok(!server.assets.some(asset => asset.name.endsWith('.exe')));
     assert.ok(summary.targets.every(target => target.php === '8.5' && target.encrypted));
     const checksumAsset = server.assets.find(asset => asset.name === 'SHA256SUMS');
-    assert.equal(server.bytes.get(checksumAsset.id).toString().trim().split('\n').length, 13);
-    assert.ok(server.release.body.includes('# 更新') && server.release.body.includes('# Changes'));
+    assert.equal(server.bytes.get(checksumAsset.id).toString().trim().split('\n').length, 12);
+    assert.ok(server.release.body.includes('# Changes'));
+    assert.doesNotMatch(server.release.body, /\p{Script=Han}/u);
+    assert.ok(!server.assets.some(asset => asset.name.includes('zh-CN')));
+});
+
+test('Windows publishes from ZIP alone and retains the extracted EXE checksum used by installers', async t => {
+    for (const stored of [false, true]) {
+        for (const descriptor of [false, true]) {
+            const local = await fixture(t, { zipOptions: { stored, descriptor } });
+            const windows = TARGETS.find(target => target.platform === 'windows');
+            const names = targetNames(TAG, windows);
+            const data = await fsp.readFile(local.locations.get(names.binary));
+            await fsp.unlink(local.locations.get(names.binary));
+            const server = new GitHubFixture();
+            await execute(local, server);
+            assert.ok(server.assets.some(asset => asset.name === names.archive));
+            assert.ok(!server.assets.some(asset => asset.name === names.binary));
+            const sums = server.bytes.get(server.assets.find(asset => asset.name === 'SHA256SUMS').id).toString();
+            assert.ok(sums.includes(`${hash(data)}  ${names.binary}\n`));
+            const summary = JSON.parse(server.bytes.get(server.assets.find(asset => asset.name === 'release-manifest.json').id));
+            assert.equal(summary.targets.find(target => target.platform === 'windows').binary.sha256, hash(data));
+            assert.ok(!(await fsp.readdir(local.outputDir)).some(name => name.startsWith('.verify-windows-')));
+        }
+    }
+});
+
+test('the real framework-generated Windows ZIP passes publication without a separate EXE', async t => {
+    const local = await fixture(t);
+    const windows = TARGETS.find(target => target.platform === 'windows');
+    const names = targetNames(TAG, windows);
+    const archiveFile = local.locations.get(names.archive);
+    await fsp.unlink(archiveFile);
+    // Use the unchanged PHP builder rather than a hand-made ZIP for this integration check.
+    execFileSync(process.env.RELEASE_TEST_PHP || 'php', ['-r',
+        "require $argv[1]; GatewayReleaseBuilder::archive($argv[2], $argv[3], $argv[4], 'windows');",
+        path.resolve(__dirname, '../scripts/build-release.php'), local.locations.get(names.binary),
+        path.resolve(__dirname, '../..'), archiveFile], { timeout: 30000 });
+    const manifest = JSON.parse(await fsp.readFile(local.locations.get(names.manifest)));
+    const bytes = await fsp.readFile(archiveFile);
+    manifest.archive = { name: names.archive, bytes: bytes.length, sha256: hash(bytes) };
+    await fsp.writeFile(local.locations.get(names.manifest), JSON.stringify(manifest));
+    await fsp.unlink(local.locations.get(names.binary));
+    const server = new GitHubFixture();
+    await execute(local, server);
+    assert.equal(server.assets.length, 12);
+    assert.ok(server.assets.every(asset => !asset.name.endsWith('.exe')));
+});
+
+test('Windows ZIP-contained hash, CPU, duplicate-entry and truncation failures prevent publication', async t => {
+    for (const problem of ['hash', 'cpu', 'duplicate', 'truncated', 'local-name', 'overflow']) {
+        const local = await fixture(t);
+        const windows = TARGETS.find(target => target.platform === 'windows');
+        const names = targetNames(TAG, windows);
+        const manifest = JSON.parse(await fsp.readFile(local.locations.get(names.manifest)));
+        let data = binary(windows);
+        if (problem === 'cpu') {
+            data.writeUInt16LE(0xaa64, 68);
+            manifest.binary.sha256 = hash(data);
+        }
+        let archive = windowsZip(data, { binaryName: problem === 'duplicate' ? 'LICENSE' : undefined });
+        if (problem === 'hash') manifest.binary.sha256 = '0'.repeat(64);
+        if (problem === 'truncated') archive = archive.subarray(0, archive.length - 8);
+        if (problem === 'local-name') archive[30] ^= 1;
+        if (problem === 'overflow') {
+            manifest.binary.bytes--;
+            // Match the central directory to the false size; stream verification must still fail.
+            const directory = archive.readUInt32LE(archive.length - 6);
+            archive.writeUInt32LE(manifest.binary.bytes, directory + 24);
+        }
+        manifest.archive = { name: names.archive, bytes: archive.length, sha256: hash(archive) };
+        await fsp.writeFile(local.locations.get(names.archive), archive);
+        await fsp.writeFile(local.locations.get(names.manifest), JSON.stringify(manifest));
+        const server = new GitHubFixture();
+        await assert.rejects(execute(local, server), /Windows ZIP|format or CPU mismatch/);
+        assert.equal(server.calls.length, 0);
+        assert.ok(!(await fsp.readdir(local.outputDir)).some(name => name.startsWith('.verify-windows-')));
+    }
+});
+
+test('publishing retains historical releases and removes a standalone Windows EXE only from its own draft', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture({ draft: true });
+    server.otherReleases = [{ id: 2, tag_name: 'v1.0.0', draft: false }, { id: 3, tag_name: 'v1.1.0', draft: false }];
+    const windowsName = targetNames(TAG, TARGETS.find(target => target.platform === 'windows')).binary;
+    const oldExe = server.addAsset(windowsName, await fsp.readFile(local.locations.get(windowsName)));
+    await execute(local, server);
+    assert.equal(server.otherReleases.length, 2);
+    assert.deepEqual(server.mutations('DELETE').map(call => call.url), [`${ROOT}/releases/assets/${oldExe.id}`]);
+    assert.ok(server.calls.every(call => !call.url.includes('/actions/')));
+    assert.ok(!server.assets.some(asset => asset.name.endsWith('.exe')));
 });
 
 test('draft retry keeps correct assets and replaces stale/partial and unexpected assets', async t => {
@@ -310,7 +525,7 @@ test('upload failure never publishes a partial draft', async t => {
     await assert.rejects(execute(local, server), /Upload failed without a complete asset/);
     assert.equal(server.release.draft, true);
     assert.equal(server.mutations('PATCH').length, 0);
-    assert.ok(server.assets.length < 14);
+    assert.ok(server.assets.length < 12);
     server.failUpload = null;
     await execute(local, server);
     assert.equal(server.release.draft, false);
@@ -348,7 +563,7 @@ test('published rerun verifies old random-encryption proofs without overwriting 
     const { result } = await execute(second, server);
     assert.equal(result.status, 'already-published');
     assert.ok(server.calls.slice(before).every(call => call.method === 'GET'));
-    assert.equal(server.assets.length, 14);
+    assert.equal(server.assets.length, 12);
 });
 
 test('published incomplete release is preserved and reported without any mutation', async t => {
@@ -393,7 +608,7 @@ test('tag moved after upload leaves the complete release as a draft', async t =>
     const server = new GitHubFixture();
     server.tagMovesBeforePublish = true;
     await assert.rejects(execute(local, server), /Remote tag commit differs/);
-    assert.equal(server.assets.length, 14);
+    assert.equal(server.assets.length, 12);
     assert.equal(server.release.draft, true);
     assert.equal(server.mutations('PATCH').length, 0);
 });
@@ -424,7 +639,7 @@ test('ambiguous create, upload and publication responses are reconciled without 
     server.ambiguousPublish = true;
     await execute(local, server);
     assert.equal(server.mutations('POST').filter(call => call.url.startsWith(ROOT)).length, 1);
-    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 14);
+    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 12);
     assert.equal(server.mutations('PATCH').length, 1);
     assert.equal(server.release.draft, false);
 });

@@ -4,6 +4,9 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const { createInflateRaw } = require('node:zlib');
+const { Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 
 const PRODUCT = 'rcmaker-codex-gateway';
 const TARGETS = Object.freeze([
@@ -13,7 +16,8 @@ const TARGETS = Object.freeze([
     { platform: 'macos', arch: 'aarch64', format: 'Mach-O' },
     { platform: 'windows', arch: 'x86_64', format: 'PE' },
 ]);
-const NOTE_NAMES = ['release-notes.zh-CN.md', 'release-notes.en.md'];
+const NOTE_NAMES = ['release-notes.en.md'];
+const LEGACY_CHINESE_NOTE = 'release-notes.zh-CN.md';
 const SUMMARY_NAME = 'release-manifest.json';
 const CHECKSUM_NAME = 'SHA256SUMS';
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -53,9 +57,10 @@ function version(tag) {
     return { numbers: match.slice(1, 4).map(BigInt), prerelease: Boolean(match[4]) };
 }
 
-/** Validate CI input and HTTPS API roots before any token-bearing request. */
-function configuration(env) {
-    for (const key of ['RELEASE_TAG', 'RELEASE_COMMIT', 'GITHUB_REPOSITORY', 'GITHUB_TOKEN', 'RELEASE_OUTPUT_DIR', 'RELEASE_NOTES_DIR']) {
+/** Validate CI input/API roots; remote-only cleanup does not require local build directories. */
+function configuration(env, { remoteOnly = false } = {}) {
+    const localKeys = remoteOnly ? [] : ['RELEASE_OUTPUT_DIR', 'RELEASE_NOTES_DIR'];
+    for (const key of ['RELEASE_TAG', 'RELEASE_COMMIT', 'GITHUB_REPOSITORY', 'GITHUB_TOKEN', ...localKeys]) {
         requireThat(typeof env[key] === 'string' && env[key].length > 0 && !/[\x00-\x1f]/.test(env[key]), `Missing or invalid ${key}.`);
     }
     const parsedVersion = version(env.RELEASE_TAG);
@@ -63,7 +68,7 @@ function configuration(env) {
     requireThat(COMMIT.test(env.RELEASE_COMMIT), 'RELEASE_COMMIT must be a full lowercase Git SHA-1.');
     requireThat(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(env.GITHUB_REPOSITORY)
         && !env.GITHUB_REPOSITORY.split('/').some(value => value === '.' || value === '..'), 'Invalid GITHUB_REPOSITORY.');
-    for (const key of ['RELEASE_OUTPUT_DIR', 'RELEASE_NOTES_DIR']) {
+    for (const key of localKeys) {
         requireThat(path.isAbsolute(env[key]), `${key} must be an absolute directory.`);
     }
     const api = new URL(env.GITHUB_API_URL || 'https://api.github.com');
@@ -92,6 +97,11 @@ function configuration(env) {
 function targetNames(tag, target) {
     const stem = `${PRODUCT}-${tag}-${target.platform}-${target.arch}`;
     return { manifest: `${stem}.manifest.json`, binary: stem + (target.platform === 'windows' ? '.exe' : ''), archive: stem + (target.platform === 'windows' ? '.zip' : '.tar.gz') };
+}
+
+/** Windows executables travel inside ZIPs in schema 2; schema 1 keeps old public proofs. */
+function publicKinds(target, schemaVersion = 2) {
+    return target.platform === 'windows' && schemaVersion === 2 ? ['archive'] : ['binary', 'archive'];
 }
 
 /** Read a small regular JSON file; symlinks cannot escape an artifact directory. */
@@ -161,6 +171,95 @@ async function inspectBinary(file, target) {
     } finally { await handle.close(); }
 }
 
+/** Read a bounded ZIP metadata range, refusing truncated input. */
+async function zipBytes(handle, position, length) {
+    const bytes = Buffer.alloc(length);
+    requireThat((await handle.read(bytes, 0, length, position)).bytesRead === length, 'Windows ZIP metadata is truncated.');
+    return bytes;
+}
+
+/**
+ * Locate the executable in the builder's flat, single-disk ZIP, using the central
+ * directory so data descriptors also work. ZIP64 is unnecessary below the release
+ * asset's 2 GiB limit. Reject duplicate/extra entries and encrypted ZIP members.
+ */
+async function windowsZipEntry(file, manifest) {
+    const handle = await fsp.open(file, 'r');
+    try {
+        const size = (await handle.stat()).size;
+        const tail = await zipBytes(handle, Math.max(0, size - 65557), Math.min(size, 65557));
+        let end = -1;
+        for (let offset = tail.length - 22; offset >= 0; offset--) {
+            if (tail.readUInt32LE(offset) === 0x06054b50 && offset + 22 + tail.readUInt16LE(offset + 20) === tail.length) { end = offset; break; }
+        }
+        requireThat(end >= 0, 'Windows ZIP has no valid end record.');
+        const count = tail.readUInt16LE(end + 10);
+        const directorySize = tail.readUInt32LE(end + 12);
+        const directoryOffset = tail.readUInt32LE(end + 16);
+        requireThat(tail.readUInt16LE(end + 4) === 0 && tail.readUInt16LE(end + 6) === 0
+            && tail.readUInt16LE(end + 8) === count && count === manifest.archive_entries.length
+            && directorySize <= 65536 && directoryOffset + directorySize === size - tail.length + end,
+        'Windows ZIP directory does not match the builder inventory.');
+        const directory = await zipBytes(handle, directoryOffset, directorySize);
+        const names = new Set();
+        let cursor = 0;
+        let binary;
+        for (let index = 0; index < count; index++) {
+            requireThat(cursor + 46 <= directory.length && directory.readUInt32LE(cursor) === 0x02014b50, 'Invalid Windows ZIP entry.');
+            const nameLength = directory.readUInt16LE(cursor + 28);
+            const next = cursor + 46 + nameLength + directory.readUInt16LE(cursor + 30) + directory.readUInt16LE(cursor + 32);
+            requireThat(next <= directory.length, 'Windows ZIP entry is truncated.');
+            const name = directory.subarray(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+            const flags = directory.readUInt16LE(cursor + 8);
+            const method = directory.readUInt16LE(cursor + 10);
+            requireThat(manifest.archive_entries.includes(name) && !names.has(name)
+                && (flags & ~0x080e) === 0 && [0, 8].includes(method)
+                && directory.readUInt16LE(cursor + 34) === 0, 'Unexpected, duplicate or encrypted Windows ZIP entry.');
+            names.add(name);
+            if (name === PRODUCT + '.exe') {
+                const compressed = directory.readUInt32LE(cursor + 20);
+                const bytes = directory.readUInt32LE(cursor + 24);
+                const offset = directory.readUInt32LE(cursor + 42);
+                requireThat(bytes === manifest.binary.bytes && bytes < 2 ** 31 && compressed > 0 && offset + 30 <= directoryOffset,
+                    'Windows ZIP executable size does not match its proof.');
+                const local = await zipBytes(handle, offset, 30);
+                requireThat(local.readUInt32LE(0) === 0x04034b50 && local.readUInt16LE(6) === flags
+                    && local.readUInt16LE(8) === method && local.readUInt16LE(26) === nameLength, 'Windows ZIP local header disagrees with its directory.');
+                const localName = await zipBytes(handle, offset + 30, nameLength);
+                const start = offset + 30 + nameLength + local.readUInt16LE(28);
+                requireThat(localName.toString('utf8') === name && start + compressed <= directoryOffset,
+                    'Windows ZIP executable range is invalid.');
+                binary = { start, compressed, method };
+            }
+            cursor = next;
+        }
+        requireThat(cursor === directory.length && binary, 'Windows ZIP executable is missing.');
+        return binary;
+    } finally { await handle.close(); }
+}
+
+/** Stream the ZIP-contained EXE to private staging; verify its hash, bytes and PE/CPU without executing it. */
+async function inspectWindowsArchive(file, manifest, outputDir, target) {
+    const entry = await windowsZipEntry(file, manifest);
+    const staging = await fsp.mkdtemp(path.join(outputDir, '.verify-windows-'));
+    try {
+        const binaryFile = path.join(staging, 'payload.bin');
+        const hash = createHash('sha256');
+        let bytes = 0;
+        const proof = new Transform({ transform(chunk, encoding, callback) {
+            bytes += chunk.length;
+            if (bytes > manifest.binary.bytes) { callback(new Error('Windows ZIP executable exceeds its declared size.')); return; }
+            hash.update(chunk);
+            callback(null, chunk);
+        } });
+        const input = fs.createReadStream(file, { start: entry.start, end: entry.start + entry.compressed - 1 });
+        const stages = [input, ...(entry.method === 8 ? [createInflateRaw()] : []), proof, fs.createWriteStream(binaryFile, { flags: 'wx' })];
+        await pipeline(...stages);
+        requireThat(bytes === manifest.binary.bytes && hash.digest('hex') === manifest.binary.sha256, 'Windows ZIP executable hash or bytes mismatch.');
+        await inspectBinary(binaryFile, target);
+    } finally { await fsp.rm(staging, { recursive: true, force: true }); }
+}
+
 /** Validate the builder's per-target identity and protected-payload assertions. */
 function validateTarget(manifest, config, target) {
     const names = targetNames(config.tag, target);
@@ -189,9 +288,16 @@ function publicRecord(record) {
     return { name: record.name, sha256: record.sha256, bytes: record.bytes };
 }
 
-/** Canonical SHA256SUMS covers the twelve payloads and the summary, avoiding self-reference. */
+/** Canonical SHA256SUMS covers payloads and the summary, avoiding self-reference. */
 function checksumText(records) {
     return [...records].sort((left, right) => left.name.localeCompare(right.name, 'en')).map(record => `${record.sha256}  ${record.name}\n`).join('');
+}
+
+/** Include the ZIP-contained Windows EXE hash so existing one-click installers still verify extracted bytes. */
+function checksumRecords(summary, records) {
+    return summary.schema_version === 2
+        ? [...records, ...summary.targets.filter(target => target.platform === 'windows').map(target => target.binary)]
+        : records;
 }
 
 /** Validate all five builds before any remote mutation; write the two combined proofs. */
@@ -211,13 +317,14 @@ async function localRelease(config) {
         requireThat(files.has(names.manifest), `Missing target manifest: ${names.manifest}.`);
         const manifest = await jsonFile(files.get(names.manifest));
         validateTarget(manifest, config, target);
-        for (const kind of ['binary', 'archive']) {
+        for (const kind of publicKinds(target)) {
             requireThat(files.has(names[kind]), `Missing ${kind}: ${names[kind]}.`);
             const record = await fileRecord(files.get(names[kind]));
             requireThat(record.sha256 === manifest[kind].sha256 && record.bytes === manifest[kind].bytes, `Hash or bytes mismatch: ${record.name}.`);
             records.push(record);
         }
-        await inspectBinary(files.get(names.binary), target);
+        if (target.platform === 'windows') await inspectWindowsArchive(files.get(names.archive), manifest, config.outputDir, target);
+        else await inspectBinary(files.get(names.binary), target);
         targets.push(manifest);
     }
     for (const name of NOTE_NAMES) {
@@ -225,16 +332,17 @@ async function localRelease(config) {
         records.push(await fileRecord(notes.get(name)));
     }
     const summary = {
-        schema_version: 1, tag: config.tag, commit: config.commit, previous_tag: metadata.previous_tag,
+        schema_version: 2, tag: config.tag, commit: config.commit, previous_tag: metadata.previous_tag,
         prerelease: config.prerelease, php: '8.5', encrypted: true, targets,
         assets: records.map(publicRecord).sort((left, right) => left.name.localeCompare(right.name, 'en')),
     };
     await fsp.writeFile(path.join(config.outputDir, SUMMARY_NAME), JSON.stringify(summary, null, 2) + '\n');
     records.push(await fileRecord(path.join(config.outputDir, SUMMARY_NAME)));
-    await fsp.writeFile(path.join(config.outputDir, CHECKSUM_NAME), checksumText(records));
+    await fsp.writeFile(path.join(config.outputDir, CHECKSUM_NAME), checksumText(checksumRecords(summary, records)));
     records.push(await fileRecord(path.join(config.outputDir, CHECKSUM_NAME)));
-    const body = (await fsp.readFile(notes.get(NOTE_NAMES[0]), 'utf8')) + '\n\n---\n\n' + (await fsp.readFile(notes.get(NOTE_NAMES[1]), 'utf8'));
-    requireThat(Buffer.byteLength(body) <= 125000, 'Combined release notes exceed the GitHub release body limit.');
+    const body = await fsp.readFile(notes.get(NOTE_NAMES[0]), 'utf8');
+    requireThat(body.trim().length > 0 && !/\p{Script=Han}/u.test(body), 'Release notes must contain English Markdown without Chinese text.');
+    requireThat(Buffer.byteLength(body) <= 125000, 'Release notes exceed the GitHub release body limit.');
     return { metadata, records, body };
 }
 
@@ -319,11 +427,12 @@ class GitHub {
         return response === null ? null : response.json();
     }
 
-    /** Paginate lists rather than trusting the release response's truncated assets. */
-    async list(endpoint) {
+    /** Collect complete snapshots before deletion; Actions lists use a named array envelope. */
+    async list(endpoint, field = null) {
         const values = [];
         for (let page = 1; page <= 100; page++) {
-            const chunk = await this.json(`${endpoint}?per_page=100&page=${page}`);
+            const data = await this.json(`${endpoint}?per_page=100&page=${page}`);
+            const chunk = field === null ? data : data?.[field];
             requireThat(Array.isArray(chunk), 'Invalid GitHub list response.');
             values.push(...chunk);
             if (chunk.length < 100) return values;
@@ -423,7 +532,7 @@ class GitHub {
         requireThat(summaries.length === 1 && checksums.length === 1, 'Published release lacks its immutable release proofs.');
         const proof = await this.download(summaries[0]);
         const summary = JSON.parse(proof.data.toString('utf8'));
-        requireThat(summary.schema_version === 1 && summary.tag === this.config.tag && summary.commit === this.config.commit
+        requireThat([1, 2].includes(summary.schema_version) && summary.tag === this.config.tag && summary.commit === this.config.commit
             && summary.prerelease === this.config.prerelease && summary.php === '8.5' && summary.encrypted === true
             && Array.isArray(summary.targets) && summary.targets.length === TARGETS.length, 'Published release manifest identity is inconsistent.');
         for (const target of TARGETS) {
@@ -431,21 +540,28 @@ class GitHub {
             requireThat(matches.length === 1, 'Published release target inventory is incomplete.');
             validateTarget(matches[0], this.config, target);
         }
-        const expected = new Set([...TARGETS.flatMap(target => { const names = targetNames(this.config.tag, target); return [names.binary, names.archive]; }), ...NOTE_NAMES]);
+        // Old public releases keep their original bilingual proofs on reruns. New
+        // releases only upload English notes; never rewrite immutable old assets.
+        const legacyNotes = Array.isArray(summary.assets) && summary.assets.some(record => record.name === LEGACY_CHINESE_NOTE)
+            ? [LEGACY_CHINESE_NOTE] : [];
+        const expected = new Set([...TARGETS.flatMap(target => {
+            const names = targetNames(this.config.tag, target);
+            return publicKinds(target, summary.schema_version).map(kind => names[kind]);
+        }), ...NOTE_NAMES, ...legacyNotes]);
         requireThat(Array.isArray(summary.assets) && summary.assets.length === expected.size
             && new Set(summary.assets.map(record => record.name)).size === expected.size, 'Published release manifest asset inventory is incomplete.');
         for (const record of summary.assets) {
             requireThat(expected.has(record.name) && SHA256.test(record.sha256) && Number.isSafeInteger(record.bytes) && record.bytes > 0, 'Invalid published asset proof.');
         }
         for (const target of summary.targets) {
-            for (const kind of ['binary', 'archive']) {
+            for (const kind of publicKinds(target, summary.schema_version)) {
                 const record = summary.assets.find(value => value.name === target[kind].name);
                 requireThat(record && record.bytes === target[kind].bytes && record.sha256 === target[kind].sha256, 'Published target and asset proofs disagree.');
             }
         }
         const records = [...summary.assets, { name: SUMMARY_NAME, bytes: proof.bytes, sha256: proof.sha256 }];
         const checksumProof = await this.download(checksums[0]);
-        requireThat(checksumProof.data.toString('utf8') === checksumText(records), 'Published checksum inventory differs from its manifest.');
+        requireThat(checksumProof.data.toString('utf8') === checksumText(checksumRecords(summary, records)), 'Published checksum inventory differs from its manifest.');
         records.push({ name: CHECKSUM_NAME, bytes: checksumProof.bytes, sha256: checksumProof.sha256 });
         await this.verifyAssets(assets, records);
     }
@@ -495,7 +611,7 @@ async function run({ env = process.env, fetch: fetchImpl = globalThis.fetch, sle
     let release = await github.findRelease();
     if (release && release.draft === false) {
         await github.verifyPublished(release);
-        log(`Release ${config.tag} already published; all 14 existing assets verified.`);
+        log(`Release ${config.tag} already published; all existing assets verified.`);
         return { status: 'already-published', tag: config.tag, releaseId: release.id };
     }
     if (!release) {
@@ -548,11 +664,11 @@ async function run({ env = process.env, fetch: fetchImpl = globalThis.fetch, sle
         requireThat(release.draft === false, 'Publication failed; the verified assets remain in a draft.');
     }
     await github.verifyPublished(release);
-    log(`Release ${config.tag} published with all 14 verified assets.`);
+    log(`Release ${config.tag} published with all ${local.records.length} verified assets.`);
     return { status: 'published', tag: config.tag, releaseId: release.id };
 }
 
-module.exports = { run, configuration, targetNames, TARGETS, NOTE_NAMES, checksumText };
+module.exports = { run, configuration, GitHub, targetNames, TARGETS, NOTE_NAMES, checksumText };
 
 if (require.main === module) {
     run().catch(error => { console.error(`Release publication failed: ${error.message}`); process.exitCode = 1; });

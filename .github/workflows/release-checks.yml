@@ -69,7 +69,7 @@ jobs:
         run: php .github/tests/release-identity.php
       - name: Check encrypted binary metadata validation
         run: node .github/tests/smoke-binary.cjs
-      - name: Check bilingual notes in a new Git repository
+      - name: Check English notes in a new Git repository
         run: node .github/tests/release-notes.cjs
-      - name: Check draft publication and safe reruns
+      - name: Check publication, ZIP-only Windows downloads and safe reruns
         run: node .github/tests/publish-release.cjs

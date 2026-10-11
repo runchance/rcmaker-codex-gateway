@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   prepare:
-    name: Validate tag and generate bilingual notes
+    name: Validate tag and generate English notes
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -38,7 +38,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Generate release identity and Chinese / English notes
+      - name: Generate release identity and English notes
         id: notes
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
@@ -51,7 +51,6 @@ jobs:
           path: ${{ runner.temp }}/rcmaker-release-notes/
           overwrite: true
           if-no-files-found: error
-          retention-days: 14
 
   build:
     name: PHP 8.5 encrypted / ${{ matrix.platform }} ${{ matrix.arch }}
@@ -109,14 +108,15 @@ jobs:
           RELEASE_OUTPUT_DIR: ${{ runner.temp }}/rcmaker-release-assets
           RELEASE_SMOKE_REPORT: ${{ runner.temp }}/rcmaker-release-smoke.json
         run: node .github/scripts/smoke-binary.cjs
-      - name: Preserve verified binaries and archives
+      - name: Preserve verified packages (Windows ZIP only)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ci-release-target-${{ matrix.platform }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/rcmaker-release-assets/
+          path: |
+            ${{ runner.temp }}/rcmaker-release-assets/
+            !${{ runner.temp }}/rcmaker-release-assets/*.exe
           overwrite: true
           if-no-files-found: error
-          retention-days: 14
           compression-level: 0
 
   publish:
@@ -139,7 +139,7 @@ jobs:
           pattern: ci-release-target-*
           merge-multiple: true
           path: ${{ runner.temp }}/rcmaker-release-assets
-      - name: Collect bilingual release notes
+      - name: Collect English release notes
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ci-release-notes
