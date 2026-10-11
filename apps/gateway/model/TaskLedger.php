@@ -1787,6 +1787,145 @@ final class TaskLedger
         });
     }
 
+    /**
+     * Reserve one native Retry on a stopped ordinary task page, without resending context.
+     * Exact ownership and drained host/MCP work are required. A failed old wait must have
+     * its real receipt covered by the retained context, without inventing delivery. The intent and
+     * page-local latch prevent duplicate activation after a lost CDP acknowledgement.
+     * @param string $responseId Current logical ordinary Responses round.
+     * @param string $incarnation Browser worker owning the exact surface.
+     * @param int $fence Surface ownership version.
+     * @param string $documentNonce Exact retained page identity.
+     * @param string $failureKey SHA-256 of the observed native error-card identity.
+     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int}
+     * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
+     */
+    public static function reserveTaskNetworkRetry(string $responseId, string $incarnation,
+        int $fence, string $documentNonce, string $failureKey): array
+    {
+        if (preg_match('/\A[a-f0-9]{64}\z/D', $failureKey) !== 1) {
+            throw new GatewayError('task_network_retry_invalid', '网页网络重试标识无效。', 400);
+        }
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey): array {
+            $db = SDB(null, 'medoo', 'sqlite');
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            self::assertFence($surface, $incarnation, $fence);
+            $task = $db->table('gateway_tasks')->where('id', $job['task_id'])->find();
+            $epoch = $db->table('gateway_task_epochs')->where('id', $job['epoch_id'])->find();
+            $binding = empty($job['mcp_binding_id']) ? null
+                : $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
+            if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
+                || $job['operation_kind'] !== 'response' || !in_array($turn['status'], ['submitted','running'], true)
+                || (int)$turn['deadline_at'] <= time() || $surface['status'] !== 'busy'
+                || empty($surface['target_id']) || empty($surface['session_id']) || $documentNonce === ''
+                || $surface['document_nonce'] !== $documentNonce || $surface['task_id'] !== $job['task_id']
+                || $surface['epoch_id'] !== $job['epoch_id'] || $turn['owner_incarnation'] !== $incarnation
+                || (int)$turn['fencing_version'] !== $fence
+                || !is_array($task) || $task['status'] !== 'active' || $task['current_epoch_id'] !== $job['epoch_id']
+                || !is_array($epoch) || $epoch['status'] !== 'active' || $epoch['task_id'] !== $job['task_id']
+                || (!empty($job['mcp_binding_id']) && (!is_array($binding) || $binding['status'] !== 'running'
+                    || $binding['current_response_id'] !== $responseId || $binding['task_id'] !== $job['task_id']
+                    || $binding['turn_id'] !== $turn['id']))) {
+                throw new GatewayError('task_network_retry_unavailable', '网页重试的当前回合或页面所有权已变化。', 409);
+            }
+            $idle = ['retry'=>false,'waiting'=>false,'exhausted'=>false,'attempt'=>0];
+            // Native regeneration must never rewrite final text already committed to Codex.
+            if (!empty($job['output_started']) || (string)$job['output_text'] !== '') return $idle;
+            $calls = $db->table('gateway_tool_invocations')->where('task_id', $job['task_id'])->select();
+            $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $job['task_id'])->select();
+            if (!is_array($calls) || !is_array($bindings)) {
+                throw new GatewayError('storage_unavailable', '网页重试的工具状态暂不可读取。', 503);
+            }
+            $waiting = false;
+            $closedWaitFailure = null;
+            foreach ($calls as $call) {
+                if ($call['status'] === 'unknown') {
+                    throw new GatewayError('task_network_retry_unknown', '工具执行结果未知，不能自动重试网页回答。', 409);
+                }
+                if ($call['status'] === 'cancelled') {
+                    $result = json_decode((string)($call['result_json'] ?? ''), true);
+                    if (empty($result['compaction_interrupted']) && empty($result['steering_interrupted'])) {
+                        throw new GatewayError('task_network_retry_unknown', '已取消工具缺少执行前中止证据，不能自动重试网页回答。', 409);
+                    }
+                }
+                if (in_array($call['status'], ['registered','delivered'], true)) $waiting = true;
+                if ($call['status'] === 'completed' && ($call['result_delivered_at'] === null || $call['result_json'] === null)) {
+                    $closedWaitFailure ??= ToolBroker::settledWaitTransportFailureForResponse($responseId);
+                    if ($call['binding_id'] === ($binding['id'] ?? null)
+                        && $closedWaitFailure === 'tool_wait_scope_changed' && $call['result_json'] !== null) {
+                        // The old wait failed conclusively, rather than remaining in flight.
+                        // Reuse the exact receipt/checkpoint coverage proof; do not acknowledge
+                        // delivery to the Web page or execute the completed host action again.
+                        ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($job, $call, $job['task_id']);
+                    } else $waiting = true;
+                }
+            }
+            foreach ($bindings as $candidate) {
+                $active = $db->table('gateway_mcp_activities')->where('binding_id', $candidate['id'])->where('status', 'active')->count();
+                if (!is_numeric($active)) throw new GatewayError('storage_unavailable', '网页重试的 MCP 活动状态暂不可读取。', 503);
+                if ((int)$active > 0 || ($candidate['id'] !== ($binding['id'] ?? null)
+                    && in_array($candidate['status'], ['awaiting_start','running'], true))) $waiting = true;
+            }
+            if ($waiting) return array_replace($idle, ['waiting'=>true]);
+            $events = $db->table('gateway_task_events')->where('turn_id', $turn['id'])
+                ->where('event_type', 'page_network_retry_intent')->order([['id','ASC']])->select('data_json');
+            if (!is_array($events)) throw new GatewayError('storage_unavailable', '网页重试次数暂不可读取。', 503);
+            $attempts = 0;
+            foreach ($events as $event) {
+                $data = json_decode((string)$event['data_json'], true, 128, JSON_THROW_ON_ERROR);
+                if (($data['generation_id'] ?? null) !== $job['generation_id'] || ($data['document_nonce'] ?? null) !== $documentNonce) continue;
+                $attempts++;
+                if (($data['failure_key'] ?? null) === $failureKey) return array_replace($idle, ['attempt'=>$attempts]);
+            }
+            if ($attempts >= 3) return array_replace($idle, ['exhausted'=>true,'attempt'=>$attempts]);
+            self::eventUnlocked($job['task_id'], $turn['id'], $responseId, $surface['id'], 'page_network_retry_intent',
+                ['failure_key'=>$failureKey,'attempt'=>$attempts+1,'generation_id'=>$job['generation_id'],
+                    'document_nonce'=>$documentNonce,'operation_kind'=>'response']);
+            return array_replace($idle, ['retry'=>true,'attempt'=>$attempts+1]);
+        });
+    }
+
+    /**
+     * Record native response-stream health separately from model-authored conversation content.
+     * This observation never changes a deadline, receipt, retry, capability or completion state.
+     * @param string $responseId Current logical response owning the exact browser document.
+     * @param string $state stream_failed, recovery_visible or recovery_cleared.
+     * @param array $metadata Bounded protocol/error/timing facts; no URL, headers or response body.
+     * @param string $incarnation Browser worker owning the observed surface.
+     * @param int $fence Exact surface ownership fence.
+     * @param string $documentNonce Exact document identity at the time of observation.
+     * @return bool False for a stale or already settled observer, without recording against another task.
+     * @throws GatewayError When durable observation storage is unavailable.
+     */
+    public static function browserTransportObserved(string $responseId, string $state, array $metadata,
+        string $incarnation, int $fence, string $documentNonce): bool
+    {
+        if (!in_array($state, ['stream_failed','recovery_visible','recovery_cleared'], true)) return false;
+        $facts = ['state'=>$state];
+        foreach (['canceled','generation_running'] as $key) {
+            if (is_bool($metadata[$key] ?? null)) $facts[$key] = $metadata[$key];
+        }
+        if (is_int($metadata['elapsed_ms'] ?? null)) $facts['elapsed_ms'] = max(0, min(86400000, $metadata['elapsed_ms']));
+        $protocol = $metadata['protocol'] ?? null;
+        if (in_array($protocol, ['h2','http/1.1','http/1.0','h3'], true)) $facts['protocol'] = $protocol;
+        $errorCode = $metadata['error_code'] ?? null;
+        if (is_string($errorCode) && preg_match('/\Anet::ERR_[A-Z0-9_]{1,80}\z/D', $errorCode) === 1) $facts['error_code'] = $errorCode;
+        $requestFingerprint = $metadata['request_fingerprint'] ?? null;
+        if (is_string($requestFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $requestFingerprint) === 1) $facts['request_fingerprint'] = $requestFingerprint;
+        return Schema::transaction(function () use ($responseId, $facts, $incarnation, $fence, $documentNonce): bool {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
+                || !in_array($turn['status'], ['submit_intent','submitted','running'], true)
+                || $surface['status'] !== 'busy' || $documentNonce === ''
+                || !hash_equals((string)$surface['document_nonce'], $documentNonce)
+                || !hash_equals((string)$surface['owner_incarnation'], $incarnation)
+                || (int)$surface['fencing_version'] !== $fence) return false;
+            self::eventUnlocked($job['task_id'], $turn['id'], $responseId, $surface['id'],
+                'browser_response_transport', $facts);
+            return true;
+        });
+    }
+
     /** Rotate document identity when the attached page performs a top-level document navigation. */
     public static function documentChanged(string $surfaceId, string $incarnation, int $fence, string $url): void
     {

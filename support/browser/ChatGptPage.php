@@ -853,6 +853,7 @@ JS));
     /**
      * Observe only the bound assistant after its stable identity has been recorded.
      * Native stream errors are scoped UI chrome; quoted transcript alerts remain content.
+     * Active native recovery chrome is returned only as transport_recovery_visible metadata.
      * @param list<string> $baselineUserIds User IDs captured before submission.
      * @param list<string> $baselineAssistantIds Assistant IDs captured before submission.
      * @param string $continuationMarker Optional exact marker for a same-turn continuation.
@@ -931,9 +932,11 @@ const endComposer=visibleOne(COMPOSER);
 const endSend=endComposer?composerSendButtons(endComposer):[];
 const sendButtonVisible=endSend.length===1&&endSend[0].getAttribute('data-testid')!=='stop-button'
     &&!/^(?:Stop|Stop generating|停止|停止生成)$/i.test(String(endSend[0].getAttribute('aria-label')||'').trim());
-let markdown='';let markdownSegments=[];let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;
+let markdown='';let markdownSegments=[];let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;let transportRecoveryVisible=false;
 if(answer){
     responsePresent=true;
+    // This localized native recovery panel is transport chrome, not model-authored progress.
+    // It can coexist with active backend tools; its presence never stops or retries this turn.
     // Agent Activity precedes the final assistant search unit. Both belong to the same
     // response, and newer DIL responses may lack the legacy .markdown class.
     const rootSelector='.markdown,[data-markdown-text-style],[data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]';
@@ -998,13 +1001,15 @@ if(answer){
         }
         return true;
     };
+    transportRecoveryVisible=[...answer.el.querySelectorAll('.text-chatgpt-recovery')]
+        .some(node=>nativeRecoveryPanel(node)!==null&&publiclyVisible(node));
     roots=roots.filter(notHidden);
     answerRootCount=roots.length;
     // Forward only rendered public progress prose, never hidden chain-of-thought panels,
     // loading animations, action buttons or the final answer itself.
     commentaryBlocks=commentary.map((root,index)=>{
         const publicSummary=activityRoots.includes(root)||root.closest('[data-testid^="cot-v5"]')!==null;
-        if(!publiclyVisible(root)||root.closest('.loading-shimmer,.aria-busy'))return null;
+        if(!publiclyVisible(root)||nativeRecoveryPanel(root)||root.closest('.loading-shimmer,.aria-busy'))return null;
         const anchor=root.closest('[data-item-anchor]')||root;
         const followingSibling=(()=>{for(let sibling=anchor.nextElementSibling;sibling;sibling=sibling.nextElementSibling){if(visible(sibling)&&String(sibling.innerText||sibling.textContent||'').trim())return true;}return false;})();
         const complete=!running||followingSibling||allMarkdown.some(next=>next!==root&&after(root,next));
@@ -1015,8 +1020,8 @@ if(answer){
     // ChatGPT renders short, user-visible activity labels separately from Markdown. Keep
     // only text shown in the status chrome; the nested Markdown and private COT panels
     // are handled separately and must never be mistaken for a stable final answer.
-    const statusBlocks=statuses.filter(publiclyVisible).slice(0,16).map((node,index)=>{
-        const copy=node.cloneNode(true);
+    const statusBlocks=statuses.filter(node=>publiclyVisible(node)&&!nativeRecoveryPanel(node)).slice(0,16).map((node,index)=>{
+        const copy=withoutNativeRecovery(node).cloneNode(true);
         copy.querySelectorAll('.markdown,[data-testid^="cot-v5"],button,svg,pre,code,.loading-shimmer,[aria-hidden="true"]').forEach(child=>child.remove());
         const label=String(copy.innerText||copy.textContent||'').replace(/\s+/g,' ').trim();
         if(!label||label.length>160)return null;
@@ -1027,9 +1032,9 @@ if(answer){
     const overlaps=(node,group)=>group.some(root=>node===root||node.contains(root)||root.contains(node));
     const statusRows=new Set();
     for(const candidate of answer.el.querySelectorAll('button,[role="status"],[aria-busy="true"],[data-testid*="cot"],[data-testid*="reason"],[data-testid*="thought"]')){
-        if(!publiclyVisible(candidate)||overlaps(candidate,roots)||overlaps(candidate,commentary))continue;
+        if(!publiclyVisible(candidate)||nativeRecoveryPanel(candidate)||overlaps(candidate,roots)||overlaps(candidate,commentary))continue;
         const row=candidate.closest('button')||candidate.closest('[data-item-anchor]')||candidate;
-        if(!publiclyVisible(row)||overlaps(row,roots)||overlaps(row,commentary))continue;
+        if(!publiclyVisible(row)||nativeRecoveryPanel(row)||overlaps(row,roots)||overlaps(row,commentary))continue;
         if(row.matches('button')&&!row.closest('[data-streaming-response-status]'))continue;
         statusRows.add(row);
         if(statusRows.size>=32)break;
@@ -1037,14 +1042,14 @@ if(answer){
     [...statusRows].forEach((row,index)=>{
         const aria=String(row.getAttribute('aria-label')||'').trim();
         const accessible=[...row.querySelectorAll('.sr-only')].map(el=>String(el.textContent||'').replace(/\s+/g,' ').trim()).find(Boolean)||'';
-        const label=(aria||accessible||String(row.innerText||row.textContent||'')).replace(/\s+/g,' ').trim();
+        const label=(aria||accessible||transcriptVisibleText(row)).replace(/\s+/g,' ').trim();
         if(label&&label.length<=160)statusBlocks.push({key:answer.id+':activity:'+index,text:label,complete:!running,public_status:true});
     });
     commentaryBlocks.push(...statusBlocks);
-    visibleText=roots.map(root=>String(root.innerText||'').replace(/\u00a0/g,' ').trim()).filter(Boolean).join('\n\n');
+    visibleText=roots.map(root=>transcriptVisibleText(root).replace(/\u00a0/g,' ').trim()).filter(Boolean).join('\n\n');
     markdown=roots.map(root=>toMarkdown(root,running)).filter(Boolean).join('\n\n');
     markdownSegments=semanticMarkdownSegments(roots,running,answer.id);
-    responseHtml=roots.map(root=>String(root.innerHTML||'')).join('');
+    responseHtml=roots.map(root=>String(withoutNativeRecovery(root).innerHTML||'')).join('');
     const pushArtifact=(href,filename,kind)=>{const existing=artifactCandidates.find(item=>item.filename===filename&&(item.href===href||item.href===''||href===''));if(existing){if(existing.href===''&&href!=='')existing.href=href;if(kind==='file_card')existing.kind='file_card';return;}artifactCandidates.push({href,filename,kind});};
     for(const anchor of roots.flatMap(root=>[...root.querySelectorAll('a')]).filter(visible)){
         const raw=String(anchor.getAttribute('href')||'').trim();
@@ -1158,7 +1163,7 @@ else if(/your session has expired|你的工作階段已過期|您的工作階段
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__'],
@@ -1504,12 +1509,45 @@ const networkErrorCard=(user,answer)=>{
 };
 const composerText=el=>('value'in el?String(el.value||''):[...el.childNodes].map(node=>String(node.textContent||'')).join('\n')).replace(/\u00a0/g,' ');
 const artifactAnchor=el=>{if(!el||String(el.tagName||'').toLowerCase()!=='a')return false;const raw=String(el.getAttribute('href')||'').trim(),download=String(el.getAttribute('download')||'').trim();return raw!==''&&(download!==''||/^sandbox:\/+(?:mnt\/data)\//i.test(raw)||/\/mnt\/data\//i.test(raw)||/\/backend-api\/(?:files|estuary\/content)(?:\/|\?|$)/i.test(raw));};
+// Recognize the observed native recovery shell by structure, independent of its language.
+// Quoted markup in model/user text remains transcript content, even with matching classes.
+const nativeRecoveryPanel=el=>{
+    if(el?.nodeType!==Node.ELEMENT_NODE)return null;
+    const panel=el.closest('[role="status"]');
+    if(!panel||!panel.querySelector('.text-chatgpt-recovery')
+        ||panel.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-content-search-unit-key$=":user"]'))return null;
+    return panel;
+};
+// Clone only roots containing platform recovery chrome; never alter the live conversation DOM.
+const withoutNativeRecovery=root=>{
+    if(nativeRecoveryPanel(root))return root.cloneNode(false);
+    const panels=[...root.querySelectorAll('.text-chatgpt-recovery')].map(nativeRecoveryPanel).filter(Boolean);
+    if(panels.length===0)return root;
+    const copy=root.cloneNode(true);
+    [...copy.querySelectorAll('.text-chatgpt-recovery')].map(nativeRecoveryPanel).filter(Boolean).forEach(panel=>panel.remove());
+    return copy;
+};
 const ignored=el=>['BUTTON','SCRIPT','STYLE','SVG','SOURCE'].includes(el.nodeName)
+    ||nativeRecoveryPanel(el)!==null
     ||el.hasAttribute?.('data-footnote-backref')
     ||el.getAttribute?.('aria-hidden')==='true'||el.hasAttribute?.('hidden')||el.hasAttribute?.('inert')
     ||(el.nodeType===Node.ELEMENT_NODE&&getComputedStyle(el).display==='none')
     ||(el.nodeType===Node.ELEMENT_NODE&&getComputedStyle(el).visibility==='hidden')
     ||(el.nodeType===Node.ELEMENT_NODE&&Number(getComputedStyle(el).opacity||1)===0);
+// Preserve the live renderer's visibility rules when removing recovery chrome from a fallback
+// container. Detached clone.textContent would also include its hidden/private descendants.
+const transcriptVisibleText=root=>{
+    if(nativeRecoveryPanel(root))return '';
+    if(![...root.querySelectorAll('.text-chatgpt-recovery')].some(node=>nativeRecoveryPanel(node)))return String(root.innerText||'');
+    const read=node=>{
+        if(node.nodeType===Node.TEXT_NODE)return String(node.nodeValue||'');
+        if(node.nodeType!==Node.ELEMENT_NODE||ignored(node))return '';
+        if(node.tagName==='BR')return '\n';
+        const text=[...node.childNodes].map(read).join('');
+        return /^(?:DIV|P|LI|UL|OL|H[1-6]|PRE|BLOCKQUOTE|TABLE|TR)$/.test(node.tagName)?'\n'+text+'\n':text;
+    };
+    return read(root).replace(/\n{3,}/g,'\n\n').trim();
+};
 let markdownRunning=false;
 const children=el=>[...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE?String(n.nodeValue||'').length>0:(n.nodeType===Node.ELEMENT_NODE&&!ignored(n)));
 const inline=(el,tail)=>{const cs=children(el);let out='';for(let i=0;i<cs.length;i++)out+=md(cs[i],tail&&i===cs.length-1);return out};
@@ -1733,6 +1771,7 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
             ...range(node),...linkState(node),...(group?{group}:{}),streamable:false});
     };
     const flatten=root=>{
+        if(nativeRecoveryPanel(root))return;
         // Only layout containers may be flattened. A root list/quote/math block owns its
         // delimiters too; flattening its children would drop them from the streamed answer.
         if(!['div','section','article'].includes(root.tagName.toLowerCase())||root.hasAttribute('data-footnotes')||mathSource(root)){

@@ -5364,6 +5364,18 @@ JS;
                 $snapshot['commentary_blocks'] = [];
             }
             $rawMarkdown = (string) ($snapshot['markdown'] ?? '');
+            if ($boundAssistantId !== '' && $observedAssistantId === $boundAssistantId) {
+                $recovering = ($snapshot['transport_recovery_visible'] ?? null) === true;
+                $wasRecovering = ($this->chatGptTurns[$responseId]['transport_recovery_visible'] ?? null) === true;
+                if ($recovering !== $wasRecovering) {
+                    // Native recovery chrome is a transport observation, never assistant progress.
+                    // Do not stop active tools, click Retry or re-send context because of this banner.
+                    $this->recordTaskTransportObservation($responseId,
+                        $recovering ? 'recovery_visible' : 'recovery_cleared',
+                        ['generation_running'=>($snapshot['generation_running'] ?? null) === true]);
+                    $this->chatGptTurns[$responseId]['transport_recovery_visible'] = $recovering;
+                }
+            }
             $prefix = (string) ($this->chatGptTurns[$responseId]['round_prefix'] ?? '');
             $rawProjection = WebModelPage::markdownAfterToolBoundary($rawMarkdown, $prefix);
             $aligned = self::alignTaskMarkdownObservation($this->chatGptTurns[$responseId], $snapshot, $now);
@@ -5532,6 +5544,8 @@ JS;
                     $this->scheduleTaskPoll($responseId, 0.5);
                     return;
                 }
+                if (($snapshot['error']['code'] ?? '') === 'CHATGPT_NETWORK_ERROR'
+                    && $this->retryTaskNetworkError($responseId, $snapshot)) return;
                 // The fresh-page path rotates its token and includes exact confirmed receipts;
                 // it cannot regenerate an earlier host mutation with a new model call key.
                 $this->recoverFailedMessageStream($responseId, true,
@@ -6456,6 +6470,70 @@ JS;
     }
 
     /**
+     * Activate the owned ordinary-task Retry after host tools and MCP replies have drained.
+     * A recovery banner or running generation never reaches this operation. The existing
+     * fresh-page recovery remains the fallback for errors without a verified native control.
+     * @param string $responseId Physical observer mapped to the current logical response.
+     * @param array $snapshot Stopped native network-error card with exact response identities.
+     * @return bool Whether this native recovery path handled polling, activation or failure.
+     */
+    private function retryTaskNetworkError(string $responseId, array $snapshot): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return true;
+        $descriptor = $snapshot['network_retry'] ?? null;
+        if (!is_array($descriptor) || empty($descriptor['failure_id']) || empty($descriptor['fingerprint'])) return false;
+        if (!empty($snapshot['generation_running'])) return false;
+        if (empty($descriptor['available'])) {
+            // Native Retry can become disabled while the browser's request is pending.
+            if ((string)($descriptor['button_label'] ?? '') === '') return false;
+            $this->scheduleTaskPoll($responseId, 0.5);
+            return true;
+        }
+        $logicalResponseId = (string)($turn['logical_response_id'] ?? $responseId);
+        $failureKey = hash('sha256', (string)$descriptor['failure_id'].'|'.(string)$descriptor['fingerprint']);
+        try {
+            $job = ResponseJob::execution($logicalResponseId);
+            if ($job['operation_kind'] !== 'response') return false;
+            $reservation = TaskLedger::reserveTaskNetworkRetry($logicalResponseId,
+                (string)$turn['owner_incarnation'], (int)$turn['fencing_version'],
+                (string)$turn['document_nonce'], $failureKey);
+            if (!empty($reservation['exhausted'])) {
+                $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
+                    'ChatGPT 网页连续出现网络错误，自动重试已达三次；原上下文和工具回执仍保留。', true);
+                return true;
+            }
+            if (empty($reservation['retry'])) {
+                if (!empty($reservation['waiting']) || !empty($reservation['attempt'])) {
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return true;
+                }
+                return false;
+            }
+            $descriptor['attempt_key'] = $failureKey;
+            $this->evaluateTask($responseId, WebModelPage::clickNetworkRetryExpression($descriptor),
+                function ($error, $result) use ($responseId): void {
+                    if (!isset($this->chatGptTurns[$responseId])) return;
+                    // Persisted intent and the DOM latch survive lost acknowledgements.
+                    // Do not re-click, send new context, rotate the token or replay tools.
+                    if ($error === null && is_array($result) && !empty($result['clicked'])) {
+                        $this->chatGptTurns[$responseId]['bound_assistant_id'] = '';
+                        $this->chatGptTurns[$responseId]['observed_markdown'] = null;
+                        $this->chatGptTurns[$responseId]['observed_content'] = false;
+                        $this->chatGptTurns[$responseId]['settle_text'] = null;
+                        $this->chatGptTurns[$responseId]['settle_at'] = 0.0;
+                        $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = null;
+                    }
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                });
+            return true;
+        } catch (GatewayError $error) {
+            $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
+            return true;
+        }
+    }
+
+    /**
      * Retry only the stopped native network-error card of a work-fenced active compaction.
      * Durable source/control ownership is checked before clicking, and the DOM is rechecked at
      * activation. No new context, token, host call or summary slot is sent by this operation.
@@ -7004,6 +7082,27 @@ JS;
         return true;
     }
 
+    /**
+     * Persist diagnostic facts under the exact current logical response and document fence.
+     * Storage/ownership failures cannot change host work or turn a UI warning into model prose.
+     * @param string $responseId Physical observer key, whose logical response can advance with tools.
+     * @param string $state Native recovery visibility transition or observed stream failure.
+     * @param array $metadata Protocol facts only; the ledger discards all unrecognized fields.
+     * @return void No task-lifetime, completion or network-retry state is changed.
+     */
+    private function recordTaskTransportObservation(string $responseId, string $state, array $metadata): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        try {
+            TaskLedger::browserTransportObserved((string)($turn['logical_response_id'] ?? $responseId),
+                $state, $metadata, (string)($turn['owner_incarnation'] ?? ''),
+                (int)($turn['fencing_version'] ?? 0), (string)($turn['document_nonce'] ?? ''));
+        } catch (\Throwable) {
+            // Diagnostic storage is independent of the existing execution/receipt transaction.
+        }
+    }
+
     private function onTaskEvent(array $message): void
     {
         $method = (string) ($message['method'] ?? '');
@@ -7021,6 +7120,7 @@ JS;
                     'submission_request_id'=>(string) ($params['requestId'] ?? ''), 'submission_finished'=>false,
                     'submission_request_started_at'=>microtime(true), 'submission_finished_at'=>0.0,
                     'submission_failed'=>false,
+                    'submission_protocol'=>null,
                     'submission_body_pending'=>false, 'submission_body_checked'=>false, 'submission_error_wait_until'=>0.0,
                 ]);
                 $this->observeTaskUserMessagePost($sessionId, $params);
@@ -7032,7 +7132,16 @@ JS;
                 $this->taskSessions[$sessionId]['submission_finished'] = true;
                 $this->taskSessions[$sessionId]['submission_finished_at'] = microtime(true);
                 $this->taskSessions[$sessionId]['submission_failed'] = $method === 'Network.loadingFailed';
-                if ($method === 'Network.loadingFailed') $this->taskSessions[$sessionId]['submission_body_checked'] = true;
+                if ($method === 'Network.loadingFailed') {
+                    $this->taskSessions[$sessionId]['submission_body_checked'] = true;
+                    $this->recordTaskTransportObservation((string)($owner['response_id'] ?? ''), 'stream_failed', [
+                        'request_fingerprint'=>hash('sha256', (string)$params['requestId']),
+                        'error_code'=>$params['errorText'] ?? null, 'canceled'=>$params['canceled'] ?? null,
+                        'protocol'=>$owner['submission_protocol'] ?? null,
+                        'elapsed_ms'=>(int)round(max(0.0, microtime(true)
+                            - (float)($owner['submission_request_started_at'] ?? microtime(true))) * 1000),
+                    ]);
+                }
             }
             return;
         }
@@ -7040,6 +7149,9 @@ JS;
             $response = is_array($params['response'] ?? null) ? $params['response'] : [];
             $url = (string) ($response['url'] ?? '');
             if (!WebModelPage::isBackendUrl($url, self::modelUrl())) return;
+            if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
+                $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
+            }
             $status = (int) round((float) ($response['status'] ?? 0));
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')
                 && WebModelPage::isBackendMessageTooLarge($url, $status, self::modelUrl())) {

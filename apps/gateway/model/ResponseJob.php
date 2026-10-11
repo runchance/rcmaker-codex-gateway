@@ -36,32 +36,11 @@ final class ResponseJob
             $existing = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('request_identity', $requestIdentity)->find();
             if (is_array($existing)) return self::decode($existing);
         }
-        // Codex may reframe the same turn after a failed stream, changing its request
-        // hash. Return that turn's durable failure instead of treating it as a new
-        // browser submission or replacing the useful error with task_needs_attention.
-        if (!empty($spec['turn_id'])) {
-            $db = SDB(null, 'medoo', 'sqlite');
-            $baseTaskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
-            $link = $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->find();
-            $taskId = is_array($link) ? (string) $link['current_task_id'] : $baseTaskId;
-            $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
-            if (is_array($task)
-                && $task['client_id'] === ($spec['client_id'] ?? 'responses')
-                && $task['thread_id'] === ($spec['thread_id'] ?? null)
-                && $task['branch_id'] === ($spec['branch_id'] ?? 'main')) {
-                $failed = $db->table('gateway_response_jobs')->where('task_id', $taskId)
-                    ->where('turn_id', (string) $spec['turn_id'])->where('status', 'failed')
-                    ->order([['rowid', 'DESC']])->limit(1)->find();
-                $currentTurn = $db->table('gateway_task_turns')->where('task_id', $taskId)
-                    ->where('client_turn_id', (string) $spec['turn_id'])->find();
-                if (is_array($failed) && is_array($currentTurn)
-                    && (string) ($currentTurn['response_id'] ?? '') === (string) $failed['id']
-                    && ($task['status'] === 'needs_attention'
-                    || !ContextRecovery::canRetryFailedBeforeCommitUnlocked((string) $failed['id']))) {
-                    return self::decode($failed);
-                }
-            }
-        }
+        // A failed stream may be replayed with the original native turn ID and a
+        // reframed request after compaction. Resolve its verified checkpoint lineage
+        // before browser admission; replaying a failure requires no live browser.
+        $failedReplay = self::failedTurnReplayUnlocked($spec);
+        if ($failedReplay !== null) return self::decode($failedReplay);
         ModelCooldown::assertReady();
         $budget = $spec['budget'] ?? ContextBudget::snapshot($spec['model'], $spec['reasoning_effort'] ?? null);
         $spec['budget'] = $budget;
@@ -148,6 +127,11 @@ final class ResponseJob
                 $spec['prompt'] = ContextHistory::plainPrompt($fresh);
             }
             $spec = ContextCompaction::resumeCommittedTurnUnlocked($spec);
+            // Full native histories can initially contain historical tool outputs.
+            // Their normalization above makes the post-checkpoint lineage provable
+            // here. Observe its durable failure instead of reserving another send.
+            $failedReplay = self::failedTurnReplayUnlocked($spec);
+            if ($failedReplay !== null) return (string) $failedReplay['id'];
             // Historical tool outputs are normalized above. Only an actual receipt for this
             // task's pending invocation may continue without rediscovering the account catalog.
             if (($spec['tool_outputs'] ?? []) === [] && empty($spec['steering_restart'])) {
@@ -342,6 +326,43 @@ final class ResponseJob
             throw new GatewayError('browser_queue_failed', '浏览器任务无法入队。', 503);
         }
         return self::get($responseId);
+    }
+
+    /**
+     * Observe the current failed response for an owned native turn or its proven checkpoint alias.
+     * The request hash may change on a Codex reconnect; the original native turn ID does not.
+     * This read-only lookup cannot reserve a browser send or authorize another host invocation.
+     * @param array $spec Parsed or transaction-normalized request; routing is applied to a copy.
+     * @return array|null Persisted failed job, excluding an inert precommit failure that can be retried.
+     * @throws GatewayError If checkpoint lineage or durable state cannot be read.
+     */
+    private static function failedTurnReplayUnlocked(array $spec): ?array
+    {
+        if (empty($spec['turn_id'])) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $baseTaskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
+        $link = $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->find();
+        $taskId = is_array($link) ? (string) $link['current_task_id'] : $baseTaskId;
+        $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+        $ownerKey = is_array($link) ? (string) $link['current_owner_key'] : (string) $spec['browser_owner_key'];
+        if (!is_array($task) || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
+            || $task['thread_id'] !== ($spec['thread_id'] ?? null)
+            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')
+            || $task['owner_key'] !== $ownerKey) return null;
+        if (is_array($link)) {
+            $spec['task_key'] = (string) $link['current_task_key'];
+            $spec['browser_owner_key'] = $ownerKey;
+        }
+        $spec = ContextCompaction::resumeCommittedTurnUnlocked($spec);
+        $turn = $db->table('gateway_task_turns')->where('task_id', $taskId)
+            ->where('client_turn_id', (string) $spec['turn_id'])->find();
+        if (!is_array($turn) || empty($turn['response_id'])) return null;
+        $failed = $db->table('gateway_response_jobs')->where('id', (string) $turn['response_id'])
+            ->where('task_id', $taskId)->where('turn_id', (string) $spec['turn_id'])
+            ->where('durable_turn_id', (string) $turn['id'])->where('status', 'failed')->find();
+        if (!is_array($failed) || ($task['status'] !== 'needs_attention'
+            && ContextRecovery::canRetryFailedBeforeCommitUnlocked((string) $failed['id']))) return null;
+        return $failed;
     }
 
     /**

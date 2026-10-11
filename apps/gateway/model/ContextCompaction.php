@@ -1881,9 +1881,9 @@ final class ContextCompaction
 
     /**
      * Preserve a completed native receipt even though its old Web wait RPC failed.
-     * The compact must contain its exact persisted output, or the same verified v2 checkpoint
+     * A compact or retained ordinary Retry must contain its exact persisted output, or the same verified v2 checkpoint
      * already used by the current stored source and covering the receipt's completion time.
-     * @param array $spec Normalized compact request containing complete readable history.
+     * @param array $spec Normalized compact request or current stored round with complete readable history.
      * @param array $call Known completed invocation from a conclusively closed wait transport.
      * @param string $taskId Exact routed task owning the call and any committed checkpoint.
      * @return void No receipt, capability or checkpoint state is changed.

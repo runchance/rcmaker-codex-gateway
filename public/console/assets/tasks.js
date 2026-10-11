@@ -28,6 +28,7 @@
         needs_attention: I18n.t('需要确认'), retired: I18n.t('已退休')
     };
     const eventLabels = {
+        browser_response_transport: I18n.t('网页回答流状态'),
         browser_observation_delayed: I18n.t('页面暂时繁忙，等待原请求结果'),
         surface_reserved: I18n.t('已为任务预留页面'), response_round_queued: I18n.t('Response Round 已登记'),
         tool_result_round_queued: I18n.t('工具结果 Round 已登记'), submit_intent: I18n.t('发送意图已持久化'),
@@ -240,8 +241,20 @@
         return card;
     }
 
+    /** Render transport observations as diagnostics, separately from task or model completion. */
     function eventDetail(event) {
         const data = event.data || {};
+        if (event.type === 'browser_response_transport') {
+            const labels = {
+                recovery_visible: '网页正在自动恢复', recovery_cleared: '网页恢复提示已消失',
+                stream_failed: data.canceled === true ? '浏览器已关闭这条回答流' : '网页回答流发生中断'
+            };
+            const parts = [I18n.t(labels[data.state] || data.state || '')];
+            if (data.error_code) parts.push(data.error_code);
+            if (data.protocol) parts.push({h2: 'HTTP/2', h3: 'HTTP/3'}[data.protocol] || data.protocol);
+            if (Number.isFinite(data.elapsed_ms)) parts.push((data.elapsed_ms / 1000).toFixed(1) + 's');
+            return parts.filter(Boolean).join(' · ');
+        }
         if (event.type === 'mcp_completion_committed' && Number(data.revision) === 0) {
             return I18n.t('本轮没有连接器工具请求到达网关；网页回复中的工具错误尚无本地调用回执。');
         }

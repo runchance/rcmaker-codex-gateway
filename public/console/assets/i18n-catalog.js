@@ -1,5 +1,10 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "网页回答流状态": "Web response stream status",
+    "网页正在自动恢复": "The web page is recovering automatically",
+    "网页恢复提示已消失": "The web recovery notice has cleared",
+    "浏览器已关闭这条回答流": "The browser closed this response stream",
+    "网页回答流发生中断": "The web response stream was interrupted",
     "运行日志": "Runtime logs",
     "运行日志 · RCMAKER AI": "Runtime logs · RCMAKER AI",
     "诊断": "DIAGNOSTICS",
