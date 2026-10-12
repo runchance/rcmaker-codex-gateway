@@ -42,7 +42,7 @@
             </div>
             <div class="field settings-confirmation-option">
                 <input id="context-extended" type="checkbox" lay-filter="context-budget" title="接入最多 3× 历史（实验性）">
-                <p class="muted">允许接入更长的历史，并在普通工作窗口用满前自动压缩。超出工作窗口的旧执行记录保留为可查询原文，模型需先核对原文再继续。需要连接器和 6 段上限；Luna/Think 不启用此实验。</p>
+                <p class="muted">按账号和模型实测容量接入更长历史，自动选择 2–6 段；分段不会扩大模型记忆。GPT-6 推理窗口：Plus 12 万、Pro 24 万 token。Luna/Think 分段输入最多 8.4 万 token；关闭扩展时通过滚动摘要续接，单条输入仍单独限额。需要连接器和 6 段上限。</p>
             </div>
             <div class="settings-grid">
                 <div class="field"><label for="context-parts">最大分段数</label><select id="context-parts"><option value="1">最多 1 段</option><option value="2">最多 2 段</option><option value="3">最多 3 段</option><option value="4">最多 4 段</option><option value="5">最多 5 段</option><option value="6">最多 6 段</option></select></div>

@@ -13,14 +13,15 @@ final class ContextBudget
      */
     public static function snapshot(string $model, ?string $effort, ?array $capabilities = null, ?array $settings = null): array
     {
-        $small = in_array($model, ['chatgpt-web/luna', 'chatgpt-web/think'], true)
+        $luna = in_array($model, ['chatgpt-web/luna', 'chatgpt-web/think'], true);
+        $small = $luna
             || (is_array($capabilities) && empty($capabilities['sol_available']));
         // Quota exhaustion changes availability, not the account's observed context capacity.
         // Otherwise a previously advertised 3x window shrinks while a native tool is in flight.
         $pro = !$small && \support\browser\ChatGptTransport::proSupported($capabilities ?? []);
         if ($small) {
-            $base = 24000;
-            $baseCompact = 14000;
+            $base = $luna ? 28000 : 24000;
+            $baseCompact = $luna ? 19808 : 14000;
         } elseif ($pro) {
             $base = $effort === 'max' ? 112193 : 111193;
             // Match the observed Pro-account trigger used by the reference
@@ -36,9 +37,9 @@ final class ContextBudget
         $settings['context_transport'] = 'auto';
         $family = self::modelFamily($model, $capabilities ?? []);
         $extensionRequested = !empty($settings['context_extended']);
-        $extensionAllowed = $family !== '6' || $effort === 'max'
-            || ($pro && in_array($effort ?? 'high', ['medium', 'high', 'xhigh'], true));
-        $extended = !$small && !empty($capabilities['sol_available']) && $extensionRequested
+        $extensionAllowed = $luna ? in_array($effort ?? 'low', ['low', 'medium'], true)
+            : ($family !== '6' || $effort !== 'low');
+        $extended = ($luna || (!$small && !empty($capabilities['sol_available']))) && $extensionRequested
             && $extensionAllowed
             && $settings['context_transport'] === 'auto' && (int) $settings['context_max_parts'] >= 6;
         $multiplier = $extended ? 3 : 1;
@@ -50,26 +51,39 @@ final class ContextBudget
         $reason = $extended ? 'enabled_threefold_transport' : 'standard_window';
         if ($family === '6' && $effort !== 'max') {
             if ($extended) {
-                // Reference 6.1.6 measured retention for GPT-6 Sol on Pro. Six
-                // composer stages do not make the model's working window 3x.
-                $context = 240000;
-                $compact = 220000;
-                $policy = 'gpt6_pro_reasoning_measured';
+                // Reference 6.1.8 measured retention separately on Plus and Pro.
+                // More composer stages do not enlarge the model's recall window.
+                $context = $pro ? 240000 : 120000;
+                $compact = $pro ? 220000 : 110000;
+                $policy = $pro ? 'gpt6_pro_reasoning_measured' : 'gpt6_plus_reasoning_measured';
                 $reason = 'gpt6_measured_retention_ceiling';
             } elseif (!$extensionAllowed) {
                 $policy = $effort === 'low' ? 'gpt6_instant_standard' : 'gpt6_non_pro_standard';
                 $reason = $effort === 'low' ? 'instant_uses_standard_context' : 'account_has_no_observed_pro_capacity';
             }
         }
-        $contractReserve = $small ? 4000 : 8192;
-        $outputReserve = $small ? 4000 : min(8000, $base - $baseCompact - 2000);
-        $message = $small ? ['tokens'=>16000, 'chars'=>128000] : self::messageLimits($effort ?? 'high', $capabilities ?? []);
-        // Every inert stage uses Medium; partition within that envelope instead of upgrading to Pro.
+        if ($luna) {
+            // Canonical Luna history is maintained by exact-parent rolling checkpoints.
+            // Its ordinary 1.05M window is not a one-message browser allowance.
+            $context = $extended ? 84000 : 1050000;
+            $compact = $extended ? 59424 : 1050000;
+            $policy = $extended ? 'luna_staged_transport' : 'luna_rolling_checkpoint';
+            $reason = $extended ? 'luna_experimental_staged_input' : 'luna_canonical_history_with_bounded_input';
+        }
+        $contractReserve = $small && !$luna ? 4000 : 8192;
+        // Compaction headroom already reserves future work. Like the reference,
+        // input admission counts the actual prompt/platform/images, not a second
+        // hypothetical output inside the same measured browser input allowance.
+        $outputReserve = $small && !$luna ? 4000 : 0;
+        $message = $luna ? ['tokens'=>19808, 'chars'=>500000]
+            : ($small ? ['tokens'=>16000, 'chars'=>128000] : self::messageLimits($effort ?? 'high', $capabilities ?? []));
+        // Sol stages use Medium; Luna stages use its ordinary Low envelope. Never stage on Pro.
         $stage = $small ? $message : self::messageLimits('medium', $capabilities ?? []);
         $stageFallback = $stage;
-        // Version 7 resolves model capacity. Existing persisted snapshots keep
+        // Version 8 includes 6.1.8's Plus/Luna limits. Existing persisted snapshots keep
         // their original limits throughout host-tool continuations and recovery.
-        return ['version' => 7, 'context_tokens' => $context, 'compact_tokens' => $compact,
+        return ['version' => 8, 'context_tokens' => $context, 'compact_tokens' => $compact,
+            'browser_context_tokens'=>$luna ? ($extended ? 84000 : 28000) : $context,
             'base_context_tokens'=>$base, 'base_compact_tokens'=>$baseCompact, 'context_multiplier'=>$multiplier,
             'context_effective_ratio'=>round($context / $base, 6),
             'budget_policy'=>$policy, 'model_family'=>$family, 'budget_reason'=>$reason,
@@ -84,7 +98,7 @@ final class ContextBudget
             'message_tokens'=>$message['tokens'], 'message_chars'=>$message['chars'],
             'stage_message_tokens'=>$stage['tokens'], 'stage_message_chars'=>$stage['chars'],
             'stage_fallback_message_tokens'=>$stageFallback['tokens'], 'stage_fallback_message_chars'=>$stageFallback['chars'],
-            'counter' => 'o200k_base_with_long_atom_upper_bound', 'model' => $model, 'effort' => $effort,
+            'counter' => 'o200k_base_with_bounded_bpe_chunks', 'model' => $model, 'effort' => $effort,
             'response_timeout_seconds' => (int) $settings['response_timeout_seconds'],
             'context_stage_timeout_seconds' => (int) $settings['context_stage_timeout_seconds'],
             'compaction_timeout_seconds' => (int) $settings['compaction_timeout_seconds']];
@@ -97,6 +111,20 @@ final class ContextBudget
      */
     public static function forCompactionTransport(array $budget): array
     {
+        if ((int) ($budget['version'] ?? 0) >= 8
+            && in_array((string) ($budget['model'] ?? ''), ['chatgpt-web/luna', 'chatgpt-web/think'], true)) {
+            $budget['context_tokens'] = $budget['browser_context_tokens'] = 84000;
+            $budget['compact_tokens'] = 59424;
+            $budget['context_multiplier'] = 3;
+            $budget['context_effective_ratio'] = 3.0;
+            $budget['context_extended'] = true;
+            $budget['budget_policy'] = 'luna_staged_transport';
+            $budget['budget_reason'] = 'luna_experimental_staged_input';
+            $budget['context_transport'] = 'auto';
+            $budget['context_max_parts'] = $budget['context_min_parts'] = 6;
+            $budget['compaction_transport'] = true;
+            return $budget;
+        }
         if ((int) ($budget['version'] ?? 0) < 5
             || empty($budget['sol_available'])
             || in_array((string) ($budget['model'] ?? ''), ['chatgpt-web/luna', 'chatgpt-web/think'], true)) {
@@ -108,6 +136,7 @@ final class ContextBudget
             $budget = self::compactionCapacity($budget);
         } else {
             $budget['context_tokens'] = $base * 3;
+            if (array_key_exists('browser_context_tokens', $budget)) $budget['browser_context_tokens'] = $budget['context_tokens'];
             $budget['context_multiplier'] = 3;
             $budget['context_extended'] = true;
             if ((int) ($budget['version'] ?? 0) >= 7) {
@@ -138,8 +167,8 @@ final class ContextBudget
         if (!empty($budget['compaction_transport'])) return $budget;
         $reserve = (int) ($budget['contract_reserve_tokens'] ?? 0)
             + (int) ($budget['output_reserve_tokens'] ?? 0) + max(0, $attachmentTokens);
-        $sourceTokens = $sourceContext === null ? 0 : self::tokens($sourceContext);
-        if (max(self::tokens($prompt), $sourceTokens) + $reserve <= (int) ($budget['base_context_tokens'] ?? 0)) return $budget;
+        $sourceTokens = $sourceContext === null ? 0 : self::tokens($sourceContext, $budget);
+        if (max(self::tokens($prompt, $budget), $sourceTokens) + $reserve <= (int) ($budget['base_context_tokens'] ?? 0)) return $budget;
         return self::forCompactionTransport($budget);
     }
 
@@ -178,18 +207,22 @@ final class ContextBudget
     {
         $pro = !empty($budget['observed_pro_capacity']);
         $base = $pro ? 111193 : 90000;
-        $context = $pro ? 240000 : 90000;
-        $compact = $pro ? 220000 : 80000;
+        $plusExtended = (int) ($budget['version'] ?? 0) >= 8;
+        $extended = $pro || $plusExtended;
+        $context = $pro ? 240000 : ($plusExtended ? 120000 : 90000);
+        $compact = $pro ? 220000 : ($plusExtended ? 110000 : 80000);
         $budget['base_context_tokens'] = $base;
         $budget['base_compact_tokens'] = $pro ? 95000 : 80000;
         $budget['context_tokens'] = $context;
         $budget['compact_tokens'] = $compact;
-        $budget['context_multiplier'] = $pro ? 3 : 1;
-        $budget['context_extended'] = $pro;
+        if (array_key_exists('browser_context_tokens', $budget)) $budget['browser_context_tokens'] = $context;
+        $budget['context_multiplier'] = $extended ? 3 : 1;
+        $budget['context_extended'] = $extended;
         $budget['context_effective_ratio'] = round($context / $base, 6);
-        $budget['budget_policy'] = $pro ? 'gpt6_pro_reasoning_measured' : 'gpt6_non_pro_standard';
+        $budget['budget_policy'] = $pro ? 'gpt6_pro_reasoning_measured'
+            : ($plusExtended ? 'gpt6_plus_reasoning_measured' : 'gpt6_non_pro_standard');
         $budget['budget_reason'] = 'summary_uses_non_pro_high_capacity';
-        $budget['extension_allowed'] = $pro;
+        $budget['extension_allowed'] = $extended;
         $budget['compaction_capacity_effort'] = 'high';
         return $budget;
     }
@@ -201,31 +234,32 @@ final class ContextBudget
             return ['tokens'=>$effort === 'max' ? 104000 : 103000,
                 'chars'=>match ($effort) { 'low'=>545000, 'max'=>1635000, default=>500000 }];
         }
-        // Plus Medium/High currently reject final /f/conversation requests near 290k chars
-        // with HTTP 413. Keep the model context window at 90k (or 270k for 3x), but pin the
-        // physical message envelope conservatively below that backend request boundary.
+        // Reference 6.1.8 rechecked Plus GPT-6: 500001 characters reached the model,
+        // while 530000 failed independently of tokens. Keep the same 500k headroom
+        // used for Pro reasoning. Pinned older jobs retain their smaller envelopes.
         return ['tokens'=>($effort === 'low' ? 41000 : 90000) - 8192 - 1,
-            'chars'=>$effort === 'low' ? 211256 : 240000];
+            'chars'=>$effort === 'low' ? 211256 : 500000];
     }
 
-    /** Share the pinned tokenizer and bounded long-atom fallback across every budget consumer. */
-    public static function tokens(string $text): int
+    /** Share the pinned counter; absent/old snapshots retain legacy long-atom upper bounds. */
+    public static function tokens(string $text, ?array $budget = null): int
     {
-        return WebTokenizer::count($text);
+        return WebTokenizer::count($text, ($budget['counter'] ?? null) === 'o200k_base_with_bounded_bpe_chunks');
     }
 
     /** Include the platform reserve in reported usage so the native trigger precedes rejection. */
     public static function inputTokens(string $text, array $budget, int $attachmentTokens = 0): int
     {
-        return self::tokens($text) + max(0, $attachmentTokens)
+        return self::tokens($text, $budget) + max(0, $attachmentTokens)
             + ((int) ($budget['version'] ?? 1) >= 2 ? (int) $budget['contract_reserve_tokens'] : 0);
     }
 
     /** Reject oversized full histories before a browser submission or SSE response begins. */
     public static function validate(string $context, array $budget, int $attachmentTokens = 0): int
     {
-        $count = self::tokens($context) + max(0, $attachmentTokens);
-        if ($count + $budget['output_reserve_tokens'] + $budget['contract_reserve_tokens'] > $budget['context_tokens']) {
+        $count = self::tokens($context, $budget) + max(0, $attachmentTokens);
+        $capacity = min((int)$budget['context_tokens'], (int)($budget['browser_context_tokens'] ?? $budget['context_tokens']));
+        if ($count + $budget['output_reserve_tokens'] + $budget['contract_reserve_tokens'] > $capacity) {
             throw new GatewayError('context_length_exceeded', '当前上下文超过所选账号、模型和扩展设置的预算，请先压缩上下文再继续。', 400);
         }
         return $count;

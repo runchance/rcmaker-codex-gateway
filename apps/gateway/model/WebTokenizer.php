@@ -10,9 +10,13 @@ final class WebTokenizer
 
     private static ?array $ranks = null;
     private static array $cache = [];
+    private static array $boundedCache = [];
 
-    /** Count ordinary text; literal special-token strings remain user text, never control tokens. */
-    public static function count(string $text): int
+    /**
+     * Count ordinary text; literal special-token strings remain user text, never control tokens.
+     * @param bool $boundedLongAtoms Opt in only through a new pinned budget; legacy partitions use the byte bound.
+     */
+    public static function count(string $text, bool $boundedLongAtoms = false): int
     {
         if ($text === '') return 0;
         self::load();
@@ -26,7 +30,13 @@ REGEX;
             if (isset(self::$cache[$piece])) { $count += self::$cache[$piece]; continue; }
             // Extremely long unbroken records use a conservative bound, avoiding quadratic work
             // in the API event loop. Normal text is exact o200k_base; the budget reports this bound.
-            if (strlen($piece) > 2048) { $count += strlen($piece); continue; }
+            if (strlen($piece) > 2048) {
+                if (!$boundedLongAtoms) { $count += strlen($piece); continue; }
+                // Reference-style bounded BPE, without sending an unbroken multi-MB
+                // atom into a quadratic scan. Lost cross-chunk merges only overcount.
+                foreach (mb_str_split($piece, 4096, 'UTF-8') as $chunk) $count += self::boundedPiece($chunk);
+                continue;
+            }
             $pieces = str_split($piece);
             while (count($pieces) > 1) {
                 $rank = PHP_INT_MAX; $chosen = -1;
@@ -42,6 +52,46 @@ REGEX;
             if (strlen($piece) <= 256) self::$cache[$piece] = $size;
         }
         return $count;
+    }
+
+    /** Count one bounded ordinary BPE piece in O(bytes log bytes), with leftmost rank ties. */
+    private static function boundedPiece(string $piece): int
+    {
+        if (isset(self::$ranks[$piece])) return 1;
+        $key = hash('sha256', $piece);
+        if (isset(self::$boundedCache[$key])) return self::$boundedCache[$key];
+        $count = strlen($piece);
+        $next = $previous = $lengths = $versions = [];
+        for ($i = 0; $i < $count; $i++) {
+            $next[$i] = $i + 1 < $count ? $i + 1 : -1;
+            $previous[$i] = $i - 1;
+            $lengths[$i] = 1;
+            $versions[$i] = 0;
+        }
+        $queue = new \SplPriorityQueue();
+        $queue->setExtractFlags(\SplPriorityQueue::EXTR_DATA);
+        $enqueue = static function (int $left) use ($piece, &$next, &$lengths, &$versions, $queue): void {
+            if ($left < 0 || $lengths[$left] === 0 || ($right = $next[$left]) < 0) return;
+            $rank = self::$ranks[substr($piece, $left, $lengths[$left] + $lengths[$right])] ?? null;
+            if ($rank !== null) $queue->insert([$left, $right, $versions[$left], $versions[$right]], [-$rank, -$left]);
+        };
+        for ($i = 0; $i < $count - 1; $i++) $enqueue($i);
+        while (!$queue->isEmpty()) {
+            [$left, $right, $leftVersion, $rightVersion] = $queue->extract();
+            if ($lengths[$left] === 0 || $next[$left] !== $right
+                || $versions[$left] !== $leftVersion || $versions[$right] !== $rightVersion) continue;
+            $lengths[$left] += $lengths[$right];
+            $lengths[$right] = 0;
+            $next[$left] = $next[$right];
+            $versions[$left]++;
+            $versions[$right]++;
+            $count--;
+            if ($next[$left] >= 0) $previous[$next[$left]] = $left;
+            $enqueue($previous[$left]);
+            $enqueue($left);
+        }
+        if (count(self::$boundedCache) >= 1024) self::$boundedCache = [];
+        return self::$boundedCache[$key] = $count;
     }
 
     /** Load immutable vocabulary once per worker; no network, environment cache or user state. */

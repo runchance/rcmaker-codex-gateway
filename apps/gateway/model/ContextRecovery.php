@@ -254,7 +254,11 @@ final class ContextRecovery
             if (($error['error']['code'] ?? '') !== 'CHATGPT_MESSAGE_TOO_LARGE'
                 || ($prior['account_plan'] ?? 'unknown') !== ($budget['account_plan'] ?? 'unknown')
                 || trim((string) $row['prompt']) === '') continue;
-            $limits = ['tokens'=>ContextBudget::tokens($row['prompt']), 'chars'=>mb_strlen($row['prompt'])];
+            // A new counter/envelope epoch must not inherit guessed limits from
+            // an older byte-bound rejection. Actual older turns remain pinned.
+            if (($budget['counter'] ?? null) === 'o200k_base_with_bounded_bpe_chunks'
+                && ($prior['counter'] ?? null) !== $budget['counter']) continue;
+            $limits = ['tokens'=>ContextBudget::tokens($row['prompt'], $prior), 'chars'=>mb_strlen($row['prompt'])];
             foreach ($limits as $unit => $observed) {
                 $limit = max(1, (int) floor($observed * 0.75));
                 foreach (['message_', 'stage_message_', 'stage_fallback_message_'] as $prefix) {

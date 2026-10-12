@@ -3339,7 +3339,7 @@ JS;
             $jobBudget = ResponseJob::execution($responseId)['budget'];
             $effectiveBudget = $jobBudget ?: \app\gateway\model\ContextBudget::snapshot('chatgpt-web/current', $requested['effort'], $capabilities);
             $effectiveBudget = ChatGptTransport::physicalBudget($effectiveBudget, $requested, $capabilities);
-            $attachmentTokens = AttachmentStore::tokenReserve((array) ($turn['attachments'] ?? []));
+            $attachmentTokens = AttachmentStore::tokenReserve((array) ($turn['attachments'] ?? []), $effectiveBudget);
             $compact = in_array((string) ($job['operation_kind'] ?? 'response'), ['compact_v1','compact_v2'], true);
             $transportBudget = $compact ? array_replace($effectiveBudget, ['final_attachment_tokens'=>$attachmentTokens]) : null;
             $decisionEvidence = null;
@@ -3366,7 +3366,7 @@ JS;
                 $remainingChars = 0; $remainingTokens = 0;
                 foreach ($remaining as $stage) {
                     $remainingChars = max($remainingChars, mb_strlen((string)$stage['text']));
-                    $remainingTokens = max($remainingTokens, \app\gateway\model\ContextBudget::tokens((string)$stage['text']));
+                    $remainingTokens = max($remainingTokens, \app\gateway\model\ContextBudget::tokens((string)$stage['text'], $transportBudget ?? $effectiveBudget));
                 }
                 $staging = ChatGptTransport::stagingMode($capabilities, $remainingChars,
                     $remainingTokens, (int) $plan['staging_context_tokens'], $requested['family'] ?? null);

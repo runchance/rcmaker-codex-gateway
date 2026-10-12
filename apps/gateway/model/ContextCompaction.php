@@ -1050,6 +1050,8 @@ final class ContextCompaction
      * Running replacement requires new human intent; terminal recovery accepts the exact
      * source, including a completed source fence whose summary was never submitted. Missing-page
      * replay remains on the original active scope. No rows mutate or authorize historical tools.
+     * A known pre-summary receipt rejection still requires complete byte-verified results;
+     * genuinely unknown source outcomes keep their independent completion-fence requirement.
      * @param string $taskId Routed task whose owner is encoded in the request.
      * @param array $spec Complete normalized read-only checkpoint request.
      * @param bool $missingReplay Inspect only queued/running same-scope page recovery.
@@ -1126,12 +1128,19 @@ final class ContextCompaction
                 // already committed a completion fence and the summary was never sent.
                 // Verify that source fence below before releasing this failed checkpoint.
                 $error = json_decode((string) ($job['error_json'] ?? ''), true);
-                if (($error['error']['code'] ?? '') !== 'RECOVERY_OUTCOME_UNKNOWN'
-                    || ($turn['error_code'] ?? '') !== 'RECOVERY_OUTCOME_UNKNOWN'
+                $failureCode = (string)($error['error']['code'] ?? '');
+                $knownReceiptFailure = $failureCode === 'compaction_context_incomplete'
+                    && ($turn['error_code'] ?? '') === $failureCode;
+                if ((!$knownReceiptFailure && ($failureCode !== 'RECOVERY_OUTCOME_UNKNOWN'
+                        || ($turn['error_code'] ?? '') !== 'RECOVERY_OUTCOME_UNKNOWN'))
                     || (string) $turn['generation_id'] !== (string) $job['generation_id']
                     || !in_array($epoch['status'], ['needs_attention', 'retired'], true)
                     || !in_array($surface['status'], ['needs_attention', 'retired'], true)) return null;
-                $settledSourceRequired = true;
+                // A receipt-comparison rejection cannot have submitted a summary: the
+                // no-send checks above and the exact receipt proof below must both pass.
+                // It can release its failed scope without pretending the model finished.
+                // Genuine unknown source outcomes still require their completion fence.
+                $settledSourceRequired = !$knownReceiptFailure;
             }
         }
         $otherJobs = $db->table('gateway_response_jobs')->where('task_id', $taskId)->where('id', '<>', (string) $job['id'])
@@ -1987,8 +1996,24 @@ final class ContextCompaction
     {
         if ($contentParts) {
             $projected = ContextHistory::toolOutputFromWire($wire);
-            return $projected !== null && ContextHistory::canonical($output)
-                === ContextHistory::canonical($projected);
+            if ($projected === null) return false;
+            // Codex can restore an omitted native screenshot detail as High in a
+            // later history. It changes the presentation, not the returned image.
+            // Remove only that proven default; text, image identity, fields and
+            // list order remain exact. Explicit native details are never ignored.
+            if (is_array($output) && is_array($projected) && array_is_list($output)
+                && array_is_list($projected) && count($output) === count($projected)) {
+                foreach ($projected as $index => $part) {
+                    if (is_array($part) && ($part['type'] ?? '') === 'image_attachment'
+                        && !array_key_exists('detail', $part)
+                        && is_array($output[$index])
+                        && ($output[$index]['type'] ?? '') === 'image_attachment'
+                        && ($output[$index]['detail'] ?? null) === 'high') {
+                        unset($output[$index]['detail']);
+                    }
+                }
+            }
+            return ContextHistory::canonical($output) === ContextHistory::canonical($projected);
         }
         if (is_string($output)) {
             if (hash_equals($wireHash, hash('sha256', $output))) return true;

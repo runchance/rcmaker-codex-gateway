@@ -91,7 +91,8 @@ final class LunaCheckpoint
     {
         if (!self::enabled($spec) || !empty($spec['tool_outputs'])) return $spec;
         $full = (string) ($spec['full_context_json'] ?? $spec['context_json']);
-        if (ContextBudget::tokens($full) < (int) ($spec['budget']['context_tokens'] * 0.55)) return $spec;
+        $window = (int)($spec['budget']['browser_context_tokens'] ?? $spec['budget']['context_tokens']);
+        if (ContextBudget::tokens($full, $spec['budget']) < (int) ($window * 0.55)) return $spec;
         $context = json_decode($full, true, 128, JSON_THROW_ON_ERROR);
         $db = SDB(null, 'medoo', 'sqlite');
         $taskId = 'task_' . substr($spec['task_key'], 0, 24);
@@ -128,7 +129,7 @@ final class LunaCheckpoint
             . $checkpoint['summary']]], $suffix);
         $compiled = ContextHistory::canonical($context);
         // An optimization must never enlarge its source or hide an oversized current request.
-        if (ContextBudget::tokens($compiled) >= ContextBudget::tokens($full)) return $spec;
+        if (ContextBudget::tokens($compiled, $spec['budget']) >= ContextBudget::tokens($full, $spec['budget'])) return $spec;
         $spec['context_json'] = $compiled;
         $spec['transport_context_json'] = $compiled;
         $spec['prompt'] = ContextHistory::plainPrompt($context);

@@ -13,7 +13,7 @@ final class ContextDecision
         try {
             $decision = $evidence ?? [
                 'version'=>1, 'reason'=>$plan === null ? 'inline' : 'pinned_recovery',
-                'parts'=>$plan['total_parts'] ?? 1, 'prompt_tokens'=>ContextBudget::tokens($prompt),
+                'parts'=>$plan['total_parts'] ?? 1, 'prompt_tokens'=>ContextBudget::tokens($prompt, $budget),
                 'prompt_chars'=>mb_strlen($prompt), 'attachment_tokens'=>$attachmentTokens,
                 'message_tokens'=>$budget['message_tokens'] ?? 0, 'message_chars'=>$budget['message_chars'] ?? 0,
                 'soft_inline_tokens'=>max(12000,intdiv((int)($budget['base_compact_tokens'] ?? $budget['message_tokens'] ?? 0),2)),
@@ -60,6 +60,8 @@ final class ContextDecision
             'extension_allowed'=>$budget['extension_allowed'] ?? null,
             'context_effective_ratio'=>$budget['context_effective_ratio'] ?? null,
             'compaction_capacity_effort'=>$budget['compaction_capacity_effort'] ?? null,
+            'browser_context_tokens'=>$budget['browser_context_tokens'] ?? null,
+            'counter'=>$budget['counter'] ?? null,
         ];
     }
 }

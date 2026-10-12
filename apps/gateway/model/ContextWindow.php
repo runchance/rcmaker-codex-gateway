@@ -33,10 +33,10 @@ final class ContextWindow
         // message uploads only its selected files. Count omitted-image notices and inline skill
         // fallbacks as physical text without rewriting the canonical history or receipt evidence.
         $physicalSource = AttachmentStore::transportJson($source);
-        $physicalAttachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $source));
+        $physicalAttachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $source), $budget);
         $reserve = $fixedReserve + $physicalAttachmentTokens;
         if ($verifiedSummary) {
-            if (ContextBudget::tokens($source) + $logicalReserve <= (int)$budget['context_tokens']) return $spec;
+            if (ContextBudget::tokens($source, $budget) + $logicalReserve <= (int)$budget['context_tokens']) return $spec;
             // An exact source page proves provenance, not retention after Pro
             // changes to High for the summary. Reuse its immutable source through
             // the existing bounded reader on a fresh page when High cannot hold it.
@@ -47,11 +47,13 @@ final class ContextWindow
             $spec['prompt'] = ContextCompaction::prompt($source);
             $spec['browser_lease_key'] = hash('sha256', $spec['browser_lease_key'] . '|summary-capacity|' . hash('sha256', $original));
         }
-        $working = (int)$budget['base_context_tokens'];
-        if (ContextBudget::tokens($physicalSource) + $reserve <= $working) return $spec;
+        $luna = (int)($budget['version'] ?? 0) >= 8
+            && in_array((string)($budget['model'] ?? ''), ['chatgpt-web/luna','chatgpt-web/think'], true);
+        $working = $luna ? (int)$budget['browser_context_tokens'] : (int)$budget['base_context_tokens'];
+        if (ContextBudget::tokens($physicalSource, $budget) + $reserve <= $working) return $spec;
         if (($spec['operation_kind'] ?? 'response') !== 'response'
             && !empty($budget['context_extended'])
-            && ContextBudget::tokens($source) + $logicalReserve <= (int)$budget['context_tokens']) {
+            && ContextBudget::tokens($source, $budget) + $logicalReserve <= (int)$budget['context_tokens']) {
             // A checkpoint is read-only. When its complete source fits the existing staged
             // transaction, send every tool receipt instead of replacing them with a
             // bounded view that then requires a separate context-reader tool call.
@@ -90,13 +92,13 @@ final class ContextWindow
         $messages = $context['messages'];
         $physicalMessages = $physicalContext['messages'];
         $kept = [];
-        $used = ContextBudget::tokens(ContextHistory::canonical(['system'=>$physicalContext['system'], 'messages'=>[]]));
+        $used = ContextBudget::tokens(ContextHistory::canonical(['system'=>$physicalContext['system'], 'messages'=>[]]), $budget);
         // Leave room for bounded original-context queries and their results during this turn.
         $target = max(1024, (int)floor(($working - $reserve) * 0.65));
         foreach ($messages as $index => $message) {
             if (in_array($message['role'] ?? '', ['user','developer','system'], true)) {
                 $kept[$index] = $message;
-                $used += ContextBudget::tokens(ContextHistory::canonical($physicalMessages[$index])) + 4;
+                $used += ContextBudget::tokens(ContextHistory::canonical($physicalMessages[$index]), $budget) + 4;
             }
         }
         if ($used > $target) {
@@ -105,7 +107,7 @@ final class ContextWindow
         // Keep whole recent records. Tool calls/results are historical JSON, never live wire items.
         for ($index = count($messages) - 1; $index >= 0; $index--) {
             if (isset($kept[$index])) continue;
-            $weight = ContextBudget::tokens(ContextHistory::canonical($physicalMessages[$index])) + 4;
+            $weight = ContextBudget::tokens(ContextHistory::canonical($physicalMessages[$index]), $budget) + 4;
             if ($used + $weight > $target) continue;
             $kept[$index] = $messages[$index];
             $used += $weight;
@@ -123,8 +125,8 @@ final class ContextWindow
         // Removing archived records can change which ten files are selected. Recount the actual
         // final projection, including newly-inline skill text, rather than reusing the old reserve.
         $physicalProjected = AttachmentStore::transportJson($projected);
-        $projectedAttachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $projected));
-        $workingTokens = ContextBudget::tokens($physicalProjected) + $fixedReserve + $projectedAttachmentTokens;
+        $projectedAttachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $projected), $budget);
+        $workingTokens = ContextBudget::tokens($physicalProjected, $budget) + $fixedReserve + $projectedAttachmentTokens;
         if ($workingTokens > $working) {
             throw new GatewayError('context_length_exceeded', '保留指令后的工作上下文仍超出预算，未丢弃原文。', 400);
         }
@@ -200,9 +202,9 @@ final class ContextWindow
             || !empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
             || !empty($spec['verified_compaction_source']) || isset($context['continuation'])) return $spec;
         $reserve = (int) $budget['contract_reserve_tokens'] + (int) $budget['output_reserve_tokens'];
-        $capacity = (int) $budget['context_tokens'] - $reserve;
+        $capacity = min((int)$budget['context_tokens'], (int)($budget['browser_context_tokens'] ?? $budget['context_tokens'])) - $reserve;
         $originalAttachments = AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $original, false);
-        if (ContextBudget::tokens($original) + AttachmentStore::tokenReserve($originalAttachments) <= $capacity) return $spec;
+        if (ContextBudget::tokens($original, $budget) + AttachmentStore::tokenReserve($originalAttachments, $budget) <= $capacity) return $spec;
         $protected = self::importProtectedIndices($messages);
         if ($protected === []) return $spec;
         [$blocks, $unsafe] = self::importAtomicBlocks($messages);
@@ -240,8 +242,8 @@ final class ContextWindow
             ContextHistory::canonical($project(count($blocks))))['turn_token'];
         $fits = static function (array $projection) use ($capacity, $spec, $previewSpec, $previewToken): bool {
             $json = ContextHistory::canonical($projection);
-            if (ContextBudget::tokens($json) + AttachmentStore::tokenReserve(
-                AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $json, false)) > $capacity) return false;
+            if (ContextBudget::tokens($json, $spec['budget']) + AttachmentStore::tokenReserve(
+                AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $json, false), $spec['budget']) > $capacity) return false;
             $budget = $previewSpec['budget'];
             try {
                 $preview = ToolBroker::previewPromptForBudget($previewSpec, $json, $previewToken);
@@ -249,7 +251,7 @@ final class ContextWindow
                     ['sol_available' => !empty($budget['sol_available']),
                         'pro_supported' => !empty($budget['observed_pro_capacity'])], null,
                     AttachmentStore::tokenReserve(AttachmentStore::selectForContext(
-                        (array) ($spec['attachments'] ?? []), $json)));
+                        (array) ($spec['attachments'] ?? []), $json), $budget));
                 return true;
             } catch (GatewayError $error) {
                 if (!in_array($error->errorCode, ['CHATGPT_CONTEXT_TOO_LARGE', 'CHATGPT_MULTIPART_UNAVAILABLE'], true)) throw $error;

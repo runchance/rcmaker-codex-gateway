@@ -121,7 +121,7 @@ final class CodexIntegration
             $standard = ModelCatalog::catalogBudget($row, array_replace($settings, ['context_extended'=>0]));
             $extended = ModelCatalog::catalogBudget($row, array_replace($settings,
                 ['context_extended'=>1, 'context_max_parts'=>6]));
-            return ['id'=>$row['id'], 'label'=>$row['label'], 'supports_extended'=>!empty($row['capabilities']['sol_available']),
+            return ['id'=>$row['id'], 'label'=>$row['label'], 'supports_extended'=>!empty($extended['extension_allowed']),
                 'notice'=>$row['notice'] ?? '', 'website_label'=>$row['website_label'] ?? $row['label'], 'efforts'=>$row['efforts'],
                 'context_tokens'=>$budget['context_tokens'], 'compact_tokens'=>$budget['compact_tokens'],
                 'base_context_tokens'=>$budget['base_context_tokens'], 'base_compact_tokens'=>$budget['base_compact_tokens'],

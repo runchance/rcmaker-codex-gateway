@@ -583,7 +583,13 @@ final class ChatGptTransport
         $family = self::auxiliaryFamily($capabilities, $family);
         $capabilities = self::familyCapabilities($capabilities, $family);
         if (empty($capabilities['sol_available'])) {
-            throw new GatewayError('CHATGPT_MULTIPART_UNAVAILABLE', 'Luna-only 账户不支持 Bigger Context 分段传输。', 409);
+            if ($family !== null || !in_array((string)($capabilities['account_plan'] ?? ''), ['free','go'], true)) {
+                throw new GatewayError('CHATGPT_MULTIPART_UNAVAILABLE', '当前账户没有可验证的分段模型能力。', 409);
+            }
+            if ($maxStageChars <= 500000 && $maxStageTokens <= 19808) {
+                return self::requestedMode('low', $capabilities) + ['family'=>null, 'purpose'=>'context_stage'];
+            }
+            throw new GatewayError('CHATGPT_CONTEXT_TOO_LARGE', '分段超过 Luna 单条消息预算。', 400);
         }
         $limits = ContextBudget::messageLimits('medium', $capabilities);
         if ($maxStageChars <= $limits['chars'] && $maxStageTokens <= $limits['tokens']) {
@@ -618,8 +624,11 @@ final class ChatGptTransport
         $finalAttachmentTokens = max(0, $finalAttachmentTokens);
         $settings = array_replace($settings, array_intersect_key($budget, array_flip(['context_transport','context_max_parts','context_extended'])));
         $reserve = (int) ($budget['contract_reserve_tokens'] ?? 0) + (int) $budget['output_reserve_tokens'];
-        $inlineTokens = ContextBudget::tokens($prompt);
+        $inlineTokens = ContextBudget::tokens($prompt, $budget);
         $maximum = min(6, (int) ($settings['context_max_parts'] ?? 3));
+        $lunaMultipart = (int)($budget['version'] ?? 0) >= 8 && !empty($budget['context_extended'])
+            && in_array((string)($budget['model'] ?? ''), ['chatgpt-web/luna','chatgpt-web/think'], true)
+            && empty($capabilities['sol_available']);
         // A very large inline message can fit the composer yet bury the current task
         // under historical records. Stage it before reaching the hard compaction limit.
         // This is only a transport choice: records remain exact, and the selected model
@@ -627,7 +636,7 @@ final class ChatGptTransport
         $softSingleLimit = max(12000, intdiv((int) ($budget['base_compact_tokens'] ?? $budget['message_tokens']), 2));
         $preferStaging = (int) ($budget['version'] ?? 1) >= 5
             && ($settings['context_transport'] ?? 'auto') === 'auto'
-            && $maximum >= 2 && !empty($capabilities['sol_available'])
+            && $maximum >= 2 && (!empty($capabilities['sol_available']) || $lunaMultipart)
             && $inlineTokens > $softSingleLimit;
         $initialParts = 1;
         if ((int) ($budget['version'] ?? 1) < 4 && !empty($budget['context_extended'])) {
@@ -635,7 +644,7 @@ final class ChatGptTransport
             $initialParts = $usage < $budget['base_compact_tokens'] ? 1 : ($usage < $budget['base_compact_tokens'] * 2 ? 2 : $maximum);
         }
         $fits = static fn(string $text, int $attachmentTokens = 0): bool => mb_strlen($text) <= $budget['message_chars']
-            && ContextBudget::tokens($text) + max(0, $attachmentTokens) <= $budget['message_tokens'];
+            && ContextBudget::tokens($text, $budget) + max(0, $attachmentTokens) <= $budget['message_tokens'];
         if ($initialParts === 1 && !$preferStaging && empty($budget['compaction_transport'])
             && $fits($prompt, $finalAttachmentTokens)
             && $inlineTokens + $finalAttachmentTokens + $reserve <= $budget['context_tokens']) return null;
@@ -646,7 +655,7 @@ final class ChatGptTransport
         if (($settings['context_transport'] ?? 'auto') === 'single') {
             throw new GatewayError('CHATGPT_CONTEXT_TOO_LARGE', '上下文超过单条输入预算，当前任务被固定为单条传输；请改用自动分段或先压缩上下文。', 400);
         }
-        if (empty($capabilities['sol_available'])) {
+        if (empty($capabilities['sol_available']) && !$lunaMultipart) {
             throw new GatewayError('CHATGPT_MULTIPART_UNAVAILABLE', '当前 ChatGPT 账户没有可验证的 Sol 分段能力，无法发送这段超长上下文。', 409);
         }
         // Choose the smallest allowed count that fits both the budgets and editor preference.
@@ -677,19 +686,23 @@ final class ChatGptTransport
                     continue;
                 }
                 if (!$fits($plan['final_text'], $finalAttachmentTokens)) continue;
-                $valid = true; $total = ContextBudget::tokens($plan['final_text']) + $finalAttachmentTokens;
+                $valid = true; $total = ContextBudget::tokens($plan['final_text'], $budget) + $finalAttachmentTokens;
                 foreach ($plan['stages'] as $stage) {
                     $stageChars = max((int) ($budget['stage_message_chars'] ?? 0), (int) ($budget['stage_fallback_message_chars'] ?? 0));
                     $stageTokens = max((int) ($budget['stage_message_tokens'] ?? 0), (int) ($budget['stage_fallback_message_tokens'] ?? 0));
                     if (mb_strlen($stage['text']) > ($stageChars ?: (int) $budget['message_chars'])
-                        || ContextBudget::tokens($stage['text']) > ($stageTokens ?: (int) $budget['message_tokens'])) { $valid = false; break; }
-                    $total += ContextBudget::tokens($stage['text']) + ContextBudget::tokens($stage['ack']);
+                        || ContextBudget::tokens($stage['text'], $budget) > ($stageTokens ?: (int) $budget['message_tokens'])) { $valid = false; break; }
+                    $total += ContextBudget::tokens($stage['text'], $budget) + ContextBudget::tokens($stage['ack'], $budget);
                     // Reserve one checksum-only repair turn per stage. The repair never retransmits the
                     // payload, but ChatGPT still counts the tiny user/assistant exchange in context.
-                    $total += ContextBudget::tokens(self::ackRepairText((string) $stage['ack']))
-                        + ContextBudget::tokens((string) $stage['ack']);
+                    $total += ContextBudget::tokens(self::ackRepairText((string) $stage['ack']), $budget)
+                        + ContextBudget::tokens((string) $stage['ack'], $budget);
                 }
                 $ceiling = !empty($budget['context_extended']) ? $budget['base_context_tokens'] * min($parts, 3) : $budget['context_tokens'];
+                // Since v8, measured account recall is authoritative even when all
+                // six physical messages fit. Old transactions rebuild unchanged.
+                if ((int)($budget['version'] ?? 0) >= 8) $ceiling = min($ceiling,
+                    (int)($budget['browser_context_tokens'] ?? $budget['context_tokens']), (int)$budget['context_tokens']);
                 if (!$valid || $total + $reserve > $ceiling) {
                     if ($parts === 2) $twoPartStatus = $valid ? 'context_limit' : 'message_limit';
                     continue;
@@ -719,7 +732,7 @@ final class ChatGptTransport
     public static function assertFinalMessageFits(string $text, array $budget, int $attachmentTokens = 0): void
     {
         if (mb_strlen($text) > (int) $budget['message_chars']
-            || ContextBudget::tokens($text) + max(0, $attachmentTokens) > (int) $budget['message_tokens']) {
+            || ContextBudget::tokens($text, $budget) + max(0, $attachmentTokens) > (int) $budget['message_tokens']) {
             throw new GatewayError('CHATGPT_MESSAGE_TOO_LARGE', '当前单条消息连同附件超过所选模型的实际输入上限。', 400);
         }
     }
@@ -788,11 +801,11 @@ final class ChatGptTransport
             $text = self::stageText($parts[$i], $transactionId, $i + 1, $totalParts, $hashes[$i], $ack);
             $stages[] = ['text' => $text, 'ack' => $ack, 'index' => $i + 1];
             $maxStageChars = max($maxStageChars, mb_strlen($text));
-            $maxStageTokens = max($maxStageTokens, ContextBudget::tokens($text));
+            $maxStageTokens = max($maxStageTokens, ContextBudget::tokens($text, $budget));
         }
         $final = self::commitText($parts, $hashes, $transactionId, $contract);
         $stagingContextTokens = (int) ($budget['version'] ?? 1) >= 3 ? array_sum(array_map(
-            static fn(array $stage): int => ContextBudget::tokens($stage['text']) + ContextBudget::tokens($stage['ack']), $stages
+            static fn(array $stage): int => ContextBudget::tokens($stage['text'], $budget) + ContextBudget::tokens($stage['ack'], $budget), $stages
         )) : 0;
         return [
             'transaction_id' => $transactionId,
@@ -891,7 +904,7 @@ final class ChatGptTransport
                     ? ($budget['stage_fallback_message_chars'] ?? $budget['stage_message_chars'])
                     : $budget['stage_message_chars']);
                 $limits[] = [
-                    'tokens' => $messageTokens - ContextBudget::tokens($fixed)
+                    'tokens' => $messageTokens - ContextBudget::tokens($fixed, $budget)
                         - ($final ? max(0, (int) ($budget['final_attachment_tokens'] ?? 0)) : 0) - 64,
                     'chars' => $messageChars - mb_strlen($fixed) - 2,
                 ];
@@ -903,7 +916,7 @@ final class ChatGptTransport
         $finalStart = count($records);
         foreach ($records as $record) {
             $json = json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-            $weights[] = ['tokens'=>ContextBudget::tokens($json) + 1, 'chars'=>mb_strlen($json) + 1];
+            $weights[] = ['tokens'=>ContextBudget::tokens($json, $budget) + 1, 'chars'=>mb_strlen($json) + 1];
         }
         foreach ($records as $index => $record) {
             if (($record['kind'] ?? '') === 'message' && ($record['message']['role'] ?? '') === 'user') $finalStart = $index;

@@ -429,6 +429,9 @@
             legacy_threefold: I18n.t('沿用该模型的 3× 历史预算'),
             standard_context: I18n.t('使用该模型的标准窗口'),
             gpt6_pro_reasoning_measured: I18n.t('GPT-6 推理档使用实测窗口上限'),
+            gpt6_plus_reasoning_measured: I18n.t('GPT-6 Plus 推理档使用实测窗口上限'),
+            luna_staged_transport: I18n.t('Luna 使用有界分段输入，原始历史保留'),
+            luna_rolling_checkpoint: I18n.t('Luna 使用滚动摘要续接，单条输入独立限额'),
             gpt6_instant_standard: I18n.t('GPT-6 Instant 使用标准窗口'),
             gpt6_non_pro_standard: I18n.t('GPT-6 当前账号使用标准窗口')
         };

@@ -284,7 +284,7 @@ final class AttachmentStore
     }
 
     /** Extra model budget consumed by file-backed skills and visual inputs. */
-    public static function tokenReserve(array $attachments): int
+    public static function tokenReserve(array $attachments, ?array $budget = null): int
     {
         $tokens = 0;
         foreach ($attachments as $attachment) {
@@ -292,7 +292,7 @@ final class AttachmentStore
                 $path = (string) ($attachment['path'] ?? '');
                 $text = $path !== '' ? @file_get_contents($path) : false;
                 if (!is_string($text)) throw new GatewayError('attachment_missing', '技能附件无法读取。', 409);
-                $tokens += ContextBudget::tokens($text);
+                $tokens += ContextBudget::tokens($text, $budget);
                 continue;
             }
             if (($attachment['kind'] ?? '') === 'image') {

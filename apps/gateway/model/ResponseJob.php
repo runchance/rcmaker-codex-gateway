@@ -202,7 +202,7 @@ final class ResponseJob
             // An explicitly selected import counts its retained history, while the complete
             // incoming source remains stored separately as read-only evidence.
             $budgetAttachments = AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $budgetContext, false);
-            $attachmentTokens = AttachmentStore::tokenReserve($budgetAttachments);
+            $attachmentTokens = AttachmentStore::tokenReserve($budgetAttachments, $budget);
             $inputTokens = ContextBudget::inputTokens($budgetContext, $budget, $attachmentTokens);
             // A genuine result continues the already-submitted Web generation. It must settle
             // before native auto-compaction can take ownership; it never uploads this full history.
@@ -220,7 +220,7 @@ final class ResponseJob
                 // This is the next physical checkpoint upload, not every image resident in the
                 // logical source above. Keep input usage and ordinary validation unchanged.
                 $compactAttachmentTokens = AttachmentStore::tokenReserve(
-                    AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $transportContext));
+                    AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $transportContext), $budget);
                 $spec['budget'] = ContextBudget::forCompactionPrompt(
                     $budget, (string) $spec['prompt'], $compactAttachmentTokens,
                     !empty($spec['verified_compaction_source']) ? null : $transportContext);
@@ -915,8 +915,9 @@ final class ResponseJob
                 $output[$outputIndex] = ResponsesProtocol::messageItem((string) $job['item_id'], 'completed', $finalText);
                 $response = ResponsesProtocol::responseWithOutput($responseId, 'completed', $output, true);
                 $response['model'] = (string) $job['model'];
-                $response['usage'] = ['input_tokens' => (int) $job['input_tokens'], 'output_tokens' => ContextBudget::tokens($finalText),
-                    'total_tokens' => (int) $job['input_tokens'] + ContextBudget::tokens($finalText)];
+                $outputTokens = ContextBudget::tokens($finalText, json_decode((string)$job['budget_json'], true, 128, JSON_THROW_ON_ERROR));
+                $response['usage'] = ['input_tokens' => (int) $job['input_tokens'], 'output_tokens' => $outputTokens,
+                    'total_tokens' => (int) $job['input_tokens'] + $outputTokens];
                 $events = array_merge($events, ResponsesProtocol::completionEvents($responseId, (string) $job['item_id'], $finalText, $outputIndex));
                 foreach ($events as &$event) if ($event['type'] === 'response.completed') $event['response'] = $response;
                 unset($event);
@@ -1058,7 +1059,8 @@ final class ResponseJob
                         : ['arguments' => $invocation['arguments'] ?? []]),
                 ], $invocations)];
             $outputTokens = ContextBudget::tokens(json_encode($evidence,
-                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                json_decode((string)$job['budget_json'], true, 128, JSON_THROW_ON_ERROR));
             $response['usage'] = [
                 'input_tokens' => (int) $job['input_tokens'],
                 'output_tokens' => $outputTokens,

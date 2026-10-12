@@ -1409,12 +1409,15 @@ const composerSendButtons=editor=>{
 // New ChatGPT renders this button by accessible name and uses a text-xs badge;
 // older builds use accounts-profile-button and text-caption-regular. Never infer
 // a plan from a person's name, an upgrade offer, or conversation content.
+// Collapsing the sidebar leaves its hydrated profile and badge in the DOM while
+// the visible avatar has no badge. Visibility is therefore not account evidence.
+// Ignore disabled loading placeholders; conflicting hydrated badges stay unknown.
 const accountPlan=()=>{
     const profiles=document.querySelectorAll('[data-testid="accounts-profile-button"],button[aria-label="打开个人资料菜单"],button[aria-label="Open profile menu"],button[aria-label="Open account menu"]');
     const names={'free':'free','免费':'free','免费版':'free','go':'go','plus':'plus','pro':'pro','business':'business','team':'team','enterprise':'enterprise'};
     const plans=new Set();
     for(const profile of profiles){
-        if(!visible(profile))continue;
+        if(profile.disabled||profile.getAttribute('aria-disabled')==='true')continue;
         for(const badge of profile.querySelectorAll('.text-caption-regular.text-token-text-tertiary,.text-xs')){
             const plan=names[String(badge.textContent||'').trim().toLowerCase()];
             if(plan)plans.add(plan);
