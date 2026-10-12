@@ -26,6 +26,8 @@ Route::post('/api/browser/connector/verify', [Browser::class, 'verifyConnector']
 Route::post('/api/browser/start', [Browser::class, 'start']);
 Route::post('/api/browser/stop', [Browser::class, 'stop']);
 Route::post('/api/browser/profile/reset', [Browser::class, 'resetProfile']);
+Route::get('/api/browser/login-reminder', [Browser::class, 'loginReminder']);
+Route::post('/api/browser/login-reminder/snooze', [Browser::class, 'snoozeLoginReminder']);
 Route::post('/api/browser/lease', [Browser::class, 'lease']);
 Route::post('/api/browser/action', [Browser::class, 'action']);
 Route::get('/api/browser/commands/{id:\d+}', [Browser::class, 'command']);

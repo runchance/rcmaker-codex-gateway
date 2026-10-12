@@ -6,6 +6,7 @@ use RC\Config;
 use RC\Request;
 use app\gateway\database\Schema;
 use app\gateway\model\BrowserState;
+use app\gateway\model\BrowserLoginLifecycle;
 use app\gateway\model\GatewayError;
 use app\gateway\model\GatewaySettings;
 use app\gateway\model\NetworkSettings;
@@ -208,9 +209,40 @@ final class Browser
     public function resetProfile(Request $request)
     {
         return $this->respond($request, function () use ($request): array {
-            $this->body($request, []);
-            return ['id' => BrowserState::enqueue('reset_profile', [], false), 'status' => 'queued'];
+            $body = $this->body($request, ['reminder_id']);
+            $payload = [];
+            if (array_key_exists('reminder_id', $body)) {
+                $payload['login_reminder_id'] = $this->reminderId($body['reminder_id']);
+                BrowserLoginLifecycle::pollCodexIdentity();
+            }
+            return ['id' => BrowserState::enqueue('reset_profile', $payload, false), 'status' => 'queued'];
         }, 202);
+    }
+
+    /** Read optional renewal reminders without changing login, model routing or task admission. */
+    public function loginReminder(Request $request)
+    {
+        return $this->respond($request, function (): array {
+            $readable = BrowserLoginLifecycle::pollCodexIdentity();
+            return BrowserLoginLifecycle::snapshot() + ['codex_identity_readable' => $readable];
+        });
+    }
+
+    /** Snooze exactly the reminder displayed by the console; never acknowledges the underlying account change. */
+    public function snoozeLoginReminder(Request $request)
+    {
+        return $this->respond($request, function () use ($request): array {
+            $body = $this->body($request, ['reminder_id']);
+            BrowserLoginLifecycle::snooze($this->reminderId($body['reminder_id'] ?? null));
+            return BrowserLoginLifecycle::snapshot();
+        });
+    }
+
+    /** Validate the opaque confirmation token with the framework's existing input validator. */
+    private function reminderId(mixed $value): string
+    {
+        try { return (string) validator()->check($value, ['rule' => 'alnum', 'len' => [64, 64], 'name' => '登录提醒']); }
+        catch (\Throwable) { throw new GatewayError('INVALID_LOGIN_REMINDER', '登录提醒编号无效。', 400); }
     }
 
     /** @return mixed Transfer manual/automation ownership and invalidate stale commands. */

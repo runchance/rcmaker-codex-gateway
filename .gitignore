@@ -22,3 +22,4 @@ composer.lock
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+/PROJECT_CONTEXT.md

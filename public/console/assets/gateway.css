@@ -239,6 +239,17 @@ p { line-height: 1.75; }
 }
 /* Product release: separate settings sections and clear first-run connector input. */
 .settings-navigation { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+.gateway-login-reminder {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 19890000;
+    width: min(460px, calc(100vw - 40px));
+    padding: 16px;
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .14);
+}
+.gateway-login-reminder p { margin: 0 0 12px; line-height: 1.6; }
 .settings-save { padding: 12px 0 24px; }
 .connector-name-input { display: flex; align-items: center; border: 1px solid var(--gateway-line); border-radius: 8px; overflow: hidden; background: #f5f8fa; }
 .connector-name-input > span { flex: 0 0 auto; padding: 0 14px; color: var(--gateway-muted); font-weight: 600; }

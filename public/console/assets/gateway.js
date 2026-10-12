@@ -262,11 +262,13 @@
 
     /** Reuse the shell's existing Pear tab; direct page use still works. */
     function openOverview() {
-        if (window.parent !== window && window.parent.PearAdmin) {
-            window.parent.PearAdmin.instances.tabPage.changePage({id: 'overview', title: I18n.t('运行准备'), type: '_iframe', url: 'pages/overview.html', close: false});
-            window.parent.PearAdmin.instances.menu.selectItem('overview');
+        let shell = window.PearAdmin;
+        try { if (!shell && window.parent !== window) shell = window.parent.PearAdmin; } catch (_) {}
+        if (shell) {
+            shell.instances.tabPage.changePage({id: 'overview', title: I18n.t('运行准备'), type: '_iframe', url: 'pages/overview.html', close: false});
+            shell.instances.menu.selectItem('overview');
         } else {
-            window.location.href = 'overview.html';
+            window.location.href = location.pathname.includes('/pages/') ? 'overview.html' : 'pages/overview.html';
         }
     }
 

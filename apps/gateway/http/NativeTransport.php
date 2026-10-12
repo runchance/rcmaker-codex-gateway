@@ -43,19 +43,23 @@ final class NativeTransport
         $client = curl();
         $state = NetworkSettings::state();
         $revision = NetworkSettings::revision((int) $state['saved_revision']);
-        NetworkTransport::configure($client, $revision, $url, $onResponse !== null ? 180 : ($endpoint === 'models' ? 30 : 900));
+        // A Responses turn can legitimately run for hours. The downstream Codex client
+        // owns cancellation; only connection establishment is time-bounded here.
+        NetworkTransport::configure($client, $revision, $url, $endpoint === 'models' ? 30 : 0);
         // Native long responses have produced CURLE_HTTP2_STREAM before their terminal event.
         // Select HTTP/1.1 before sending, avoiding HTTP/2 stream resets without replaying a POST.
         // Browser/MCP traffic and other native endpoints retain their existing transport.
         if (in_array($endpoint, ['responses', 'responses/compact'], true)) {
             $client->setOpt(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
         }
-        foreach ($headers as $name => $value) {
-            if (in_array(strtolower($name), ['authorization', 'chatgpt-account-id', 'openai-beta', 'originator',
-                'user-agent', 'accept', 'content-type', 'content-encoding', 'x-codex-turn-metadata', 'x-codex-beta-features',
-                'x-codex-session-id', 'session_id', 'conversation_id', 'x-request-id', 'idempotency-key'], true)) {
-                $client->setHeader($name, $value);
-            }
+        // The controller has removed hop-by-hop and regenerated headers. Preserve new
+        // official Codex metadata instead of silently dropping unknown header names.
+        foreach ($headers as $name => $value) $client->setHeader($name, $value);
+        if ($method === 'POST' && in_array($endpoint, ['responses', 'responses/compact'], true)) {
+            // Large HTTP/1.1 bodies make libcurl add Expect: 100-continue. The native
+            // upstream has repeatedly reset after that interim status, before any final
+            // response headers. Send the already buffered body in one request instead.
+            $client->setHeader('Expect', '');
         }
         $client->setHeader('Accept-Encoding', 'identity');
         $client->setOpt(CURLOPT_ENCODING, '');
@@ -64,6 +68,7 @@ final class NativeTransport
         if ($method === 'POST') $client->setOpt(CURLOPT_POSTFIELDS, $body);
         $client->childOfMultiCurl = true;
         $started = false; $stream = false; $buffer = ''; $lineBuffer = ''; $terminated = false; $bytes = 0;
+        $requestBytes = strlen($body);
         $paused = false; $pauseCount = 0; $resumeCount = 0; $queuePeak = 0; $terminalType = ''; $abortReason = '';
         $responseHeaders = []; $status = 0;
         $client->setOpt(CURLOPT_HEADERFUNCTION, static function ($handle, string $line) use (&$status, &$responseHeaders): int {
@@ -130,7 +135,7 @@ final class NativeTransport
         $timer = null;
         $timer = Timer::add(0.02, static function () use ($client, $multi, $connection, $endpoint, $onCatalog, $onResponse,
             &$timer, &$started, &$stream, &$buffer, &$status, &$responseHeaders, &$terminated, &$lineBuffer,
-            &$paused, &$pauseCount, &$resumeCount, &$queuePeak, &$terminalType, &$abortReason, &$bytes): void {
+            &$paused, &$pauseCount, &$resumeCount, &$queuePeak, &$terminalType, &$abortReason, &$bytes, $requestBytes): void {
             $finished = !self::open($connection); $error = 0;
             $queuePeak = max($queuePeak, $connection->getSendBufferQueueSize());
             if (!$finished && $paused && $connection->getSendBufferQueueSize()
@@ -150,11 +155,14 @@ final class NativeTransport
             }
             if (!$finished) return;
             Timer::del($timer);
+            $proxyConnectCode = (int) $client->getInfo(CURLINFO_HTTP_CONNECTCODE);
             curl_multi_remove_handle($multi, $client->curl);
             $client->close(); curl_multi_close($multi);
-            if ($error !== 0 || !self::open($connection) || $pauseCount > 0
+            if ($error !== 0 || $status >= 500 || !self::open($connection) || $pauseCount > 0
                 || ($stream && $started && $terminalType === '' && !$terminated)) {
-                self::trace($endpoint, ['http_status'=>$status, 'curl_result'=>$error, 'body_bytes'=>$bytes,
+                self::trace($endpoint, ['http_status'=>$status, 'proxy_connect_status'=>$proxyConnectCode,
+                    'curl_result'=>$error, 'body_bytes'=>$bytes,
+                    'request_bytes'=>$requestBytes,
                     'stream_started'=>$stream && $started, 'terminal_type'=>$terminalType, 'done_seen'=>$terminated,
                     'pause_count'=>$pauseCount, 'resume_count'=>$resumeCount, 'queue_peak'=>$queuePeak,
                     'client_open'=>self::open($connection), 'abort_reason'=>$abortReason]);

@@ -227,14 +227,19 @@ final class Responses
         return new DeferredResponse($request);
     }
 
-    /** Copy explicit headers before asynchronous work; never close over the reusable Request. */
+    /** Snapshot end-to-end Codex headers before asynchronous work; never retain the reusable Request. */
     private function nativeHeaders(Request $request): array
     {
         $headers = [];
-        foreach (['authorization', 'chatgpt-account-id', 'openai-beta', 'originator', 'user-agent', 'accept', 'content-type', 'content-encoding',
-            'x-codex-turn-metadata', 'x-codex-beta-features', 'x-codex-session-id', 'session_id', 'conversation_id', 'x-request-id', 'idempotency-key'] as $name) {
-            $value = (string) $request->header($name, '');
-            if ($value !== '') $headers[$name] = $value;
+        foreach ((array) $request->header() as $name => $value) {
+            if (!is_string($name) || !is_string($value)) continue;
+            $name = strtolower($name);
+            if (preg_match('/\A[A-Za-z0-9!#$%&\'*+.^_`|~-]+\z/D', $name) !== 1
+                || strpbrk($value, "\r\n\0") !== false) continue;
+            if (in_array($name, ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+                'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length',
+                'expect', 'accept-encoding'], true)) continue;
+            $headers[$name] = $value;
         }
         return $headers;
     }

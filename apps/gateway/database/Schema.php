@@ -479,6 +479,10 @@ final class Schema
                 'CREATE INDEX gateway_task_conversations_current ON gateway_task_conversations(current_task_id)',
                 'CREATE INDEX gateway_response_attachments_attachment ON gateway_response_attachments(attachment_id)',
             ],
+            54 => [
+                "CREATE TABLE gateway_login_lifecycle (id INTEGER PRIMARY KEY CHECK(id=1), codex_identity TEXT, profile_codex_identity TEXT, login_account_key TEXT, login_started_at INTEGER NOT NULL DEFAULT 0, snoozed_reminder_id TEXT, snoozed_until INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)",
+                'INSERT INTO gateway_login_lifecycle(id) VALUES (1)',
+            ],
         ];
     }
 

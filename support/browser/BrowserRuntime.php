@@ -66,6 +66,8 @@ final class BrowserRuntime
     /** Bound Unix death checks independently of CDP discovery and in-flight startup deadlines. */
     private float $lastUnixExitCheck = 0.0;
     private float $lastHeartbeat = 0.0;
+    /** Optional account-change reminders have no role in native/Web task execution. */
+    private float $lastLoginIdentityCheck = 0.0;
     private float $lastChatGptInspection = 0.0;
     /** Serialize event/tick capability reads so an older setup document cannot replace a native-page observation. */
     private bool $capabilityInspectionBusy = false;
@@ -177,6 +179,10 @@ final class BrowserRuntime
         if (microtime(true) - $this->lastHeartbeat >= 1.0) {
             BrowserState::heartbeat();
             $this->lastHeartbeat = microtime(true);
+        }
+        if (microtime(true) - $this->lastLoginIdentityCheck >= 5.0) {
+            $this->lastLoginIdentityCheck = microtime(true);
+            try { \app\gateway\model\BrowserLoginLifecycle::pollCodexIdentity(); } catch (\Throwable) {}
         }
         $state = BrowserState::state();
         if ((int) ($state['profile_reset_required'] ?? 0) === 1) {
@@ -1475,13 +1481,14 @@ final class BrowserRuntime
   try{
     const response=await fetch('/api/auth/session',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(3000)});
     const url=new URL(response.url);
+    if(response.status===401)return {authenticated:false};
     if(!response.ok||url.origin!==location.origin||url.pathname!=='/api/auth/session')return null;
     const session=await response.json();
-    if(session.error||(session.expires&&Date.parse(session.expires)<=Date.now()))return null;
+    if(session.error||!session.user?.id||(session.expires&&Date.parse(session.expires)<=Date.now()))return {authenticated:false};
     const id=session.user?.id,account=session.account?.id,plan=session.account?.planType;
     if([id,account,plan].some(value=>typeof value!=='string'||!value||value.length>256))return null;
     const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id+'\0'+account));
-    return {account_key:[...new Uint8Array(hash)].map(value=>value.toString(16).padStart(2,'0')).join(''),plan_type:plan};
+    return {authenticated:true,account_key:[...new Uint8Array(hash)].map(value=>value.toString(16).padStart(2,'0')).join(''),plan_type:plan};
   }catch(_){return null;}
 })()
 JS;
@@ -1490,6 +1497,10 @@ JS;
                 $value = $result['result']['value'] ?? null;
                 if ($error === null && is_array($value)) {
                     try { \app\gateway\model\GatewayUsage::observeAccount($value); } catch (\Throwable) {}
+                    try {
+                        if (($value['authenticated'] ?? null) === false) \app\gateway\model\BrowserLoginLifecycle::observeWebLogout();
+                        else \app\gateway\model\BrowserLoginLifecycle::observeWebLogin((string) ($value['account_key'] ?? ''));
+                    } catch (\Throwable) {}
                 }
             }, 4.0);
     }
@@ -1607,6 +1618,7 @@ JS;
                 throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器清理命令状态已变化，仍需重试清空。', 503);
             }
             BrowserState::write(['profile_reset_required' => 0]);
+            \app\gateway\model\BrowserLoginLifecycle::profileClearedUnlocked();
             BrowserState::finish($commandId, true, ['status' => 'cleared', 'removed' => $removed]);
         });
         $this->commandBusy = false;

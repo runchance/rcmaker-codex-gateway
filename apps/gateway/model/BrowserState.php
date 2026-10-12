@@ -94,7 +94,10 @@ final class BrowserState
             if (is_array($reset) || ($action !== 'reset_profile' && (int) ($state['profile_reset_required'] ?? 0) === 1)) {
                 throw new GatewayError('BROWSER_PROFILE_RESET_PENDING', '浏览器资料正在清空，请等待操作结束。', 409);
             }
-            if ($action === 'reset_profile') self::assertProfileResetIdle();
+            if ($action === 'reset_profile') {
+                if (isset($payload['login_reminder_id'])) BrowserLoginLifecycle::assertReminderUnlocked((string) $payload['login_reminder_id']);
+                self::assertProfileResetIdle();
+            }
             if ($action === 'start') {
                 // Auto-start and a simultaneous login click must observe the same pending launch.
                 $pendingStart = $db->table('gateway_browser_commands')->where('action', 'start')
