@@ -562,9 +562,11 @@ final class BrowserProcess
         return $value === false ? null : str_replace("\0", ' ', $value);
     }
 
+    /** Allow the internal blank bootstrap page; ordinary callers retain the configured HTTP(S) URL validation. */
     private static function initialUrl(?string $url): string
     {
         $url = trim((string) $url);
+        if ($url === 'about:blank') return $url;
         if ($url === '') return 'https://chatgpt.com/';
         $parts = parse_url($url);
         if (!$parts || !in_array(strtolower((string) ($parts['scheme'] ?? '')), ['http', 'https'], true) || isset($parts['user']) || isset($parts['pass'])) {

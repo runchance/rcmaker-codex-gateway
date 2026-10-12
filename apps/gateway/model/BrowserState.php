@@ -95,6 +95,13 @@ final class BrowserState
                 throw new GatewayError('BROWSER_PROFILE_RESET_PENDING', '浏览器资料正在清空，请等待操作结束。', 409);
             }
             if ($action === 'reset_profile') self::assertProfileResetIdle();
+            if ($action === 'start') {
+                // Auto-start and a simultaneous login click must observe the same pending launch.
+                $pendingStart = $db->table('gateway_browser_commands')->where('action', 'start')
+                    ->where('status', 'IN', ['queued', 'running'])->order([['id', 'ASC']])->find('id');
+                if ($pendingStart === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器启动状态暂不可读取。', 503);
+                if (is_array($pendingStart)) return (int) $pendingStart['id'];
+            }
             if (!in_array($action, ['start', 'install', 'reset_profile'], true) && $state['status'] === 'stopped') {
                 throw new GatewayError('BROWSER_NOT_RUNNING', '请先启动受控浏览器。', 409);
             }
@@ -188,7 +195,10 @@ final class BrowserState
                     $query = $db->table('gateway_browser_commands')->where('status', 'queued');
                     // Deferred model work must not repeatedly reclaim the head of the queue ahead
                     // of the start/install command that makes its own execution possible.
-                    if ($state['status'] !== 'ready') $query->where('action', '<>', 'chatgpt_text');
+                    if ($state['status'] !== 'ready') {
+                        // A queued login/native operation cannot overtake slow Chrome startup.
+                        $query->where('action', 'IN', ['install', 'start', 'stop', 'reset_profile']);
+                    }
                     $row = $query->order([['id', 'ASC']])->find();
                 }
             }
@@ -254,6 +264,22 @@ final class BrowserState
         if (!$updated) {
             throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作结果无法保存。', 503);
         }
+    }
+
+    /**
+     * Record bounded startup diagnostics without changing the command lifecycle or admitting
+     * downstream work. Terminal/recovered commands cannot be overwritten by late stage callbacks.
+     * @param int $id Running start command ID.
+     * @param array $progress Non-secret stage/elapsed/PID metadata from its owning browser worker.
+     * @throws GatewayError When the diagnostic update cannot be persisted.
+     */
+    public static function startupProgress(int $id, array $progress): void
+    {
+        $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('id', $id)
+            ->where('action', 'start')->where('status', 'running')->update([
+                'result_json'=>json_encode($progress, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            ]);
+        if ($updated === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器启动诊断暂不可保存。', 503);
     }
 
     /**
@@ -332,7 +358,12 @@ final class BrowserState
                     ? json_decode((string) $row['payload_json'], true) : null;
                 if (is_array($payload) && is_string($payload['response_id'] ?? null)
                     && self::finishUnknownToolCommandUnlocked((int) $row['id'], $payload['response_id'])) continue;
-                self::finish((int) $row['id'], false, ['code' => 'BROWSER_COMMAND_INTERRUPTED', 'message' => '浏览器控制进程已重启，操作结果未知，请重新执行。']);
+                $result = ['code'=>'BROWSER_COMMAND_INTERRUPTED', 'message'=>'浏览器控制进程已重启，操作结果未知，请重新执行。'];
+                if ($row['action'] === 'start') {
+                    $progress = json_decode((string) ($row['result_json'] ?? ''), true);
+                    if (is_array($progress) && ($progress['status'] ?? '') === 'starting') $result['startup'] = $progress;
+                }
+                self::finish((int) $row['id'], false, $result);
             }
             self::write(['worker_heartbeat' => time()]);
         });

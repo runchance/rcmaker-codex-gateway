@@ -44,6 +44,63 @@ final class ContextCompaction
     }
 
     /**
+     * Reuse a verified read-only checkpoint when Codex changes only its temporary thread ID.
+     * Existing conversations and active native tool batches retain their normal admission.
+     * Client, branch, integration, model/effort and the complete context bytes must match;
+     * failed, pending, active-source or missing-attachment checkpoints are never cached.
+     * Called within the existing task-maintenance admission boundary, before browser checks.
+     * @param array $spec Fresh compact request, before any conversation routing mutation.
+     * @return array|null Exact completed job, or null to run the unchanged compact flow.
+     * @throws GatewayError On storage failure; invalid cached envelopes simply cannot be reused.
+     */
+    public static function completedReadonlyReplay(array $spec): ?array
+    {
+        if (($spec['operation_kind'] ?? '') !== 'compact_v2' || empty($spec['integration_id'])
+            || !empty($spec['previous_response_id']) || (array)($spec['tool_outputs'] ?? []) !== []
+            || (array)($spec['tools'] ?? []) !== [] || ($spec['tool_choice'] ?? null) !== 'none') return null;
+        return Schema::transaction(static function () use ($spec): ?array {
+            $db = SDB(null, 'medoo', 'sqlite');
+            $requestedTask = 'task_' . substr((string)$spec['task_key'], 0, 24);
+            if (is_array($db->table('gateway_tasks')->where('id', $requestedTask)->find())
+                || is_array($db->table('gateway_task_conversations')->where('base_task_id', $requestedTask)->find())) return null;
+            // Bound candidates before reading large transcripts; the join owns checkpoint
+            // provenance and prevents any cross-client/integration summary substitution.
+            $rows = DB('medoo', 'sqlite')->query("SELECT j.id FROM gateway_response_jobs j
+                JOIN gateway_tasks t ON t.id=j.task_id
+                JOIN gateway_context_checkpoints c ON c.response_id=j.id AND c.id=j.compact_id
+                WHERE j.status='completed' AND j.operation_kind='compact_v2' AND j.previous_response_id IS NULL
+                AND j.integration_id=:integration AND j.model=:model AND j.reasoning_effort IS :effort
+                AND t.client_id=:client AND t.branch_id=:branch AND c.state='committed'
+                AND c.source_response_id IS NULL AND c.protocol='compact_v2'
+                ORDER BY j.rowid DESC LIMIT 16", [':integration'=>$spec['integration_id'], ':model'=>$spec['model'],
+                    ':effort'=>$spec['reasoning_effort'] ?? null, ':client'=>$spec['client_id'] ?? 'responses',
+                    ':branch'=>$spec['branch_id'] ?? 'main'])->fetchAll(\PDO::FETCH_ASSOC);
+            foreach ($rows as $candidate) {
+                $job = $db->table('gateway_response_jobs')->where('id', $candidate['id'])->find();
+                if (!is_array($job) || $job['context_json'] !== $spec['context_json']) continue;
+                $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $job['compact_id'])->find();
+                if (!is_array($checkpoint) || $checkpoint['task_id'] !== $job['task_id']) continue;
+                $response = json_decode((string)$job['response_json'], true);
+                $savedResponse = json_decode((string)$checkpoint['response_json'], true);
+                // The job and checkpoint serialize slashes differently. Verify the full
+                // decoded wire object, not that harmless storage-encoding difference.
+                if (!is_array($response) || !is_array($savedResponse)
+                    || ContextHistory::canonical($response) !== ContextHistory::canonical($savedResponse)) continue;
+                $envelope = $response['output'][0]['encrypted_content'] ?? null;
+                if (!is_string($envelope) || ($response['status'] ?? '') !== 'completed'
+                    || ($response['id'] ?? '') !== $job['id'] || ($response['model'] ?? '') !== $spec['model']) continue;
+                try { self::replay($envelope); }
+                catch (GatewayError $error) {
+                    if ($error->errorCode === 'storage_unavailable') throw $error;
+                    continue;
+                }
+                return $job;
+            }
+            return null;
+        });
+    }
+
+    /**
      * Codex keeps its client turn_id after an automatic v2 checkpoint. The checkpoint
      * may finish that ledger turn at an active tool boundary or use a separate turn
      * after its last response settled. Derive a new identity only when the committed
@@ -375,7 +432,7 @@ final class ContextCompaction
             }
             return [
                 'prompt' => self::retainedHandoffPrompt($token, $handoffId,
-                    ToolBroker::connectorNameForJob($job)),
+                    ToolBroker::connectorNameForJob($job), ToolBroker::retainedCompactionFailedWaitReceiptsUnlocked($job)),
                 'turn_token' => $token,
                 'handoff_id' => $handoffId,
                 'expires_at' => $expiresAt,
@@ -788,9 +845,9 @@ final class ContextCompaction
         });
     }
 
-    /** Compose the only tool-capable prompt on the retained source conversation. */
+    /** Compose the control-only checkpoint prompt, including any verified failed-wait receipts. */
     private static function retainedHandoffPrompt(string $controlToken, string $handoffId,
-        string $connectorName): string
+        string $connectorName, array $failedWaitReceipts = []): string
     {
         $call = json_encode(['turn_token' => $controlToken,
             'wire_name' => 'codex.control.compaction_handoff',
@@ -803,6 +860,10 @@ final class ContextCompaction
             . "- What remains to be done (clear next steps)\n"
             . "- Any critical data, examples, or references needed to continue\n\n"
             . "Be concise, structured, and focused on helping the next LLM seamlessly continue the work.\n"
+            . ($failedWaitReceipts === [] ? '' : "The following native results were already executed and verified, but their earlier Web wait failed. "
+                . "Treat them as exact task evidence, include their relevant facts in the checkpoint, and do not repeat these calls.\n"
+                . "<codex_compaction_receipts>\n" . ContextHistory::canonical($failedWaitReceipts)
+                . "\n</codex_compaction_receipts>\n")
             . 'Submit the summary to the pending Codex task through the attached ' . $connectorName
             . " App using codex_tool_call with the binding below.\n"
             . "The reserved codex.control.compaction_handoff operation stores this summary for task continuation. "
@@ -2034,6 +2095,7 @@ final class ContextCompaction
                 throw new GatewayError('compaction_handoff_missing', '网页没有提交与活动源回合绑定的交接摘要，原上下文仍保留。', 502);
             }
             $summary = (string) $handoff['summary'];
+            ToolBroker::commitCompactionFailedWaitReceiptsUnlocked($job);
         }
         $summary = trim($summary);
         if ($summary === '' || ContextBudget::tokens($summary) > 12000) throw new GatewayError('compaction_summary_invalid', '摘要为空或过长，未替换原上下文。', 502);

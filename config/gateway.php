@@ -75,6 +75,8 @@ return [
     'browser_runtime_dir' => $runtimeNormalized,
     'browser_runtime_manifest_url' => 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json',
     'browser_runtime_lock_timeout_seconds' => 120,
+    'browser_runtime_publish_timeout_seconds' => max(1, min(30, (int) rcEnv('gateway.browser_runtime_publish_timeout_seconds', 10))),
+    'browser_start_timeout_seconds' => max(30, min(600, (int) rcEnv('gateway.browser_start_timeout_seconds', 180))),
     // Deployment-owned allowlist: the HTTP API accepts a target ID, never a URL.
     'probe_targets' => [
         'model_site' => ['label' => '模型网站', 'url' => (string) rcEnv('gateway.diagnostic_url', 'https://chatgpt.com/')],

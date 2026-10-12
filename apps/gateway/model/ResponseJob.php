@@ -36,6 +36,12 @@ final class ResponseJob
             $existing = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('request_identity', $requestIdentity)->find();
             if (is_array($existing)) return self::decode($existing);
         }
+        // Codex may open a new temporary compaction thread for the same read-only
+        // transcript. An exact completed checkpoint requires no new browser message.
+        if ($idempotencyKey === null) {
+            $checkpointReplay = ContextCompaction::completedReadonlyReplay($spec);
+            if ($checkpointReplay !== null) return self::decode($checkpointReplay);
+        }
         // A failed stream may be replayed with the original native turn ID and a
         // reframed request after compaction. Resolve its verified checkpoint lineage
         // before browser admission; replaying a failure requires no live browser.

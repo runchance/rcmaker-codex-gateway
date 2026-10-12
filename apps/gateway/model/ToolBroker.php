@@ -184,6 +184,7 @@ final class ToolBroker
                 && (string) ($call['response_id'] ?? '') === $sourceId
                 && isset($ids[(string) $call['call_id']]);
             if (!$current && self::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)) continue;
+            if (!$current && self::activeFailedWaitReceiptCoveredUnlocked($call, $spec, $source)) continue;
             if ($current && ((string) $call['status'] === 'delivered'
                 || ((string) $call['status'] === 'completed' && $call['result_delivered_at'] === null))) {
                 $hasWaitingSourceResult = true;
@@ -1558,6 +1559,99 @@ final class ToolBroker
     }
 
     /**
+     * Prove an older failed wait inside the same still-running source turn.
+     * The active-source caller already verified the current capability, page and native batch.
+     * Exact native output and a typed closed wait are required; nothing is acknowledged here.
+     * @return bool Whether this earlier completed call is covered by the compact's real history.
+     * @throws GatewayError If a claimed historical receipt differs from its persisted result.
+     */
+    private static function activeFailedWaitReceiptCoveredUnlocked(array $call, array $spec, array $source): bool
+    {
+        if (($call['task_id'] ?? '') !== ($source['task_id'] ?? null)
+            || ($call['binding_id'] ?? '') !== ($source['mcp_binding_id'] ?? null)
+            || ($call['turn_id'] ?? '') !== ($source['durable_turn_id'] ?? null)
+            || ($call['status'] ?? '') !== 'completed' || ($call['result_delivered_at'] ?? null) !== null
+            || empty($call['delivered_at']) || empty($call['completed_at'])
+            || empty($call['response_id']) || $call['response_id'] === $source['id']) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $older = $db->table('gateway_response_jobs')->where('id', $call['response_id'])->find();
+        if (!is_array($older) || $older['task_id'] !== $source['task_id']
+            || $older['durable_turn_id'] !== $source['durable_turn_id']
+            || $older['mcp_binding_id'] !== $source['mcp_binding_id']
+            || $older['epoch_id'] !== $source['epoch_id'] || $older['surface_id'] !== $source['surface_id']
+            || $older['status'] !== 'completed' || $older['round_kind'] !== 'tool_call'
+            || $older['operation_kind'] !== 'response' || (int)$older['round_no'] >= (int)$source['round_no']) return false;
+        $events = $db->table('gateway_task_events')->where('task_id', $source['task_id'])
+            ->where('turn_id', $source['durable_turn_id'])->where('response_id', $call['response_id'])
+            ->where('event_type', 'tool_result_transport_failed')->select('data_json');
+        if (!is_array($events)) throw new GatewayError('storage_unavailable', '工具等待失败记录暂不可读取。', 503);
+        foreach ($events as $event) {
+            $facts = json_decode((string)$event['data_json'], true);
+            if (($facts['invocation_id'] ?? '') !== $call['id'] || ($facts['code'] ?? '') !== 'tool_wait_scope_changed') continue;
+            ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($spec, $call, (string)$source['task_id']);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Collect exact failed-wait results for the one-shot retained checkpoint message.
+     * These are already executed native results, not new tool requests or old RPC delivery.
+     * @param array $job Active compact job owning its current binding and checkpoint.
+     * @return list<array> Native receipt records that the old Web wait did not receive.
+     * @throws GatewayError On unreadable or inconsistent source receipt evidence.
+     */
+    public static function retainedCompactionFailedWaitReceiptsUnlocked(array $job): array
+    {
+        if (!in_array($job['operation_kind'] ?? '', ['compact_v1','compact_v2'], true)
+            || empty($job['previous_response_id']) || empty($job['mcp_binding_id'])) return [];
+        $binding = self::bindingByIdUnlocked((string)$job['mcp_binding_id']);
+        if ($binding['current_response_id'] !== $job['id'] || $binding['task_id'] !== $job['task_id']
+            || self::activeCompactionCheckpointUnlocked($binding, (string)$job['id'], (string)$job['previous_response_id']) === null) return [];
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', $job['previous_response_id'])->find();
+        if (!is_array($source) || $source['task_id'] !== $job['task_id']
+            || $source['mcp_binding_id'] !== $binding['id'] || $source['durable_turn_id'] !== $job['durable_turn_id']) return [];
+        $rows = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status', 'completed')->where('result_delivered_at', null)->select();
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '工具回执状态暂不可读取。', 503);
+        $receipts = [];
+        foreach ($rows as $call) {
+            $result = json_decode((string)$call['result_json'], true);
+            if (!empty($result['canonical_handoff_response_id'])
+                || !self::activeFailedWaitReceiptCoveredUnlocked($call, $job, $source)) continue;
+            $tool = self::catalogEntry($binding, (string)$call['wire_name']);
+            $receipts[] = ['type'=>!empty($tool['tool_search']) ? 'tool_search_output'
+                : ($call['input_text'] !== null ? 'custom_tool_call_output' : 'function_call_output'),
+                'call_id'=>(string)$call['call_id'], 'wire_name'=>(string)$call['wire_name'], 'output'=>(string)$result['output']];
+        }
+        return $receipts;
+    }
+
+    /**
+     * Record canonical receipt handoff only after an actual summary control receipt was accepted.
+     * Called inside the checkpoint commit transaction; original output/hash and old RPC delivery
+     * remain unchanged, and a rolled-back checkpoint leaves no handoff coverage behind.
+     * @param array $job Exact compact whose accepted control receipt the caller verified.
+     * @return void
+     * @throws GatewayError If a known native receipt changes during checkpoint commit.
+     */
+    public static function commitCompactionFailedWaitReceiptsUnlocked(array $job): void
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        foreach (self::retainedCompactionFailedWaitReceiptsUnlocked($job) as $receipt) {
+            $call = $db->table('gateway_tool_invocations')->where('binding_id', $job['mcp_binding_id'])
+                ->where('call_id', $receipt['call_id'])->find();
+            $result = json_decode((string)$call['result_json'], true, 128, JSON_THROW_ON_ERROR);
+            $result['canonical_handoff_response_id'] = (string)$job['id'];
+            $updated = $db->table('gateway_tool_invocations')->where('id', $call['id'])
+                ->where('status', 'completed')->where('result_delivered_at', null)->where('result_hash', $call['result_hash'])
+                ->update(['result_json'=>ContextHistory::canonical($result), 'updated_at'=>time()]);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('tool_result_conflict', '工具摘要交接状态发生变化。', 409);
+        }
+    }
+
+    /**
      * End only the failed result transport after its browser owner proves a stable stopped final.
      * Native results stay completed and unacknowledged; no success or unknown effect is invented.
      * @param string $responseId Exact current ordinary text response.
@@ -2569,12 +2663,24 @@ final class ToolBroker
         if ($count === false || $count === null) throw new GatewayError('storage_unavailable', '工具调用状态暂不可读取。', 503);
         $unacknowledged = $db->table('gateway_tool_invocations')
             ->where('binding_id', $bindingId)->where('status', 'completed')->where('result_delivered_at', null)
-            ->select('result_json');
+            ->select('call_id,result_json');
         if (!is_array($unacknowledged)) throw new GatewayError('storage_unavailable', '工具回执状态暂不可读取。', 503);
+        $covered = [];
+        if ($unacknowledged !== []) {
+            // Ordinary waits need no archive scan. Read the large context only for
+            // this rare active-checkpoint case with a previously failed wait.
+            $bindingRows = $db->table('gateway_mcp_bindings')->where('id', $bindingId)->select('current_response_id');
+            $currentId = $bindingRows[0]['current_response_id'] ?? '';
+            $jobRows = $db->table('gateway_response_jobs')->where('id', $currentId)->select('operation_kind');
+            if (in_array($jobRows[0]['operation_kind'] ?? '', ['compact_v1','compact_v2'], true)) {
+                $job = $db->table('gateway_response_jobs')->where('id', $currentId)->find();
+                if (is_array($job)) $covered = array_fill_keys(array_column(self::retainedCompactionFailedWaitReceiptsUnlocked($job), 'call_id'), true);
+            }
+        }
         $pending = 0;
         foreach ($unacknowledged as $row) {
             $result = is_string($row['result_json'] ?? null) ? json_decode($row['result_json'], true) : null;
-            if (empty($result['canonical_handoff_response_id'])) $pending++;
+            if (empty($result['canonical_handoff_response_id']) && !isset($covered[$row['call_id']])) $pending++;
         }
         return (int) $count + $pending;
     }

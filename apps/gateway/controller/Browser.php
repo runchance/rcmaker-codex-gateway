@@ -129,7 +129,12 @@ final class Browser
             }
             if ($state['status'] === 'starting') {
                 BrowserState::setAutoStart(true);
-                return ['id'=>null, 'status'=>'starting'];
+                $pending = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('action', 'start')
+                    ->where('status', 'IN', ['queued', 'running'])->order([['id', 'ASC']])->find('id');
+                if ($pending === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器启动状态暂不可读取。', 503);
+                // Return the real launch ID; a reattached worker can instead be observed by
+                // the console's read-only readiness wait. Neither path launches another Chrome.
+                return ['id'=>is_array($pending) ? (int) $pending['id'] : null, 'status'=>'starting'];
             }
             if ($state['status'] !== 'stopped') {
                 throw new GatewayError('BROWSER_RESTART_REQUIRED', '浏览器状态需要恢复，请重试登录检查。', 409);

@@ -249,7 +249,7 @@ final class ChromeForTestingRuntime
                     self::makeRuntimeWritable($versionRoot, $platform);
                     self::removeTree($versionRoot, $root);
                 }
-                if (!@rename($tempRoot, $versionRoot)) self::fail('BROWSER_RUNTIME_INSTALL_FAILED', '无法发布已验证的浏览器 Runtime。', $platform, 'installing');
+                self::publishVerifiedRuntime($tempRoot, $versionRoot, $platform, $progress);
                 $relativeWithinTemp = substr($executable, strlen(rtrim($tempRoot, '\\/')) + 1);
                 $finalExecutable = $versionRoot . DIRECTORY_SEPARATOR . $relativeWithinTemp;
                 $relative = 'stable/' . $selected['version'] . '/' . str_replace('\\', '/', $relativeWithinTemp);
@@ -438,6 +438,52 @@ final class ChromeForTestingRuntime
         if (@file_put_contents($tmp, $json, LOCK_EX) !== strlen($json) || !@rename($tmp, $path)) {
             @unlink($tmp); self::fail('BROWSER_RUNTIME_INSTALL_FAILED', '无法保存 installed.json。', $platform, 'installing');
         }
+    }
+
+    /**
+     * Publish the verified sibling tree under the existing installation lock. Windows scanners
+     * can briefly deny directory moves; retry only those native sharing/access errors without
+     * redownloading, copying partial files, or overwriting a remaining destination tree.
+     * @param string $source Already validated temporary version directory.
+     * @param string $destination Final version directory in the same parent.
+     * @param array $platform Current browser platform metadata.
+     * @param callable|null $progress Existing installation progress observer.
+     * @throws GatewayError When publication remains blocked or its paths are invalid.
+     */
+    private static function publishVerifiedRuntime(string $source, string $destination, array $platform, ?callable $progress): void
+    {
+        $parent = realpath(dirname($source));
+        if ($parent === false || realpath(dirname($destination)) !== $parent || is_link($source)
+            || !is_dir($source) || !preg_match('/\A\.install-[a-f0-9]{12}\z/', basename($source))
+            || !preg_match('/\A\d+(?:\.\d+){3}\z/', basename($destination))) {
+            self::fail('BROWSER_RUNTIME_INSTALL_FAILED', '浏览器 Runtime 发布目录无效。', $platform, 'installing');
+        }
+        self::emit($progress, ['stage'=>'installing'] + $platform);
+        $deadline = microtime(true) + (float) Config::get('gateway', 'browser_runtime_publish_timeout_seconds');
+        $attempts = 0;
+        $nativeCode = null;
+        $detail = '';
+        do {
+            clearstatcache(true, $destination);
+            if (file_exists($destination) || is_link($destination)) {
+                $detail = 'destination still exists after stale-version cleanup';
+                break;
+            }
+            ++$attempts;
+            error_clear_last();
+            if (@rename($source, $destination)) return;
+            $detail = (string) (error_get_last()['message'] ?? 'directory rename failed');
+            $nativeCode = preg_match('/\(code:\s*(\d+)\)/', $detail, $match) === 1 ? (int) $match[1] : null;
+            if (PHP_OS_FAMILY !== 'Windows' || !in_array($nativeCode, [5, 32, 33], true)
+                || microtime(true) >= $deadline) break;
+            usleep(100000);
+        } while (true);
+        $detail = preg_replace('/[\x00-\x1F\x7F]/', ' ', $detail) ?? '';
+        self::log('publication failed attempts=' . $attempts . ' native_code=' . ($nativeCode ?? 'unknown')
+            . ' detail=' . mb_substr($detail, 0, 1200), $platform);
+        self::fail('BROWSER_RUNTIME_INSTALL_FAILED', '无法发布已验证的浏览器 Runtime。'
+            . ($nativeCode !== null ? ' Windows error=' . $nativeCode . '。' : '')
+            . ' 请确认安装目录可写，且浏览器文件未被其他程序持续占用。', $platform, 'installing');
     }
 
     /** Write a deterministic hash manifest before the version directory becomes immutable. */

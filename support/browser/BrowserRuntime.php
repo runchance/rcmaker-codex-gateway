@@ -38,6 +38,8 @@ final class BrowserRuntime
     private const IDLE_CAPABILITY_REFRESH_SECONDS = BrowserState::IDLE_CAPABILITY_REFRESH_SECONDS;
     /** Fresh Temporary Chat pages can expose the composer before the model picker hydrates. */
     private const TASK_MODEL_CONTROL_READY_SECONDS = 30.0;
+    /** First-profile recovery requires a continuous absence of initialization progress. */
+    private const COLD_PROFILE_IDLE_RETRY_SECONDS = 45.0;
 
     private CdpClient $cdp;
     private CdpClient $taskCdp;
@@ -74,6 +76,13 @@ final class BrowserRuntime
     private ?int $pendingStartCommand = null;
     private float $startDeadline = 0.0;
     private string $startupStage = 'idle';
+    /** The first browser profile can need one bounded, pre-ready restart; never used for live Web tasks. */
+    private ?array $startupPlan = null;
+    /** One setup-tab creation intent per actual Chrome incarnation; a lost reply is reconciled, not resent. */
+    private ?array $startupPageCreation = null;
+    private float $startupStartedAt = 0.0;
+    /** Closing an unready page for the owned cold-start retry must not fail its original command callbacks. */
+    private bool $startupRestarting = false;
     private bool $taskConnecting = false;
     private string $taskBrowserSocket = '';
     private bool $taskDownloadsReady = false;
@@ -97,7 +106,7 @@ final class BrowserRuntime
     /** A connector check owns a background page; the setup browser remains on the user's tab. */
     private ?string $connectorProbeTargetId = null;
     private ?string $connectorProbeSessionId = null;
-    /** @var array<int,float> A missing browser-level CDP connection cannot starve the queue indefinitely. */
+    /** @var array<int,float> Setup/native/connector commands cannot wait forever for browser-level CDP. */
     private array $connectorProbeCdpWaitSince = [];
     /** @var resource|null */
     private $ownershipLock = null;
@@ -139,6 +148,8 @@ final class BrowserRuntime
 
         $this->ownedProcess = null;
         $this->pendingStartCommand = null;
+        $this->startupPlan = null;
+        $this->startupPageCreation = null;
         $this->chatGptTurns = [];
         $this->taskSessions = [];
         $this->taskDownloads = [];
@@ -216,10 +227,16 @@ final class BrowserRuntime
             $this->lastUnixExitCheck = microtime(true);
             $state = $this->reconcileExitedUnixBrowser($state);
         }
+        if ($this->recoverColdStartup($state)) $state = BrowserState::state();
         if ($state['status'] !== 'stopped' && !$this->cdp->ready() && !$this->connecting) {
             $this->tryConnect($state);
         }
-        if ($state['status'] === 'ready') {
+        if ($this->pendingStartCommand !== null && $this->cdp->ready() && !$this->connecting) {
+            // Establish the browser-level transport before publishing startup readiness. Native
+            // window/login operations use this connection, not just the setup page WebSocket.
+            $this->ensureTaskCdp($state);
+        }
+        if ($state['status'] === 'ready' && $this->pendingStartCommand === null) {
             $this->recoverResponses($state);
             $this->ensureTaskCdp($state);
             $cleanupInterval = ($this->chatGptTurns !== [] || $this->pendingResumes !== [])
@@ -236,7 +253,7 @@ final class BrowserRuntime
         }
         $inspectionInterval = ($this->commandBusy || $this->pendingStartCommand !== null || $this->chatGptTurns !== [])
             ? 1.0 : self::IDLE_CAPABILITY_REFRESH_SECONDS;
-        if ($state['status'] === 'ready' && ($this->cdp->ready() || $this->taskCdp->ready())
+        if ($state['status'] === 'ready' && $this->pendingStartCommand === null && ($this->cdp->ready() || $this->taskCdp->ready())
             && microtime(true) - $this->lastChatGptInspection >= $inspectionInterval) {
             $this->refreshChatGptCapability();
             $this->lastChatGptInspection = microtime(true);
@@ -262,6 +279,9 @@ final class BrowserRuntime
                 error_log('[browser] failed-start cleanup: ' . mb_substr($error->getMessage(), 0, 300));
             }
             $this->ownedProcess = null;
+            $this->cdp->close('BROWSER_START_TIMEOUT');
+            $this->taskCdp->close('BROWSER_START_TIMEOUT');
+            $this->taskDownloadsReady = false;
             @unlink(self::screenshotPath());
             $this->clearMonitorScreenshots();
             BrowserState::write([
@@ -318,15 +338,19 @@ final class BrowserRuntime
         if ($this->pendingStartCommand === null && !self::observerActive(self::screenshotObserverPath())) return;
         if ($this->screenshotBusy || $this->connecting || $this->switchingTarget || !$this->cdp->ready()) return;
         $state = BrowserState::state();
-        if ($state['status'] !== 'ready') return;
+        if ($state['status'] !== 'ready' && !($state['status'] === 'starting' && $this->pendingStartCommand !== null)) return;
         $this->screenshotBusy = true;
         $this->cdp->send('Page.captureScreenshot', [
             'format' => 'jpeg', 'quality' => 68, 'fromSurface' => true, 'captureBeyondViewport' => false,
-        ], null, function ($error, $result): void {
+        ], null, function ($error, $result) use ($state): void {
             $this->screenshotBusy = false;
+            $current = BrowserState::state();
+            if (($current['launch_nonce'] ?? null) !== ($state['launch_nonce'] ?? null)
+                || ($current['active_target'] ?? null) !== ($state['active_target'] ?? null)
+                || !in_array($current['status'], ['starting', 'ready'], true)) return;
             if ($error !== null || !isset($result['data']) || !is_string($result['data']) || strlen($result['data']) > 8 * 1024 * 1024) return;
             $bytes = base64_decode($result['data'], true);
-            if ($bytes === false || strlen($bytes) > 6 * 1024 * 1024) return;
+            if ($bytes === false || $bytes === '' || strlen($bytes) > 6 * 1024 * 1024) return;
             $path = self::screenshotPath();
             $directory = dirname($path);
             if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) return;
@@ -345,10 +369,12 @@ final class BrowserRuntime
                 });
                 $this->refreshMetadata();
                 $this->refreshTabs();
-                if ($this->pendingStartCommand !== null) {
+                if ($this->pendingStartCommand !== null && $this->taskCdp->ready()) {
                     $pending = $this->pendingStartCommand;
+                    $this->recordStartupStage('ready');
                     $this->pendingStartCommand = null;
-                    $this->startupStage = 'ready';
+                    $this->startupPlan = null;
+                    BrowserState::write(['status'=>'ready', 'last_error'=>null]);
                     $this->finishCommand($pending, ['status' => 'ready', 'target_id' => BrowserState::state()['active_target']]);
                 }
             } catch (\Throwable) {
@@ -643,6 +669,19 @@ final class BrowserRuntime
     /** Display/hide a separate native setup window without replacing the embedded page or any task session. */
     private function nativeWindow(int $commandId, array $payload): void
     {
+        if (!$this->taskCdp->ready()) {
+            // Worker reattachment can restore the setup page before the browser WebSocket.
+            // No native-window effect has started, so defer the same command instead of failing it.
+            $since = $this->connectorProbeCdpWaitSince[$commandId] ?? microtime(true);
+            $this->connectorProbeCdpWaitSince[$commandId] = $since;
+            if (microtime(true) - $since >= 20.0) {
+                $this->failCommand($commandId, 'BROWSER_NOT_READY', '浏览器控制连接尚未就绪。');
+                return;
+            }
+            BrowserState::defer($commandId);
+            $this->commandBusy = false;
+            return;
+        }
         NativeBrowserWindow::setVisible($this->taskCdp, BrowserState::state(), ($payload['mode'] ?? '') === 'show',
             self::modelUrl(), function ($error, $result) use ($commandId): void {
                 if ($error instanceof GatewayError) $this->failCommand($commandId, $error->errorCode, $error->getMessage());
@@ -745,7 +784,7 @@ final class BrowserRuntime
     {
         $revision = NetworkSettings::revision((int) ($payload['revision'] ?? 0));
         $runtime = BrowserProcess::select('bundled', $revision);
-        BrowserState::write(['last_error' => null]);
+        BrowserState::write(['last_error' => null, 'worker_heartbeat' => time()]);
         $this->finishCommand($commandId, [
             'installed' => true,
             'version' => (string) ($runtime['version'] ?? ''),
@@ -753,6 +792,7 @@ final class BrowserRuntime
         ]);
     }
 
+    /** Start the private Chrome once; complete only after both CDP transports and a real frame exist. */
     private function startBrowser(int $commandId, array $payload): void
     {
         $state = BrowserState::state();
@@ -768,9 +808,16 @@ final class BrowserRuntime
         $revision = NetworkSettings::revision($revisionId);
         $port = (int) Config::get('gateway', 'browser_debug_port');
         $preference = (string) ($payload['browser'] ?? 'auto');
-        BrowserProcess::clearSessionRestore((string) Config::get('gateway', 'browser_profile_dir'));
-        $launch = BrowserProcess::launch($preference, $port, $revision, self::modelUrl());
-        $this->startupStage = 'process_started';
+        $profile = (string) Config::get('gateway', 'browser_profile_dir');
+        $coldProfile = !is_file(rtrim($profile, '\\/') . '/Local State');
+        $this->startupPlan = null;
+        $this->startupPageCreation = null;
+        $this->startupStartedAt = microtime(true);
+        $this->recordStartupStage('preparing_runtime', $commandId);
+        BrowserProcess::clearSessionRestore($profile);
+        // The first renderer must not depend on ChatGPT/network initialization. Navigate only
+        // after the owned browser and page CDP transports can actually control this blank page.
+        $launch = BrowserProcess::launch($preference, $port, $revision, 'about:blank');
         $this->ownedProcess = $launch;
         $generation = (int) $state['surface_generation'] + 1;
         BrowserState::write([
@@ -780,12 +827,93 @@ final class BrowserRuntime
             'document_nonce' => bin2hex(random_bytes(12)), 'lease_mode' => 'manual', 'url' => '', 'title' => '',
             'tabs_json' => '[]', 'screenshot_sequence' => 0, 'screenshot_mime' => null,
             'last_error' => null, 'owner_identity' => self::identity(), 'launch_nonce' => bin2hex(random_bytes(16)),
+            'chatgpt_json' => null, 'chatgpt_observed_at' => 0,
         ]);
         @unlink(self::screenshotPath());
         $this->pendingStartCommand = $commandId;
-        $this->startDeadline = microtime(true) + 30;
-        $this->startupStage = 'cdp_discovery';
+        $this->startDeadline = microtime(true) + (float) Config::get('gateway', 'browser_start_timeout_seconds');
+        $this->startupPageCreation = null;
+        $this->startupPlan = ['revision'=>$revisionId, 'browser'=>$preference, 'cold_profile'=>$coldProfile,
+            'retry_count'=>0, 'launch_nonce'=>BrowserState::state()['launch_nonce'],
+            'launched_at'=>microtime(true), 'last_progress_at'=>microtime(true)];
+        $this->recordStartupStage('cdp_discovery');
         $this->tryConnect(BrowserState::state(), true);
+    }
+
+    /**
+     * Recover one first-profile Chrome that never supplied an initialized page. The original
+     * command/deadline/profile survive; only the exact guardian-owned Chrome is stopped. A task,
+     * navigation already underway, unknown ownership or an ordinary warm start is never restarted.
+     * @return bool True when one cold-start recovery attempt changed the browser state.
+     */
+    private function recoverColdStartup(array $state): bool
+    {
+        $plan = $this->startupPlan;
+        if ($this->pendingStartCommand === null || !is_array($plan) || empty($plan['cold_profile'])
+            || (int) $plan['retry_count'] !== 0
+            || microtime(true) - max((float) $plan['launched_at'], (float) ($plan['last_progress_at'] ?? 0)) < self::COLD_PROFILE_IDLE_RETRY_SECONDS
+            || microtime(true) >= $this->startDeadline - 20.0 || ($state['status'] ?? '') !== 'starting'
+            || (string) ($state['launch_nonce'] ?? '') !== (string) $plan['launch_nonce']
+            || (int) ($state['screenshot_sequence'] ?? 0) !== 0 || $this->chatGptTurns !== [] || $this->pendingResumes !== []
+            || !in_array($this->startupStage, ['cdp_discovery', 'page_target_wait', 'page_cdp_connect',
+                'page_enable', 'viewport', 'cdp_disconnected', 'cdp_initialization_retry'], true)
+            || $this->ownedProcess === null || (int) ($this->ownedProcess['pid'] ?? 0) !== (int) ($state['browser_pid'] ?? 0)
+            || !OwnedRuntime::alive($this->ownedProcess)) return false;
+        $this->startupPlan['retry_count'] = 1;
+        $this->recordStartupStage('cold_profile_restart');
+        $this->startupRestarting = true;
+        $this->switchingTarget = true;
+        $this->cdp->close('BROWSER_COLD_START_RETRY');
+        $this->taskCdp->close('BROWSER_COLD_START_RETRY');
+        $this->connecting = false;
+        $this->taskConnecting = false;
+        $this->taskDownloadsReady = false;
+        $this->startupPageCreation = null;
+        try {
+            BrowserProcess::terminate($this->ownedProcess, (int) $state['browser_pid'],
+                (string) Config::get('gateway', 'browser_profile_dir'), (int) $state['debug_port']);
+            $launch = BrowserProcess::launch((string) $plan['browser'], (int) $state['debug_port'],
+                NetworkSettings::revision((int) $plan['revision']), 'about:blank');
+            $this->ownedProcess = $launch;
+            $nonce = bin2hex(random_bytes(16));
+            BrowserState::write(['status'=>'starting', 'browser_pid'=>$launch['pid'], 'executable'=>$launch['path'],
+                'active_target'=>null, 'session_id'=>null, 'launch_nonce'=>$nonce,
+                'surface_generation'=>(int) $state['surface_generation'] + 1, 'document_nonce'=>bin2hex(random_bytes(12)),
+                'url'=>'', 'title'=>'', 'tabs_json'=>'[]', 'chatgpt_json'=>null, 'chatgpt_observed_at'=>0, 'last_error'=>null]);
+            $this->startupPlan['launch_nonce'] = $nonce;
+            $this->startupPlan['launched_at'] = microtime(true);
+            $this->recordStartupStage('cdp_discovery');
+        } catch (\Throwable $error) {
+            $this->recordStartupStage('cold_profile_restart_failed');
+            $this->connectionFailed('BROWSER_COLD_START_RETRY_FAILED', ['code'=>0,
+                'message'=>get_class($error), 'detail'=>mb_substr($error->getMessage(), 0, 160)]);
+        } finally {
+            $this->switchingTarget = false;
+            $this->startupRestarting = false;
+        }
+        return true;
+    }
+
+    /** Best-effort non-secret stage evidence survives a manual restart and never changes readiness. */
+    private function recordStartupStage(string $stage, ?int $commandId = null): void
+    {
+        if ($this->startupStage === $stage && $commandId === null) return;
+        $this->startupStage = $stage;
+        if ($this->startupPlan !== null) $this->startupPlan['last_progress_at'] = microtime(true);
+        $commandId ??= $this->pendingStartCommand;
+        if ($commandId === null) return;
+        try {
+            $state = BrowserState::state();
+            $progress = ['status'=>'starting', 'stage'=>$stage, 'observed_at'=>time(),
+                'elapsed_ms'=>$this->startupStartedAt > 0 ? (int) ((microtime(true) - $this->startupStartedAt) * 1000) : 0,
+                'browser_pid'=>$state['browser_pid'] ?? null, 'retry_count'=>(int) ($this->startupPlan['retry_count'] ?? 0)];
+            BrowserState::startupProgress($commandId, $progress);
+            $path = dirname(self::screenshotPath()) . '/startup.log';
+            if (!is_dir(dirname($path))) @mkdir(dirname($path), 0700, true);
+            @file_put_contents($path, json_encode(['command_id'=>$commandId] + $progress, JSON_UNESCAPED_SLASHES) . PHP_EOL, FILE_APPEND | LOCK_EX);
+        } catch (\Throwable) {
+            // A diagnostic cannot abort a verified owned browser's initialization.
+        }
     }
 
     /** Verify the exact connector with a no-host-effect round trip in the signed-in setup browser. */
@@ -1536,8 +1664,9 @@ JS;
         $this->lastDiscovery = $now;
         $port = (int) ($state['debug_port'] ?? 0);
         if ($port < 1) return;
-        $targets = $this->discoverTargets($port);
-        if ($targets === []) return;
+        $targets = $this->discoverTargetsIfAvailable($port);
+        if ($targets === null) return;
+        if ($targets === [] && $this->pendingStartCommand === null) return;
         $profile = (string) Config::get('gateway', 'browser_profile_dir');
         $pid = (int) ($state['browser_pid'] ?? 0);
         $ownedHere = $this->ownedProcess !== null
@@ -1546,6 +1675,7 @@ JS;
             && BrowserProcess::sameProfile((string) ($this->ownedProcess['profile'] ?? ''), $profile);
         $version = $this->devtoolsRequest($port, '/json/version');
         $browserSocket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
+        if ($browserSocket === '' && $this->pendingStartCommand !== null && $ownedHere) return;
         // After a FileMonitor/worker reload the proc_open handle is gone. On Windows, querying
         // Win32_Process command lines can be denied (and can block for tens of seconds), while the
         // product-owned profile + exact loopback DevTools endpoint + listener PID are already
@@ -1558,9 +1688,53 @@ JS;
             try { BrowserState::write(['status' => 'error', 'last_error' => 'BROWSER_OWNERSHIP_UNCONFIRMED']); } catch (\Throwable) {}
             return;
         }
+        if ($targets === []) {
+            if ($this->pendingStartCommand !== null && $ownedHere) {
+                $this->recordStartupStage('page_target_wait');
+                // A fresh profile may expose browser CDP before any page exists. Waiting for
+                // page CDP before connecting browser CDP makes that state impossible to recover.
+                $this->ensureTaskCdp($state);
+                if ($this->discoverPhysicalPageIdsIfAvailable($port) === []) {
+                    $this->createStartupPage($state, $browserSocket);
+                }
+            }
+            return;
+        }
         $targetId = (string) ($state['active_target'] ?? '');
+        $startupTarget = (string) ($this->startupPageCreation['target_id'] ?? '');
+        if ($targetId === '' && $startupTarget !== '' && isset($targets[$startupTarget])) $targetId = $startupTarget;
         if ($targetId === '' || !isset($targets[$targetId])) $targetId = self::preferredTargetId($targets, self::modelUrl());
         $this->connectTarget($targetId, null, $targets);
+    }
+
+    /**
+     * Create one blank setup page only after an authoritative empty page inventory and exact
+     * launch ownership were proved by tryConnect(). Timeout keeps the intent: subsequent discovery
+     * can adopt a page created despite a lost reply, but must never create another setup tab.
+     */
+    private function createStartupPage(array $state, string $browserSocket): void
+    {
+        if ($this->pendingStartCommand === null || $this->startupPageCreation !== null || !$this->taskCdp->ready()
+            || $this->taskBrowserSocket !== $browserSocket) return;
+        $commandId = $this->pendingStartCommand;
+        $nonce = (string) $state['launch_nonce'];
+        $this->startupPageCreation = ['command_id'=>$commandId, 'launch_nonce'=>$nonce];
+        $this->recordStartupStage('page_target_wait');
+        $this->taskCdp->send('Target.createTarget', ['url'=>'about:blank'], null,
+            function ($error, $result) use ($commandId, $nonce): void {
+                $current = BrowserState::state();
+                if ($this->pendingStartCommand !== $commandId || (string) ($current['launch_nonce'] ?? '') !== $nonce
+                    || ($current['status'] ?? '') !== 'starting') return;
+                if ($error !== null && (int) ($error['code'] ?? 0) !== -2) {
+                    $this->connectionFailed('BROWSER_SETUP_PAGE_FAILED', is_array($error) ? $error : null);
+                    return;
+                }
+                if ($error === null && is_string($result['targetId'] ?? null) && $result['targetId'] !== '') {
+                    $this->startupPageCreation['target_id'] = $result['targetId'];
+                }
+                // The next normal tick discovers/attaches the real page. No second create,
+                // navigation, login inference or readiness publication is performed here.
+            }, 10.0);
     }
 
     /** Prefer the configured model-site target when browsers also expose a vendor new-tab page. */
@@ -1677,10 +1851,11 @@ JS;
         }
         $this->connecting = true;
         $this->switchingTarget = true;
-        $this->startupStage = 'page_cdp_connect';
+        $this->recordStartupStage('page_cdp_connect');
         $this->cdp->close('BROWSER_TARGET_SWITCH');
         try {
             $this->cdp->connect((string) $target['webSocketDebuggerUrl'], function () use ($targetId, $commandId): void {
+                if ($this->startupRestarting) return;
                 $state = BrowserState::state();
                 BrowserState::write([
                     'active_target' => $targetId, 'session_id' => null,
@@ -1688,8 +1863,9 @@ JS;
                     'document_nonce' => bin2hex(random_bytes(12)), 'last_error' => null,
                 ]);
                 \app\gateway\model\ModelCatalog::advanceSurfaceGeneration((int) $state['surface_generation'], (int) $state['surface_generation'] + 1);
-                if ($this->pendingStartCommand !== null) $this->startupStage = 'page_enable';
+                if ($this->pendingStartCommand !== null) $this->recordStartupStage('page_enable');
                 $this->cdp->send('Page.enable', [], null, function ($pageError) use ($commandId): void {
+                    if ($this->startupRestarting) return;
                     if ($pageError !== null) {
                         $this->connecting = false;
                         $this->switchingTarget = false;
@@ -1697,9 +1873,10 @@ JS;
                         $this->connectionFailed('BROWSER_PAGE_ENABLE_FAILED', is_array($pageError) ? $pageError : null);
                         return;
                     }
-                    if ($this->pendingStartCommand !== null) $this->startupStage = 'viewport';
+                    if ($this->pendingStartCommand !== null) $this->recordStartupStage('viewport');
                     $this->cdp->send('Emulation.setDeviceMetricsOverride', ['width' => 1280, 'height' => 720, 'deviceScaleFactor' => 1, 'mobile' => false], null,
                         function ($metricsError) use ($commandId): void {
+                            if ($this->startupRestarting) return;
                             if ($metricsError !== null) {
                                 $this->connecting = false;
                                 $this->switchingTarget = false;
@@ -1712,14 +1889,15 @@ JS;
                                 return;
                             }
                             $this->finishTargetConnection($commandId);
-                        });
-                });
+                        }, $this->pendingStartCommand !== null ? 20.0 : 5.0);
+                }, $this->pendingStartCommand !== null ? 20.0 : 5.0);
             }, function (array $message): void { $this->onEvent($message); }, function (bool $wasReady): void {
                 $this->connecting = false;
-                if ($this->switchingTarget) return;
-                if ($this->pendingStartCommand !== null) $this->startupStage = 'cdp_disconnected';
+                if ($this->switchingTarget || $this->startupRestarting) return;
+                if ($this->pendingStartCommand !== null) $this->recordStartupStage('cdp_disconnected');
                 if ($this->stopping) return;
-                try { BrowserState::write(['status' => 'error', 'session_id' => null, 'last_error' => 'BROWSER_CDP_DISCONNECTED']); } catch (\Throwable) {}
+                try { BrowserState::write(['status' => $this->pendingStartCommand !== null ? 'starting' : 'error',
+                    'session_id' => null, 'last_error' => 'BROWSER_CDP_DISCONNECTED']); } catch (\Throwable) {}
             });
         } catch (\Throwable) {
             $this->connecting = false;
@@ -1732,7 +1910,7 @@ JS;
     /** Confirm the renderer's real URL before deciding whether startup needs navigation. */
     private function initializeStartupLocation(?int $commandId): void
     {
-        $this->startupStage = 'initial_location_check';
+        $this->recordStartupStage('initial_location_check');
         $this->cdp->send('Runtime.evaluate', [
             'expression' => 'String(location.href||"")', 'returnByValue' => true,
         ], null, function ($locationError, $locationResult) use ($commandId): void {
@@ -1748,7 +1926,7 @@ JS;
     /** Navigate once, then reconcile a lost/late Page.navigate reply against the live renderer. */
     private function navigateStartup(?int $commandId): void
     {
-        $this->startupStage = 'initial_navigation';
+        $this->recordStartupStage('initial_navigation');
         $this->cdp->send('Page.navigate', ['url' => self::modelUrl()], null,
             function ($navigationError) use ($commandId): void {
                 if ($navigationError === null) {
@@ -1768,7 +1946,7 @@ JS;
     private function verifyStartupLocation(?int $commandId, array $navigationError, int $attempt): void
     {
         if ($this->pendingStartCommand === null) return;
-        $this->startupStage = 'initial_navigation_verify';
+        $this->recordStartupStage('initial_navigation_verify');
         $this->cdp->send('Runtime.evaluate', [
             'expression' => 'String(location.href||"")', 'returnByValue' => true,
         ], null, function ($locationError, $locationResult) use ($commandId, $navigationError, $attempt): void {
@@ -1797,19 +1975,19 @@ JS;
         return $as === $es && strtolower((string) $a['host']) === strtolower((string) $e['host']) && $ap === $ep;
     }
 
-    /** Mark one initialized page target ready after any required startup navigation has been accepted. */
+    /** Publish page readiness immediately on ordinary tab switches; fresh startup still waits for both transports and its first frame. */
     private function finishTargetConnection(?int $commandId): void
     {
         $this->connecting = false;
         $this->switchingTarget = false;
-        BrowserState::write(['status' => 'ready', 'last_error' => null]);
+        BrowserState::write(['status' => $this->pendingStartCommand !== null ? 'starting' : 'ready', 'last_error' => null]);
         $this->refreshTabs();
         $this->refreshMetadata();
         if ($commandId !== null) $this->finishCommand($commandId, ['target_id' => BrowserState::state()['active_target']]);
         if ($this->pendingStartCommand !== null) {
             // Startup is not complete until the Web workspace has produced its first actual frame.
             // capture() will finish the pending start command after persisting screenshot #1.
-            $this->startupStage = 'first_frame';
+            $this->recordStartupStage('first_frame');
         }
     }
 
@@ -5668,31 +5846,40 @@ JS;
                 $this->chatGptTurns[$responseId]['observed_markdown'] = $roundMarkdown;
                 $this->chatGptTurns[$responseId]['observed_content'] = $roundMarkdown !== '';
             }
-            if (!$activeCompact) {
-                $emptySession = $this->taskSessions[(string) $turn['session_id']] ?? [];
+            $emptySession = $this->taskSessions[(string) $turn['session_id']] ?? [];
+            $stoppedCompactSource = $activeCompact && $toolCapable
+                && $deliveredAt !== null && $deliverySignature !== ''
+                && ((!empty($emptySession['submission_finished']) && !empty($emptySession['submission_failed']))
+                    || empty($emptySession['submission_request_id']));
+            if (!$activeCompact || $stoppedCompactSource) {
                 $emptyTransportSettled = !empty($emptySession['submission_request_id'])
                     && !empty($emptySession['submission_finished']) && empty($emptySession['submission_failed'])
                     && (!is_string($postToolBaseline) || $sourceTransportSettled);
                 // A tool-only answer may return to Send without a final body or Copy action,
                 // while its private stream observer still lacks a post-receipt finish event.
                 // Exact delivered source receipts plus a drained MCP fence can settle this
-                // empty terminal as a failure; they never manufacture a successful answer.
+                // empty ordinary terminal as a failure. An active checkpoint instead begins
+                // its separate summary-only handoff; it does not complete the user's task.
                 $emptyUiReceiptsSettled = $toolCapable && $deliveredAt !== null
                     && $deliverySignature !== '' && ($snapshot['send_button_visible'] ?? null) === true
                     && ($snapshot['generation_running'] ?? null) === false;
-                if ($this->observeEmptyResponseFailure($responseId, $logicalResponseId, $snapshot, [
+                if ($this->observeEmptyResponseSettlement($responseId, $logicalResponseId, $snapshot, [
                     'response_id' => $logicalResponseId,
                     'session_id' => (string) $turn['session_id'],
                     'document_nonce' => (string) ($turn['document_nonce'] ?? ''),
                     'assistant_id' => $boundAssistantId,
-                    'request_id' => (string) ($emptySession['submission_request_id'] ?? ''),
+                    // Reattachment loses private HTTP IDs. The exact saved source round,
+                    // document and delivered receipt signature still bind a new idle witness.
+                    'request_id' => !empty($emptySession['submission_request_id'])
+                        ? (string) $emptySession['submission_request_id']
+                        : (string) ($activeCompact ? $logicalJob['previous_response_id'] : ''),
                     'request_finished_at' => $emptySession['submission_finished_at'] ?? null,
                     'source_receipt_signature' => $this->chatGptTurns[$responseId]['source_receipt_signature'] ?? '',
                     'transport_settled' => $emptyTransportSettled,
                     'ui_receipts_settled' => $emptyUiReceiptsSettled,
                     'round_markdown' => $roundMarkdown,
                     'has_artifacts' => $hasArtifacts,
-                ], $now)) return;
+                ], $now, $stoppedCompactSource)) return;
             } else {
                 $this->chatGptTurns[$responseId]['empty_response_health'] = null;
             }
@@ -5976,18 +6163,20 @@ JS;
     }
 
     /**
-     * Fail only a continuously observed empty terminal after the owned stream and tools settled.
-     * A fresh MCP fence is read on every candidate poll and again before failure; it never commits
-     * an empty final answer. Unknown-outcome failure preserves any concurrent host-effect evidence.
+     * Resolve only a continuously observed empty terminal after the owned stream and tools settled.
+     * A fresh MCP fence is read on every candidate poll and again before resolving the source;
+     * it never publishes an empty user final. Ordinary requests fail honestly; a reserved checkpoint
+     * with exact delivered source receipts starts its separate control-only summary message.
      * @param string $responseId Physical runtime observer key.
      * @param string $logicalResponseId Current native Responses round on the same owned page.
      * @param array $snapshot Fresh, bound response DOM observation.
      * @param array $evidence Current transport/ownership metadata for the pure health rule.
      * @param float $now Observation time in seconds.
-     * @return bool True after a failed terminal was published and this observer was released.
+     * @param bool $activeCompact Whether this is the stopped failed or reattached checkpoint source.
+     * @return bool True after terminal failure or transition into the one-shot summary handoff.
      */
-    private function observeEmptyResponseFailure(string $responseId, string $logicalResponseId,
-        array $snapshot, array $evidence, float $now): bool
+    private function observeEmptyResponseSettlement(string $responseId, string $logicalResponseId,
+        array $snapshot, array $evidence, float $now, bool $activeCompact = false): bool
     {
         $evidence['mcp_revision'] = 0;
         if (ChatGptTransport::emptyResponseHealth(null, $snapshot, $evidence, $now)['candidate'] === null) {
@@ -6011,6 +6200,18 @@ JS;
                 $this->chatGptTurns[$responseId]['empty_response_health'] = null;
                 return false;
             }
+        }
+        if ($activeCompact) {
+            // Settle only this source's tool channel through its existing atomic fence.
+            // The native compact stays running until a separate real summary receipt;
+            // no empty user answer or synthetic checkpoint is emitted here.
+            if (!ToolBroker::commitCompletionFenceForResponse($logicalResponseId,
+                (int) $evidence['mcp_revision'], '')) {
+                $this->chatGptTurns[$responseId]['empty_response_health'] = null;
+                return false;
+            }
+            $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, '');
+            return true;
         }
         $this->taskFailTurn($responseId, $health['error_code'],
             'ChatGPT 已停止生成并持续显示空回答终态，当前回合没有可确认的正文或产物；已停止等待，不会自动重发。', true);
@@ -7332,8 +7533,18 @@ JS;
         $this->commandBusy = false;
     }
 
+    /** Retry a pre-ready CDP timeout within the original startup deadline, without relaunching Chrome. */
     private function connectionFailed(string $code, ?array $protocolError = null): void
     {
+        if ($this->pendingStartCommand !== null && (int) ($protocolError['code'] ?? 0) === -2
+            && microtime(true) < $this->startDeadline) {
+            $this->connecting = false;
+            $this->switchingTarget = false;
+            $this->recordStartupStage('cdp_initialization_retry');
+            BrowserState::write(['status'=>'starting', 'last_error'=>null, 'session_id'=>null]);
+            $this->cdp->close($code);
+            return;
+        }
         BrowserState::write(['status' => 'error', 'last_error' => $code, 'session_id' => null]);
         if ($this->pendingStartCommand !== null) {
             $id = $this->pendingStartCommand;

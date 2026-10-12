@@ -233,7 +233,22 @@
     /** Enqueue once, with a command-specific UI wait and optional polling cadence; other callers keep the existing default. */
     async function browserCommand(path, body, timeoutMs, pollIntervalMs = 100) {
         const queued = await Gateway.request(path, body || {});
-        return queued && queued.id ? waitBrowserCommand(queued.id, timeoutMs, pollIntervalMs) : (queued || {});
+        if (queued && queued.id) return waitBrowserCommand(queued.id, timeoutMs, pollIntervalMs);
+        if (path === '/api/browser/login' && queued && queued.status === 'starting') {
+            // A worker reattachment may have no live start command. Observe it without issuing
+            // another login/navigation operation or announcing the page ready prematurely.
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+                const state = await Gateway.request('/api/browser');
+                if (state.status === 'ready' && state.worker_ready && Number(state.screenshot_sequence) > 0) return state;
+                if (state.status === 'stopped' || state.status === 'error') {
+                    throw new Error(I18n.error(state.last_error || I18n.t('浏览器操作失败。'), state.last_error));
+                }
+                await sleep(500);
+            }
+            throw new Error(I18n.t('操作等待超时，请稍后重试。'));
+        }
+        return queued || {};
     }
     async function waitNetworkTest(id) {
         const deadline = Date.now() + 60000;
