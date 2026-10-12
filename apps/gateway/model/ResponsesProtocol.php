@@ -726,21 +726,21 @@ final class ResponsesProtocol
         return self::tools($definitions);
     }
 
-    /** Store one native tool with reference-compatible namespace and description metadata. */
+    /** Store one native tool with normalized namespace and description metadata. */
     private static function appendTool(array &$tools, array &$wireNames, array $entry, string $type, ?string $namespace): void
     {
         $name = $entry['name'] ?? null;
         if (!is_string($name) || !preg_match('/\A[A-Za-z0-9_.:-]{1,128}\z/', $name)) {
             throw new GatewayError('invalid_request_error', 'tool.name 格式无效。', 400);
         }
-        // Codex's built-in functions group is implicit in the reference tool inventory.
+        // Codex's built-in functions group is implicit in the Web tool inventory.
         $namespace = $namespace === 'functions' ? null : $namespace;
         // Other connector namespaces retain a prefix to prevent bridge name collisions.
         $wireName = $namespace !== null && $namespace !== 'functions' ? $namespace . '__' . $name : $name;
         if (isset($wireNames[$wireName])) throw new GatewayError('invalid_request_error', 'tools 中存在重复工具名称。', 400);
         $wireNames[$wireName] = true;
         if ($type === 'custom') {
-            // Match the reference bridge's model-visible freeform schema. Codex's native
+            // Declare the model-visible freeform schema explicitly. Codex's native
             // custom spec has no JSON parameters, but the Web model needs an explicit raw
             // input field to avoid sending a JSON object as the apply_patch body.
             $parameters = [
@@ -857,7 +857,7 @@ final class ResponsesProtocol
         return $environment;
     }
 
-    /** Normalize native tool selection to the same optional choice shape as the reference adapter. */
+    /** Normalize native tool selection to the transport's optional choice format. */
     private static function toolChoice(mixed $choice): string|array|null
     {
         if ($choice === null) return null;

@@ -396,7 +396,7 @@ final class Schema
                 'CREATE INDEX gateway_web_messages_task_order ON gateway_web_messages(task_id,id)',
             ],
             41 => [
-                // The original 64-call default prevents already observed reference-length
+                // The original 64-call default prevents already observed long-running
                 // Web turns. Zero means no count cap; the durable turn deadline still applies.
                 'UPDATE gateway_settings SET max_tool_calls_per_turn=0, updated_at=updated_at+1 WHERE max_tool_calls_per_turn=64',
             ],

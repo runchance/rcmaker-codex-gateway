@@ -427,7 +427,7 @@
         layui.use('layer', () => {
             let confirmed = false;
             layui.layer.confirm(
-                I18n.t('这会关闭 RCMAKER 自有 Chrome，清除当前与旧版 RCMAKER 自有的全部 Chrome Profiles，以及其中的 ChatGPT、Google 登录记录。网关任务记录、Tunnel 配置、系统 Chrome 和参考桥会保留。完成后需手动重新打开登录页面。是否继续？'),
+                I18n.t('这会关闭 RCMAKER 自有 Chrome，清除当前与旧版 RCMAKER 自有的全部 Chrome Profiles，以及其中的 ChatGPT、Google 登录记录。网关任务记录、Tunnel 配置和系统 Chrome 会保留。完成后需手动重新打开登录页面。是否继续？'),
                 {title: I18n.t('清空内置 Chrome 登录资料'), btn: [I18n.t('清空登录资料'), I18n.t('取消')], closeBtn: 1,
                     end: () => { if (!confirmed) { accountResetPending = false; byId('account-reset').disabled = false; } }},
                 index => { confirmed = true; layui.layer.close(index); resetBrowserProfile(); }

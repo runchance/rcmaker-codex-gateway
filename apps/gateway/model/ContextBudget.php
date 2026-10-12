@@ -24,8 +24,8 @@ final class ContextBudget
             $baseCompact = $luna ? 19808 : 14000;
         } elseif ($pro) {
             $base = $effort === 'max' ? 112193 : 111193;
-            // Match the observed Pro-account trigger used by the reference
-            // adapter. The ordinary window still leaves room for compaction
+            // Use the observed Pro-account trigger. The ordinary window
+            // still leaves room for compaction
             // before the browser's physical message limit is reached.
             $baseCompact = 95000;
         } else {
@@ -51,7 +51,7 @@ final class ContextBudget
         $reason = $extended ? 'enabled_threefold_transport' : 'standard_window';
         if ($family === '6' && $effort !== 'max') {
             if ($extended) {
-                // Reference 6.1.8 measured retention separately on Plus and Pro.
+                // Measured retention differs between Plus and Pro accounts.
                 // More composer stages do not enlarge the model's recall window.
                 $context = $pro ? 240000 : 120000;
                 $compact = $pro ? 220000 : 110000;
@@ -71,7 +71,7 @@ final class ContextBudget
             $reason = $extended ? 'luna_experimental_staged_input' : 'luna_canonical_history_with_bounded_input';
         }
         $contractReserve = $small && !$luna ? 4000 : 8192;
-        // Compaction headroom already reserves future work. Like the reference,
+        // Compaction headroom already reserves future work;
         // input admission counts the actual prompt/platform/images, not a second
         // hypothetical output inside the same measured browser input allowance.
         $outputReserve = $small && !$luna ? 4000 : 0;
@@ -227,16 +227,16 @@ final class ContextBudget
         return $budget;
     }
 
-    /** Return the reference-derived single-message envelope; 3x never changes these limits. */
+    /** Return the measured single-message envelope; 3x never changes these limits. */
     public static function messageLimits(string $effort, array $capabilities): array
     {
         if (\support\browser\ChatGptTransport::proSupported($capabilities)) {
             return ['tokens'=>$effort === 'max' ? 104000 : 103000,
                 'chars'=>match ($effort) { 'low'=>545000, 'max'=>1635000, default=>500000 }];
         }
-        // Reference 6.1.8 rechecked Plus GPT-6: 500001 characters reached the model,
-        // while 530000 failed independently of tokens. Keep the same 500k headroom
-        // used for Pro reasoning. Pinned older jobs retain their smaller envelopes.
+        // Plus GPT-6 uses a conservative 500k-character input envelope independent
+        // of its token ceiling, shared with Pro reasoning. Pinned older jobs
+        // retain their smaller envelopes.
         return ['tokens'=>($effort === 'low' ? 41000 : 90000) - 8192 - 1,
             'chars'=>$effort === 'low' ? 211256 : 500000];
     }

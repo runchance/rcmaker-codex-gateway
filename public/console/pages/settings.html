@@ -69,7 +69,7 @@
                     <li>请求是历史压缩（<code>compaction</code>）：用“只读压缩”模板，只生成交接摘要，不执行原任务。</li>
                 </ul>
             </div>
-            <p class="muted">参考实现的 <code>manualControl</code>／Zero Risk 是独立后端模式；RCMAKER 当前未提供该模式，这四种模板不覆盖它。</p>
+            <p class="muted">这里的四种模板分别用于首轮、后续回合、无宿主工具和只读压缩。</p>
             <p class="muted">模型和推理强度主要决定能力路由、分段预算及网页模型选择；不是在模板里简单替换一个型号。<code>multipart</code> 会先发送不执行任务的上下文分段，最后的提交消息再携带所选契约。Luna 的滚动检查点通过 <code>{{checkpoint_instructions}}</code> 加入普通回合；<code>verbosity</code> 和 <code>output_format</code> 由 <code>{{output_control}}</code> 加入，压缩回合不使用普通答案格式约束。勾选“上传技能文件”且本回合有已选技能时，<code>{{skill_contract}}</code> 说明附件与其原始指令位置。</p>
             <p class="muted">所有模板必须保留 <code>{{context_json}}</code>；有宿主工具的首轮和后续模板还必须保留 <code>{{turn_token}}</code>。用户提示词已包含在上下文中，通常无需重复；如需单独引用可使用 <code>{{latest_user_prompt}}</code>。其他可选变量：<code>{{connector_name}}</code>、<code>{{model_display_label}}</code>、<code>{{output_control}}</code>、<code>{{checkpoint_instructions}}</code>、<code>{{answer_instruction}}</code>、<code>{{context_only_notice}}</code>、<code>{{archive_requirement}}</code>、<code>{{read_context_notice}}</code>、<code>{{skill_contract}}</code>。变量在发送时替换；不要在模板中写真实令牌。</p>
             <details class="contract-editor" open><summary>有宿主工具 · 首轮／新页面：完整上下文契约</summary><div class="field"><label for="web-initial-contract" class="visually-hidden">有宿主工具 · 首轮／新页面：完整上下文契约</label>

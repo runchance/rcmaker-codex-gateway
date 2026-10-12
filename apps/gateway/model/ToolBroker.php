@@ -2831,7 +2831,7 @@ final class ToolBroker
         return "<codex_context_window_notice>\n" . $original['notice'] . "\n</codex_context_window_notice>";
     }
 
-    /** Keep the tool-capable Web contract aligned with the reference transport and preserve its exact context JSON. */
+    /** Build the tool-capable Web contract while preserving its exact context JSON. */
     private static function conciseControlPrompt(string $token, string $contextJson, ?string $checkpointMarker,
         bool $readContext, bool $contextOnly, bool $archiveRequired, array $hostToolNames,
         bool $parallelToolCalls, ?string $hostShell, array $outputControl, ?bool $retainedPage = null): string
@@ -2899,7 +2899,7 @@ final class ToolBroker
         return 'The outer Codex turn advertises mcp__cua_repl__js for browser UI work. ChatGPT tool_search is a separate catalog and cannot establish whether this Codex host tool is absent. Call the attached connector\'s codex_tool_inventory with query=mcp__cua_repl__js, then use codex_tool_call with the returned wire_name, schema, and current turn_token. Follow that tool\'s first-call instructions before reading Chrome tabs; report its actual result or error.';
     }
 
-    /** Match the reference's explicit no-local-bridge branch for a tool-free normal turn. */
+    /** Build the explicit no-host-tools contract for a tool-free normal turn. */
     private static function readOnlyControlPrompt(array $spec): string
     {
         $contextJson = (string)($spec['context_json'] ?? '');
@@ -3136,7 +3136,7 @@ final class ToolBroker
         return json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     }
 
-    /** Use the reference's 32-character base64url shape without punctuation that Web models may miscopy. */
+    /** Use a 32-character base64url body, excluding punctuation from turn tokens to prevent copying errors. */
     private static function opaque(string $prefix): string
     {
         do {

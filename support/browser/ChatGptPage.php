@@ -1087,7 +1087,7 @@ if(answer){
     completion=rendered!==null&&(copies.length>0||adjacentCopies.length===1);
     // ChatGPT's terminal status must belong to this bound assistant turn. A quoted phrase in
     // the answer or public commentary is content, not evidence that generation stopped.
-    // Exact labels match the reference adapter's observed ChatGPT locale resources.
+    // Match exact terminal labels from observed ChatGPT locale resources.
     const stoppedLabels=new Set([
         'ማሰብ ቆሟል','توقّف التفكير','Спря да мисли','চিন্তা থেমেছে','Razmišljanje prekinuto',
         'Pensament interromput','Přemýšlení zastaveno','Tænkning stoppet','Denken gestoppt',

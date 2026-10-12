@@ -53,7 +53,7 @@ NOTICE;
         return str_contains($prompt, self::STEERING_NOTICE);
     }
 
-    /** Browser-only envelope with the reference's version/system/messages key order. */
+    /** Browser-only envelope with stable version/system/messages key order. */
     public static function contextJson(string $contextJson): string
     {
         $context = json_decode(AttachmentStore::transportJson($contextJson), true, 128, JSON_THROW_ON_ERROR);
@@ -81,7 +81,7 @@ NOTICE;
             'system' => array_values((array)($context['system'] ?? [])),
             'messages' => $messages,
         ];
-        // Normal prompts match the reference's three-key envelope. A bounded RCMAKER
+        // Normal prompts use the three-key envelope. A bounded RCMAKER
         // working view additionally needs its original-history reader descriptor.
         if (isset($context['original_context'])) $envelope['original_context'] = $context['original_context'];
         return json_encode($envelope, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -125,7 +125,7 @@ NOTICE;
         return '""';
     }
 
-    /** Return the reference's file-backed skill sentence only when such a ref is transported. */
+    /** Include the file-backed skill contract only when such an attachment is transported. */
     public static function skillContract(string $contextJson): string
     {
         $context = json_decode($contextJson, true, 128, JSON_THROW_ON_ERROR);
@@ -141,7 +141,7 @@ NOTICE;
     }
 
     /**
-     * Return editable reference-based defaults with recovery scoped to missing authorization.
+     * Return editable transport defaults with recovery scoped to missing authorization.
      * Existing user authorization and platform restrictions remain independent boundaries.
      * @return array<string,string> Templates keyed by their persisted settings field.
      */

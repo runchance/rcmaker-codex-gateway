@@ -296,7 +296,7 @@ final class AttachmentStore
                 continue;
             }
             if (($attachment['kind'] ?? '') === 'image') {
-                // Match the reference bridge's visual reserve. Codex's original detail is
+                // Reserve visual input capacity. Codex's original detail is
                 // uploaded as high, but still needs its larger original-detail budget.
                 $tokens += ($attachment['metadata']['source_detail'] ?? '') === 'original' ? 8192 : 4096;
             }

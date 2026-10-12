@@ -356,7 +356,7 @@ final class McpProtocol
         return $discovery;
     }
 
-    /** Present one host tool in the same public inventory shape as the reference bridge. */
+    /** Present one host tool in the public inventory format used by the Web transport. */
     private static function inventoryPageEntry(array $tool, bool $includeSchema): array
     {
         $wireName = (string) ($tool['wire_name'] ?? '');
@@ -834,7 +834,7 @@ final class McpProtocol
             ];
         }
         try {
-            // Reference Web bridge parses the normalized text, including a native multi-block
+            // Parse the normalized text, including a native multi-block
             // receipt joined into one text block when no image is present.
             $structured = json_decode($text, false, 128, JSON_THROW_ON_ERROR);
             if ($structured instanceof \stdClass || is_array($structured)) $result['structuredContent'] = $structured;

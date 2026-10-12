@@ -19,7 +19,7 @@ Chrome for Testing and OpenAI tunnel-client are prepared separately from
 their official distributions. They are not embedded in this source binary;
 their own distribution notices and terms continue to apply.
 
-The following MIT notices apply to transport compatibility/reference work
+The following MIT notices apply to included transport contracts
 and the included Pear Admin and tokenizer resources.
 
 codex-chatgpt-web

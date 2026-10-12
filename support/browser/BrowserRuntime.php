@@ -25,7 +25,7 @@ final class BrowserRuntime
 {
     private const CONNECTOR_NO_START_MAX_RETRIES = 3;
     private const CONNECTOR_RUNTIME_PROBE_MAX_RETRIES = 3;
-    /** Match the reference launcher: a terminal DOM must remain unchanged before completion. */
+    /** A terminal DOM must remain unchanged before completion. */
     private const COMPLETION_SETTLE_SECONDS = 2.0;
     private const TOOL_POST_ANSWER_GRACE_SECONDS = 60.0;
     /** Console screenshot endpoints refresh these tiny runtime markers while a surface is visible. */
@@ -3854,7 +3854,7 @@ JS;
                     return;
                 }
                 // ChatGPT's controlled editor can reject a DOM selection after a remount.
-                // Use the same native Select All / Backspace sequence as the reference bridge.
+                // Clear the controlled editor with native Select All / Backspace input.
                 $this->evaluateTask($responseId, WebModelPage::focusComposerExpression(),
                     function ($focusError, $focused) use ($responseId, $code, $message, $after, $detail): void {
                         if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
@@ -5026,8 +5026,8 @@ JS;
             ];
             $sameTurnProof = !in_array(false, $sameTurnChecks, true);
             if (($turn['compaction_phase'] ?? null) === 'preparing') {
-                // The reference bridge keeps the exact Connector binding on its
-                // retained source page for the separate control-only checkpoint.
+                // Keep the exact Connector binding on the retained source page
+                // for the separate control-only checkpoint.
                 $compactJob = ResponseJob::execution($logicalResponseId);
                 $sourceResponseId = (string)($compactJob['previous_response_id'] ?? '');
                 $sourceJob = $sourceResponseId !== '' ? ResponseJob::execution($sourceResponseId) : [];

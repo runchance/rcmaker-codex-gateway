@@ -104,9 +104,9 @@ final class ContextHistory
             if (ResponsesProtocol::isCodexDelegation($item)) {
                 // This is Codex's current cross-thread delivery, not a host tool
                 // receipt. Keep it as an instruction for the durable turn; the
-                // browser projection restores the reference's tool_result role
+                // browser projection restores the transport's tool_result role
                 // only for send_message_to_thread. create_thread remains a user
-                // instruction because that native entry is not in the reference.
+                // instruction in this transport.
                 $context['messages'][] = [
                     'role' => 'user',
                     'content' => (string) $item['output'],
@@ -410,7 +410,7 @@ final class ContextHistory
             if (($message['role'] ?? null) === 'user'
                 && ($message['origin'] ?? null) === 'codex_delegation'
                 && ($message['delegation_tool'] ?? null) === 'send_message_to_thread') {
-                // The reference parses this native no-call_id function output as
+                // Project this native no-call_id function output as
                 // an unpaired tool result. Its instruction identity is retained
                 // in the durable context, but Web must see the original role.
                 $projected[] = ['role'=>'tool_result', 'tool_name'=>'',

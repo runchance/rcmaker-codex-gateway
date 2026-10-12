@@ -8,7 +8,7 @@ final class LunaCheckpoint
     /** @param array $spec Parsed request/job. @return bool Whether this is a normal Luna-family response eligible for a private checkpoint. */
     public static function enabled(array $spec): bool
     {
-        // The legacy Think route is Luna at medium effort; the reference uses one Luna ID for both efforts.
+        // The legacy Think route is Luna at medium effort; both routes share checkpoint handling.
         return in_array($spec['model'] ?? '', ['chatgpt-web/luna', 'chatgpt-web/think'], true)
             && ($spec['operation_kind'] ?? null) === 'response';
     }

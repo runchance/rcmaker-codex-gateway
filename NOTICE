@@ -7,10 +7,8 @@ This application contains modifications to the RCMaker application scaffold
 and uses the RCMaker framework by runchance / wobless. Original attribution
 and dependency license notices are retained.
 
-Transport compatibility and prompt/tool contract work references
-codex-chatgpt-web, Copyright (c) 2026 codex-chatgpt-web contributors,
-licensed under the MIT License. Its applicable notice is reproduced in
-THIRD_PARTY_NOTICES. This acknowledgement does not imply endorsement.
+Additional third-party copyright and license notices are reproduced in
+THIRD_PARTY_NOTICES. These notices do not imply endorsement.
 
 Pear Admin, Layui, tiktoken resources and Composer dependencies retain their
 respective licenses. See THIRD_PARTY_NOTICES and the bundled license files.

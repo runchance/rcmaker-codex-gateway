@@ -475,7 +475,7 @@ final class ModelCatalog
                 'effective_context_window_percent' => (int) round($budget['compact_tokens'] / $budget['context_tokens'] * 100),
                 'auto_compact_token_limit' => $budget['compact_tokens'],
                 'additional_speed_tiers' => [], 'service_tiers' => [], 'default_service_tier' => null,
-                // The Web bridge uses the reference connector's Compatibility V1 subagent
+                // The Web transport uses the Compatibility V1 subagent
                 // surface. Inheriting a native V2 template makes Codex inject different
                 // developer instructions into the same task before it reaches this gateway.
                 'multi_agent_version' => 'v1',

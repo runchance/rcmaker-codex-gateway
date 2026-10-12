@@ -32,7 +32,7 @@ REGEX;
             // in the API event loop. Normal text is exact o200k_base; the budget reports this bound.
             if (strlen($piece) > 2048) {
                 if (!$boundedLongAtoms) { $count += strlen($piece); continue; }
-                // Reference-style bounded BPE, without sending an unbroken multi-MB
+                // Use bounded BPE without sending an unbroken multi-MB
                 // atom into a quadratic scan. Lost cross-chunk merges only overcount.
                 foreach (mb_str_split($piece, 4096, 'UTF-8') as $chunk) $count += self::boundedPiece($chunk);
                 continue;

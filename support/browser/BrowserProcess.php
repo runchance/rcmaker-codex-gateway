@@ -12,8 +12,8 @@ final class BrowserProcess
     /**
      * Declare this browser's host product while preserving its actual native UA and Client Hints.
      *
-     * The ChatGPT task surface needs a stable application identity, like the reference launcher's
-     * default Electron product token. Never borrow its product name or freeze a Chrome version.
+     * The ChatGPT task surface needs this product's stable application identity.
+     * Preserve the actual Chrome version and native browser metadata.
      * Unsupported native metadata leaves the browser unchanged; it must not block local work.
      *
      * @param string $userAgent Browser.getVersion's native userAgent from the owned browser.
