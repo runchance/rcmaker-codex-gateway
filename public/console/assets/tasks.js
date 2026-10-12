@@ -247,11 +247,19 @@
         if (event.type === 'browser_response_transport') {
             const labels = {
                 recovery_visible: '网页正在自动恢复', recovery_cleared: '网页恢复提示已消失',
-                stream_failed: data.canceled === true ? '浏览器已关闭这条回答流' : '网页回答流发生中断'
+                stream_failed: data.canceled === true ? '浏览器已关闭这条回答流' : '网页回答流发生中断',
+                response_http: '网页回答流已收到 HTTP 响应',
+                empty_candidate: '正在核验空回答终态',
+                empty_cleared: '空回答终态条件已解除',
+                empty_settlement: '已核验回答流与工具状态',
+                empty_stream_recovery: '回答流中断，正在保留回执并恢复'
             };
             const parts = [I18n.t(labels[data.state] || data.state || '')];
             if (data.error_code) parts.push(data.error_code);
             if (data.protocol) parts.push({h2: 'HTTP/2', h3: 'HTTP/3'}[data.protocol] || data.protocol);
+            if (Number.isInteger(data.http_status)) parts.push('HTTP ' + data.http_status);
+            if (typeof data.fence_drained === 'boolean') parts.push(I18n.t(data.fence_drained
+                ? '工具和 MCP 回执已排空' : '工具或 MCP 回执尚未排空'));
             if (Number.isFinite(data.elapsed_ms)) parts.push((data.elapsed_ms / 1000).toFixed(1) + 's');
             return parts.filter(Boolean).join(' · ');
         }

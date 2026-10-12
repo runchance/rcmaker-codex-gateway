@@ -1889,7 +1889,7 @@ final class TaskLedger
      * Record native response-stream health separately from model-authored conversation content.
      * This observation never changes a deadline, receipt, retry, capability or completion state.
      * @param string $responseId Current logical response owning the exact browser document.
-     * @param string $state stream_failed, recovery_visible or recovery_cleared.
+     * @param string $state Stream HTTP/failure/recovery observation or an empty-response settlement transition.
      * @param array $metadata Bounded protocol/error/timing facts; no URL, headers or response body.
      * @param string $incarnation Browser worker owning the observed surface.
      * @param int $fence Exact surface ownership fence.
@@ -1900,18 +1900,30 @@ final class TaskLedger
     public static function browserTransportObserved(string $responseId, string $state, array $metadata,
         string $incarnation, int $fence, string $documentNonce): bool
     {
-        if (!in_array($state, ['stream_failed','recovery_visible','recovery_cleared'], true)) return false;
+        if (!in_array($state, ['stream_failed','recovery_visible','recovery_cleared','response_http',
+            'empty_candidate','empty_cleared','empty_settlement','empty_stream_recovery'], true)) return false;
         $facts = ['state'=>$state];
-        foreach (['canceled','generation_running'] as $key) {
+        foreach (['canceled','generation_running','response_present','send_button_visible','send_button_disabled',
+            'completion_action_visible','content_present','transport_recovery_visible','transport_failed',
+            'transport_settled','ui_receipts_settled','request_finished','fence_drained',
+            'source_receipt_present','has_artifacts'] as $key) {
             if (is_bool($metadata[$key] ?? null)) $facts[$key] = $metadata[$key];
         }
         if (is_int($metadata['elapsed_ms'] ?? null)) $facts['elapsed_ms'] = max(0, min(86400000, $metadata['elapsed_ms']));
+        foreach (['answer_root_count','commentary_root_count','markdown_chars','visible_chars','candidate_age_ms','mcp_revision'] as $key) {
+            if (is_int($metadata[$key] ?? null)) $facts[$key] = max(0, min(2147483647, $metadata[$key]));
+        }
+        if (is_int($metadata['http_status'] ?? null) && $metadata['http_status'] >= 100 && $metadata['http_status'] <= 599) {
+            $facts['http_status'] = $metadata['http_status'];
+        }
         $protocol = $metadata['protocol'] ?? null;
         if (in_array($protocol, ['h2','http/1.1','http/1.0','h3'], true)) $facts['protocol'] = $protocol;
         $errorCode = $metadata['error_code'] ?? null;
         if (is_string($errorCode) && preg_match('/\Anet::ERR_[A-Z0-9_]{1,80}\z/D', $errorCode) === 1) $facts['error_code'] = $errorCode;
         $requestFingerprint = $metadata['request_fingerprint'] ?? null;
         if (is_string($requestFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $requestFingerprint) === 1) $facts['request_fingerprint'] = $requestFingerprint;
+        $responseFingerprint = $metadata['response_fingerprint'] ?? null;
+        if (is_string($responseFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $responseFingerprint) === 1) $facts['response_fingerprint'] = $responseFingerprint;
         return Schema::transaction(function () use ($responseId, $facts, $incarnation, $fence, $documentNonce): bool {
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'

@@ -859,5 +859,12 @@
     "关闭结果暂未确认，正在核对页面状态；不会重复发送关闭请求。": "Closure is not yet confirmed. Checking the page state without sending another close request.",
     "正在关闭页面；确认 Chrome 页面已消失后会从列表移除。": "Closing the page. It will disappear from the list once Chrome confirms it is gone.",
     "正在等待已请求关闭的页面，完成后可继续关闭其他页面。": "Waiting for the requested page closure. You can close other pages once it finishes.",
-    "此页面暂不能关闭。": "This page cannot be closed yet."
+    "此页面暂不能关闭。": "This page cannot be closed yet.",
+    "网页回答流已收到 HTTP 响应": "The web response stream received an HTTP response",
+    "正在核验空回答终态": "Checking the empty response terminal state",
+    "空回答终态条件已解除": "The empty response terminal conditions no longer hold",
+    "已核验回答流与工具状态": "Response stream and tool states verified",
+    "回答流中断，正在保留回执并恢复": "The response stream was interrupted; preserving receipts and recovering",
+    "工具和 MCP 回执已排空": "Tool and MCP receipts have drained",
+    "工具或 MCP 回执尚未排空": "Tool or MCP receipts are still pending"
 }

@@ -132,11 +132,14 @@ final class ChatGptTransport
      * and a fresh drained MCP fence revision. The UI-only fallback fails an empty answer; it
      * never authorizes successful completion or bypasses pending host execution.
      * a missing fence, changing ownership, activity, content or observation gap resets the window.
+     * A confirmed non-cancelled network failure is a stream-recovery cause, not an empty
+     * model answer. A native recovery notice without that evidence cannot settle the turn.
      * Generation duration is deliberately absent from this rule.
      * @param array|null $previous Prior candidate from this exact runtime turn, or null.
      * @param array $snapshot Current responseExpression() observation.
      * @param array $evidence Owned response/session/document/assistant/request IDs, transport_settled,
      *     ui_receipts_settled (optional, exact source receipts delivered and Send returned),
+     *     transport_failed (optional, an observed non-cancelled request failure),
      *     mcp_revision (null while tools are pending), round_markdown and has_artifacts.
      * @param float $now Current observation time in seconds; tests may use a deterministic clock.
      * @return array{candidate:?array,error_code:?string} Updated private observation and optional failure.
@@ -145,10 +148,12 @@ final class ChatGptTransport
     public static function emptyResponseHealth(?array $previous, array $snapshot, array $evidence, float $now): array
     {
         $empty = ['candidate' => null, 'error_code' => null];
+        $transportFailed = ($evidence['transport_failed'] ?? null) === true;
         $settled = ($evidence['transport_settled'] ?? null) === true
             || (($evidence['ui_receipts_settled'] ?? null) === true
                 && ($snapshot['send_button_visible'] ?? null) === true);
         if (!is_finite($now) || $now < 0.0
+            || (($snapshot['transport_recovery_visible'] ?? null) === true && !$transportFailed)
             || !self::hasTerminalAnswer($snapshot, $settled)
             || ($snapshot['content_present'] ?? null) !== false
             || !is_string($snapshot['markdown'] ?? null) || trim($snapshot['markdown']) !== ''
@@ -169,6 +174,7 @@ final class ChatGptTransport
             $evidence['source_receipt_signature'] ?? '', $snapshot['response_html'] ?? '',
             $snapshot['commentary_blocks'] ?? [], $snapshot['send_button_visible'] ?? null,
             $snapshot['completion_action_visible'] ?? null,
+            $transportFailed, $snapshot['transport_recovery_visible'] ?? null,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         $since = $now;
         if (is_array($previous) && ($previous['signature'] ?? null) === $signature
@@ -179,7 +185,8 @@ final class ChatGptTransport
         }
         return [
             'candidate' => ['signature' => $signature, 'since' => $since, 'observed_at' => $now],
-            'error_code' => $now - $since >= self::EMPTY_RESPONSE_GRACE_SECONDS ? 'CHATGPT_EMPTY_RESPONSE' : null,
+            'error_code' => $now - $since >= self::EMPTY_RESPONSE_GRACE_SECONDS
+                ? ($transportFailed ? 'CHATGPT_MESSAGE_STREAM_ERROR' : 'CHATGPT_EMPTY_RESPONSE') : null,
         ];
     }
 

@@ -5888,6 +5888,8 @@ JS;
                     'request_finished_at' => $emptySession['submission_finished_at'] ?? null,
                     'source_receipt_signature' => $this->chatGptTurns[$responseId]['source_receipt_signature'] ?? '',
                     'transport_settled' => $emptyTransportSettled,
+                    'transport_failed' => !empty($emptySession['submission_failed'])
+                        && ($emptySession['submission_canceled'] ?? null) !== true,
                     'ui_receipts_settled' => $emptyUiReceiptsSettled,
                     'round_markdown' => $roundMarkdown,
                     'has_artifacts' => $hasArtifacts,
@@ -6177,7 +6179,8 @@ JS;
     /**
      * Resolve only a continuously observed empty terminal after the owned stream and tools settled.
      * A fresh MCP fence is read on every candidate poll and again before resolving the source;
-     * it never publishes an empty user final. Ordinary requests fail honestly; a reserved checkpoint
+     * it never publishes an empty user final. Confirmed failed streams use bounded recovery;
+     * healthy ordinary empty terminals fail honestly. A reserved checkpoint
      * with exact delivered source receipts starts its separate control-only summary message.
      * @param string $responseId Physical runtime observer key.
      * @param string $logicalResponseId Current native Responses round on the same owned page.
@@ -6191,7 +6194,10 @@ JS;
         array $snapshot, array $evidence, float $now, bool $activeCompact = false): bool
     {
         $evidence['mcp_revision'] = 0;
+        $previousHealth = $this->chatGptTurns[$responseId]['empty_response_health'] ?? null;
         if (ChatGptTransport::emptyResponseHealth(null, $snapshot, $evidence, $now)['candidate'] === null) {
+            if (is_array($previousHealth)) $this->recordEmptyResponseObservation($responseId,
+                'empty_cleared', $snapshot, $evidence, $previousHealth, $now);
             $this->chatGptTurns[$responseId]['empty_response_health'] = null;
             return false;
         }
@@ -6204,6 +6210,13 @@ JS;
             $this->chatGptTurns[$responseId]['empty_response_health'] ?? null, $snapshot, $evidence, $now
         );
         $this->chatGptTurns[$responseId]['empty_response_health'] = $health['candidate'];
+        if ($health['candidate'] === null && is_array($previousHealth)) {
+            $this->recordEmptyResponseObservation($responseId, 'empty_cleared', $snapshot, $evidence, $previousHealth, $now);
+        }
+        if (is_array($health['candidate']) && (!is_array($previousHealth)
+            || ($previousHealth['signature'] ?? null) !== $health['candidate']['signature'])) {
+            $this->recordEmptyResponseObservation($responseId, 'empty_candidate', $snapshot, $evidence, $health['candidate'], $now);
+        }
         if ($health['error_code'] === null) return false;
         if ($toolCapable) {
             try { $freshRevision = ToolBroker::beginCompletionFenceForResponse($logicalResponseId); }
@@ -6213,6 +6226,7 @@ JS;
                 return false;
             }
         }
+        $this->recordEmptyResponseObservation($responseId, 'empty_settlement', $snapshot, $evidence, $health['candidate'], $now);
         if ($activeCompact) {
             // Settle only this source's tool channel through its existing atomic fence.
             // The native compact stays running until a separate real summary receipt;
@@ -6225,9 +6239,46 @@ JS;
             $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, '');
             return true;
         }
+        if ($health['error_code'] === 'CHATGPT_MESSAGE_STREAM_ERROR') {
+            // The original HTTP stream failed while MCP tools continued. A drained empty
+            // Send state cannot change that into a successful/empty model final. Reuse the
+            // existing bounded recovery, which verifies and carries all confirmed receipts.
+            $this->recordEmptyResponseObservation($responseId, 'empty_stream_recovery', $snapshot, $evidence, $health['candidate'], $now);
+            if (!$this->retryTaskNetworkError($responseId, $snapshot)) {
+                $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_MESSAGE_STREAM_ERROR');
+            }
+            return true;
+        }
         $this->taskFailTurn($responseId, $health['error_code'],
             'ChatGPT 已停止生成并持续显示空回答终态，当前回合没有可确认的正文或产物；已停止等待，不会自动重发。', true);
         return true;
+    }
+
+    /** Log one empty-state transition, with transport/UI/fence facts only and no conversation or tool contents. */
+    private function recordEmptyResponseObservation(string $responseId, string $state, array $snapshot,
+        array $evidence, ?array $candidate, float $now): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? [];
+        $session = $this->taskSessions[(string) ($turn['session_id'] ?? '')] ?? [];
+        $facts = array_intersect_key($snapshot, array_flip(['generation_running', 'response_present',
+            'send_button_visible', 'send_button_disabled', 'completion_action_visible', 'content_present',
+            'transport_recovery_visible', 'answer_root_count', 'commentary_root_count']));
+        $facts += array_intersect_key($evidence, array_flip(['transport_failed', 'transport_settled', 'ui_receipts_settled']));
+        $facts += ['request_finished' => !empty($session['submission_finished']),
+            'canceled' => ($session['submission_canceled'] ?? null) === true,
+            'fence_drained' => is_int($evidence['mcp_revision'] ?? null),
+            'mcp_revision' => $evidence['mcp_revision'] ?? null,
+            'source_receipt_present' => (string) ($evidence['source_receipt_signature'] ?? '') !== '',
+            'markdown_chars' => mb_strlen((string) ($snapshot['markdown'] ?? '')),
+            'visible_chars' => mb_strlen((string) ($snapshot['visible_text'] ?? '')),
+            'has_artifacts' => !empty($evidence['has_artifacts']),
+            'candidate_age_ms' => (int) round(max(0.0, $now - (float) ($candidate['since'] ?? $now)) * 1000),
+            'http_status' => $session['submission_http_status'] ?? null,
+            'protocol' => $session['submission_protocol'] ?? null,
+            'error_code' => $session['submission_error_code'] ?? null,
+            'request_fingerprint' => hash('sha256', (string) ($session['submission_request_id'] ?? '')),
+            'response_fingerprint' => hash('sha256', (string) ($snapshot['response_html'] ?? ''))];
+        $this->recordTaskTransportObservation($responseId, $state, $facts);
     }
 
     /** A pre-receipt stream finish is never evidence of the source's post-tool answer. */
@@ -7333,6 +7384,7 @@ JS;
                     'submission_request_id'=>(string) ($params['requestId'] ?? ''), 'submission_finished'=>false,
                     'submission_request_started_at'=>microtime(true), 'submission_finished_at'=>0.0,
                     'submission_failed'=>false,
+                    'submission_canceled'=>false, 'submission_error_code'=>null, 'submission_http_status'=>null,
                     'submission_protocol'=>null,
                     'submission_body_pending'=>false, 'submission_body_checked'=>false, 'submission_error_wait_until'=>0.0,
                 ]);
@@ -7346,11 +7398,14 @@ JS;
                 $this->taskSessions[$sessionId]['submission_finished_at'] = microtime(true);
                 $this->taskSessions[$sessionId]['submission_failed'] = $method === 'Network.loadingFailed';
                 if ($method === 'Network.loadingFailed') {
+                    $this->taskSessions[$sessionId]['submission_canceled'] = ($params['canceled'] ?? null) === true;
+                    $this->taskSessions[$sessionId]['submission_error_code'] = $params['errorText'] ?? null;
                     $this->taskSessions[$sessionId]['submission_body_checked'] = true;
                     $this->recordTaskTransportObservation((string)($owner['response_id'] ?? ''), 'stream_failed', [
                         'request_fingerprint'=>hash('sha256', (string)$params['requestId']),
                         'error_code'=>$params['errorText'] ?? null, 'canceled'=>$params['canceled'] ?? null,
                         'protocol'=>$owner['submission_protocol'] ?? null,
+                        'http_status'=>$owner['submission_http_status'] ?? null,
                         'elapsed_ms'=>(int)round(max(0.0, microtime(true)
                             - (float)($owner['submission_request_started_at'] ?? microtime(true))) * 1000),
                     ]);
@@ -7364,6 +7419,12 @@ JS;
             if (!WebModelPage::isBackendUrl($url, self::modelUrl())) return;
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
                 $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
+                $this->taskSessions[$sessionId]['submission_http_status'] = (int) round((float) ($response['status'] ?? 0));
+                $this->recordTaskTransportObservation((string) ($owner['response_id'] ?? ''), 'response_http', [
+                    'protocol' => $response['protocol'] ?? null,
+                    'http_status' => (int) round((float) ($response['status'] ?? 0)),
+                    'request_fingerprint' => hash('sha256', (string) $params['requestId']),
+                ]);
             }
             $status = (int) round((float) ($response['status'] ?? 0));
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')

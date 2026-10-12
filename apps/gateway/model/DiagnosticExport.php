@@ -21,7 +21,7 @@ final class DiagnosticExport
         'tasks' => ['gateway_tasks', 60, 'id,thread_id,status,current_epoch_id,created_at,updated_at,cancelled_at'],
         'turns' => ['gateway_task_turns', 240, 'id,task_id,epoch_id,surface_id,client_turn_id,request_hash,response_id,status,fencing_version,deadline_at,submit_intent_at,submitted_at,committed_at,retired_at,error_code,created_at,updated_at'],
         'responses' => ['gateway_response_jobs', 240, 'id,task_id,epoch_id,durable_turn_id,surface_id,model,reasoning_effort,operation_kind,round_kind,round_no,status,request_hash,previous_response_id,rolling_source_response_id,continuation_source_response_id,compact_id,command_id,input_tokens,output_started,sequence_next,terminal_type,transport_parts_total,transport_stage_sent,transport_stage_acked,transport_stage_effort,transport_final_effort,repair_count,accepted_at,submit_intent_at,created_at,started_at,finished_at,error_json,budget_json,transport_decision_json,physical_selection_json'],
-        'tools' => ['gateway_tool_invocations', 400, 'id,task_id,turn_id,response_id,binding_id,call_id,wire_name,request_hash,result_hash,status,delivery_count,created_at,updated_at,delivered_at,completed_at'],
+        'tools' => ['gateway_tool_invocations', 400, 'id,task_id,turn_id,response_id,binding_id,call_id,wire_name,request_hash,result_hash,status,delivery_count,created_at,updated_at,delivered_at,completed_at,result_delivered_at,result_delivered_at_us'],
         'bindings' => ['gateway_mcp_bindings', 100, 'id,task_id,turn_id,current_response_id,status,activity_revision,completion_revision,required_tool_count,sent_at,started_at,expires_at,created_at,updated_at,revoked_at'],
         'checkpoints' => ['gateway_context_checkpoints', 100, 'id,task_id,source_epoch_id,source_response_id,request_hash,response_id,protocol,state,created_at,committed_at,consumed_at'],
         'handoffs' => ['gateway_compaction_handoffs', 100, 'compact_response_id,checkpoint_id,task_id,source_response_id,state,created_at,expires_at,submit_intent_at,accepted_at,consumed_at'],
@@ -63,6 +63,15 @@ final class DiagnosticExport
         'operation_kind', 'network_revision', 'generation', 'fencing_version', 'heartbeat',
         'created_at', 'updated_at', 'started_at', 'finished_at', 'deadline_at', 'expires_at',
         'success', 'ok', 'ready', 'reachable', 'tls_verified', 'timed_out', 'connect_ms', 'total_ms',
+        'canceled', 'generation_running', 'response_present', 'send_button_visible', 'send_button_disabled',
+        'completion_action_visible', 'content_present', 'transport_recovery_visible', 'transport_failed',
+        'transport_settled', 'ui_receipts_settled', 'request_finished', 'fence_drained',
+        'source_receipt_present', 'has_artifacts', 'answer_root_count', 'commentary_root_count',
+        'markdown_chars', 'visible_chars', 'candidate_age_ms', 'mcp_revision',
+        'request_fingerprint', 'response_fingerprint', 'proxy_connect_status', 'curl_result',
+        'request_bytes', 'body_bytes', 'stream_started', 'terminal_type', 'done_seen',
+        'pause_count', 'resume_count', 'queue_peak', 'client_open', 'abort_reason',
+        'flushed', 'is_error', 'tool_error_code', 'result_delivered_at', 'result_delivered_at_us',
     ];
 
     /**
