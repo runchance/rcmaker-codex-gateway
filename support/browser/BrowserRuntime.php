@@ -11,6 +11,7 @@ use app\gateway\model\AttachmentStore;
 use app\gateway\model\AdapterCapabilities;
 use app\gateway\model\ConnectorState;
 use app\gateway\model\ContextCompaction;
+use app\gateway\model\CodexCancellation;
 use app\gateway\model\GatewayError;
 use app\gateway\model\GatewaySettings;
 use app\gateway\model\NetworkSettings;
@@ -97,6 +98,11 @@ final class BrowserRuntime
     private array $taskSessions = [];
     /** @var array<string,true> */
     private array $pendingResumes = [];
+    /** Explicit native stops use separate CDP observers; ordinary transport recovery is unchanged. */
+    private ?CodexCancellation $codexCancellation = null;
+    private float $lastCodexStopObservation = 0.0;
+    /** @var array<string,array> Current stop intent and acknowledgement, scoped to its exact generation. */
+    private array $codexUserStops = [];
     /** @var array<int,int> Browser command id => submitted no-side-effect Connector probe attempts. */
     private array $connectorProbeAttempts = [];
     /** Runtime fences live only for the current asynchronous connector commands. */
@@ -243,6 +249,7 @@ final class BrowserRuntime
             $this->ensureTaskCdp($state);
         }
         if ($state['status'] === 'ready' && $this->pendingStartCommand === null) {
+            $this->observeCodexUserStops();
             $this->recoverResponses($state);
             $this->ensureTaskCdp($state);
             $cleanupInterval = ($this->chatGptTurns !== [] || $this->pendingResumes !== [])
@@ -331,6 +338,131 @@ final class BrowserRuntime
             BrowserState::setLease('manual');
         }
         $this->responsesRecovered = true;
+    }
+
+    /**
+     * Observe precise local manual-stop events once per second, even between native tool rounds.
+     * No connection close, inactivity timeout or browser error enters this path.
+     */
+    private function observeCodexUserStops(): void
+    {
+        if (microtime(true) - $this->lastCodexStopObservation < 1.0) return;
+        $this->lastCodexStopObservation = microtime(true);
+        $this->codexCancellation ??= new CodexCancellation();
+        foreach (TaskLedger::cancellableExecutions() as $execution) {
+            $id = (string) $execution['job']['id'];
+            if (($execution['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_PENDING') {
+                $native = TaskLedger::cancellationNativeTurn($execution);
+                $task = SDB(null, 'medoo', 'sqlite')->table('gateway_tasks')->where('id', $execution['turn']['task_id'])->find();
+                $evidence = $native !== null && is_array($task)
+                    ? $this->codexCancellation->interruption((string) ($task['thread_id'] ?? ''), $native,
+                        (int) $execution['turn']['created_at']) : null;
+                if ($evidence === null || !TaskLedger::requestUserStop($id, $evidence)) continue;
+                $execution = TaskLedger::execution($id);
+            }
+            // Detaching cancels queued callbacks, not the browser target. A dedicated observer confirms Stop.
+            foreach ($this->chatGptTurns as $observer => $turn) {
+                if (($turn['durable_turn_id'] ?? '') === $execution['turn']['id']) $this->releaseTaskSession((string) $observer);
+            }
+            unset($this->pendingResumes[$id]);
+            if (!isset($this->codexUserStops[$id])) {
+                $this->codexUserStops[$id] = ['execution' => $execution, 'session_id' => null,
+                    'busy' => false, 'clicked' => false, 'idle_since' => null];
+            }
+        }
+        foreach (array_keys($this->codexUserStops) as $id) $this->pollCodexUserStop($id);
+    }
+
+    /** Click once, then read back idle state; retain the target and never resend an interrupted request. */
+    private function pollCodexUserStop(string $responseId): void
+    {
+        $stop = $this->codexUserStops[$responseId] ?? null;
+        if (!is_array($stop) || $stop['busy']) return;
+        $expected = $stop['execution'];
+        if (!TaskLedger::userStopOwns($expected)) { $this->releaseCodexStopObserver($responseId); return; }
+        $targetId = (string) ($expected['surface']['target_id'] ?? '');
+        if ($targetId === '' && empty($expected['job']['submit_intent_at'])) {
+            TaskLedger::confirmUserStop($expected, true);
+            $this->releaseCodexStopObserver($responseId);
+            return;
+        }
+        if (!$this->taskCdp->ready()) return;
+        $this->codexUserStops[$responseId]['busy'] = true;
+        if ($stop['session_id'] === null) {
+            $this->taskCdp->send('Target.getTargets', [], null, function ($error, $result) use ($responseId, $expected, $targetId): void {
+                if (!isset($this->codexUserStops[$responseId])) return;
+                $this->codexUserStops[$responseId]['busy'] = false;
+                if ($error !== null || !is_array($result['targetInfos'] ?? null) || !TaskLedger::userStopOwns($expected)) return;
+                $matches = array_values(array_filter($result['targetInfos'], static fn($row) => is_array($row) && ($row['targetId'] ?? '') === $targetId));
+                if ($matches === []) {
+                    TaskLedger::confirmUserStop($expected, true);
+                    $this->releaseCodexStopObserver($responseId);
+                    return;
+                }
+                $this->codexUserStops[$responseId]['busy'] = true;
+                $this->taskCdp->send('Target.attachToTarget', ['targetId' => $targetId, 'flatten' => true], null,
+                    function ($attachError, $attached) use ($responseId, $expected): void {
+                        $sessionId = (string) ($attached['sessionId'] ?? '');
+                        if (!isset($this->codexUserStops[$responseId]) || !TaskLedger::userStopOwns($expected)) {
+                            if ($sessionId !== '') $this->detachTaskSessionRaw($sessionId);
+                            return;
+                        }
+                        $this->codexUserStops[$responseId]['busy'] = false;
+                        if ($attachError !== null || $sessionId === '') return;
+                        $this->codexUserStops[$responseId]['session_id'] = $sessionId;
+                        $this->pollCodexUserStop($responseId);
+                    }, 3.0);
+            }, 3.0);
+            return;
+        }
+        preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $expected['job']['prompt'], $tokens);
+        $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [];
+        if (!empty($expected['job']['transport_transaction_id']) && (int) ($expected['job']['transport_stage_sent'] ?? 0) > 0) {
+            $witnesses[] = (string) $expected['job']['transport_transaction_id'];
+        }
+        $users = json_decode((string) ($expected['job']['baseline_users_json'] ?? '[]'), true) ?: [];
+        $url = (string) $expected['surface']['url'];
+        if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl();
+        $expression = WebModelPage::userStopExpression($url, $witnesses, $users, !$stop['clicked']);
+        $this->evaluateTaskSession((string) $stop['session_id'], $expression,
+            function ($error, $result) use ($responseId, $expected): void {
+                if (!isset($this->codexUserStops[$responseId])) return;
+                $this->codexUserStops[$responseId]['busy'] = false;
+                if (!TaskLedger::userStopOwns($expected)) { $this->releaseCodexStopObserver($responseId); return; }
+                if ($error !== null) {
+                    // Browser-level reconnect invalidates flattened CDP sessions, not the retained tab.
+                    $sessionId = (string) ($this->codexUserStops[$responseId]['session_id'] ?? '');
+                    $this->codexUserStops[$responseId]['session_id'] = null;
+                    $this->codexUserStops[$responseId]['idle_since'] = null;
+                    if ($sessionId !== '') $this->detachTaskSessionRaw($sessionId);
+                    return;
+                }
+                if (!is_array($result)) return;
+                if (($result['page_invalid'] ?? null) === true) {
+                    TaskLedger::confirmUserStop($expected, false, true);
+                    $this->releaseCodexStopObserver($responseId);
+                    return;
+                }
+                if (empty($result['owned'])) return;
+                if (!empty($result['stopped'])) $this->codexUserStops[$responseId]['clicked'] = true;
+                if (!empty($result['generation_running']) || empty($result['editor_ready'])) {
+                    $this->codexUserStops[$responseId]['idle_since'] = null;
+                    return;
+                }
+                $since = $this->codexUserStops[$responseId]['idle_since'];
+                if ($since === null) { $this->codexUserStops[$responseId]['idle_since'] = microtime(true); return; }
+                if (microtime(true) - $since < 1.0) return;
+                TaskLedger::confirmUserStop($expected);
+                $this->releaseCodexStopObserver($responseId);
+            });
+    }
+
+    /** Release only the stop observer; the Chrome tab remains available for the user's next turn. */
+    private function releaseCodexStopObserver(string $responseId): void
+    {
+        $sessionId = (string) ($this->codexUserStops[$responseId]['session_id'] ?? '');
+        unset($this->codexUserStops[$responseId]);
+        if ($sessionId !== '') $this->detachTaskSessionRaw($sessionId);
     }
 
     /** Capture the current page surface without blocking the API worker. */
@@ -2590,6 +2722,10 @@ JS;
 
     private function prepareTaskSurface(string $responseId, int $commandId, bool $recover): void
     {
+        if ((TaskLedger::execution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
+            $this->finishCommand($commandId, ['status' => 'user_stop_pending']);
+            return;
+        }
         if (!$this->taskCdp->ready()) {
             if ($recover) $this->pendingResumes[$responseId] = true;
             else {
@@ -2674,6 +2810,11 @@ JS;
         $this->taskCdp->send('Target.attachToTarget', ['targetId' => $targetId, 'flatten' => true], null,
             function ($error, $result) use ($responseId, $commandId, $targetId, $url, $recover): void {
                 $sessionId = (string) ($result['sessionId'] ?? '');
+                if ((TaskLedger::execution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
+                    if ($sessionId !== '') $this->detachTaskSessionRaw($sessionId);
+                    $this->finishCommand($commandId, ['status' => 'user_stop_pending']);
+                    return;
+                }
                 if ($error !== null || $sessionId === '') {
                     $this->taskFailTurn($responseId, 'CHATGPT_SURFACE_ATTACH_FAILED', '无法附着任务 ChatGPT 页面。', $recover);
                     return;
@@ -2952,6 +3093,11 @@ JS;
 
     private function startTaskTurn(string $responseId, int $commandId, string $sessionId, bool $recover): void
     {
+        if ((TaskLedger::execution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
+            $this->detachTaskSessionRaw($sessionId);
+            $this->finishCommand($commandId, ['status' => 'user_stop_pending']);
+            return;
+        }
         try {
             $job = ResponseJob::execution($responseId);
             $toolCapable = !empty($job['mcp_binding_id']);

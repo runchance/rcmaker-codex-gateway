@@ -330,6 +330,8 @@ While a task runs, send corrections or questions in the **same Codex conversatio
 
 Stop a task in Codex and check its Task center status. Before closing the gateway, finish tasks and pending approvals, then use **Ctrl+C** in the startup terminal. Closing a running Web page is not a substitute for cancelling a task.
 
+When Codex and RCMAKER share the configured Codex home, an explicit manual interruption is matched to its session and turn. RCMAKER stops that task's Web generation and retains its tab and readable history. Continue in the same Codex chat; a missing or invalid page uses full context on a fresh page. Already completed tool receipts are retained, and unconfirmed local effects are not replayed. Temporary disconnections, automatic reconnects and browser errors keep their existing recovery behavior. An inaccessible local session file does not authorize stopping a page.
+
 ### Browser workspace
 
 The workspace retains up to five task pages, labeled active/idle and managed by the gateway. At capacity, wait for work to release a page or close an idle page the interface permits you to close. **Closing a page and deleting a task record are different actions.**

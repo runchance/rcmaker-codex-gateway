@@ -1,5 +1,7 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "收到 Codex 手动停止，正在确认网页停止": "Codex manual stop received; confirming Web stop",
+    "手动停止已确认，保留标签与历史": "Manual stop confirmed; tab and history retained",
     "网页已停止思考，未确认完成": "The webpage stopped thinking; completion is unconfirmed",
     "网页回答流状态": "Web response stream status",
     "网页正在自动恢复": "The web page is recovering automatically",

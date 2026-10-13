@@ -15,6 +15,139 @@ final class TaskLedger
     private const CLIENT_TRANSPORT_EVENT_LIMIT = 256;
 
     /**
+     * List current turns for the local explicit-stop observer, including completed tool rounds.
+     * @return list<array> Internal execution rows; never exposed through the console API.
+     * @throws GatewayError If the active ledger cannot be read.
+     */
+    public static function cancellableExecutions(): array
+    {
+        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('status', 'IN', self::ACTIVE_TURNS)->select();
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '停止观察账本暂不可读取。', 503);
+        $executions = [];
+        foreach ($rows as $row) {
+            if (empty($row['response_id'])) continue;
+            $execution = self::execution((string) $row['response_id']);
+            if (self::ownsCurrentGeneration($execution['job'], $execution['turn'])) $executions[] = $execution;
+        }
+        return $executions;
+    }
+
+    /**
+     * Find the exact native turn through synthetic post-compaction response ancestry.
+     * @param array $execution Current durable execution, not an arbitrary session's latest event.
+     * @return ?string Native UUID, or null when readable same-task ancestry is unavailable.
+     */
+    public static function cancellationNativeTurn(array $execution): ?string
+    {
+        $job = $execution['job'];
+        for ($depth = 0; $depth < 64; $depth++) {
+            $id = (string) ($job['turn_id'] ?? '');
+            if (CodexCancellation::uuid($id)) return $id;
+            if (!str_starts_with($id, 'postcompact_') || empty($job['previous_response_id'])) return null;
+            $parent = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['previous_response_id'])->find();
+            if (!is_array($parent) || $parent['task_id'] !== $execution['job']['task_id']) return null;
+            $job = $parent;
+        }
+        return null;
+    }
+
+    /**
+     * Fence a proven manual stop before clicking the page. Host effects already delivered stay unknown.
+     * @param string $responseId Current logical response. @param array $evidence Exact local interruption metadata.
+     * @return bool True when this generation is waiting for Web stop confirmation.
+     * @throws GatewayError If the stop intent/capability revocation cannot commit atomically.
+     */
+    public static function requestUserStop(string $responseId, array $evidence): bool
+    {
+        return Schema::transaction(static function () use ($responseId, $evidence): bool {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if (!self::ownsCurrentGeneration($job, $turn) || !in_array($turn['status'], self::ACTIVE_TURNS, true)) return false;
+            $nativeTurn = self::cancellationNativeTurn(['job' => $job, 'turn' => $turn]);
+            if ($nativeTurn === null || ($evidence['turn_id'] ?? '') !== $nativeTurn
+                || ($evidence['reason'] ?? '') !== 'interrupted' || !is_int($evidence['interrupted_at'] ?? null)
+                || $evidence['interrupted_at'] < (int) $turn['created_at'] || $evidence['interrupted_at'] > time() + 5) return false;
+            if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') return true;
+            $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $turn['id'])
+                ->where('response_id', $responseId)->where('generation_id', $turn['generation_id'])
+                ->where('status', 'IN', self::ACTIVE_TURNS)->update(['error_code' => 'CODEX_USER_STOP_PENDING', 'updated_at' => time()]);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '手动停止意图无法保存。', 503);
+            ToolBroker::revokeTaskUnlocked((string) $turn['task_id'], 'codex_user_interrupted');
+            self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'],
+                'codex_user_stop_requested', $evidence);
+            return true;
+        });
+    }
+
+    /**
+     * Recheck the precise pending generation before every asynchronous stop action/acknowledgement.
+     * @param array $expected Internal execution captured after durable stop intent.
+     * @return bool Whether its response, turn, target, document and owner still match.
+     */
+    public static function userStopOwns(array $expected): bool
+    {
+        $actual = self::execution((string) $expected['job']['id']);
+        if (!self::ownsCurrentGeneration($actual['job'], $actual['turn'])
+            || !in_array($actual['turn']['status'], self::ACTIVE_TURNS, true)
+            || ($actual['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_PENDING') return false;
+        foreach (['id', 'generation_id', 'surface_id', 'response_id'] as $key) {
+            if ($actual['turn'][$key] !== $expected['turn'][$key]) return false;
+        }
+        foreach (['target_id', 'document_nonce', 'owner_incarnation', 'fencing_version'] as $key) {
+            if ($actual['surface'][$key] !== $expected['surface'][$key]) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Release only a proven manually stopped turn. Retain its target/context and immutable tool receipts.
+     * @param array $expected Exact stop ownership. @param bool $missing Successful target inventory proved absence.
+     * @param bool $invalid Owned target was read successfully but no longer contains a Temporary Chat.
+     * @return bool False for a stale callback; true after durable terminal acknowledgement.
+     * @throws GatewayError If the stop confirmation or response terminal cannot be committed.
+     */
+    public static function confirmUserStop(array $expected, bool $missing = false, bool $invalid = false): bool
+    {
+        return Schema::transaction(static function () use ($expected, $missing, $invalid): bool {
+            if (!self::userStopOwns($expected)) return false;
+            [$job, $turn, $surface] = self::executionRowsUnlocked((string) $expected['job']['id']);
+            $db = SDB(null, 'medoo', 'sqlite');
+            $now = time();
+            $updated = $db->table('gateway_task_turns')->where('id', $turn['id'])->where('response_id', $job['id'])
+                ->where('error_code', 'CODEX_USER_STOP_PENDING')->update([
+                    'status' => 'cancelled', 'error_code' => 'CODEX_USER_STOPPED', 'retired_at' => $now, 'updated_at' => $now,
+                ]);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '手动停止确认无法保存。', 503);
+            $values = ['status' => 'ready', 'session_id' => null, 'updated_at' => $now, 'last_observed_at' => $now];
+            if ($missing) $values['target_id'] = null;
+            $updated = $db->table('gateway_browser_surfaces')->where('id', $surface['id'])->update($values);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '保留停止页面失败。', 503);
+            if ($invalid) self::retireEpochUnlocked((string) $turn['task_id'], (string) $turn['epoch_id'], 'codex_user_stop_page_invalid');
+            $unknown = $db->table('gateway_tool_invocations')->where('turn_id', $turn['id'])->where('status', 'unknown')->count();
+            if ($unknown === false || $unknown === null) throw new GatewayError('storage_unavailable', '停止后的工具状态无法读取。', 503);
+            $updated = $db->table('gateway_tasks')->where('id', $turn['task_id'])->update([
+                'status' => (int) $unknown > 0 ? 'needs_attention' : 'active', 'updated_at' => $now,
+            ]);
+            if (!$updated) throw new GatewayError('storage_unavailable', '停止后的任务状态无法保存。', 503);
+            // Completed tool-call responses are immutable. A live response gets one cancelled terminal.
+            ResponseJob::failSupersededUnlocked((string) $job['id'], '当前回合已由 Codex 用户手动停止。', 'codex_user_cancelled');
+            $responses = $db->table('gateway_response_jobs')->where('durable_turn_id', $turn['id'])
+                ->where('command_id', '<>', null)->select('id,command_id');
+            if (!is_array($responses)) throw new GatewayError('storage_unavailable', '停止回合的浏览器命令无法读取。', 503);
+            foreach ($responses as $response) {
+                $command = $db->table('gateway_browser_commands')->where('id', $response['command_id'])->find();
+                if (!is_array($command) || !in_array($command['status'], ['queued', 'running'], true)) continue;
+                $payload = json_decode((string) $command['payload_json'], true);
+                if ($command['action'] === 'chatgpt_text' && ($payload['response_id'] ?? '') === $response['id']) {
+                    BrowserState::finish((int) $command['id'], true, ['status' => 'codex_user_stopped']);
+                }
+            }
+            self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], (string) $job['id'], (string) $surface['id'],
+                'codex_user_stop_confirmed', ['page_missing' => $missing, 'page_invalid' => $invalid, 'unknown_host_results' => (int) $unknown]);
+            return true;
+        });
+    }
+
+    /**
      * Record one HTTP subscriber's lifecycle without cancelling generation or host work.
      * @param string $responseId Owned durable response, including a terminal tool-call round.
      * @param string $subscriberId Opaque identifier generated by ResponseTransport for this connection.
@@ -71,6 +204,32 @@ final class TaskLedger
         $newUserMessage = ($lastMessage['role'] ?? '') === 'user'
             && !ContextHistory::isOperationalUserMessage($lastMessage);
         $operation = (string) ($spec['operation_kind'] ?? 'response');
+        if (is_array($task) && $task['status'] === 'active' && $newUserMessage && !$hasToolOutputs && $operation === 'response') {
+            $latestTurn = $db->table('gateway_task_turns')->where('task_id', $taskId)->order([['rowid', 'DESC']])->limit(1)->find();
+            if (is_array($latestTurn) && $latestTurn['status'] === 'cancelled'
+                && ($latestTurn['error_code'] ?? '') === 'CODEX_USER_STOPPED'
+                && ($spec['turn_id'] ?? null) !== $latestTurn['client_turn_id']) {
+                $parent = empty($spec['previous_response_id']) ? null
+                    : $db->table('gateway_response_jobs')->where('id', $spec['previous_response_id'])->find();
+                if ($parent === null || (is_array($parent) && $parent['task_id'] === $taskId
+                    && $parent['durable_turn_id'] === $latestTurn['id'])) {
+                    // A stopped response is readable history, never a live continuation handle.
+                    // Reconstruct a delta from its exact stored context before clearing that handle.
+                    $spec['previous_response_id'] = (string) $latestTurn['response_id'];
+                    $spec = ContextHistory::prepareUnlocked($spec);
+                    // The stopped capability cannot authorize an exact-prefix suffix. Keep the
+                    // retained tab, but send the reconstructed complete context and its attachments.
+                    $complete = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+                    unset($complete['continuation']);
+                    $spec['context_json'] = $spec['full_context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($complete);
+                    $spec['prompt'] = ContextHistory::plainPrompt($complete);
+                    $spec['previous_response_id'] = null;
+                    $spec['continuation_source_response_id'] = null;
+                    $spec['rolling_source_response_id'] = null;
+                    return ['spec' => $spec, 'prepared' => true];
+                }
+            }
+        }
         $detachedRestart = is_array($task) && self::retireDetachedTurnForNewHumanUnlocked($spec, $task, $incoming);
         if ($detachedRestart) $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
         $lateReceiptsRecovered = is_array($task) && ToolBroker::settleLateHostReceiptsUnlocked($spec, $task);
@@ -1309,6 +1468,7 @@ final class TaskLedger
                 throw $error;
             }
             if (!self::ownsCurrentGeneration($job, $turn)) return;
+            if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') return;
             if (in_array((string) $turn['status'], ['committed', 'failed', 'cancelled', 'needs_attention'], true)) return;
             $now = time();
             $status = $unknown ? 'needs_attention' : 'failed';
@@ -1557,6 +1717,8 @@ final class TaskLedger
                 $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
                 $surface = $db->table('gateway_browser_surfaces')->where('id', (string) $turn['surface_id'])->find();
                 if (!is_array($job) || !is_array($surface)) continue;
+                // Explicit stop recovery belongs to the stop observer, never the resend/resume queue.
+                if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') continue;
                 $jobStatus = (string) ($job['status'] ?? '');
                 if ($jobStatus === 'completed') {
                     if ((string) ($job['round_kind'] ?? '') === 'tool_call') {

@@ -1083,15 +1083,16 @@ final class ResponseJob
     }
 
     /**
-     * Publish the native failed terminal for a proven superseded physical response.
-     * The caller owns the reservation transaction and proves the newer native context;
+     * Publish the native failed terminal for a proven superseded or manually interrupted response.
+     * The caller owns the ledger transaction and proves the newer native context or explicit interruption;
      * an existing failed terminal is preserved without rewriting its error or events.
      * @param string $responseId Source response replaced by a proven native context revision.
      * @param ?string $message Human- or mailbox-specific terminal explanation; null keeps the human default.
+     * @param string $code Defaults to supersession; explicit stop uses codex_user_cancelled.
      * @return void
      * @throws GatewayError If the old response changes while its terminal is recorded.
      */
-    public static function failSupersededUnlocked(string $responseId, ?string $message = null): void
+    public static function failSupersededUnlocked(string $responseId, ?string $message = null, string $code = 'response_superseded'): void
     {
         $job = self::row($responseId);
         if (!in_array((string) $job['status'], ['queued', 'running'], true)) return;
@@ -1100,8 +1101,8 @@ final class ResponseJob
         }
         $message ??= '网页回合已接收新的用户指令。';
         self::appendEventsUnlocked($job, [ResponsesProtocol::failedEvent($responseId,
-            (string) $job['item_id'], $message, 'response_superseded')]);
-        $error = ResponsesProtocol::error($message, 'response_superseded', null, 'server_error');
+            (string) $job['item_id'], $message, $code)]);
+        $error = ResponsesProtocol::error($message, $code, null, 'server_error');
         $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)
             ->where('status', (string) $job['status'])->update([
                 'status' => 'failed',

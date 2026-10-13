@@ -421,6 +421,35 @@ return {running:true,stopped:true};
 JS);
     }
 
+    /**
+     * Stop/read only a manually interrupted task's verified document and user-message witness.
+     * @param string $url Persisted target URL. @param array $tokens Current task/part transport identities, never logged.
+     * @param array $users Pre-send user identities for tasks without a Connector token.
+     * @param bool $click False reads acknowledgement; true may click the unique semantic Stop control.
+     * @return string CDP expression returning ownership, composer readiness and generation state.
+     */
+    public static function userStopExpression(string $url, array $tokens, array $users, bool $click): string
+    {
+        $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users), 'click' => $click], JSON_THROW_ON_ERROR);
+        return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
+const composer=visibleOne(COMPOSER),rows=userTurns();
+const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
+const witness=expected.tokens.length?expected.tokens.some(token=>String(latest?.innerText||latest?.textContent||'').includes(token))
+    :!!identity&&!expected.users.includes(identity);
+let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
+const temporary=sameOrigin&&temporaryChatPage(location.pathname,location.search);
+if(!temporary)return {owned:false,page_invalid:true,generation_running:false,editor_ready:!!composer,stopped:false};
+const owned=String(location.href||'')===expected.url||witness;
+const stops=[...document.querySelectorAll('[data-testid="stop-button"]')].filter(visible);
+if(stops.length>1)return {owned:false,generation_running:true,editor_ready:!!composer,stopped:false};
+const stop=generationStop();
+// An idle owned composer acknowledges a stop; a running answer also needs its task message witness.
+if(!owned||(stop&&!witness))return {owned:false,generation_running:!!stop,editor_ready:!!composer,stopped:false};
+if(stop&&expected.click)stop.click();
+return {owned:true,generation_running:!!stop,editor_ready:!!composer,stopped:!!stop&&expected.click};
+JS);
+    }
+
     /** Read the visible Temporary Chat personalization state without mutating it. */
     public static function personalizationStateExpression(): string
     {
