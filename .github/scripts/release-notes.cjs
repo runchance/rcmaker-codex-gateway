@@ -5,8 +5,9 @@
  * Generate reproducible release notes from the checked-out tag, using only Git
  * and Node.js. An optional committed .github/release-notes/<tag>.en.md file
  * replaces the generated English body. Chinese notes are not published.
- * Commit bodies are private by default: only explicit Release-Note-EN lines
- * are published, never the rest of a commit body.
+ * Publish every explicit Release-Note-EN line as a separate visible change.
+ * Unmarked commit bodies stay private. English subjects remain a fallback;
+ * Chinese subjects require English change notes or a committed English override.
  *
  * CLI: RELEASE_TAG and GITHUB_REPOSITORY are required. RELEASE_COMMIT is an
  * optional full commit SHA assertion. RELEASE_OUTPUT_DIR is required. The
@@ -16,7 +17,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const MAX_COMMIT_ENTRIES = 100;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const SEMVER_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 const COMMIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -210,17 +210,21 @@ function escapeMarkdown(value) {
 }
 
 /**
- * Read a single explicit English note; ignore Chinese-only or ambiguous fields.
+ * Read every explicit public English change without discarding repeated note fields.
  * @param {string} body Original commit body, never included wholesale in output.
- * @returns {string|null} Author-provided English text, or null when absent/ambiguous.
+ * @returns {string[]} Author-provided English changes in their original order.
+ * @throws {Error} An explicitly public field is empty or contains Chinese text.
  */
-function englishNote(body) {
+function englishNotes(body) {
     const notes = [];
     for (const line of body.split(/\r?\n/)) {
         const match = /^Release-Note-EN:\s*(.*)$/i.exec(line);
-        if (match && match[1].trim()) notes.push(match[1].trim());
+        if (!match) continue;
+        const note = match[1].trim();
+        if (!note || HAN_TEXT.test(note)) throw new Error('Release-Note-EN must contain nonempty English change details.');
+        notes.push(note);
     }
-    return notes.length === 1 && !HAN_TEXT.test(notes[0]) ? notes[0] : null;
+    return notes;
 }
 
 /** Decode NUL-separated Git records; valid commit messages cannot contain NUL bytes. */
@@ -271,28 +275,24 @@ function renderEnglish(model) {
     if (breakingCount) {
         lines.push('', `${breakingCount} commits explicitly mark breaking changes; review the linked commits before upgrading.`);
     }
-    lines.push('', '### Commit details', '',
-        'Author-written Release-Note-EN fields take priority. Chinese commit titles are represented by their change category and a commit link, without an invented translation.', '');
+    lines.push('', '### Changes', '');
     for (const [category, label] of CATEGORIES) {
         const entries = commits.filter((entry) => entry.category === category);
         if (!entries.length) continue;
         lines.push(`#### ${label}`, '');
         for (const entry of entries) {
             const link = `[${entry.sha.slice(0, 7)}](${baseUrl}/commit/${entry.sha})`;
-            if (entry.note) {
-                lines.push(`- ${escapeMarkdown(entry.note)} (${link})`);
+            if (entry.notes.length) {
+                for (const note of entry.notes) lines.push(`- ${escapeMarkdown(note)} (${link})`);
             } else if (HAN_TEXT.test(entry.subject)) {
-                lines.push(`- ${label}: see commit for details (${link})`);
+                throw new Error(`Commit ${entry.sha.slice(0, 7)} has no English change details. Add Release-Note-EN lines or .github/release-notes/${tag}.en.md; incomplete release notes will not be published.`);
             } else {
-                lines.push(`- Original commit: ${escapeMarkdown(entry.subject)} (${link})`);
+                lines.push(`- ${escapeMarkdown(entry.subject)} (${link})`);
             }
         }
         lines.push('');
     }
     if (!commits.length) lines.push('There are no additional commits since the previous eligible release.', '');
-    if (commitCount > MAX_COMMIT_ENTRIES) {
-        lines.push(`The latest ${commits.length} of ${commitCount} commits are listed here. Use the complete changelog below for all commits.`, '');
-    }
     lines.push(`[Complete changelog](${changelogUrl}) · [Release commit](${baseUrl}/commit/${commit})`);
     return `${lines.join('\n').trim()}\n`;
 }
@@ -323,16 +323,15 @@ function generateReleaseNotes(options) {
     }
     const previous = findPreviousRelease(repoRoot, current, commit);
     const range = previous ? `${previous.commit}..${commit}` : commit;
+    const overrides = readOverrides(repoRoot, tag, commit);
+    const commits = parseCommitLog(git(repoRoot, ['log', '--topo-order', '-z', '--format=%H%x00%s%x00%b', range, '--']).stdout, 3)
+        .map(([sha, subject, body]) => ({ sha, subject, ...classifyCommit(subject, body), notes: overrides ? [] : englishNotes(body) }));
     const categoryCounts = Object.fromEntries(CATEGORIES.map(([key]) => [key, 0]));
-    const summaries = parseCommitLog(git(repoRoot, ['log', '-z', '--format=%s%x00%b', range, '--']).stdout, 2);
     let breakingCount = 0;
-    for (const [subject, body] of summaries) {
-        const classification = classifyCommit(subject, body);
-        categoryCounts[classification.category] += 1;
-        if (classification.breaking) breakingCount += 1;
+    for (const entry of commits) {
+        categoryCounts[entry.category] += 1;
+        if (entry.breaking) breakingCount += 1;
     }
-    const commits = parseCommitLog(git(repoRoot, ['log', '--topo-order', `--max-count=${MAX_COMMIT_ENTRIES}`, '-z', '--format=%H%x00%s%x00%b', range, '--']).stdout, 3)
-        .map(([sha, subject, body]) => ({ sha, subject, ...classifyCommit(subject, body), note: englishNote(body) }));
     const pathArgs = previous ? ['diff', '--no-renames', '--name-only', '-z', previous.commit, commit, '--']
         : ['ls-tree', '-r', '--name-only', '-z', commit];
     const changedPaths = [...new Set(git(repoRoot, pathArgs).stdout.split('\0').filter(Boolean))];
@@ -340,8 +339,7 @@ function generateReleaseNotes(options) {
     for (const filePath of changedPaths) subsystemCounts[classifyPath(filePath)] += 1;
     const baseUrl = `https://github.com/${repository}`;
     const changelogUrl = previous ? `${baseUrl}/compare/${encodeURIComponent(previous.tag)}...${encodeURIComponent(tag)}` : `${baseUrl}/commits/${commit}`;
-    const overrides = readOverrides(repoRoot, tag, commit);
-    const model = { tag, previous, commit, commitCount: summaries.length, commits, categoryCounts, subsystemCounts,
+    const model = { tag, previous, commit, commitCount: commits.length, commits, categoryCounts, subsystemCounts,
         changedFileCount: changedPaths.length, breakingCount, baseUrl, changelogUrl };
     const en = overrides ? `${overrides}\n` : renderEnglish(model);
     const metadata = {
@@ -350,7 +348,7 @@ function generateReleaseNotes(options) {
         sha: commit,
         previous_tag: previous ? previous.tag : null,
         prerelease: current.prerelease.length > 0,
-        commit_count: summaries.length,
+        commit_count: commits.length,
         listed_commit_count: commits.length,
         changed_file_count: changedPaths.length,
         breaking_change_count: breakingCount,
@@ -395,8 +393,8 @@ function main(env = process.env) {
     return result;
 }
 
-module.exports = { MAX_COMMIT_ENTRIES, parseVersion, compareVersions, validateRepository, classifyCommit, classifyPath,
-    escapeMarkdown, englishNote, findPreviousRelease, generateReleaseNotes, main };
+module.exports = { parseVersion, compareVersions, validateRepository, classifyCommit, classifyPath,
+    escapeMarkdown, englishNotes, findPreviousRelease, generateReleaseNotes, main };
 
 if (require.main === module) {
     try {

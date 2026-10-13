@@ -86,7 +86,8 @@ try {
 
     test('fresh history produces English-only notes even with Chinese commit titles', () => {
         const repoRoot = fixture();
-        const sha = commit(repoRoot, '初始提交：新的仓库', { 'apps/gateway/bridge.php': '<?php', 'config/app.php': '<?php' });
+        const sha = commit(repoRoot, '初始提交：新的仓库', { 'apps/gateway/bridge.php': '<?php', 'config/app.php': '<?php' },
+            'Release-Note-EN: Initialize the gateway and deployment configuration.');
         git(repoRoot, ['tag', '-a', 'v1.0.0', '-m', 'first annotated release']);
         const result = generate(repoRoot, 'v1.0.0', { commit: sha });
         assert.equal(result.metadata.previous_tag, null);
@@ -102,7 +103,8 @@ try {
             assert.ok(text.includes(`https://github.com/${repository}/releases/tag/v1.0.0`));
             assert.ok(text.includes(`https://github.com/${repository}/commits/${sha}`));
             assert.doesNotMatch(text, /\p{Script=Han}/u);
-            assert.ok(text.includes('Other changes: see commit for details'));
+            assert.ok(text.includes('Initialize the gateway and deployment configuration\\.'));
+            assert.ok(!text.includes('see commit for details'));
             assert.ok(text.includes(`/commit/${sha}`));
         }
         assert.equal(result.files['release-notes.zh-CN.md'], undefined);
@@ -116,7 +118,8 @@ try {
         commit(repoRoot, 'feat(gateway): English [link](https://evil.invalid) <img src=x> `code` $(); touch marker',
             { 'apps/gateway/bridge.php': '<?php changed' }, 'Private-Prompt: DO_NOT_LEAK_THE_PRIVATE_PROMPT');
         commit(repoRoot, 'fix(runtime)!: preserve upgrade data', { 'support/process/worker.php': '<?php worker' });
-        commit(repoRoot, '普通中文提交', { 'public/app.js': 'console.log(1)' });
+        commit(repoRoot, '普通中文提交', { 'public/app.js': 'console.log(1)' },
+            'Release-Note-EN: Update the management interface.');
         git(repoRoot, ['tag', 'stage-gateway']);
         git(repoRoot, ['tag', 'v1.1.0']);
         const result = generate(repoRoot, 'v1.1.0');
@@ -158,8 +161,51 @@ try {
             assert.ok(!result.files[name].includes('UNPAIRED_MUST_NOT_APPEAR'));
         }
         assert.equal(result.metadata.breaking_change_count, 1);
-        assert.equal(notes.englishNote('Release-Note-EN: 中文'), null);
-        assert.equal(notes.englishNote('Release-Note-EN: first\nRelease-Note-EN: second'), null);
+        assert.throws(() => notes.englishNotes('Release-Note-EN: 中文'), /nonempty English change details/);
+        assert.throws(() => notes.englishNotes('Release-Note-EN: '), /nonempty English change details/);
+        assert.deepEqual(notes.englishNotes('Release-Note-EN: first\nRelease-Note-EN: second'), ['first', 'second']);
+    });
+
+    test('all English changes from a single commit appear directly and in order', () => {
+        const repoRoot = fixture();
+        commit(repoRoot, 'seed');
+        git(repoRoot, ['tag', 'v2.1.0']);
+        const sha = commit(repoRoot, 'fix(console): 完整更新说明', { 'public/app.js': 'updated' },
+            'Private-Prompt: KEEP_PRIVATE\nRelease-Note-EN: Restore the setup wizard.\n'
+            + 'Release-Note-EN: Preserve tab state and unsaved input.\n'
+            + 'Release-Note-EN: Keep copying and scrolling stable during polling.');
+        git(repoRoot, ['tag', 'v2.1.1']);
+        const text = generate(repoRoot, 'v2.1.1').files['release-notes.md'];
+        assert.match(text, /#### Fixes/);
+        const changes = ['Restore the setup wizard\\.', 'Preserve tab state and unsaved input\\.',
+            'Keep copying and scrolling stable during polling\\.'];
+        let previousIndex = -1;
+        for (const change of changes) {
+            const index = text.indexOf(`- ${change} ([${sha.slice(0, 7)}]`);
+            assert.ok(index > previousIndex, `Visible change missing or reordered: ${change}`);
+            previousIndex = index;
+        }
+        assert.ok(!text.includes('KEEP_PRIVATE'));
+        assert.ok(!text.includes('see commit'));
+        assert.doesNotMatch(text, /\p{Script=Han}/u);
+    });
+
+    test('missing English details cannot silently publish an empty category placeholder', () => {
+        const repoRoot = fixture();
+        commit(repoRoot, 'seed');
+        git(repoRoot, ['tag', 'v2.2.0']);
+        const sha = commit(repoRoot, 'fix: 只有中文说明', {}, 'Private-Prompt: KEEP_PRIVATE');
+        git(repoRoot, ['tag', 'v2.2.1']);
+        const outputDir = path.join(repoRoot, 'not-created');
+        assert.throws(() => generate(repoRoot, 'v2.2.1', { outputDir }),
+            (error) => error.message.includes(sha.slice(0, 7)) && error.message.includes('Release-Note-EN')
+                && !error.message.includes('KEEP_PRIVATE'));
+        assert.ok(!fs.existsSync(outputDir));
+        commit(repoRoot, 'docs: complete release notes', {
+            '.github/release-notes/v2.2.2.en.md': '# Changes\n\n- Restore task continuity.\n',
+        });
+        git(repoRoot, ['tag', 'v2.2.2']);
+        assert.match(generate(repoRoot, 'v2.2.2').files['release-notes.md'], /Restore task continuity/);
     });
 
     test('prereleases use earlier same-version prereleases and ignore another line', () => {
@@ -280,7 +326,7 @@ try {
         assert.throws(() => generate(repoRoot, 'v4.1.2'), /must not contain Chinese/);
     });
 
-    test('100 detail entries cap preserves full counts and complete changelog', () => {
+    test('more than 100 commits are all visible without truncating changes', () => {
         const repoRoot = fixture();
         commit(repoRoot, 'seed');
         git(repoRoot, ['tag', 'v5.0.0']);
@@ -288,10 +334,12 @@ try {
         git(repoRoot, ['tag', 'v5.0.1']);
         const result = generate(repoRoot, 'v5.0.1');
         assert.equal(result.metadata.commit_count, 105);
-        assert.equal(result.metadata.listed_commit_count, 100);
+        assert.equal(result.metadata.listed_commit_count, 105);
         assert.equal(result.metadata.category_counts.fix, 105);
-        assert.equal((result.files['release-notes.en.md'].match(/^- Original commit:/gm) || []).length, 100);
-        assert.match(result.files['release-notes.en.md'], /latest 100 of 105 commits/);
+        assert.equal((result.files['release-notes.en.md'].match(/^- fix: change /gm) || []).length, 105);
+        assert.ok(result.files['release-notes.en.md'].includes('- fix: change 1 ('));
+        assert.ok(result.files['release-notes.en.md'].includes('- fix: change 105 ('));
+        assert.ok(!result.files['release-notes.en.md'].includes('latest 100'));
         assert.ok(result.files['release-notes.en.md'].includes('/compare/v5.0.0...v5.0.1'));
     });
 
