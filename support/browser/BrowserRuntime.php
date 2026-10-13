@@ -5799,10 +5799,12 @@ JS;
             );
             // Completion UI and file cards can settle after the stop button disappears.
             // Let the completion transaction append that last suffix after its settle window.
-            // A tool-capable request is still a text stream. Only hold a premature answer
-            // while a required host action has not occurred. The initial no-action case can retry.
+            // Tool-capable text is provisional commentary. A required future host call must
+            // not delay visible progress; final-answer and completion guards remain separate.
             $streamCompletion = $toolCapable ? ToolBroker::completionForResponse($logicalResponseId) : null;
-            if (!$activeCompact && ChatGptTransport::canStreamAnswer($streamCompletion) && $stable !== null && !empty($snapshot['generation_running'])) {
+            $canStream = $toolCapable ? ChatGptTransport::canStreamDraft($streamCompletion)
+                : ChatGptTransport::canStreamAnswer($streamCompletion);
+            if (!$activeCompact && $canStream && $stable !== null && !empty($snapshot['generation_running'])) {
                 if (!empty($logicalJob['checkpoint_marker'])) {
                     $stable = \app\gateway\model\LunaCheckpoint::visible($stable, $logicalJob['checkpoint_marker']);
                 }

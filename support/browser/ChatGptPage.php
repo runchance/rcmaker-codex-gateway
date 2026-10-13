@@ -1013,7 +1013,11 @@ if(answer){
         if(!publiclyVisible(root)||nativeRecoveryPanel(root)||root.closest('.loading-shimmer,.aria-busy'))return null;
         const anchor=root.closest('[data-item-anchor]')||root;
         const followingSibling=(()=>{for(let sibling=anchor.nextElementSibling;sibling;sibling=sibling.nextElementSibling){if(visible(sibling)&&String(sibling.innerText||sibling.textContent||'').trim())return true;}return false;})();
-        const complete=!running||followingSibling||allMarkdown.some(next=>next!==root&&after(root,next));
+        // A following public status closes this prose even when no later answer paragraph exists yet.
+        // Nested, hidden and native recovery chrome cannot settle model-authored progress.
+        const followingStatus=statuses.some(next=>!root.contains(next)&&!next.contains(root)
+            &&publiclyVisible(next)&&!nativeRecoveryPanel(next)&&after(root,next));
+        const complete=!running||followingSibling||followingStatus||allMarkdown.some(next=>next!==root&&after(root,next));
         const text=(complete||activityRoots.includes(root))?toMarkdown(root,false):'';
         return text?{key:answer.id+':commentary:'+index,text,complete,public_summary:publicSummary,
             public_status:activityRoots.includes(root)}:null;

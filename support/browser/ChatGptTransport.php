@@ -381,7 +381,18 @@ final class ChatGptTransport
         return ['observed' => $observed, 'ready' => $ready];
     }
 
-    /** Tools alone must not buffer the answer; a required action must first be registered. */
+    /**
+     * Permit a stable public draft before required host work; publishing progress is not task completion.
+     * The browser caller still proves ownership, Markdown stability and an ordinary response operation.
+     * @param array|null $completion Current tool binding; incomplete original-context reads stay blocked.
+     * @return bool Whether provisional commentary may be streamed without releasing a final answer.
+     */
+    public static function canStreamDraft(?array $completion): bool
+    {
+        return empty($completion['context_read_pending']);
+    }
+
+    /** A final-answer prefix still requires registered host work and completed original-context reads. */
     public static function canStreamAnswer(?array $completion): bool
     {
         if (!empty($completion['context_read_pending'])) return false;
