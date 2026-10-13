@@ -3509,7 +3509,7 @@ JS;
                     $effectiveBudget,
                     GatewaySettings::internal(), $capabilities,
                     is_string($turn['transport_transaction_id'] ?? null) ? (string) $turn['transport_transaction_id'] : null,
-                    $attachmentTokens, $decisionEvidence
+                    $attachmentTokens, $decisionEvidence, $this->isFirstFreeConversation($job, $capabilities)
             ) : null;
             \app\gateway\model\ContextDecision::record($responseId, (string)$turn['prompt'], $effectiveBudget, $plan, $attachmentTokens, $decisionEvidence);
             if (is_array($plan)) {
@@ -3582,6 +3582,28 @@ JS;
             $this->failModelSelection($responseId, $error->errorCode, $error->getMessage(), $recover);
         } catch (\Throwable $error) {
             $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 模型档位准备失败：' . $error->getMessage(), $recover);
+        }
+    }
+
+    /**
+     * Limit the Free inline exception to the first unsent request of a new durable task.
+     * Existing tasks, imported history, recovery and paid accounts retain their pinned planning policy.
+     * @param array $job Current internal browser job. @param array $capabilities Verified account state.
+     * @return bool False on missing evidence; this optional optimization never weakens admission.
+     */
+    private function isFirstFreeConversation(array $job, array $capabilities): bool
+    {
+        if (($capabilities['account_plan'] ?? '') !== 'free'
+            || !in_array($job['model'] ?? '', ['chatgpt-web/luna', 'chatgpt-web/think'], true)) return false;
+        try {
+            $stored = TaskLedger::execution((string) $job['id'])['job'];
+            if (!ChatGptTransport::canUseFreeInitialInline($stored, $capabilities)) return false;
+            $others = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('task_id', $stored['task_id'])
+                ->where('id', '<>', $stored['id'])->count();
+            return is_numeric($others) && (int) $others === 0;
+        } catch (\Throwable) {
+            // Missing optional scope evidence keeps the established transport, never a new task failure.
+            return false;
         }
     }
 

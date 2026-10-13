@@ -611,6 +611,35 @@ final class ChatGptTransport
     }
 
     /**
+     * Recognize an unsent Free first request with complete instructions but no prior task history.
+     * The browser caller must additionally prove this is the task's first durable response.
+     * @param array $job Internal persisted job, including complete context and submission metadata.
+     * @param array $capabilities Current account observations; unknown/paid accounts retain their policy.
+     * @return bool Eligibility only; message, attachment and context limits still decide the transport.
+     */
+    public static function canUseFreeInitialInline(array $job, array $capabilities): bool
+    {
+        if (($capabilities['account_plan'] ?? '') !== 'free'
+            || !in_array($job['model'] ?? '', ['chatgpt-web/luna', 'chatgpt-web/think'], true)
+            || ($job['operation_kind'] ?? '') !== 'response' || (int) ($job['round_no'] ?? 0) !== 1
+            || ($job['compaction_epoch'] ?? 'base') !== 'base'
+            || !in_array($job['status'] ?? '', ['queued', 'running'], true)) return false;
+        foreach (['previous_response_id', 'continuation_source_response_id', 'transport_transaction_id',
+            'submit_intent_at', 'accepted_at', 'transport_parts_total', 'transport_stage_sent', 'transport_stage_acked'] as $key) {
+            if (!empty($job[$key])) return false;
+        }
+        $context = json_decode((string) ($job['context_json'] ?? ''), true, 128);
+        if (!is_array($context) || !is_array($context['messages'] ?? null)
+            || !empty($context['continuation']) || !empty($context['original_context'])) return false;
+        $hasUser = false;
+        foreach ($context['messages'] as $message) {
+            if (!is_array($message) || !in_array($message['role'] ?? '', ['system', 'developer', 'user'], true)) return false;
+            if (($message['role'] ?? '') === 'user') $hasUser = true;
+        }
+        return $hasUser;
+    }
+
+    /**
      * Choose inline delivery or the smallest fitting multipart transaction for new turns.
      * Older pinned budgets retain their recorded partition policy for deterministic recovery.
      * @param array $budget Pinned limits, optionally with a first-import-only fixed transaction ID.
@@ -619,10 +648,11 @@ final class ChatGptTransport
      * @param string|null $transactionId Existing recovery identity; takes priority over the import budget ID.
      * @param int $finalAttachmentTokens Image and skill-file reserve on the commit message.
      * @param array|null $decisionEvidence Optional diagnostic output; never changes the returned plan or its wire text.
+     * @param bool $freshFreeConversation Caller-proven first Free request; suppress only the soft history threshold.
      * @return array|null Null when the complete prompt fits inline; otherwise a staged plan.
      * @throws GatewayError When no authorized partition fits, or an internal import transaction ID is invalid.
      */
-    public static function plan(string $prompt, array $budget, array $settings, array $capabilities, ?string $transactionId = null, int $finalAttachmentTokens = 0, ?array &$decisionEvidence = null): ?array
+    public static function plan(string $prompt, array $budget, array $settings, array $capabilities, ?string $transactionId = null, int $finalAttachmentTokens = 0, ?array &$decisionEvidence = null, bool $freshFreeConversation = false): ?array
     {
         // First-import admission and its actual send must count the same random envelope.
         // A caller's explicit recovery ID remains authoritative; ordinary plans stay random.
@@ -646,10 +676,15 @@ final class ChatGptTransport
         // This is only a transport choice: records remain exact, and the selected model
         // and effort still own the final execution message.
         $softSingleLimit = max(12000, intdiv((int) ($budget['base_compact_tokens'] ?? $budget['message_tokens']), 2));
+        $freeInitialInline = $freshFreeConversation && (int) ($budget['version'] ?? 0) >= 8
+            && ($capabilities['account_plan'] ?? '') === 'free' && ($budget['account_plan'] ?? '') === 'free'
+            && in_array($budget['model'] ?? '', ['chatgpt-web/luna', 'chatgpt-web/think'], true)
+            && $transactionId === null && empty($budget['compaction_transport']) && empty($budget['context_min_parts'])
+            && !isset($budget['imported_history_selection']);
         $preferStaging = (int) ($budget['version'] ?? 1) >= 5
             && ($settings['context_transport'] ?? 'auto') === 'auto'
             && $maximum >= 2 && (!empty($capabilities['sol_available']) || $lunaMultipart)
-            && $inlineTokens > $softSingleLimit;
+            && $inlineTokens > $softSingleLimit && !$freeInitialInline;
         $initialParts = 1;
         if ((int) ($budget['version'] ?? 1) < 4 && !empty($budget['context_extended'])) {
             $usage = $inlineTokens + (int) $budget['contract_reserve_tokens'];
@@ -659,7 +694,15 @@ final class ChatGptTransport
             && ContextBudget::tokens($text, $budget) + max(0, $attachmentTokens) <= $budget['message_tokens'];
         if ($initialParts === 1 && !$preferStaging && empty($budget['compaction_transport'])
             && $fits($prompt, $finalAttachmentTokens)
-            && $inlineTokens + $finalAttachmentTokens + $reserve <= $budget['context_tokens']) return null;
+            && $inlineTokens + $finalAttachmentTokens + $reserve <= $budget['context_tokens']) {
+            if ($freeInitialInline) $decisionEvidence = ['version'=>1, 'reason'=>'inline', 'parts'=>1,
+                'free_initial_inline'=>true, 'prompt_tokens'=>$inlineTokens, 'prompt_chars'=>mb_strlen($prompt),
+                'attachment_tokens'=>$finalAttachmentTokens, 'soft_inline_tokens'=>$softSingleLimit,
+                'message_tokens'=>(int)$budget['message_tokens'], 'message_chars'=>(int)$budget['message_chars'],
+                'context_tokens'=>(int)$budget['context_tokens'], 'compact_tokens'=>(int)($budget['compact_tokens'] ?? 0),
+                'context_multiplier'=>(int)($budget['context_multiplier'] ?? 1)];
+            return null;
+        }
         $balanced = (int) ($budget['version'] ?? 1) >= 3;
         // Pinned legacy jobs rebuild with their original count via multipart(). Version 6
         // tries every allowed count; version 5 keeps its original two/six selection policy.

@@ -388,6 +388,8 @@ New requests use saved changes. Already-started work retains its budget and wait
 
 **Multipart delivery** sends longer history in batches. **Compaction** creates a summary for subsequent work. Both can add waiting time without implying failure. History includes instructions, skills and tool results, not just the few messages you typed.
 
+For a new Free conversation without prior assistant/tool history, the complete first request is sent in one message when text, attachments and reserved context all fit. Larger requests still use multipart delivery without removing instructions or context. Existing tasks, compaction, started multipart transactions and paid models keep their established transport policy.
+
 Historical staging normally uses the selected family's non-Pro Medium mode; gateway summaries use non-Pro High. Actual tasks use your chosen model and effort. Inspect the recorded purpose and tier to confirm a submission. 3× does not triple memory, and a summary is not a verbatim copy of all previous records.
 
 **Setup → Account and usage** covers this installation's last seven days of Web submissions, Pro use and estimated tokens. Other devices and direct Web conversations are excluded. “Official balance unavailable” does not mean zero. See [context FAQ](faq.en.md#history) and [usage FAQ](faq.en.md#usage).
