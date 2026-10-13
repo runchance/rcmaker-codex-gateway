@@ -72,6 +72,8 @@ final class DiagnosticExport
         'request_bytes', 'body_bytes', 'stream_started', 'terminal_type', 'done_seen',
         'pause_count', 'resume_count', 'queue_peak', 'client_open', 'abort_reason',
         'flushed', 'is_error', 'tool_error_code', 'result_delivered_at', 'result_delivered_at_us',
+        'page_error_code', 'stopped_thinking_visible', 'network_retry_available',
+        'tool_invocations_pending', 'tool_receipts_pending', 'mcp_activities_pending',
     ];
 
     /**

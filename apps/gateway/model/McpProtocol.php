@@ -690,13 +690,14 @@ final class McpProtocol
             ]);
     }
 
-    /** Reject shell metacharacters and traversal before constructing a read-only PowerShell command. */
-    private static function readFileCommand(string $path, int $offset, int $limit): string
+    /** Build a bounded read for the native host shell; optional OS injection is only for isolated tests. */
+    private static function readFileCommand(string $path, int $offset, int $limit, ?string $osFamily = null): string
     {
-        if (PHP_OS_FAMILY !== 'Windows') {
-            throw new GatewayError('read_file_host_unsupported', '当前只读文件桥尚不支持非 Windows 宿主。', 409);
+        $osFamily ??= PHP_OS_FAMILY;
+        $literal = self::relativePathLiteral($path, 'read_file_path_invalid', $osFamily);
+        if ($osFamily !== 'Windows') {
+            return self::unixReadFileCommand($literal, $offset, $limit);
         }
-        $literal = self::relativePathLiteral($path, 'read_file_path_invalid');
         return '$p=Join-Path (Get-Location).Path ' . $literal . '; '
             . '$item=Get-Item -LiteralPath $p -ErrorAction Stop; '
             . 'if ($item.PSIsContainer -or $item.Length -gt 1048576) { throw "File is a directory or exceeds 1 MiB" }; '
@@ -707,19 +708,66 @@ final class McpProtocol
             . 'Write-Output $content.Substring($start,$length)';
     }
 
-    /** Validate one project-relative path before embedding it as a PowerShell literal. */
-    private static function relativePathLiteral(string $path, string $errorCode): string
+    /**
+     * Use POSIX utilities supplied by Linux/macOS, retaining exact newlines and UTF-8 character boundaries.
+     * The generated command is executed by Codex's native command tool under its normal approval rules.
+     * @param string $literal Already validated, single-quoted POSIX path literal.
+     * @param int $offset Character offset. @param int $limit Maximum characters to return.
+     * @return string Read-only shell program; no Python, Node, PHP or GNU-specific utilities required.
+     */
+    private static function unixReadFileCommand(string $literal, int $offset, int $limit): string
+    {
+        $program = <<<'AWK'
+function invalid() { print "File is not valid UTF-8 text" > "/dev/stderr"; exit 1 }
+{ content = content $0 "\n" }
+END {
+    content = substr(content, 1, bytes)
+    if (substr(content, 1, 3) == "\357\273\277") content = substr(content, 4)
+    total = 0; result = ""
+    for (i = 1; i <= length(content); i += width) {
+        lead = substr(content, i, 1); width = 1
+        if (lead ~ /^[\302-\337]$/) width = 2
+        else if (lead ~ /^[\340-\357]$/) width = 3
+        else if (lead ~ /^[\360-\364]$/) width = 4
+        else if (lead !~ /^[\001-\177]$/) invalid()
+        chunk = substr(content, i, width)
+        if (length(chunk) != width) invalid()
+        for (j = 2; j <= width; j++) if (substr(chunk, j, 1) !~ /^[\200-\277]$/) invalid()
+        second = substr(chunk, 2, 1)
+        if (lead == "\340" && second !~ /^[\240-\277]$/) invalid()
+        if (lead == "\355" && second !~ /^[\200-\237]$/) invalid()
+        if (lead == "\360" && second !~ /^[\220-\277]$/) invalid()
+        if (lead == "\364" && second !~ /^[\200-\217]$/) invalid()
+        if (total >= offset && total < offset + limit) result = result chunk
+        total++
+    }
+    start = offset < total ? offset : total
+    count = limit < total - start ? limit : total - start
+    printf "chars=%d offset=%d next=%d\n", total, start, start + count
+    printf "%s\n", result
+}
+AWK;
+        return 'p=' . $literal . '; '
+            . 'if [ ! -f "$p" ]; then printf "%s\n" "File is not a regular file" >&2; exit 1; fi; '
+            . 'bytes=$(LC_ALL=C wc -c < "$p") || exit 1; '
+            . 'if [ "$bytes" -gt 1048576 ]; then printf "%s\n" "File exceeds 1 MiB" >&2; exit 1; fi; '
+            . 'LC_ALL=C awk -v BINMODE=3 -v bytes="$bytes" -v offset=' . $offset . ' -v limit=' . $limit . " '" . $program . "' < \"\$p\"";
+    }
+
+    /** Validate a project-relative path and quote it for the current platform's native shell. */
+    private static function relativePathLiteral(string $path, string $errorCode, string $osFamily = PHP_OS_FAMILY): string
     {
         if (str_starts_with($path, '/') || str_starts_with($path, '\\')
-            || preg_match('/\A[A-Za-z]:/', $path) === 1 || preg_match('/[\x00-\x1f<>:"|?*]/', $path) === 1) {
+            || preg_match('/\A[A-Za-z]:/', $path) === 1 || preg_match('/[\x00-\x1f]/', $path) === 1
+            || ($osFamily === 'Windows' && preg_match('/[<>:"|?*]/', $path) === 1)) {
             throw new GatewayError($errorCode, '文件路径必须是当前项目内的相对路径。', 400);
         }
-        $segments = preg_split('~[\\\\/]~', $path) ?: [];
+        $segments = $osFamily === 'Windows' ? (preg_split('~[\\\\/]~', $path) ?: []) : explode('/', $path);
         if ($segments === [] || in_array('', $segments, true) || in_array('.', $segments, true)
             || in_array('..', $segments, true)) {
             throw new GatewayError($errorCode, '文件路径不能包含空段或目录回退。', 400);
         }
-        return "'" . str_replace("'", "''", $path) . "'";
+        return "'" . str_replace("'", $osFamily === 'Windows' ? "''" : "'\"'\"'", $path) . "'";
     }
 
     /**

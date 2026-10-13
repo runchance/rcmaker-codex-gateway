@@ -8,11 +8,36 @@
     <link rel="stylesheet" href="../assets/gateway.css">
 </head>
 <body class="gateway-page">
-    <header class="page-heading">
-        <div>
-            <div class="eyebrow">GET READY</div>
-            <h1>运行准备</h1>
-            <p class="muted">第一次使用只需要按顺序完成下面几步。以后这些配置都会保留，不需要每次重新设置。</p>
+    <section id="setup-wizard" class="setup-wizard" hidden aria-labelledby="wizard-title">
+        <header class="setup-wizard-header">
+            <select id="wizard-language" class="console-language" data-language-choice aria-label="Language"><option value="en">English</option><option value="zh-CN">简体中文</option></select>
+            <span class="eyebrow">RCMAKER AI</span>
+            <h1 id="wizard-title">开始使用</h1>
+            <p id="wizard-description" class="muted">按步骤完成设置，进度会自动保存。</p>
+            <ol class="setup-wizard-steps" aria-label="初始化进度">
+                <li data-step="network"><i class="layui-icon layui-icon-link"></i><span>网络</span></li>
+                <li data-step="runtime"><i class="layui-icon layui-icon-download-circle"></i><span>组件</span></li>
+                <li data-step="account"><i class="layui-icon layui-icon-user"></i><span>登录</span></li>
+                <li data-step="tunnel"><i class="layui-icon layui-icon-key"></i><span>隧道</span></li>
+                <li data-step="connector"><i class="layui-icon layui-icon-component"></i><span>连接器</span></li>
+                <li data-step="codex"><i class="layui-icon layui-icon-console"></i><span>Codex 接入</span></li>
+            </ol>
+        </header>
+        <div id="wizard-content" class="setup-wizard-content"></div>
+        <section id="wizard-complete" class="notice" hidden>
+            <h2><i class="layui-icon layui-icon-ok-circle"></i> 设置已完成</h2>
+            <p>请完全退出并重新打开 Codex，再选择带 RC 标记的 Web 模型。保持 RCMAKER 运行。</p>
+        </section>
+        <footer class="setup-wizard-footer">
+            <button id="wizard-back" type="button" class="layui-btn layui-btn-primary">上一步</button>
+            <span id="wizard-status" class="muted" role="status" aria-live="polite">正在检查已保存的设置…</span>
+            <button id="wizard-next" type="button" class="layui-btn" disabled>下一步</button>
+        </footer>
+    </section>
+    <header class="page-heading setup-dashboard">
+        <div class="page-heading-main">
+            <span class="heading-icon"><i class="layui-icon layui-icon-console" aria-hidden="true"></i></span>
+            <div><h1>运行准备</h1><p class="muted">连接状态、账号用量与常用设置。</p></div>
         </div>
         <button id="refresh" type="button" class="layui-btn layui-btn-primary"><i class="layui-icon layui-icon-refresh"></i> 刷新状态</button>
     </header>
@@ -25,61 +50,57 @@
         <button id="codex-restart-check" type="button" class="layui-btn layui-btn-primary">我已重启，检查接入状态</button>
     </section>
 
-    <section class="panel setup-home">
+    <section class="panel setup-home setup-dashboard">
         <div class="panel-title">
             <div>
-                <h2>开始前检查</h2>
+                <h2><i class="layui-icon layui-icon-engine"></i> 连接状态</h2>
                 <p id="ready-detail" class="muted task-panel-help">正在检查本机运行条件…</p>
             </div>
-            <span id="overall-status" class="badge pending">正在检查</span>
+            <div class="setup-overview-toolbar">
+                <span id="overall-status" class="badge pending">正在检查</span>
+                <button id="next-action" type="button" class="layui-btn layui-btn-sm">继续下一步</button>
+            </div>
         </div>
 
         <div class="setup-flow">
-            <article id="step-network" class="setup-flow-step">
-                <div class="setup-flow-title"><span class="step-number">1</span><strong>选择网络方式</strong><span id="network-status" class="badge">检查中</span></div>
-                <p id="network-detail" class="muted">选择直连或填写代理 IP 与端口，系统会自动测试 ChatGPT。</p>
+            <article id="step-network" class="setup-flow-step setup-service-card">
+                <div class="setup-flow-title"><i class="layui-icon layui-icon-link setup-service-icon" aria-hidden="true"></i><strong>网络连接</strong><span id="network-status" class="badge">检查中</span></div>
+                <p id="network-detail" class="muted">选择直连或 HTTP 代理。</p>
                 <div id="network-choice" class="actions">
                     <button id="use-direct" type="button" class="layui-btn layui-btn-sm">不使用代理</button>
                     <button id="open-network" type="button" class="layui-btn layui-btn-primary layui-btn-sm">设置网络</button>
                 </div>
             </article>
 
-            <article id="step-runtime" class="setup-flow-step">
-                <div class="setup-flow-title"><span class="step-number">2</span><strong>准备运行组件</strong><span id="runtime-status" class="badge">等待</span></div>
-                <p id="runtime-detail" class="muted">系统会自动识别操作系统和 CPU 架构，准备项目私有 Chrome 与工具连接组件。</p>
-                <div class="actions"><button id="open-runtime" type="button" class="layui-btn layui-btn-sm">准备运行组件</button></div>
+            <article id="step-runtime" class="setup-flow-step setup-service-card">
+                <div class="setup-flow-title"><i class="layui-icon layui-icon-app setup-service-icon" aria-hidden="true"></i><strong>运行组件</strong><span id="runtime-status" class="badge">等待</span></div>
+                <p id="runtime-detail" class="muted">准备浏览器与工具连接组件。</p>
+                <div class="actions"><button id="open-runtime" type="button" class="layui-btn layui-btn-primary layui-btn-sm">准备运行组件</button></div>
             </article>
 
-            <article id="step-account" class="setup-flow-step">
-                <div class="setup-flow-title"><span class="step-number">3</span><strong>登录 ChatGPT</strong><span id="account-status" class="badge">等待</span></div>
-                <p id="account-detail" class="muted">只需要在这里登录一次，系统随后自动检查模型连接，后续任务会复用登录状态。</p>
-                <div class="actions"><button id="open-login" type="button" class="layui-btn layui-btn-sm">登录 ChatGPT</button></div>
+            <article id="step-account" class="setup-flow-step setup-service-card">
+                <div class="setup-flow-title"><i class="layui-icon layui-icon-user setup-service-icon" aria-hidden="true"></i><strong>ChatGPT</strong><span id="account-status" class="badge">等待</span></div>
+                <p id="account-detail" class="muted">登录后自动同步模型。</p>
+                <div class="actions"><button id="open-login" type="button" class="layui-btn layui-btn-primary layui-btn-sm">登录 ChatGPT</button></div>
             </article>
 
-            <article id="step-tools" class="setup-flow-step">
-                <div class="setup-flow-title"><span class="step-number">4</span><strong>连接 Codex 工具</strong><span id="tools-status" class="badge">等待</span></div>
-                <p id="tools-detail" class="muted">填写 Tunnel ID 和 API Key，在这里完成连接器创建与检查。</p>
-                <div class="actions"><button id="open-tools" type="button" class="layui-btn layui-btn-sm">配置工具连接</button></div>
+            <article id="step-tools" class="setup-flow-step setup-service-card">
+                <div class="setup-flow-title"><i class="layui-icon layui-icon-component setup-service-icon" aria-hidden="true"></i><strong>Codex 工具</strong><span id="tools-status" class="badge">等待</span></div>
+                <p id="tools-detail" class="muted">连接隧道并验证连接器。</p>
+                <div class="actions"><button id="open-tools" type="button" class="layui-btn layui-btn-primary layui-btn-sm">配置工具连接</button></div>
             </article>
         </div>
 
         <div id="ready-banner" class="notice" hidden>
             <strong>运行条件已全部准备完成。</strong> 现在 Codex 可以自动打开 ChatGPT 页面、选择模型、发送任务并完成工具往返。
         </div>
-        <div class="actions setup-home-actions">
-            <button id="next-action" type="button" class="layui-btn">继续下一步</button>
-        </div>
     </section>
 
-    <section class="panel" id="usage-panel"><div class="panel-title"><div><h2>账号与用量</h2><p class="muted">最近七天的本机记录。Token 为传输估算，不是 OpenAI 账单；其他设备或网页中的用量不在这里统计。</p></div><button id="usage-refresh" type="button" class="layui-btn layui-btn-primary layui-btn-sm">刷新用量</button></div><p id="usage-account" class="muted">正在读取账号信息…</p><div class="metrics"><div class="metric"><span>网页提交</span><strong id="usage-submissions" class="metric-value">—</strong></div><div class="metric"><span>Pro 已用</span><strong id="usage-pro" class="metric-value">—</strong></div><div class="metric"><span>Pro 预计剩余</span><strong id="usage-remaining" class="metric-value">—</strong></div><div class="metric"><span>估算 Token</span><strong id="usage-tokens" class="metric-value">—</strong></div></div><p id="usage-models" class="muted"></p><p id="usage-breakdown" class="muted"></p><p id="usage-notice" class="muted">官方剩余额度未提供；设置跟踪预算后显示本机估算，不影响任务执行。</p></section>
-    <section class="panel">
-        <h2>正常使用时你会看到什么</h2>
-        <p class="muted">Codex 发起任务后，浏览器页面由系统自动创建和维护。你不需要管理标签页；“浏览器工作区”会实时显示正在发生的网页自动化，“任务中心”会保留任务结果、工具调用和恢复状态。</p>
-    </section>
+    <section class="panel setup-dashboard" id="usage-panel"><div class="panel-title"><div><h2><i class="layui-icon layui-icon-chart"></i> 账号与用量</h2><p class="muted">本机最近七天的记录，Token 和余额仅供估算。</p></div><button id="usage-refresh" type="button" class="layui-btn layui-btn-primary layui-btn-sm"><i class="layui-icon layui-icon-refresh"></i> 刷新用量</button></div><p id="usage-account" class="muted">正在读取账号信息…</p><div class="metrics"><div class="metric"><span>网页提交</span><strong id="usage-submissions" class="metric-value">—</strong></div><div class="metric"><span>Pro 已用</span><strong id="usage-pro" class="metric-value">—</strong></div><div class="metric"><span>Pro 预计剩余</span><strong id="usage-remaining" class="metric-value">—</strong></div><div class="metric"><span>估算 Token</span><strong id="usage-tokens" class="metric-value">—</strong></div></div><div id="usage-models" class="codex-model-summary"></div><details class="setup-help"><summary>统计说明</summary><p id="usage-breakdown" class="muted"></p><p id="usage-notice" class="muted">官方剩余额度未提供；设置跟踪预算后显示本机估算，不影响任务执行。</p></details></section>
 
     <div id="network-layer" class="setup-layer">
         <h2>网络连接</h2>
-        <p class="muted">能直接访问就选直连；需要代理时只填写代理 IP 和端口。保存后会自动测试 https://chatgpt.com。选择代理后，浏览器、运行组件下载、Tunnel 和后续外部页面都会复用这份代理配置，不会回退到系统代理或直连。</p>
+        <p class="muted">选择连接方式，保存后自动测试 ChatGPT。代理设置同时用于下载、浏览器和工具连接。</p>
         <div class="setup-choice">
             <button id="network-direct" type="button" class="layui-btn layui-btn-primary">直接连接</button>
             <button id="network-proxy" type="button" class="layui-btn layui-btn-primary">使用 HTTP 代理</button>
@@ -88,6 +109,12 @@
             <div class="field"><label for="proxy-host">代理 IP</label><input id="proxy-host" class="layui-input" maxlength="253" placeholder="127.0.0.1"></div>
             <div class="field"><label for="proxy-port">端口</label><input id="proxy-port" class="layui-input" type="number" min="1" max="65535" placeholder="20810"></div>
         </div>
+        <details id="proxy-auth" class="setup-help" hidden>
+            <summary>代理认证（可选）</summary>
+            <div class="field"><label for="proxy-username">用户名</label><input id="proxy-username" class="layui-input" maxlength="128" autocomplete="off"></div>
+            <div class="field"><label for="proxy-password">代理密码</label><input id="proxy-password" class="layui-input" type="password" maxlength="1024" autocomplete="new-password" placeholder="已保存时留空保留"></div>
+            <p class="muted">已保存的密码不回显；清空用户名可移除代理认证。</p>
+        </details>
         <div class="setup-layer-actions"><button id="network-confirm" type="button" class="layui-btn">保存并测试</button></div>
         <div id="network-progress" class="notice setup-layer-status">请选择连接方式。</div>
     </div>
@@ -101,11 +128,10 @@
 
     <div id="account-layer" class="setup-layer">
         <h2>登录 ChatGPT</h2>
-        <p class="muted">在下面页面完成登录。页面支持点击、滚动和输入；登录完成后系统会自动检查模型连接，通过后才进入下一步。</p>
+        <p class="muted">登录后自动同步可用模型；已有连接器会自动检查。</p>
         <div class="setup-layer-actions"><button id="account-start" type="button" class="layui-btn">打开登录页面</button><button id="account-reload" type="button" class="layui-btn layui-btn-primary">刷新页面</button><button id="account-reset" type="button" class="layui-btn layui-btn-primary">清空内置 Chrome 登录资料</button></div>
         <div class="setup-layer-actions compact-actions"><button id="account-native-open" type="button" class="layui-btn layui-btn-primary">打开原生浏览器</button><button id="account-native-hide" type="button" class="layui-btn layui-btn-primary">收起原生浏览器</button></div>
-        <p class="muted">原生浏览器在独立 Chrome 窗口中打开，共用 RCMAKER 私有登录资料，支持直接输入、粘贴和滚动。原来的内置画面仍可使用；完成登录后收起窗口并刷新内置页面。</p>
-        <p class="muted">清空会关闭 RCMAKER 自有 Chrome，并移除当前与旧版 RCMAKER 自有的全部 Chrome Profiles 和已保存的 ChatGPT、Google 登录记录。网关任务记录、Tunnel 配置和系统 Chrome 会保留；完成后需手动重新打开登录页面。</p>
+        <details class="setup-help"><summary>登录与清理说明</summary><p class="muted">原生窗口与内置页面共用登录资料。清空仅移除 RCMAKER 私有浏览器的登录记录；任务、设置和系统 Chrome 不受影响。</p></details>
         <div id="account-progress" class="notice setup-layer-status">等待打开登录页面。</div>
         <div class="setup-surface">
             <div id="account-surface-wrap" class="browser-surface-wrap" tabindex="0">
@@ -118,23 +144,20 @@
 
     <div id="tools-layer" class="setup-layer">
         <h2>连接 Codex 工具</h2>
-        <div class="setup-guide-intro">
-            <strong>你只需要完成下面 3 件事</strong>
-            <span>按 1 → 3 顺序操作即可。Tunnel、API Key 和 ChatGPT 必须使用同一个 OpenAI 账号。</span>
-        </div>
+        <div class="setup-guide-intro"><span>Tunnel、API Key 与 ChatGPT 请使用同一个 OpenAI 账号。</span></div>
 
-        <section class="tools-guide-card">
+        <section class="tools-guide-card" data-tool-step="tunnel">
             <div class="tools-guide-heading"><span class="step-number">1</span><strong>创建 OpenAI Tunnel</strong><span id="tools-tunnel-guide-status" class="badge">待创建</span></div>
-            <p class="muted">Tunnel 用来让 ChatGPT 安全连接到本机工具。点击下面按钮进入 OpenAI Tunnel 页面，创建后复制以 <code>tunnel_</code> 开头的 Tunnel ID。</p>
+            <p class="muted">创建 Tunnel，将 Tunnel ID 粘贴到下方。</p>
             <div class="setup-layer-actions compact-actions">
                 <a id="tools-open-tunnel-admin" class="layui-btn layui-btn-primary" href="https://platform.openai.com/settings/organization/tunnels" target="_blank" rel="noopener noreferrer">打开 Tunnel 创建页面</a>
             </div>
             <div class="field tools-guide-field"><label for="setup-tunnel-id">把 Tunnel ID 粘贴到这里</label><input id="setup-tunnel-id" class="layui-input" maxlength="80" placeholder="例如：tunnel_..."></div>
         </section>
 
-        <section class="tools-guide-card">
+        <section class="tools-guide-card" data-tool-step="tunnel">
             <div class="tools-guide-heading"><span class="step-number">2</span><strong>创建普通 API Key 并连接</strong><span id="tools-key-guide-status" class="badge">待创建</span></div>
-            <p class="muted">创建普通 API Key（不是 Admin key），并确保它和上面的 Tunnel、当前 ChatGPT 登录使用同一个 OpenAI 账号。已保存的 Key 不会在页面重新显示。</p>
+            <p class="muted">创建普通 API Key。已保存的 Key 无需重复填写。</p>
             <div class="setup-layer-actions compact-actions">
                 <a id="tools-open-key-admin" class="layui-btn layui-btn-primary" href="https://platform.openai.com/settings/organization/api-keys" target="_blank" rel="noopener noreferrer">打开 API Key 创建页面</a>
             </div>
@@ -143,18 +166,16 @@
             <div class="setup-layer-actions compact-actions"><button id="tools-connect" type="button" class="layui-btn">保存并连接工具隧道</button></div>
         </section>
 
-        <section class="tools-guide-card">
+        <section class="tools-guide-card" data-tool-step="connector">
             <div class="tools-guide-heading"><span class="step-number">3</span><strong>创建 ChatGPT Connector</strong><span id="tools-connector-guide-status" class="badge">等待</span></div>
-            <p class="muted">Tunnel 和 API Key 页面在你当前使用的浏览器中新标签页打开。ChatGPT 登录和 Connector 创建使用内置 Chrome，确保插件绑定到网页模型使用的账号。创建完成后点击“检查连接器”。</p>
+            <p class="muted">打开 ChatGPT 设置，创建连接器后点击“检查连接器”。</p>
             <ol class="connector-checklist">
                 <li>先在 ChatGPT 设置中启用 <strong>Developer Mode</strong>。</li>
                 <li>新建 Connector，类型/来源选择 <strong>Tunnel</strong>，并选择刚才创建的 Tunnel。</li>
-                <li>连接器名称必须填写 <strong id="setup-connector-name">RCMAKER Codex</strong>。不要把旧连接器直接改名；MCP 契约升级后需要创建新连接器身份。</li>
+                <li>名称填写 <strong id="setup-connector-name">RCMAKER Codex</strong>。</li>
                 <li><strong>Authentication</strong> 选择 <strong>None</strong>。</li>
-                <li>保存 Connector 即可；<strong>不要在顶部全局权限里寻找“Allow all actions”</strong>。不同账号/Workspace 显示的权限项可能不同，RCMAKER 会用无主机副作用的命令类探针实际验证能力。</li>
-                <li>只有 RCMAKER 更新了工具名称、参数或权限标记时，才需在 ChatGPT 的连接器页面点击 <strong>Refresh</strong> 并核对工具清单。普通重启不需要；这里的“检查连接器”只验证连通性，不刷新 ChatGPT 保存的工具目录。</li>
-                <li>如果第一次创建失败而 Tunnel 已连接，可等待 5–10 秒再试一次；完成后点击“检查连接器”。</li>
             </ol>
+            <details class="setup-help"><summary>连接器常见问题</summary><p class="muted">创建失败时等待 5–10 秒再试。修改名称后请新建连接器；工具目录更新后请在 ChatGPT 中点击 Refresh。普通重启无需重新创建。</p></details>
             <div class="setup-layer-actions">
                 <button id="tools-open-connector" type="button" class="layui-btn layui-btn-primary">打开 ChatGPT Connector 设置</button>
                 <button id="tools-native-open" type="button" class="layui-btn layui-btn-primary">打开原生浏览器</button>
@@ -163,11 +184,11 @@
                 <button id="tools-verify" type="button" class="layui-btn">检查连接器</button>
             </div>
         </section>
-        <section class="tools-guide-card">
+        <section class="tools-guide-card" data-tool-step="codex">
             <h3>4. 在 Codex 中启用 Web 模型</h3>
-            <p class="muted">先检测当前 ChatGPT 账号的可用模型，再预览并保存接入配置。保存工作后完全退出 Codex（包括后台进程）再打开，保持 RCMAKER 运行。</p>
-            <p class="muted">保存会备份并替换已有模型路由，保留 MCP、项目和权限设置。“恢复接入前配置”回到安装前的路由；“恢复 Codex 官方路由”清除桥接路由及 Web 默认模型。</p>
-            <div id="codex-models" class="muted">尚未检测可用模型。</div>
+            <p class="muted">预览并保存配置，然后完全退出并重新打开 Codex。</p>
+            <details class="setup-help"><summary>配置与恢复说明</summary><p class="muted">保存前自动备份模型路由，保留 MCP、项目和权限设置。需要时可恢复接入前配置或官方路由。</p></details>
+            <div id="codex-models" class="codex-model-summary">尚未检测可用模型。</div>
             <div class="setup-layer-actions">
                 <button id="codex-probe" type="button" class="layui-btn layui-btn-primary">检测可用模型</button>
                 <button id="codex-preview" type="button" class="layui-btn layui-btn-primary">预览接入配置</button>
@@ -181,7 +202,7 @@
         </section>
         <div id="tools-progress" class="notice setup-layer-status">等待配置。</div>
         <div id="tools-surface-panel" class="setup-surface" hidden>
-            <p class="muted">下面是项目私有浏览器画面。Tunnel、API Key 和 Connector 创建都从这里操作；配置了代理时这些外部访问都会继续走同一代理。交互时会暂缓后台截图刷新，避免下拉菜单被连续刷新打断；页面异步变化没有及时显示时可手动刷新。</p>
+            <p class="muted">可在下方操作 ChatGPT 设置，也可打开原生窗口。</p>
             <div class="setup-layer-actions compact-actions"><button id="tools-surface-refresh" type="button" class="layui-btn layui-btn-primary layui-btn-sm">刷新项目内画面</button></div>
             <div id="tools-surface-wrap" class="browser-surface-wrap" tabindex="0">
                 <img id="tools-surface" alt="ChatGPT 连接器设置页面" draggable="false" hidden>

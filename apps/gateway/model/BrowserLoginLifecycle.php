@@ -48,7 +48,8 @@ final class BrowserLoginLifecycle
     {
         $home = (string) Config::get('gateway', 'codex_home');
         if ($home === '') return false;
-        $path = rtrim($home, '\\/') . '/auth.json';
+        if (PHP_OS_FAMILY === 'Windows') $home = str_replace('\\', '/', $home);
+        $path = rtrim($home, '/') . '/auth.json';
         clearstatcache(true, $path);
         if (!is_file($path) || (int) @filesize($path) > 1048576) return false;
         $raw = @file_get_contents($path, false, null, 0, 1048577);

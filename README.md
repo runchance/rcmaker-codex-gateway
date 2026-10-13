@@ -84,17 +84,24 @@ Deployment overrides are optional; see [`.env.example`](.env.example). Source an
 
 ## First-time setup
 
-Keep the gateway running and open the **[local console](http://127.0.0.1:28910/)**. The interface defaults to English; switch to Chinese in **Settings → Console language**.
+Keep the gateway running and open the **[local console](http://127.0.0.1:28910/)**. A required setup wizard opens on first use. Choose its language at the top right; the default is English. Other console pages become available after setup completes.
+
+Progress is saved automatically. If you close or restart RCMAKER partway through, the wizard resumes at the first unfinished step.
 
 | Step | What to do | Continue when |
 | --- | --- | --- |
 | 1. Network | Choose direct access or enter an HTTP proxy; select **Save and test** | The network check passes |
 | 2. Components | Select **Prepare runtime components → Start preparation** | Private Chrome and tunnel components are ready |
 | 3. ChatGPT | Open the sign-in page; use **Open native browser** for direct interaction | Your account and available models are detected |
-| 4. Tool connection | Save the Tunnel ID, runtime API key and connector name; then create the matching ChatGPT plugin | **Check connector** passes |
-| 5. Codex integration | **Detect available models → Preview integration → Save integration** | Configuration is saved |
+| 4. Tunnel | Save the Tunnel ID, runtime API key and connector name | The tunnel is connected |
+| 5. Connector | Create the matching ChatGPT plugin and select **Check connector** | The connector check passes |
+| 6. Codex integration | **Preview integration → Save integration**, then **Open workspace** | The configuration is detected |
 
 The default connector name is **RCMAKER Codex**. Its suffix is editable; copy the full name into ChatGPT exactly. **Connect the tunnel before creating the plugin.** The [illustrated setup guide](docs/user-guide.en.md#connect-tools) shows each field.
+
+The integration check recognizes both `# RCMAKER BEGIN` and `# RCMAKER END` comments in Codex configuration. Identifier suffixes may be old or different; no matching installation journal is required for detection. Configuration writes still use preview and backup.
+
+This completes only the Codex configuration step. Network, runtime, sign-in, tunnel and connector checks must also pass before the setup overlay closes.
 
 > **After saving integration, wait for the gateway's Ready message, then fully quit and reopen Codex, including background processes. Keep RCMAKER running. Opening a new chat is not a restart.**
 
@@ -106,6 +113,8 @@ and identify any missing setup steps. Do not modify files.
 ```
 
 Check the answer against the real tool output. **Browser workspace** shows the task page; **Task center** records its messages and results. You can then submit a development task with a clear outcome.
+
+The console remembers opened tabs and the active page. Switching back refreshes status while preserving unsaved form input. Automatic redraw waits while you copy, type, scroll or drag; inactive tabs pause polling. After a confirmed sign-in reset, the wizard guides sign-in again, syncs models and checks the saved connector automatically.
 
 <a id="troubleshooting"></a>
 
@@ -130,6 +139,13 @@ To update a binary installation, finish active tasks, stop RCMAKER, enter the **
 | [User guide](docs/user-guide.en.md) | Installation, illustrated setup, everyday use, settings and upgrades |
 | [FAQ](docs/faq.en.md) | Symptom-based troubleshooting and explanations |
 | [Deployment settings](.env.example) | Optional ports, data directory name and startup language |
+
+For maintainers, pushing a version tag triggers builds and English Release notes. Each `Release-Note-EN:` line in a commit body becomes a visible change on the Release page; use one line per change. All commits since the previous eligible release are included. English commit subjects are used when no note is provided. Chinese subjects need English note lines or a committed `.github/release-notes/<tag>.en.md` override; missing details produce an explicit error rather than an incomplete release.
+
+```text
+Release-Note-EN: Restore the six-step setup wizard.
+Release-Note-EN: Preserve unsaved input when switching console tabs.
+```
 
 ## License and notices
 

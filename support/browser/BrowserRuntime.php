@@ -5480,6 +5480,9 @@ JS;
                 return;
             }
             if (is_array($snapshot['error'] ?? null)) {
+                if (($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING') {
+                    $this->recordStoppedThinkingObservation($responseId, $snapshot);
+                }
                 $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = null;
                 $networkError = ($snapshot['error']['code'] ?? '') === 'CHATGPT_NETWORK_ERROR';
                 $failedMessageStream = $networkError
@@ -6279,6 +6282,47 @@ JS;
             'request_fingerprint' => hash('sha256', (string) ($session['submission_request_id'] ?? '')),
             'response_fingerprint' => hash('sha256', (string) ($snapshot['response_html'] ?? ''))];
         $this->recordTaskTransportObservation($responseId, $state, $facts);
+    }
+
+    /**
+     * Record an owned stopped-thinking terminal before the existing error handling settles it.
+     * Pending counts are diagnostic observations only; they never authorize completion or retry.
+     * Storage failures cannot replace the page error or change task execution.
+     * @param string $responseId Current physical observer mapped to its logical Responses round.
+     * @param array $snapshot Current owned response DOM; only flags and lengths are retained.
+     * @return void
+     */
+    private function recordStoppedThinkingObservation(string $responseId, array $snapshot): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $session = $this->taskSessions[(string) ($turn['session_id'] ?? '')] ?? [];
+        $facts = array_intersect_key($snapshot, array_flip(['generation_running', 'response_present',
+            'send_button_visible', 'send_button_disabled', 'completion_action_visible', 'content_present',
+            'transport_recovery_visible', 'stopped_thinking_visible', 'answer_root_count', 'commentary_root_count']));
+        $facts += ['page_error_code' => 'CHATGPT_STOPPED_THINKING',
+            'markdown_chars' => mb_strlen((string) ($snapshot['markdown'] ?? '')),
+            'visible_chars' => mb_strlen((string) ($snapshot['visible_text'] ?? '')),
+            'request_finished' => $session['submission_finished'] ?? null,
+            'canceled' => $session['submission_canceled'] ?? null,
+            'http_status' => $session['submission_http_status'] ?? null,
+            'protocol' => $session['submission_protocol'] ?? null,
+            'error_code' => $session['submission_error_code'] ?? null,
+            'network_retry_available' => !empty($snapshot['network_retry']['available']),
+            'request_fingerprint' => hash('sha256', (string) ($session['submission_request_id'] ?? ''))];
+        try {
+            $job = ResponseJob::execution((string) ($turn['logical_response_id'] ?? $responseId));
+            $db = SDB(null, 'medoo', 'sqlite');
+            $facts['tool_invocations_pending'] = (int) $db->table('gateway_tool_invocations')
+                ->where('task_id', $job['task_id'])->where('status', 'IN', ['registered', 'delivered'])->count();
+            $facts['tool_receipts_pending'] = (int) $db->table('gateway_tool_invocations')
+                ->where('task_id', $job['task_id'])->where('status', 'completed')->where('result_delivered_at', null)->count();
+            $facts['mcp_activities_pending'] = empty($job['mcp_binding_id']) ? 0 : (int) $db->table('gateway_mcp_activities')
+                ->where('binding_id', $job['mcp_binding_id'])->where('status', 'active')->count();
+        } catch (\Throwable) {
+            // Missing counters are unknown, not evidence that work has drained.
+        }
+        $this->recordTaskTransportObservation($responseId, 'stopped_thinking', $facts);
     }
 
     /** A pre-receipt stream finish is never evidence of the source's post-tool answer. */

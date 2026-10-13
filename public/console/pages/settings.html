@@ -7,16 +7,17 @@
     <link rel="stylesheet" href="../component/pear/css/pear.css">
     <link rel="stylesheet" href="../assets/gateway.css">
 </head>
-<body class="gateway-page">
+<body class="gateway-page settings-page">
     <header class="page-heading">
-        <div><div class="eyebrow">SETTINGS</div><h1>设置</h1><p class="muted">这里保存长期运行参数。网络、登录、Tunnel 和连接器都在“运行准备”中完成。</p></div>
-        <button id="reload" type="button" class="layui-btn layui-btn-primary">重新载入</button>
+        <div class="page-heading-main"><span class="heading-icon"><i class="layui-icon layui-icon-set" aria-hidden="true"></i></span><div><h1>设置</h1><p class="muted">调整使用偏好与模型行为。</p></div></div>
+        <button id="reload" type="button" class="layui-btn layui-btn-primary"><i class="layui-icon layui-icon-refresh" aria-hidden="true"></i>重新载入</button>
     </header>
     <div id="error" class="notice error" role="alert" hidden></div>
     <div id="saved" class="notice" hidden>更改已保存。</div>
     <div class="settings-navigation" role="tablist" aria-label="Settings sections"><button type="button" class="layui-btn" id="settings-general-tab" role="tab" aria-selected="true" aria-controls="settings-general">日常设置</button><button type="button" class="layui-btn layui-btn-primary" id="settings-contracts-tab" role="tab" aria-selected="false" aria-controls="settings-contracts">模型契约</button></div><div id="settings-general" role="tabpanel"><form id="settings-form" class="layui-form" autocomplete="off">
-        <section class="panel"><div class="panel-title"><h2>语言与显示</h2></div><div class="field"><label for="ui-locale">控制台语言</label><select id="ui-locale" data-language-choice lay-filter="ui-locale"><option value="en">English</option><option value="zh-CN">简体中文</option></select><p class="muted">语言切换立即生效并保存，不需要重启，也不会修改模型契约或用户消息。</p></div><div class="field"><label for="pro-weekly-budget">Pro 每周跟踪预算（0 表示不设置）</label><input id="pro-weekly-budget" class="layui-input" type="number" min="0" max="100000"><p class="muted">填写你的账号实际额度，例如 50。这里只显示最近七天本机记录的预计余额，不限制发送，也不是 OpenAI 的官方剩余额度。</p></div></section>
+        <section class="panel"><div class="panel-title"><h2><i class="layui-icon layui-icon-slider panel-heading-icon" aria-hidden="true"></i>语言与显示</h2></div><div class="settings-grid"><div class="field"><label for="ui-locale">控制台语言</label><select id="ui-locale" data-language-choice lay-filter="ui-locale"><option value="en">English</option><option value="zh-CN">简体中文</option></select><p class="muted">立即生效，无需重启。</p></div><div class="field"><label for="pro-weekly-budget">Pro 每周跟踪预算（0 表示不设置）</label><input id="pro-weekly-budget" class="layui-input" type="number" min="0" max="100000"><p class="muted">仅按本机用量估算余额，不限制发送，不代表官方额度。</p></div></div></section>
         <section class="panel">
+            <div class="panel-title"><h2><i class="layui-icon layui-icon-component panel-heading-icon" aria-hidden="true"></i>工具与附件</h2></div>
             <details class="settings-disclosure"><summary>Advanced tool waits</summary><p class="muted">一般无需修改。这里只影响工具等待与结果容量。</p>
             <div class="settings-grid">
                 <div class="field"><label for="invoke-timeout">工具派发等待（秒）</label><input id="invoke-timeout" class="layui-input" type="number" min="10" max="110" step="1"><p class="muted">仅限制交付到 Codex 前的等待；已交付调用的执行和权限审批沿用回合等待上限，实际工具超时由 Codex 控制。</p></div>
@@ -26,23 +27,23 @@
             </details>
             <div class="field settings-confirmation-option">
                 <input id="auto-approve-tools" type="checkbox" title="自动确认 ChatGPT 的一次性工具调用">
-                <p class="muted">开启后仅会在当前 RCMAKER Connector 的确认框中选择 <strong>Allow once / Allow</strong>，不会选择永久授权；本机 Codex 的沙箱和审批仍照常生效。</p>
+                <p class="muted">只确认当前连接器的单次调用；Codex 的权限审批保持不变。</p>
             </div>
-            <div class="panel-title"><h2>图片与技能</h2></div>
             <div class="field settings-confirmation-option">
                 <input id="skill-transport" type="checkbox" title="上传技能文件">
-                <p class="muted">默认不勾选：不上传技能文件，技能指令以正文传递，不占图片名额。勾选后，把 Codex 已选技能作为文件上传。</p>
-                <p class="muted">每次最多上传 10 个文件。图片自动选取对话中最近的图片；技能文件会占用名额，例如 2 个技能文件加最近 8 张图片。</p>
+                <p class="muted">默认以文字传递。开启后技能与最近图片共享 10 个附件名额。</p>
             </div>
-            <div class="panel-title"><h2>长任务与上下文</h2></div>
-            <p class="muted">长对话会自动压缩并继续。上下文预算根据当前 ChatGPT 账号和所选模型调整。</p>
+        </section>
+        <section class="panel">
+            <div class="panel-title"><h2><i class="layui-icon layui-icon-time panel-heading-icon" aria-hidden="true"></i>长任务与上下文</h2></div>
+            <p class="muted">根据账号与模型自动分段和压缩，继续长任务。</p>
             <div class="field settings-confirmation-option">
                 <input id="official-handoff-summary" type="checkbox" title="切换到 Web 时使用官方模型生成交接摘要">
-                <p class="muted">默认关闭。开启后，遇到 Web 无法读取的官方加密压缩历史时，会先用当前 Codex 官方登录生成一次只读交接摘要，再继续 Web 请求。这会消耗官方模型额度；关闭时保留可读历史，并明确标记无法读取的片段。</p>
+                <p class="muted">遇到不可读的加密历史时，使用官方模型补充摘要，会消耗官方模型额度。默认关闭。</p>
             </div>
             <div class="field settings-confirmation-option">
                 <input id="context-extended" type="checkbox" lay-filter="context-budget" title="接入最多 3× 历史（实验性）">
-                <p class="muted">按账号和模型实测容量接入更长历史，自动选择 2–6 段；分段不会扩大模型记忆。GPT-6 推理窗口：Plus 12 万、Pro 24 万 token。Luna/Think 分段输入最多 8.4 万 token；关闭扩展时通过滚动摘要续接，单条输入仍单独限额。需要连接器和 6 段上限。</p>
+                <p class="muted">接入更长历史，需将最大分段数设为 6。不会扩大网页模型的记忆窗口。</p>
             </div>
             <div class="settings-grid">
                 <div class="field"><label for="context-parts">最大分段数</label><select id="context-parts"><option value="1">最多 1 段</option><option value="2">最多 2 段</option><option value="3">最多 3 段</option><option value="4">最多 4 段</option><option value="5">最多 5 段</option><option value="6">最多 6 段</option></select></div>
@@ -50,17 +51,21 @@
                 <div class="field"><label for="stage-timeout">每段确认最长等待（秒）</label><input id="stage-timeout" class="layui-input" type="number" min="30" max="300"></div>
                 <div class="field"><label for="compact-timeout">上下文压缩摘要等待（秒）</label><input id="compact-timeout" class="layui-input" type="number" min="30" max="86400"></div>
             </div>
-            <p id="context-budget-detail" class="muted" aria-live="polite"></p>
             <details class="settings-disclosure"><summary>How history and context work</summary>
-            <p class="muted">工具返回实际结果后，下一次模型响应重新计时；此等待时间不是整个项目任务的总时限。</p>
-            <p class="muted">系统按上下文大小自动选择单条、2 段或 6 段；上限为 3–5 段时新请求最多使用 2 段。历史分段使用 Medium 接收，最后执行任务时切回你在 Codex 选择的模型强度；超过上限时先压缩上下文。</p>
-            <p class="muted">超长历史的只读压缩可能额外使用六段预载；每段按“每段确认最长等待”独立计时，并为最后的摘要保留额外时间。</p>
-            <p class="muted">压缩摘要默认等待 4 小时（14400 秒），可设为最长 24 小时。新建摘要使用保存的等待时间；已开始的摘要沿用开始时的设置。</p>
-            <p class="muted">压缩会保留交接摘要、有界的用户原话和最近最多 10 张图片。3× 是历史接入预算，不扩大网页模型的记忆窗口。分段越多，发送和等待越久；6 段不代表 6 倍窗口。保存后新请求生效，已发送任务保留原预算；Codex 若仍显示旧预算，需要完全退出后重开。</p>
+            <div id="context-budget-detail" aria-live="polite"></div>
+            <p class="muted">按上下文大小自动分段，并在发送任务时使用你在 Codex 选择的模型和强度。</p>
+            <dl class="state-grid context-policy-summary">
+                <div><dt>历史扩展</dt><dd>3× 用于接入更多历史，不扩大模型记忆；容量以当前账号和模型为准。</dd></div>
+                <div><dt>摘要保留</dt><dd>保留交接摘要、必要用户原话和最近最多 10 张图片。</dd></div>
+                <div><dt>等待与生效</dt><dd>工具返回结果后重新计时；已开始的任务沿用原设置。</dd></div>
+                <div><dt>更新模型目录</dt><dd>Codex 仍显示旧预算时，完全退出后重新打开。</dd></div>
+            </dl>
+            <p class="help">更多分段需要更长传输时间；六段不等于六倍模型窗口。</p>
             </details>
         </section>
         <div class="actions settings-save"><button id="save" type="submit" class="layui-btn">保存日常设置</button></div></form></div><div id="settings-contracts" role="tabpanel" hidden><form id="contracts-form" class="layui-form" autocomplete="off"><section class="panel" aria-labelledby="web-contract-heading">
-            <div class="panel-title"><div><h2 id="web-contract-heading">Web 模型契约</h2><p class="muted task-panel-help">下面四个文本框显示各分支实际使用的模板，可直接编辑并分别恢复默认。保存只影响之后新提交的网页消息；已开始的回合沿用提交时的模板快照。</p></div></div>
+            <div class="panel-title"><div><h2 id="web-contract-heading"><i class="layui-icon layui-icon-code-circle panel-heading-icon" aria-hidden="true"></i>Web 模型契约</h2><p class="muted task-panel-help">修改只对新消息生效，正在运行的任务保持原设置。</p></div></div>
+            <details class="settings-disclosure contract-reference"><summary>模板说明与可用变量</summary>
             <div class="tools-guide-card">
                 <strong>模板如何选择</strong>
                 <ul class="connector-checklist">
@@ -69,9 +74,10 @@
                     <li>请求是历史压缩（<code>compaction</code>）：用“只读压缩”模板，只生成交接摘要，不执行原任务。</li>
                 </ul>
             </div>
-            <p class="muted">这里的四种模板分别用于首轮、后续回合、无宿主工具和只读压缩。</p>
             <p class="muted">模型和推理强度主要决定能力路由、分段预算及网页模型选择；不是在模板里简单替换一个型号。<code>multipart</code> 会先发送不执行任务的上下文分段，最后的提交消息再携带所选契约。Luna 的滚动检查点通过 <code>{{checkpoint_instructions}}</code> 加入普通回合；<code>verbosity</code> 和 <code>output_format</code> 由 <code>{{output_control}}</code> 加入，压缩回合不使用普通答案格式约束。勾选“上传技能文件”且本回合有已选技能时，<code>{{skill_contract}}</code> 说明附件与其原始指令位置。</p>
             <p class="muted">所有模板必须保留 <code>{{context_json}}</code>；有宿主工具的首轮和后续模板还必须保留 <code>{{turn_token}}</code>。用户提示词已包含在上下文中，通常无需重复；如需单独引用可使用 <code>{{latest_user_prompt}}</code>。其他可选变量：<code>{{connector_name}}</code>、<code>{{model_display_label}}</code>、<code>{{output_control}}</code>、<code>{{checkpoint_instructions}}</code>、<code>{{answer_instruction}}</code>、<code>{{context_only_notice}}</code>、<code>{{archive_requirement}}</code>、<code>{{read_context_notice}}</code>、<code>{{skill_contract}}</code>。变量在发送时替换；不要在模板中写真实令牌。</p>
+            <p class="muted">工具回执直接让同一网页回答继续，不另发“工具回执后续轮”提示词。无宿主工具和压缩请求没有 <code>turn_token</code>；这两种模板若包含 <code>{{turn_token}}</code>，保存时会被拒绝。</p>
+            </details>
             <details class="contract-editor" open><summary>有宿主工具 · 首轮／新页面：完整上下文契约</summary><div class="field"><label for="web-initial-contract" class="visually-hidden">有宿主工具 · 首轮／新页面：完整上下文契约</label>
                 <p class="muted">此处的 <code>{{context_json}}</code> 是本次请求允许接入的完整上下文。</p>
                 <textarea id="web-initial-contract" class="layui-textarea technical" rows="18" spellcheck="false" aria-describedby="web-initial-status"></textarea>
@@ -88,7 +94,6 @@
                 <p class="muted">压缩请求优先选择此模板；只整理提供的历史供下一回合接续，不执行历史任务或调用工具。</p>
                 <textarea id="web-compact-contract" class="layui-textarea technical" rows="14" spellcheck="false" aria-describedby="web-compact-status"></textarea>
                 <div class="actions"><span id="web-compact-status" class="muted" aria-live="polite"></span><button id="reset-web-compact" type="button" class="layui-btn layui-btn-primary layui-btn-sm">恢复压缩默认模板</button></div></div></details>
-            <p class="muted">工具回执直接让同一网页回答继续，不另发“工具回执后续轮”提示词。无宿主工具和压缩请求没有 <code>turn_token</code>；这两种模板若包含 <code>{{turn_token}}</code>，保存时会被拒绝。</p>
             <div class="actions"><button id="save-contracts" type="submit" class="layui-btn">保存模型契约</button></div>
         </section>
     </form></div>

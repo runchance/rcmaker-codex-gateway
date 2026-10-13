@@ -64,11 +64,15 @@ Use the current [Add custom MCP server instructions](https://developers.openai.c
 
 ### The native browser is signed in, but Setup still looks stale.
 
-Return to Setup, allow account/model detection to settle, and use **Refresh status** or **Refresh page** when needed. Ensure you signed into RCMAKER's private native window, not only system Chrome. Do not clear all profiles as a first response; that removes login state and requires a new sign-in.
+Account and model detection run automatically, and signing in again checks the saved connector. Ensure you used RCMAKER's private native window. Refresh the browser image if necessary; you do not need to reopen the sign-in page. A routine refresh does not require clearing profiles.
 
 <a id="models"></a>
 
 ## Models
+
+### Does an old identifier suffix make the configuration look uninstalled?
+
+No. Both actual `# RCMAKER BEGIN` and `# RCMAKER END` comments mean the configuration is integrated, regardless of their identifier suffixes. Configuration detection is separate from a first real task. Changing routing still uses preview, save and a full Codex restart.
 
 ### Web entries do not appear in Codex after saving integration.
 

@@ -4,6 +4,82 @@
     let bootstrapPromise;
     let modelProbe = {at: 0, ready: false, error: ''};
     let admittedState = null;
+    let lastInteractionAt = 0;
+    let pointerHeld = false;
+
+    /** Pear keeps inactive documents alive; document.hidden alone cannot identify the active tab. */
+    function isPageActive() {
+        if (document.hidden) return false;
+        try {
+            if (window.parent !== window) {
+                if (window.parent.document.hidden) return false;
+                const frame = window.frameElement;
+                if (!frame || frame.closest('[inert]')) return false;
+                const tab = frame.closest('.layui-tab-item');
+                if (tab && !tab.classList.contains('layui-show')) return false;
+            }
+        } catch (_) { return false; }
+        return true;
+    }
+
+    /** Defer automatic DOM commits during interaction. Explicit actions never use this guard. */
+    function automaticRefreshAllowed(options) {
+        if (!isPageActive() || pointerHeld || Date.now() - lastInteractionAt < 850) return false;
+        const selection = window.getSelection && window.getSelection();
+        if (selection && !selection.isCollapsed && String(selection).length) return false;
+        const focused = document.activeElement;
+        if (focused && focused.matches && focused.matches('input,textarea,select,[contenteditable="true"],[role="textbox"]')) return false;
+        if ([...document.querySelectorAll('.layui-form-selected,.layui-dropdown,.layui-laydate')]
+            .some(node => node.getClientRects().length > 0)) return false;
+        if (!(options && options.allowLayers) && document.querySelector('.layui-layer')) return false;
+        return true;
+    }
+
+    /** Refresh state on activation without reloading an iframe or destroying unsaved input. */
+    function onPageActivate(callback) {
+        let lastActivation = 0;
+        let disposed = false;
+        const activate = () => {
+            if (disposed || !isPageActive() || Date.now() - lastActivation < 250) return;
+            lastActivation = Date.now();
+            Promise.resolve().then(() => { if (!disposed && isPageActive()) return callback(); }).catch(() => {});
+        };
+        window.addEventListener('gateway:page-activate', activate);
+        window.addEventListener('focus', activate);
+        document.addEventListener('visibilitychange', activate);
+        const dispose = () => {
+            disposed = true;
+            window.removeEventListener('gateway:page-activate', activate);
+            window.removeEventListener('focus', activate);
+            document.removeEventListener('visibilitychange', activate);
+            window.removeEventListener('pagehide', hide);
+            window.removeEventListener('pageshow', show);
+        };
+        const hide = event => { if (!event.persisted) dispose(); };
+        const show = event => { if (event.persisted) activate(); };
+        window.addEventListener('pagehide', hide);
+        window.addEventListener('pageshow', show);
+        return dispose;
+    }
+
+    /** Publish configuration changes as a refresh hint, never as readiness proof. */
+    function notifyStateChange(reason) {
+        let host = window;
+        try { if (window.parent !== window && window.parent.Gateway) host = window.parent; } catch (_) {}
+        const targets = new Set([window, host]);
+        host.document.querySelectorAll('iframe').forEach(frame => {
+            try { if (frame.contentWindow.Gateway) targets.add(frame.contentWindow); } catch (_) {}
+        });
+        targets.forEach(target => target.dispatchEvent(new target.CustomEvent('gateway:state-change', {detail: {reason}})));
+    }
+
+    // Selection, scrollbar dragging and wheel scrolling must remain stable across background updates.
+    const interacted = () => { lastInteractionAt = Date.now(); };
+    ['wheel', 'scroll', 'keydown', 'input'].forEach(type => document.addEventListener(type, interacted, {capture: true, passive: true}));
+    document.addEventListener('pointerdown', () => { pointerHeld = true; interacted(); }, {capture: true, passive: true});
+    document.addEventListener('pointerup', () => { pointerHeld = false; interacted(); }, {capture: true, passive: true});
+    document.addEventListener('pointercancel', () => { pointerHeld = false; }, {passive: true});
+    window.addEventListener('blur', () => { pointerHeld = false; });
 
     /** Fetch bounded JSON; failures never echo request bodies or upstream content. */
     async function jsonFetch(url, options, timeoutMs) {
@@ -320,5 +396,6 @@
         }
     }
 
-    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics};
+    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics,
+        isPageActive, automaticRefreshAllowed, onPageActivate, notifyStateChange};
 })();

@@ -14,7 +14,7 @@ final class CodexEnvironment
     public static function resolve(array $environment, string $osFamily, ?string $unixAccountHome = null): string
     {
         $codexHome = self::value($environment['CODEX_HOME'] ?? null);
-        if ($codexHome !== '') return self::normalize($codexHome);
+        if ($codexHome !== '') return self::normalize($codexHome, $osFamily);
 
         if ($osFamily === 'Windows') {
             $home = self::value($environment['USERPROFILE'] ?? null);
@@ -29,7 +29,7 @@ final class CodexEnvironment
             if ($home === '') $home = self::value($unixAccountHome);
         }
 
-        return $home === '' ? '' : self::normalize($home) . '/.codex';
+        return $home === '' ? '' : rtrim(self::normalize($home, $osFamily), '/') . '/.codex';
     }
 
     /** Resolve from the real process environment/effective user. */
@@ -50,8 +50,12 @@ final class CodexEnvironment
         return is_string($value) ? trim($value) : '';
     }
 
-    private static function normalize(string $path): string
+    /** Preserve Unix filename characters; backslashes are separators only on Windows. */
+    private static function normalize(string $path, string $osFamily): string
     {
-        return rtrim(str_replace('\\', '/', trim($path)), '/');
+        $path = trim($path);
+        if ($osFamily === 'Windows') $path = str_replace('\\', '/', $path);
+        $normalized = rtrim($path, '/');
+        return $normalized === '' ? '/' : $normalized;
     }
 }

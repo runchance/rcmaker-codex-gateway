@@ -371,10 +371,12 @@ final class ChromeForTestingRuntime
         }
     }
 
+    /** Extract regular files first, then restore only links resolving inside the complete private tree. */
     private static function extractSafe(string $archive, string $destination, array $platform): void
     {
         $zip = new \ZipArchive();
         if ($zip->open($archive) !== true) self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', 'Chrome for Testing ZIP 无法打开。', $platform, 'extracting');
+        $links = [];
         try {
             for ($i = 0; $i < $zip->numFiles; $i++) {
                 $stat = $zip->statIndex($i); $name = is_array($stat) ? (string) ($stat['name'] ?? '') : '';
@@ -388,10 +390,12 @@ final class ChromeForTestingRuntime
                 if ($zip->getExternalAttributesIndex($i, $opsys, $attr)) $isSymlink = ((($attr >> 16) & 0170000) === 0120000);
                 if ($isSymlink) {
                     $link = $zip->getFromIndex($i);
-                    if (!is_string($link) || self::safeRelative(dirname($relative) . '/' . $link) === null || str_starts_with($link, '/') || preg_match('/\A[A-Za-z]:/', $link)) {
+                    if (!is_string($link) || self::linkTargetRelative($relative, $link) === null) {
                         self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', 'ZIP 包含不安全符号链接。', $platform, 'extracting');
                     }
-                    if (!function_exists('symlink') || !@symlink($link, $target)) self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', '无法恢复浏览器包中的符号链接。', $platform, 'extracting');
+                    // macOS helpers legitimately point upwards within the same application bundle.
+                    // Defer every link so subsequent ZIP writes cannot follow one outside the tree.
+                    $links[$relative] = $link;
                     continue;
                 }
                 $input = $zip->getStream($name); $output = @fopen($target, 'wb');
@@ -403,6 +407,52 @@ final class ChromeForTestingRuntime
                 }
             }
         } finally { $zip->close(); }
+        self::restoreArchiveLinks($destination, $links, $platform);
+    }
+
+    /**
+     * Normalize a ZIP link target relative to its parent, allowing internal .. but never root escape.
+     * @param string $relative Validated archive entry path. @param string $link Raw relative link target.
+     * @return string|null Archive-relative destination, or null for an unsafe target.
+     */
+    private static function linkTargetRelative(string $relative, string $link): ?string
+    {
+        if ($link === '' || str_starts_with($link, '/') || str_contains($link, '\\')
+            || preg_match('/[\x00-\x1f:]/', $link)) return null;
+        $parent = dirname($relative);
+        $parts = $parent === '.' ? [] : explode('/', $parent);
+        foreach (explode('/', $link) as $part) {
+            if ($part === '' || $part === '.') continue;
+            if ($part === '..') {
+                if ($parts === []) return null;
+                array_pop($parts);
+            } else {
+                $parts[] = $part;
+            }
+        }
+        return implode('/', $parts);
+    }
+
+    /** Restore internal link chains independently of ZIP order; dangling/cyclic/external links fail closed. */
+    private static function restoreArchiveLinks(string $destination, array $links, array $platform): void
+    {
+        while ($links !== []) {
+            $restored = false;
+            foreach ($links as $relative => $link) {
+                $target = rtrim($destination, '\\/') . '/' . $relative;
+                $linkPath = dirname($target) . '/' . $link;
+                clearstatcache(true, $linkPath);
+                $resolved = realpath($linkPath);
+                if ($resolved === false) continue;
+                if (!self::pathInside($resolved, realpath($destination) ?: $destination)
+                    || !function_exists('symlink') || !@symlink($link, $target)) {
+                    self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', '无法恢复浏览器包中的安全符号链接。', $platform, 'extracting');
+                }
+                unset($links[$relative]);
+                $restored = true;
+            }
+            if (!$restored) self::fail('BROWSER_RUNTIME_EXTRACT_FAILED', '浏览器包中的符号链接目标缺失或循环。', $platform, 'extracting');
+        }
     }
 
     /**

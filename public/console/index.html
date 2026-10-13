@@ -12,9 +12,9 @@
     <link rel="stylesheet" href="assets/gateway.css">
 </head>
 <body class="layui-layout-body pear-admin gateway-shell">
-    <div class="layui-layout layui-layout-admin">
+    <div class="layui-layout layui-layout-admin" id="gateway-workspace" inert>
         <header class="layui-header">
-            <div class="layui-logo"><img class="logo" alt=""><span class="title"></span></div>
+            <div class="layui-logo"><i class="gateway-brand-mark layui-icon layui-icon-link" aria-hidden="true"></i><img class="logo" alt=""><span class="title"></span></div>
             <ul class="layui-nav layui-layout-left">
                 <li class="collapse layui-nav-item"><a href="#" class="layui-icon layui-icon-shrink-right" aria-label="展开或收起菜单" title="展开或收起菜单"></a></li>
             </ul>
@@ -22,7 +22,8 @@
             <div class="gateway-local-badge"><span><i class="layui-icon layui-icon-console"></i> 本机 · 免登录</span><select id="console-language" data-language-choice aria-label="控制台语言"><option value="en">English</option><option value="zh-CN">简体中文</option></select></div>
         </header>
         <aside class="layui-side layui-bg-black">
-            <div class="layui-logo"><img class="logo" alt=""><span class="title"></span></div>
+            <div class="layui-logo"><i class="gateway-brand-mark layui-icon layui-icon-link" aria-hidden="true"></i><img class="logo" alt=""><span class="title"></span></div>
+            <div class="gateway-brand-subtitle">AI WORKSPACE</div>
             <div class="layui-side-scroll"><div id="side"></div></div>
         </aside>
         <main class="layui-body"><div id="content"></div></main>
@@ -31,6 +32,13 @@
         <div class="loader-wrapper"><div class="loader"></div></div>
     </div>
     <div class="pear-collapsed-pe collapse"><a href="#" class="layui-icon layui-icon-shrink-right" aria-label="菜单"></a></div>
+    <div id="gateway-startup" class="prerequisite-mask" role="status">
+        <div class="prerequisite-card">
+            <i class="layui-icon layui-icon-loading layui-anim layui-anim-rotate layui-anim-loop" aria-hidden="true"></i>
+            <h2>正在准备控制台</h2><p class="muted">正在读取已保存的设置…</p>
+            <button id="gateway-startup-retry" type="button" class="layui-btn" hidden>重试</button>
+        </div>
+    </div>
     <noscript>Enable JavaScript to use this local console. All page resources are included with the application.</noscript>
     <script src="assets/i18n-catalog.js"></script>
     <script src="assets/i18n.js"></script>

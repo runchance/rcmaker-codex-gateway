@@ -7,23 +7,23 @@
     <link rel="stylesheet" href="../component/pear/css/pear.css">
     <link rel="stylesheet" href="../assets/gateway.css">
 </head>
-<body class="gateway-page">
+<body class="gateway-page network-page">
     <header class="page-heading">
-        <div><div class="eyebrow">CONNECTION SETTINGS</div><h1>网络与代理</h1><p class="muted">选择本应用如何访问外网。这里的设置只影响 RCMAKER，不修改系统代理。</p></div>
-        <button id="reload" type="button" class="layui-btn layui-btn-primary">重新载入设置</button>
+        <div class="page-heading-main"><span class="heading-icon"><i class="layui-icon layui-icon-link" aria-hidden="true"></i></span><div><h1>网络与代理</h1><p class="muted">仅配置 RCMAKER 的网络，不修改系统代理。</p></div></div>
+        <button id="reload" type="button" class="layui-btn layui-btn-primary"><i class="layui-icon layui-icon-refresh" aria-hidden="true"></i>重新载入设置</button>
     </header>
     <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
     <section class="panel">
-        <div class="panel-title"><h2>连接方式</h2><span id="dirty" class="badge">正在载入</span></div>
+        <div class="panel-title"><h2><i class="layui-icon layui-icon-link panel-heading-icon" aria-hidden="true"></i>连接方式</h2><span id="dirty" class="badge">正在载入</span></div>
         <form id="network-form" class="layui-form" lay-filter="network" autocomplete="off" novalidate>
             <div class="field">
                 <label>网络模式</label>
                 <input type="radio" name="mode" value="manual" title="使用代理" lay-filter="mode" checked>
                 <input type="radio" name="mode" value="direct" title="不使用代理（直连）" lay-filter="mode">
-                <p class="help">代理失败不会静默改成直连，避免任务在你不知情的情况下走错网络。</p>
+                <p class="help">代理连接失败时不会自动切换为直连。</p>
             </div>
             <div id="proxy-fields">
-                <div class="field"><label for="protocol">代理协议</label><select id="protocol" name="protocol" lay-filter="protocol"><option value="http">HTTP CONNECT</option></select><p class="help">这里的 HTTP 指代理监听协议，检测目标仍使用 HTTPS。SOCKS5、HTTPS 代理和系统代理模式尚未开放。</p></div>
+                <div class="field"><label for="protocol">代理协议</label><select id="protocol" name="protocol" lay-filter="protocol"><option value="http">HTTP CONNECT</option></select><p class="help">目前支持 HTTP 代理；目标连接仍使用 HTTPS。</p></div>
                 <div class="form-grid">
                     <div class="field"><label for="host">代理主机</label><input id="host" name="host" class="layui-input" maxlength="253" placeholder="例如 127.0.0.1" spellcheck="false"><p class="help">只填主机名或 IP，不包含 http://、路径和用户名。</p></div>
                     <div class="field"><label for="port">端口</label><input id="port" name="port" class="layui-input" inputmode="numeric" maxlength="5" placeholder="1–65535"></div>
@@ -37,13 +37,13 @@
                     <div id="password-field" class="field"><label for="password">代理密码</label><input id="password" name="password" type="password" class="layui-input" maxlength="256" autocomplete="new-password"><p id="credential-help" class="help">使用当前 Windows 用户的系统密码保护；保存后不回显密码。</p></div>
                 </div>
             </div>
-            <div id="direct-help" class="notice" hidden>不使用代理时，RCMAKER 会直接访问外网。以后需要代理，可以随时回来修改。</div>
-            <div class="actions"><button id="save" type="submit" class="layui-btn" lay-submit lay-filter="save-network">保存并使用</button><button id="continue-setup" type="button" class="layui-btn layui-btn-primary" hidden>继续准备运行组件</button><span class="help">保存后立即应用到本应用；不会修改 Windows/macOS/Linux 的系统代理。</span></div>
+            <div id="direct-help" class="notice" hidden>RCMAKER 将直接访问外网。</div>
+            <div class="actions"><button id="save" type="submit" class="layui-btn" lay-submit lay-filter="save-network"><i class="layui-icon layui-icon-ok" aria-hidden="true"></i>保存并使用</button><button id="continue-setup" type="button" class="layui-btn layui-btn-primary" hidden>继续准备运行组件</button><span class="help">保存后立即生效。</span></div>
         </form>
     </section>
     <details class="panel advanced-panel">
-        <summary>高级网络诊断与恢复</summary>
-        <p class="muted">正常使用不需要展开。网络异常时可在这里查看当前应用版本、检测连接或恢复旧配置。</p>
+        <summary><i class="layui-icon layui-icon-set panel-heading-icon" aria-hidden="true"></i>高级网络诊断与恢复</summary>
+        <p class="muted">检测连接或恢复之前的网络配置。</p>
     <section>
         <h2>当前配置</h2>
         <dl class="state-grid">

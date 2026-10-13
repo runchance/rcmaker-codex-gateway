@@ -13,6 +13,8 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
     let polling = false;
     let disposed = false;
     let editVersion = 0;
+    let loadSequence = 0;
+    let activePollMs = 0;
 
     /** Show a safe product message without rendering server text as HTML. */
     function message(text, error) {
@@ -97,8 +99,11 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
     }
 
     /** Reload explicitly; callers decide whether replacing unsaved fields is authorized. */
-    async function load(hydrate, expectedEdit = editVersion) {
+    async function load(hydrate, expectedEdit = editVersion, automatic = false) {
+        if (disposed || (automatic && (busy || !Gateway.automaticRefreshAllowed()))) return;
+        const sequence = ++loadSequence;
         const value = await Gateway.request('/api/network');
+        if (disposed || sequence !== loadSequence || (automatic && !Gateway.automaticRefreshAllowed())) return;
         render(value, hydrate && expectedEdit === editVersion);
     }
 
@@ -112,6 +117,7 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
         try {
             const outcome = await Gateway.request(path, payload);
             acknowledged = true;
+            Gateway.notifyStateChange('network');
             if (path.endsWith('/save') && submittedEdit === editVersion) byId('password').value = '';
             message(success + ' r' + outcome.revision + (I18n.locale === 'en' ? '.' : '。'));
             await load(hydrate, submittedEdit);
@@ -135,6 +141,7 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
             savedRevision = Number(saved.revision);
             if (submittedEdit === editVersion) byId('password').value = '';
             await Gateway.request('/api/network/apply', {expected_revision: savedRevision});
+            Gateway.notifyStateChange('network');
             message(I18n.t('网络配置 r') + savedRevision + I18n.t(' 已保存并应用，可以继续完成运行准备。'));
             await load(true, submittedEdit);
         } catch (error) {
@@ -161,20 +168,28 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
     /** Poll only the current persisted job, with no editable-form replacement. */
     async function poll() {
         if (polling || disposed || jobId === null) return;
-        if (document.hidden) {
+        const now = Date.now();
+        if (!Gateway.automaticRefreshAllowed()) {
+            pollStarted = now;
             pollTimer = setTimeout(poll, 1000);
             return;
         }
+        activePollMs += now - pollStarted;
+        pollStarted = now;
         polling = true;
+        const observedJobId = jobId;
         try {
-            const job = await Gateway.request('/api/network/tests/' + jobId);
+            const job = await Gateway.request('/api/network/tests/' + observedJobId);
+            if (disposed || jobId !== observedJobId || !Gateway.automaticRefreshAllowed()) return;
             result(job);
             if (!['queued', 'running'].includes(job.status)) jobId = null;
         } catch (error) {
-            byId('test-result').textContent = error.message + I18n.t(' 检测记录已保留，可重新载入查询。');
+            if (!disposed && jobId === observedJobId && Gateway.automaticRefreshAllowed()) {
+                byId('test-result').textContent = error.message + I18n.t(' 检测记录已保留，可重新载入查询。');
+            }
         } finally {
             polling = false;
-            if (Date.now() - pollStarted > 60000 && jobId !== null) {
+            if (activePollMs > 60000 && jobId !== null && Gateway.automaticRefreshAllowed()) {
                 jobId = null;
                 byId('test-result').textContent = I18n.t('结果尚未确认，已暂停查询。请重新载入核对，不自动重复检测。');
             }
@@ -188,6 +203,7 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
         clearTimeout(pollTimer);
         jobId = id;
         pollStarted = Date.now();
+        activePollMs = 0;
         controls();
         pollTimer = setTimeout(poll, 300);
     }
@@ -255,7 +271,27 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
         } catch (error) { message(error.message, true); }
         finally { busy = false; controls(); }
     });
-    window.addEventListener('pagehide', function () { disposed = true; clearTimeout(pollTimer); });
+    Gateway.onPageActivate(() => {
+        if (disposed || busy) return;
+        if (jobId !== null) {
+            clearTimeout(pollTimer);
+            pollStarted = Date.now();
+            poll();
+        }
+        load(false, editVersion, true).catch(error => {
+            if (!disposed && Gateway.automaticRefreshAllowed()) message(error.message, true);
+        });
+    });
+    window.addEventListener('pagehide', function () { disposed = true; ++loadSequence; clearTimeout(pollTimer); });
+    window.addEventListener('pageshow', function () {
+        if (!disposed) return;
+        disposed = false;
+        if (jobId !== null) {
+            pollStarted = Date.now();
+            pollTimer = setTimeout(poll, 300);
+        }
+        load(false, editVersion, true).catch(error => message(error.message, true));
+    });
     window.addEventListener('gateway-language-changed', function () {
         if (snapshot) render(snapshot, false);
     });

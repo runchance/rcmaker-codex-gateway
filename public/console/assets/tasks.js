@@ -48,8 +48,7 @@
     };
 
     /** Poll small cleanup metadata; progress never reloads or replaces the open task transcript. */
-    async function readCleanup() {
-        const result = await Gateway.request('/api/tasks/cleanup');
+    function renderCleanup(result) {
         const format = bytes => (Number(bytes || 0) / (1024 * 1024)).toLocaleString(I18n.locale, {maximumFractionDigits: 1}) + ' MB';
         byId('task-storage-size').textContent = I18n.t('任务数据库：') + format(result.database_bytes)
             + ' · ' + I18n.t('可复用空间：') + format(result.reusable_bytes);
@@ -128,6 +127,16 @@
         return task.conversation_title || task.latest_user || I18n.t('任务');
     }
 
+    /** Pair the existing action label with a decorative Layui icon without changing its accessible name. */
+    function actionLabel(button, iconName, text) {
+        const icon = document.createElement('i');
+        icon.className = 'layui-icon layui-icon-' + iconName;
+        icon.setAttribute('aria-hidden', 'true');
+        const label = document.createElement('span');
+        label.textContent = text;
+        button.append(icon, label);
+    }
+
     function renderMetrics() {
         byId('metric-total').textContent = String(state.counts.total || 0);
         byId('metric-active').textContent = String(state.counts.active || 0);
@@ -189,13 +198,13 @@
             const view = document.createElement('button');
             view.type = 'button';
             view.className = 'layui-btn layui-btn-primary layui-btn-sm';
-            view.textContent = I18n.t('查看时间线');
+            actionLabel(view, 'time', I18n.t('查看时间线'));
             view.addEventListener('click', () => openTimeline(task.id, view));
             actions.append(view);
             const remove = document.createElement('button');
             remove.type = 'button';
             remove.className = 'layui-btn layui-btn-danger layui-btn-sm';
-            remove.textContent = I18n.t('删除');
+            actionLabel(remove, 'delete', I18n.t('删除'));
             remove.disabled = task.can_delete !== true || state.mutationBusy;
             remove.title = task.cleanup_pending ? I18n.t('任务记录正在清理') : task.can_delete === true
                 ? I18n.t('删除任务及其关联记录') : I18n.t('工作中或等待审批的任务不能删除');
@@ -252,9 +261,11 @@
                 empty_candidate: '正在核验空回答终态',
                 empty_cleared: '空回答终态条件已解除',
                 empty_settlement: '已核验回答流与工具状态',
-                empty_stream_recovery: '回答流中断，正在保留回执并恢复'
+                empty_stream_recovery: '回答流中断，正在保留回执并恢复',
+                stopped_thinking: '网页已停止思考，未确认完成'
             };
             const parts = [I18n.t(labels[data.state] || data.state || '')];
+            if (data.page_error_code) parts.push(data.page_error_code);
             if (data.error_code) parts.push(data.error_code);
             if (data.protocol) parts.push({h2: 'HTTP/2', h3: 'HTTP/3'}[data.protocol] || data.protocol);
             if (Number.isInteger(data.http_status)) parts.push('HTTP ' + data.http_status);
@@ -670,7 +681,9 @@
 
     async function readDetail(taskId, replaceExisting, trigger) {
         if (state.detailReading || state.mutationBusy) return;
+        if (!trigger && (!Gateway.automaticRefreshAllowed({allowLayers: true}) || userReadingModal())) return;
         state.detailReading = true;
+        const triggerContent = trigger ? Array.from(trigger.childNodes) : [];
         if (trigger) {
             trigger.disabled = true;
             trigger.dataset.label = trigger.textContent;
@@ -681,7 +694,7 @@
             if (state.disposed || state.modalTaskId !== taskId) return;
             const signature = JSON.stringify(detail);
             if (signature === state.modalSignature) return;
-            if (!trigger && replaceExisting && userReadingModal()) return;
+            if (!trigger && replaceExisting && (!Gateway.automaticRefreshAllowed({allowLayers: true}) || userReadingModal())) return;
             const body = buildDetail(detail);
             if (replaceExisting && state.modalBody && state.modalBody.isConnected) {
                 const oldBody = state.modalBody;
@@ -726,7 +739,7 @@
                 });
             });
         } catch (error) {
-            setError(error.message);
+            if (!state.disposed && state.modalTaskId === taskId && (trigger || Gateway.automaticRefreshAllowed({allowLayers: true}))) setError(error.message);
             if (trigger && replaceExisting && state.modalBody && state.modalBody.isConnected && state.modalTaskId === taskId) {
                 const failed = modalMessage(error.message || I18n.t('任务时间线读取失败。'), taskId);
                 state.modalBody.replaceWith(failed);
@@ -736,7 +749,8 @@
             state.detailReading = false;
             if (trigger && trigger.isConnected) {
                 trigger.disabled = false;
-                trigger.textContent = trigger.dataset.label || I18n.t('查看时间线');
+                if (triggerContent.length) trigger.replaceChildren(...triggerContent);
+                else trigger.textContent = trigger.dataset.label || I18n.t('查看时间线');
             }
         }
     }
@@ -779,15 +793,16 @@
                 async function (index) {
                     layui.layer.close(index);
                     state.mutationBusy = true;
+                    ++state.sequence;
                     try {
                         const result = await Gateway.request('/api/tasks/' + encodeURIComponent(task.id) + '/cancel', {});
                         layui.layer.msg(result.pending_surface_cleanup > 0 ? I18n.t('取消已登记，任务页面正在自动清理。') : I18n.t('任务已取消。'));
                         if (state.modalIndex !== null) layui.layer.close(state.modalIndex);
-                        await refresh(true);
                     } catch (error) {
                         setError(error.message);
                     } finally {
                         state.mutationBusy = false;
+                        await refresh(true);
                     }
                 }
             );
@@ -796,7 +811,7 @@
 
     async function refresh(manual) {
         if (state.disposed || state.mutationBusy) return;
-        if (!manual && (state.reading || document.hidden)) return;
+        if (!manual && (state.reading || !Gateway.automaticRefreshAllowed({allowLayers: true}))) return;
         state.reading = true;
         const sequence = ++state.sequence;
         const status = state.status;
@@ -804,16 +819,19 @@
             const result = await Gateway.request('/api/tasks?status=' + encodeURIComponent(status)
                 + '&page=' + state.page + '&page_size=' + state.pageSize);
             if (state.disposed || sequence !== state.sequence || status !== state.status) return;
+            const cleanup = await Gateway.request('/api/tasks/cleanup');
+            if (state.disposed || sequence !== state.sequence || status !== state.status) return;
+            if (state.modalTaskId) readDetail(state.modalTaskId, true);
+            if (!manual && !Gateway.automaticRefreshAllowed()) return;
             state.tasks = Array.isArray(result.items) ? result.items : [];
             state.total = Number(result.total || 0);
             state.pages = Number(result.pages || 1);
             state.counts = result.counts || state.counts;
-            await readCleanup();
-            if (state.disposed || sequence !== state.sequence || status !== state.status) return;
+            renderCleanup(cleanup);
             if (state.page > state.pages) {
                 state.page = state.pages;
                 state.reading = false;
-                return refresh(true);
+                return refresh(manual);
             }
             renderMetrics();
             const listSignature = JSON.stringify([state.status, state.page, state.pageSize, state.total, state.pages, state.tasks]);
@@ -823,9 +841,8 @@
                 state.listSignature = listSignature;
             }
             setError('');
-            if (state.modalTaskId) readDetail(state.modalTaskId, true);
         } catch (error) {
-            setError(error.message);
+            if (!state.disposed && sequence === state.sequence && (manual || Gateway.automaticRefreshAllowed())) setError(error.message);
         } finally {
             if (sequence === state.sequence) state.reading = false;
         }
@@ -847,15 +864,28 @@
             refresh(true);
         });
     });
+    Gateway.onPageActivate(() => {
+        byId('follow-status').textContent = I18n.t('自动跟随');
+        byId('follow-status').className = 'badge good';
+        refresh(false);
+    });
     document.addEventListener('visibilitychange', () => {
-        byId('follow-status').textContent = document.hidden ? I18n.t('已暂停') : I18n.t('自动跟随');
-        byId('follow-status').className = 'badge ' + (document.hidden ? '' : 'good');
-        if (!document.hidden) refresh(true);
+        if (!document.hidden) return;
+        byId('follow-status').textContent = I18n.t('已暂停');
+        byId('follow-status').className = 'badge';
     });
     window.addEventListener('pagehide', () => {
         state.disposed = true;
         if (state.timer) clearInterval(state.timer);
-    }, {once: true});
+        ++state.sequence;
+        state.reading = false;
+    });
+    window.addEventListener('pageshow', () => {
+        if (!state.disposed) return;
+        state.disposed = false;
+        schedule();
+        refresh(true);
+    });
     window.addEventListener('gateway-language-changed', () => {
         renderMetrics();
         renderList();

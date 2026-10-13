@@ -157,11 +157,15 @@ Keep the process running and open the **[local console](http://127.0.0.1:28910/)
 
 ## 4. Setup: network → components → sign-in
 
-A fresh installation uses English. Change it in **Settings → Console language**; the preference is saved immediately without a restart.
+A fresh installation uses English. Choose the language at the top right of the setup wizard. After setup, use the top language menu or **Settings → Console language**. The preference is saved immediately without a restart.
 
-Open **Setup** and complete the numbered cards. A fresh installation waits at an unfinished step; complete that step rather than waiting indefinitely for Ready.
+First use opens a required overlay: **network → runtime → sign-in → tunnel → connector → Codex integration**. Only the current step's controls are available. Saved progress resumes after a refresh or restart. Select **Open workspace** after completing setup.
+
+Existing installations see connection cards in Setup and can manage individual settings.
 
 ![Setup cards for network, components, sign-in and tool connection](images/user-guide/en/setup.jpg)
+
+*Console illustration uses demo data. Account, model and usage values follow your actual detection results.*
 
 ### 4.1 Configure the network
 
@@ -171,7 +175,7 @@ Select **Configure network**. Choose **Direct connection** when the services are
 | --- | --- |
 | Proxy IP / host | For example `127.0.0.1`, without `http://`, a username or a path |
 | Port | The HTTP CONNECT port actually provided by your proxy software |
-| Proxy authentication | Configure it in the detailed **Network and proxy** page when needed |
+| Proxy authentication | Expand **Proxy authentication (optional)** for username and password; leave a saved password blank to keep it |
 
 The saved route is used by the application browser, component downloads and tool tunnel. It does not change your system proxy. A SOCKS-only port cannot be entered as an HTTP port.
 
@@ -203,7 +207,7 @@ Select **Prepare runtime components → Start preparation** and wait for private
 
 Select **Sign in to ChatGPT → Open sign-in page** and complete sign-in. For easier typing or scrolling, choose **Open native browser** and use the separate private Chrome window.
 
-Return to the console and let account/model detection finish. **Hide native browser** hides the window; use **Reload page** or **Refresh status** if the display has not updated.
+Account detection and model sync run automatically after sign-in; you do not need to open the page again. **Hide native browser** hides the window; use **Reload page** if the browser image itself needs refreshing.
 
 **Success:** the account is recognized and model checks finish. Continue to the tool connection.
 
@@ -216,11 +220,13 @@ Return to the console and let account/model detection finish. **Hide native brow
 
 **Clear private Chrome sign-in data is a reset.** It removes the application's saved ChatGPT/Google login state and profiles, requiring another sign-in. Do not use it for a routine refresh. Finish active tasks before deliberately resetting an account.
 
+Confirming a reset immediately opens the sign-in step. After sign-in and model sync, the saved connector is checked automatically; follow the manual check prompt if it fails. Tasks and gateway settings remain saved, including the Tunnel ID and key.
+
 <a id="connect-tools"></a>
 
 ## 5. Tool connection and Codex integration
 
-Open **Setup → Configure tool connection**. Follow this order: **create a Tunnel → save the key and connect → create the ChatGPT plugin → check the connector → enable Codex models**.
+During initialization, use the Tunnel and Connector steps. Afterwards, open **Setup → Manage connection**. Follow this order: **create a Tunnel → save the key and connect → create the ChatGPT plugin → check the connector → enable Codex models**.
 
 ### 5.1 Create and connect the Tunnel
 
@@ -279,7 +285,11 @@ Saving backs up and replaces model routing while preserving unrelated MCP, proje
 
 > **Wait for Ready in RCMAKER's startup window, then fully quit Codex, including background processes, and reopen it. Keep RCMAKER running. Closing a chat tab or opening a new chat is not a restart.**
 
-**Success:** Codex displays model names ending in **RC (Web)** and the local integration check passes. If Ready never appears, return to Setup and complete the waiting card.
+**Configuration detection:** both actual `# RCMAKER BEGIN` and `# RCMAKER END` comments mean the configuration is integrated. Identifier suffixes need not match the current journal or URL. Examples inside strings and compression-only markers do not count. Detection does not rewrite configuration.
+
+This check covers only the final Codex step. An unfinished earlier step keeps the setup overlay open, even when Codex configuration is already present.
+
+After a full Codex restart, model names ending in **RC (Web)** should appear. A first real task verifies tool communication; it is not required to unlock the console. If Ready never appears, complete the remaining setup step.
 
 <a id="first-task"></a>
 
@@ -305,6 +315,12 @@ After this succeeds, submit a concrete development request and handle approvals 
 <a id="daily-use"></a>
 
 ## 7. Everyday use
+
+### Console tabs and automatic updates
+
+Opened tabs and the active page are remembered. Returning to Setup or Browser workspace reads current status while keeping scroll position and unsaved form input. A whole-browser refresh does not retain unsaved drafts.
+
+Automatic redraw waits while you copy, type, scroll or drag; explicit actions still work. Inactive tabs pause polling and resume when reopened. Models are grouped by family, duplicate website notices appear once, and context capacities use a table. Detailed explanations can be expanded when needed.
 
 ### Start, steer and stop
 
@@ -413,6 +429,8 @@ Use the console for preferences and credentials; ordinary operation does not req
 | `data_directory` | `data`, a directory name beside the program, not an arbitrary absolute path |
 | `default_locale` | `en`, used before a language preference has been saved |
 | `codex_home` | Empty for automatic detection; can target another Codex configuration directory |
+
+Codex configuration is resolved in this order: `.env` → `[gateway] codex_home`, then `CODEX_HOME`, then the current user's `.codex` directory. Windows uses `USERPROFILE` or `HOMEDRIVE` + `HOMEPATH`; Linux/macOS use `HOME`, with the effective user's home as a fallback. The gateway reads `config.toml` from that directory, independently of its own `data/` directory. Browser installation selects the host OS and CPU package; it preserves Unix executable permissions and internal application-bundle links.
 
 All three ports must differ. Restart RCMAKER after deployment changes. If the Codex endpoint changes, preview/save integration again and restart Codex. Changing `data_directory` selects another store; **it does not migrate existing login state or tasks**.
 

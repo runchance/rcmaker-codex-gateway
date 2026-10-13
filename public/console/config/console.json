@@ -1,7 +1,7 @@
 {
   "logo": {"title": "RCMAKER AI", "image": "admin/images/logo.png"},
   "menu": {"data": "config/menu.json", "method": "GET", "accordion": true, "collapse": false, "control": false, "select": "overview", "async": true},
-  "tab": {"enable": true, "keepState": true, "session": false, "preload": false, "max": false, "index": {"id": "overview", "href": "pages/overview.html", "title": "运行准备", "type": "_iframe"}},
+  "tab": {"enable": true, "keepState": true, "session": true, "preload": false, "max": false, "index": {"id": "overview", "href": "pages/overview.html", "title": "运行准备", "type": "_iframe"}},
   "theme": {"defaultColor": "gateway", "defaultMenu": "light-theme", "defaultHeader": "light-theme", "allowCustom": false, "banner": false, "dark": false},
   "colors": [{"id": "gateway", "color": "#16746e", "second": "#edf6f5"}],
   "other": {"keepLoad": 100, "autoHead": false, "footer": false},

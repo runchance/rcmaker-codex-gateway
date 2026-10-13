@@ -76,8 +76,21 @@ final class CodexConfigDocument
         return false;
     }
 
+    /** Detect both real route comments, accepting legacy, absent or differing identifier suffixes. */
+    public function hasIntegrationMarkers(): bool
+    {
+        $markers = [];
+        foreach ($this->statements as $statement) {
+            if ($statement['kind'] === 'comment'
+                && preg_match('/^# RCMAKER (BEGIN|END)(?:[ \t]+.*)?$/', trim($statement['text']), $match)) {
+                $markers[$match[1]] = true;
+            }
+        }
+        return isset($markers['BEGIN'], $markers['END']);
+    }
+
     /**
-     * Remove only specified assignments and exact generated marker comments.
+     * Remove only specified assignments and managed marker comments, including legacy suffixes.
      * @param list<list<string>> $paths Absolute TOML key paths.
      * @return string All other bytes preserved.
      */
@@ -86,7 +99,7 @@ final class CodexConfigDocument
         $result = '';
         foreach ($this->statements as $s) {
             if ($s['kind'] === 'assignment' && in_array($s['path'], $paths, true)) continue;
-            if ($markers && $s['kind'] === 'comment' && preg_match('/^# RCMAKER (?:COMPRESSION )?(?:BEGIN|END) rcm_[a-f0-9]{24}$/', trim($s['text']))) continue;
+            if ($markers && $s['kind'] === 'comment' && preg_match('/^# RCMAKER (?:COMPRESSION )?(?:BEGIN|END)(?:[ \t]+.*)?$/', trim($s['text']))) continue;
             $result .= $s['text'];
         }
         return $result;

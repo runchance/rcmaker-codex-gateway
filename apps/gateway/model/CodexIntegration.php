@@ -15,7 +15,8 @@ final class CodexIntegration
     {
         $override = (string) Config::get('gateway', 'codex_home');
         if ($override === '') throw new GatewayError('codex_home_missing', '无法定位 Codex 配置目录。', 422);
-        return rtrim(str_replace('\\', '/', $override), '/') . '/config.toml';
+        if (PHP_OS_FAMILY === 'Windows') $override = str_replace('\\', '/', $override);
+        return rtrim($override, '/') . '/config.toml';
     }
 
     /**
@@ -81,20 +82,23 @@ final class CodexIntegration
         });
     }
 
-    /** Public status contains no existing config contents or native credentials. */
+    /** Detect configuration by its route marker pair; suffix identity is not an installation requirement. */
     public static function status(?string $path = null): array
     {
         Schema::initialize(); $path = self::canonicalPath($path ?? self::configPath());
         $current = self::readConfig($path);
         $row = self::recoverInterruptedWrite(self::record($path, $current), $current);
-        $status = is_array($row) ? (string) $row['state'] : 'not_installed';
         $document = new CodexConfigDocument($current);
-        if ($status === 'removed' || !is_array($row) || !$document->hasMarker((string) $row['id'])) $status = 'not_installed';
-        elseif (!self::isInstalled($row, $current) || $status === 'writing') $status = 'config_conflict';
-        $active = !in_array($status, ['not_installed', 'config_conflict'], true);
+        $configured = $document->hasIntegrationMarkers();
+        $status = $configured ? 'configured' : 'not_installed';
+        if ($configured && is_array($row) && in_array($row['state'], ['restart_required', 'client_connected', 'verified'], true)) {
+            $status = (string) $row['state'];
+        }
+        $canRestore = is_array($row) && !in_array($row['state'], ['removed', 'writing'], true) && self::isInstalled($row, $current);
         return ['id' => $row['id'] ?? null, 'state' => $status, 'path' => $path,
-            'expected_hash' => hash('sha256', $current), 'catalog_seen_at' => $active ? ($row['catalog_seen_at'] ?? null) : null,
-            'response_seen_at' => $active ? ($row['response_seen_at'] ?? null) : null, 'models' => self::publicModels(), 'account' => ModelCatalog::account()];
+            'configured' => $configured, 'can_restore' => $canRestore,
+            'expected_hash' => hash('sha256', $current), 'catalog_seen_at' => $configured ? ($row['catalog_seen_at'] ?? null) : null,
+            'response_seen_at' => $configured ? ($row['response_seen_at'] ?? null) : null, 'models' => self::publicModels(), 'account' => ModelCatalog::account()];
     }
 
     /** Record actual client contact for its configured route; mere config write is never verified. */

@@ -15,9 +15,11 @@ if (!in_array($defaultLocale, ['en', 'zh-CN'], true)) throw new RuntimeException
 $databaseStem = preg_replace('/\.sqlite\z/', '', $databaseName) ?: 'gateway';
 $testRuntimeRoot = $dataDirectory . '/tests/tmp/gateway-runtime/' . $databaseStem;
 $browserProfileName = $gatewayTestMode ? (string) rcEnv('gateway.browser_profile_name', 'gateway') : 'gateway';
-$projectRoot = rtrim(str_replace('\\', '/', phar_path()), '/');
+$projectRoot = rtrim(PHP_OS_FAMILY === 'Windows' ? str_replace('\\', '/', phar_path()) : phar_path(), '/');
 $runtimeCandidate = $gatewayTestMode ? (string) rcEnv('gateway.browser_runtime_dir', $dataDirectory . '/browser-runtime') : $dataDirectory . '/browser-runtime';
-$runtimeNormalized = rtrim(str_replace('\\', '/', $runtimeCandidate), '/');
+$runtimeNormalized = rtrim(PHP_OS_FAMILY === 'Windows' ? str_replace('\\', '/', $runtimeCandidate) : $runtimeCandidate, '/');
+$runtimeBoundary = PHP_OS_FAMILY === 'Windows' ? strtolower($runtimeNormalized) : $runtimeNormalized;
+$projectBoundary = PHP_OS_FAMILY === 'Windows' ? strtolower($projectRoot) : $projectRoot;
 $configuredCodexHome = trim((string) rcEnv('gateway.codex_home', ''));
 $codexHome = $configuredCodexHome !== '' ? $configuredCodexHome : \support\process\CodexEnvironment::detect();
 if ($consolePort < 1024 || $consolePort > 65535 || $apiPort < 1024 || $apiPort > 65535 || $browserDebugPort < 1024 || $browserDebugPort > 65535
@@ -31,7 +33,7 @@ if (!preg_match('/\A[a-zA-Z0-9_-]{1,80}\z/', $browserProfileName)) {
     throw new RuntimeException('Invalid gateway browser profile name.');
 }
 if ($runtimeNormalized === '' || str_contains('/' . $runtimeNormalized . '/', '/../')
-    || !str_starts_with(strtolower($runtimeNormalized) . '/', strtolower($projectRoot) . '/')) {
+    || !str_starts_with($runtimeBoundary . '/', $projectBoundary . '/')) {
     throw new RuntimeException('Gateway browser Runtime must stay inside the project directory.');
 }
 return [

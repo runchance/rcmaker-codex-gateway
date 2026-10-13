@@ -2,7 +2,7 @@
     'use strict';
     const byId = id => document.getElementById(id);
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-    let snapshot = null, reading = false, busy = false, activeLayer = null;
+    let snapshot = null, reading = false, busy = false, activeLayer = null, setupDialogIndex = null;
     let usageSnapshot = null;
     let accountResetPending = false, accountResetting = false;
     let screenshotBusy = false, screenshotTimer = null, stateTimer = null, networkMode = 'direct';
@@ -10,9 +10,92 @@
     let surfaceInteractionUntil = 0;
     let surfaceActionRevision = 0;
     let codexPreview = null, codexStatus = null, codexUiRevision = 0;
+    const wizardMode = /(?:^|[?&])setup=1(?:&|$)/.test(window.location?.search || '');
+    const wizardSteps = ['network', 'runtime', 'account', 'tunnel', 'connector', 'codex'];
+    let wizardStep = null, wizardReview = false, wizardCompleted = false;
+    let refreshSequence = 0, overviewTimer = null, autoConnectorAttempt = null;
+    let networkEditRevision = 0;
     // A model probe may wait up to 180 seconds in the existing browser queue,
     // then spend 45 seconds reading the website. This is a UI wait, not a task deadline.
     const MODEL_PROBE_WAIT_MS = 240000;
+
+    /** Saved server evidence defines resumable setup; no local completion flag grants readiness. */
+    function setupState(state, codex) {
+        const tunnel = state?.settings?.tunnel || {};
+        const connector = state?.settings?.connector || {};
+        const installed = Boolean(codex && (codex.configured === true || ['configured', 'restart_required', 'client_connected', 'verified'].includes(codex.state)));
+        const completed = {
+            network: Boolean(state?.networkTested), runtime: Boolean(state?.runtimeReady),
+            account: Boolean(state?.accountReady && state?.modelReady && !state?.browser?.profile_reset_required),
+            tunnel: Boolean(tunnel.configured && tunnel.status === 'ready'
+                && Number(tunnel.network_revision) === Number(state?.network?.saved?.id)),
+            connector: Boolean(connector.verified && state?.toolsReady), codex: installed
+        };
+        return {completed, step: wizardSteps.find(step => !completed[step]) || 'codex',
+            ready: Boolean(state?.ready && installed)};
+    }
+
+    /** Notify the same-origin shell of current evidence; the shell independently verifies completion. */
+    function notifySetup(type, detail) {
+        if (window.parent !== window) window.parent.postMessage(Object.assign({type}, detail || {}), window.location.origin);
+    }
+
+    /** Mount one existing form at a time without rebuilding user inputs or installing a second router. */
+    function showWizardStep(step) {
+        if (!wizardMode || wizardStep === step) return;
+        stopScreenshotLoop();
+        wizardStep = step;
+        activeLayer = ['tunnel', 'connector', 'codex'].includes(step) ? 'tools' : step;
+        for (const name of ['network', 'runtime', 'account', 'tools']) {
+            const panel = byId(name + '-layer');
+            panel.hidden = name !== activeLayer;
+            if (name === activeLayer) panel.setAttribute('data-wizard-active', '');
+            else panel.removeAttribute('data-wizard-active');
+        }
+        document.querySelectorAll('[data-tool-step]').forEach(panel => { panel.hidden = panel.dataset.toolStep !== step; });
+        byId('tools-surface-panel').hidden = true;
+        if (step === 'network') prepareNetworkFields();
+        if (step === 'tunnel' && snapshot) fillToolFields();
+        if (step === 'account' || step === 'connector') startScreenshotLoop();
+        byId('wizard-title').textContent = I18n.t('开始使用');
+    }
+
+    /** Update only wizard navigation; verified transitions never erase an in-progress form. */
+    function renderWizard(state) {
+        if (!wizardMode) return;
+        const status = setupState(state, codexStatus);
+        const currentIndex = wizardSteps.indexOf(wizardStep);
+        const targetIndex = wizardSteps.indexOf(status.step);
+        if (!wizardStep || (!wizardReview && !busy && targetIndex > currentIndex)
+            || (!wizardReview && targetIndex < currentIndex)) showWizardStep(status.step);
+        wizardCompleted = status.ready;
+        document.querySelectorAll('.setup-wizard-steps [data-step]').forEach(item => {
+            item.classList.toggle('is-current', item.dataset.step === wizardStep);
+            item.classList.toggle('is-complete', status.completed[item.dataset.step]);
+            if (item.dataset.step === wizardStep) item.setAttribute('aria-current', 'step');
+            else item.removeAttribute('aria-current');
+        });
+        byId('wizard-back').disabled = busy || wizardSteps.indexOf(wizardStep) <= 0;
+        byId('wizard-next').disabled = busy || (!status.ready && !status.completed[wizardStep]);
+        byId('wizard-next').textContent = I18n.t(status.ready ? '进入控制台' : '下一步');
+        byId('wizard-complete').hidden = !status.ready;
+        byId('wizard-status').textContent = I18n.t(status.ready ? '设置已保存。' : '进度自动保存，可在重启后继续。');
+        byId('codex-restart-notice').hidden = true;
+        notifySetup('gateway-setup-state', {ready: status.ready, step: wizardStep});
+    }
+
+    /** After an existing installation signs in again, check its saved connector once, never in a loop. */
+    async function restoreSavedConnector(state) {
+        const connector = state?.settings?.connector || {};
+        if (busy || !state?.modelReady || !state?.accountReady || state.toolsReady
+            || !(state.settings.tunnel?.configured && state.settings.tunnel?.status === 'ready')
+            || !(codexStatus?.configured === true || ['configured', 'restart_required', 'client_connected', 'verified'].includes(codexStatus?.state))
+            || connector.verified || connector.reconnecting || connector.recheck_queued || connector.probe_pending
+            || connector.last_error || connector.status === 'error' || autoConnectorAttempt
+            || (Gateway.isPageActive && !Gateway.isPageActive())) return;
+        autoConnectorAttempt = state.settings.connector_name;
+        await verifyConnector();
+    }
 
     async function codexAction(button, action) {
         if (busy) return;
@@ -21,28 +104,69 @@
         try { await action(); } catch (e) { progress('codex-progress', e.message, 'error'); }
         finally { busy = false; loading(button, false); }
     }
-    /** Show observed website names and each website notice once, without translating or interpreting model captions. */
-    function modelListText(models) {
-        const notices = new Map();
+    /** Group observed model choices into readable cards and show each website notice once. */
+    function renderModelChoices(container, models) {
+        const title = document.createElement('h4');
+        title.className = 'model-list-title'; title.textContent = I18n.t('可用模型：');
+        container.append(title);
+        if (!models.length) {
+            const empty = document.createElement('p'); empty.className = 'muted';
+            empty.textContent = I18n.t('尚未检测可用模型。'); container.append(empty); return;
+        }
+        const groups = new Map(), notices = new Map();
         models.forEach(model => {
-            if (model.notice) notices.set(model.family || model.id, (model.website_label || model.label) + ': ' + model.notice);
+            const name = model.website_label || model.label;
+            if (!groups.has(name)) groups.set(name, []);
+            groups.get(name).push(model);
+            if (model.notice) {
+                if (!notices.has(model.notice)) notices.set(model.notice, new Set());
+                notices.get(model.notice).add(name);
+            }
         });
-        return models.map(model => model.label).join(', ')
-            + (notices.size ? ' · ' + [...notices.values()].join(' · ') : '');
+        const grid = document.createElement('div'); grid.className = 'model-choice-grid';
+        groups.forEach((choices, name) => {
+            const card = document.createElement('section'); card.className = 'model-choice-card';
+            const heading = document.createElement('h5'); heading.textContent = name;
+            const list = document.createElement('ul'); list.className = 'model-choice-list';
+            choices.forEach(model => {
+                const item = document.createElement('li'); item.title = model.label;
+                item.textContent = model.label.startsWith(name)
+                    ? (model.label.slice(name.length).replace(/^[\s·:-]+/, '') || model.label) : model.label;
+                list.append(item);
+            });
+            card.append(heading, list); grid.append(card);
+        });
+        container.append(grid);
+        notices.forEach((names, notice) => {
+            const item = document.createElement('p'); item.className = 'model-website-notice';
+            const label = document.createElement('strong'); label.textContent = [...names].join(' / ');
+            const text = document.createElement('span'); text.textContent = notice;
+            item.append(label, text); container.append(item);
+        });
     }
     function renderCodexDetails() {
         if (!codexStatus) return;
         const account = codexStatus.account || {};
-        const accountText = account.plan && account.plan !== 'unknown' ? I18n.t('当前 ChatGPT 账号：') + I18n.t(account.label) + '. ' : I18n.t('正在识别 ChatGPT 账号类型。');
-        byId('codex-models').textContent = accountText + (account.refreshing ? I18n.t('正在自动刷新可用模型…') : (codexStatus.models.length ? I18n.t('可用模型：') + modelListText(codexStatus.models) : I18n.t('尚未检测可用模型。')));
-        if (codexStatus.models.some(model => Array.isArray(model.efforts) && model.efforts.includes('max'))) {
-            byId('codex-models').textContent += ' ' + I18n.t('网页 Pro 对应 Codex 的 Ultra 档；选择 Ultra 即可使用网页 Pro，无需开启 Max。');
+        const container = byId('codex-models'); container.replaceChildren();
+        const accountText = document.createElement('p'); accountText.className = 'model-account-line';
+        accountText.textContent = account.plan && account.plan !== 'unknown'
+            ? I18n.t('当前 ChatGPT 账号：') + I18n.t(account.label) : I18n.t('正在识别 ChatGPT 账号类型。');
+        container.append(accountText);
+        if (account.refreshing) {
+            const pending = document.createElement('p'); pending.className = 'muted';
+            pending.textContent = I18n.t('正在自动刷新可用模型…'); container.append(pending);
         }
-        byId('codex-remove').disabled = ['not_installed','removed','config_conflict'].includes(codexStatus.state);
+        renderModelChoices(container, codexStatus.models);
+        if (codexStatus.models.some(model => Array.isArray(model.efforts) && model.efforts.includes('max'))) {
+            const hint = document.createElement('p'); hint.className = 'model-compatibility-note';
+            hint.textContent = I18n.t('网页 Pro 对应 Codex 的 Ultra 档；选择 Ultra 即可使用网页 Pro，无需开启 Max。');
+            container.append(hint);
+        }
+        byId('codex-remove').disabled = codexStatus.can_restore === false || ['not_installed','removed','config_conflict'].includes(codexStatus.state);
     }
     function renderCodexStatus() {
         if (!codexStatus) return;
-        const states = {not_installed: I18n.t('尚未接入 Codex。'), writing: I18n.t('配置正在保存。'), restart_required: I18n.t('配置已保存。请完全退出 Codex 后再打开。'),
+        const states = {not_installed: I18n.t('尚未接入 Codex。'), configured: I18n.t('已检测到 Codex 接入配置。'), writing: I18n.t('配置正在保存。'), restart_required: I18n.t('配置已保存。请完全退出 Codex 后再打开。'),
             client_connected: I18n.t('Codex 已读取模型目录。选择一个 Web 模型完成一次对话后，即可确认接入成功。'),
             verified: I18n.t('Codex 已使用 Web 模型完成真实调用，接入成功。'), removed: I18n.t('接入已移除，请完全退出 Codex 后再打开。'), config_conflict: I18n.t('接入配置已变化，点击“预览接入配置”即可重新接入，也可恢复 Codex 官方路由。')};
         progress('codex-progress', states[codexStatus.state] || I18n.t('正在检查接入状态…'));
@@ -61,10 +185,11 @@
             area:[Math.min(560,window.innerWidth-32)+'px','auto'], maxHeight:Math.max(240,window.innerHeight-64),
             content:content.outerHTML, btn:[I18n.t('我知道了')], yes:index=>layui.layer.close(index), shadeClose:false});
     }
-    async function readCodexStatus(apply = true) {
+    /** Commit only the current action and refresh, so a late poll cannot regress setup progress. */
+    async function readCodexStatus(apply = true, refreshOwner = null) {
         const revision = codexUiRevision;
         const status = await Gateway.request('/api/codex');
-        if (revision !== codexUiRevision) return status;
+        if (revision !== codexUiRevision || (refreshOwner !== null && refreshOwner !== refreshSequence)) return status;
         codexStatus = status;
         if (apply) renderCodexStatus();
         return codexStatus;
@@ -78,7 +203,8 @@
         byId('usage-pro').textContent = Number(usage.totals.pro_submissions).toLocaleString();
         byId('usage-remaining').textContent = usage.pro_remaining_estimate === null ? I18n.t('未提供') : String(usage.pro_remaining_estimate);
         byId('usage-tokens').textContent = Number(usage.totals.input_tokens + usage.totals.output_tokens).toLocaleString();
-        byId('usage-models').textContent = I18n.t('可用模型：') + modelListText(usage.models);
+        byId('usage-models').replaceChildren();
+        renderModelChoices(byId('usage-models'), usage.models);
         const purposes = {task:I18n.t('真实任务'), context_stage:I18n.t('历史分段'),
             compaction:I18n.t('摘要与压缩'), connector_probe:I18n.t('连接检测')};
         byId('usage-breakdown').textContent = (usage.by_purpose || []).map(row =>
@@ -117,6 +243,7 @@
         if (!button.dataset.label) button.dataset.label = button.textContent;
         button.disabled = value;
         button.innerHTML = value ? '<i class="layui-icon layui-icon-loading layui-anim layui-anim-rotate layui-anim-loop"></i>' + (label || I18n.t('处理中…')) : I18n.t(button.dataset.label);
+        if (!value && !busy && snapshot) renderWizard(snapshot);
     }
     function layerArea(wide) {
         const width = Math.min(wide ? 1120 : 720, Math.max(320, window.innerWidth * .92));
@@ -124,13 +251,14 @@
         return [Math.round(width) + 'px', Math.round(height) + 'px'];
     }
     function openLayer(name, title, wide) {
+        if (wizardMode) { showWizardStep(name === 'tools' ? setupState(snapshot, codexStatus).step : name); return; }
         activeLayer = name;
-        layui.use('layer', () => layui.layer.open({
+        layui.use('layer', () => { setupDialogIndex = layui.layer.open({
             type: 1, title, area: layerArea(wide), resize: true, shadeClose: false,
             content: layui.$('#' + name + '-layer'),
             success: () => { if (name === 'account' || name === 'tools') startScreenshotLoop(); },
-            end: () => { if (activeLayer === name) activeLayer = null; stopScreenshotLoop(); refresh(); }
-        }));
+            end: () => { setupDialogIndex = null; if (activeLayer === name) activeLayer = null; stopScreenshotLoop(); refresh(); }
+        }); });
     }
     /** Locale redraw updates product copy while preserving active setup controls and operation ownership. */
     function render(state, labelsOnly = false) {
@@ -139,17 +267,19 @@
         const accountChecking = state.accountStatus === 'checking';
         const profileResetRequired = Boolean(state.browser.profile_reset_required);
         badge('network-status', state.networkTested ? I18n.t('已完成') : I18n.t('待设置'), state.networkTested ? 'good' : 'pending');
-        byId('network-detail').textContent = state.networkTested ? Gateway.describe(network.saved) + I18n.t(' · 网络连接已确认。') : I18n.t('选择直连，或填写代理 IP 与端口；网络连接确认后即可继续。');
+        byId('network-detail').textContent = state.networkTested ? Gateway.describe(network.saved) : I18n.t('选择直连或 HTTP 代理。');
         byId('use-direct').hidden = state.networkTested; byId('open-network').textContent = state.networkTested ? I18n.t('修改网络') : I18n.t('设置网络');
         badge('runtime-status', state.runtimeReady ? I18n.t('已完成') : (state.networkTested ? I18n.t('待准备') : I18n.t('等待网络')), state.runtimeReady ? 'good' : (state.networkTested ? 'pending' : ''));
-        byId('runtime-detail').textContent = state.runtimeReady ? I18n.t('运行组件已准备完成，并保存在本应用目录中。') : (state.networkTested ? I18n.t('点击后自动识别电脑并准备所需组件。') : I18n.t('先完成第 1 步。'));
+        byId('runtime-detail').textContent = state.runtimeReady ? I18n.t('组件已安装。') : (state.networkTested ? I18n.t('准备浏览器与工具连接组件。') : I18n.t('请先连接网络。'));
+        byId('open-runtime').textContent = state.runtimeReady ? I18n.t('查看组件') : I18n.t('准备运行组件');
         if (!labelsOnly) byId('open-runtime').disabled = !state.networkTested;
         badge('account-status', profileResetRequired ? I18n.t('清理未完成') : (state.modelReady ? I18n.t('已完成') : (state.accountReady ? I18n.t('检查连接') : (accountChecking ? I18n.t('正在检查') : (state.runtimeReady ? I18n.t('需要登录') : I18n.t('等待'))))), !profileResetRequired && state.modelReady ? 'good' : (state.runtimeReady ? 'pending' : ''));
         byId('account-detail').textContent = profileResetRequired
-            ? I18n.t('上次清空内置 Chrome 登录资料未完成。请打开登录窗口并继续清空，完成前不会使用残留资料。')
+            ? I18n.t('资料清理未完成，请继续清理。')
             : state.modelReady
-            ? I18n.t('ChatGPT 已登录') + (codexStatus?.account?.plan && codexStatus.account.plan !== 'unknown' ? ' (' + I18n.t(codexStatus.account.label) + ')' : '') + I18n.t('，模型连接检查通过；会员变化后会自动刷新模型。')
-            : (state.accountReady ? (state.modelError ? I18n.error(state.modelError, state.modelErrorCode) : I18n.t('ChatGPT 已登录，正在检查模型连接。')) : (accountChecking ? I18n.t('正在确认当前 ChatGPT 页面和登录状态…') : (state.runtimeReady ? I18n.t('在弹出窗口内完成一次 ChatGPT 登录，系统随后自动检查模型连接。') : I18n.t('先完成第 2 步。'))));
+            ? I18n.t('已登录 · 模型已同步。')
+            : (state.accountReady ? (state.modelError ? I18n.error(state.modelError, state.modelErrorCode) : I18n.t('已登录，正在同步模型。')) : (accountChecking ? I18n.t('正在检查登录状态…') : (state.runtimeReady ? I18n.t('登录后自动同步模型。') : I18n.t('请先准备运行组件。'))));
+        byId('open-login').textContent = state.accountReady && !profileResetRequired ? I18n.t('管理登录') : I18n.t('登录 ChatGPT');
         if (!labelsOnly) {
             byId('open-login').disabled = !state.runtimeReady;
             byId('account-start').disabled = busy || profileResetRequired;
@@ -158,23 +288,25 @@
         }
         if (!accountResetting) byId('account-reset').textContent = profileResetRequired ? I18n.t('继续清空内置 Chrome 登录资料') : I18n.t('清空内置 Chrome 登录资料');
         badge('tools-status', state.toolsReady ? I18n.t('已连接') : (state.modelReady ? I18n.t('待配置') : I18n.t('等待')), state.toolsReady ? 'good' : (state.modelReady ? 'pending' : ''));
-        byId('tools-detail').textContent = state.toolsReady ? I18n.t('工具隧道与 ChatGPT 连接器均已检查通过。') : (state.modelReady ? (tunnel.status === 'ready' ? (connector.reconnecting ? (connector.recheck_queued ? I18n.t('工具隧道重建后，正在自动复检连接器。') : I18n.t('工具隧道重建后，正在等待浏览器准备自动复检连接器。')) : (connector.last_error ? I18n.error(connector.last_error, connector.error_code || 'CONNECTOR_NOT_VERIFIED') : I18n.t('工具隧道已连接，继续创建并检查连接器。'))) : I18n.t('按引导创建 Tunnel 和普通 API Key，再创建 ChatGPT Connector。')) : I18n.t('先完成第 3 步。'));
+        byId('tools-detail').textContent = state.toolsReady ? I18n.t('连接器已验证。') : (state.modelReady ? (tunnel.status === 'ready' ? (connector.reconnecting ? (connector.recheck_queued ? I18n.t('正在自动复检连接器。') : I18n.t('等待浏览器就绪后复检。')) : (connector.last_error ? I18n.error(connector.last_error, connector.error_code || 'CONNECTOR_NOT_VERIFIED') : I18n.t('隧道已连接，请验证连接器。'))) : I18n.t('连接隧道并验证连接器。')) : I18n.t('请先登录并同步模型。'));
+        byId('open-tools').textContent = state.toolsReady ? I18n.t('管理连接') : I18n.t('配置工具连接');
         if (!labelsOnly) {
             byId('open-tools').disabled = profileResetRequired || !state.modelReady;
             renderToolsGuide(state);
         }
-        const clientVerified = !profileResetRequired && state.ready && codexStatus && codexStatus.state === 'verified';
-        badge('overall-status', profileResetRequired ? I18n.t('浏览器资料清理未完成') : (clientVerified ? I18n.t('Codex 接入已验证') : (state.ready ? I18n.t('网关已就绪 · 待确认 Codex 接入') : I18n.t('尚未准备完成'))), clientVerified ? 'good' : 'pending');
-        byId('ready-banner').hidden = !clientVerified;
-        byId('ready-detail').textContent = profileResetRequired ? I18n.t('上次清空内置 Chrome 登录资料未完成，请在第 3 步继续清空。') : (clientVerified ? I18n.t('网关已就绪，且已收到 Codex 的真实调用。') : (state.ready ? I18n.t('网页和工具已准备完成。请在第 4 步完成接入配置，完全退出并重新打开 Codex，再选择 Web 模型发起一次任务。') : I18n.t('按 1 → 4 的顺序完成即可；已经完成的步骤以后会自动跳过。')));
+        const clientReady = !profileResetRequired && state.ready && codexStatus
+            && (codexStatus.configured === true || ['configured','restart_required','client_connected','verified'].includes(codexStatus.state));
+        badge('overall-status', profileResetRequired ? I18n.t('浏览器资料清理未完成') : (clientReady ? I18n.t('Codex 已接入') : (state.ready ? I18n.t('网关已就绪 · 待确认 Codex 接入') : I18n.t('尚未准备完成'))), clientReady ? 'good' : 'pending');
+        byId('ready-banner').hidden = true;
+        byId('ready-detail').textContent = profileResetRequired ? I18n.t('资料清理未完成，请继续清理。') : (state.ready && codexStatus?.state === 'restart_required' ? I18n.t('请重启 Codex，让接入配置生效。') : (clientReady ? I18n.t('可以从 Codex 开始任务。') : (state.ready ? I18n.t('完成 Codex 接入') : I18n.t('按提示完成缺少的设置。'))));
         const next = byId('next-action');
-        if (!state.networkTested) { next.textContent = I18n.t('第 1 步：设置网络'); next.dataset.action = 'network'; }
-        else if (!state.runtimeReady) { next.textContent = I18n.t('第 2 步：准备运行组件'); next.dataset.action = 'runtime'; }
-        else if (profileResetRequired) { next.textContent = I18n.t('第 3 步：继续清空登录资料'); next.dataset.action = 'account'; }
-        else if (!state.accountReady) { next.textContent = accountChecking ? I18n.t('第 3 步：检查登录状态') : I18n.t('第 3 步：登录 ChatGPT'); next.dataset.action = 'account'; }
-        else if (!state.modelReady) { next.textContent = I18n.t('第 3 步：检查模型连接'); next.dataset.action = 'account'; }
-        else if (!state.toolsReady) { next.textContent = I18n.t('第 4 步：连接 Codex 工具'); next.dataset.action = 'tools'; }
-        else if (!clientVerified) { next.textContent = I18n.t('第 4 步：完成 Codex 接入'); next.dataset.action = 'tools'; }
+        if (!state.networkTested) { next.textContent = I18n.t('设置网络'); next.dataset.action = 'network'; }
+        else if (!state.runtimeReady) { next.textContent = I18n.t('准备运行组件'); next.dataset.action = 'runtime'; }
+        else if (profileResetRequired) { next.textContent = I18n.t('继续清空登录资料'); next.dataset.action = 'account'; }
+        else if (!state.accountReady) { next.textContent = accountChecking ? I18n.t('检查登录状态') : I18n.t('登录 ChatGPT'); next.dataset.action = 'account'; }
+        else if (!state.modelReady) { next.textContent = I18n.t('同步模型'); next.dataset.action = 'account'; }
+        else if (!state.toolsReady) { next.textContent = I18n.t('连接 Codex 工具'); next.dataset.action = 'tools'; }
+        else if (!clientReady) { next.textContent = I18n.t('完成 Codex 接入'); next.dataset.action = 'tools'; }
         else { next.textContent = I18n.t('打开浏览器工作区'); next.dataset.action = 'browser'; }
     }
     function renderToolsGuide(state) {
@@ -195,28 +327,43 @@
         byId('tools-copy-connector').disabled = !tunnelReady;
         byId('tools-verify').disabled = !tunnelReady;
     }
+    /** Prefill only when a settings panel opens, never on a polling update. */
+    function fillToolFields() {
+        if (!snapshot) return;
+        byId('setup-tunnel-id').value = snapshot.settings.tunnel_id || '';
+        byId('setup-api-key').value = '';
+        byId('setup-connector-suffix').value = (snapshot.settings.connector_name || 'RCMAKER Codex').replace(/^RCMAKER\s+/i, '');
+    }
     async function refresh(options) {
         const passive = Boolean(options && options.passive);
-        if (reading) return snapshot;
+        if (passive && (reading || document.hidden || (Gateway.isPageActive && !Gateway.isPageActive()))) return snapshot;
+        const sequence = ++refreshSequence;
         reading = true;
         if (!passive) byId('refresh').disabled = true;
         try {
             const state = await Gateway.prerequisites();
-            await readCodexStatus(!passive);
+            if (sequence !== refreshSequence) return snapshot;
+            await readCodexStatus(false, sequence);
+            if (sequence !== refreshSequence) return snapshot;
             snapshot = state;
-            // Background polling may keep data fresh, but an open setup layer belongs to the
-            // user. Never let a timer repaint progress, buttons or form state underneath them.
-            if (passive) return state;
+            // Poll reads stay fresh while DOM commits wait for copy, typing and scrolling.
+            if (passive && (busy || (Gateway.automaticRefreshAllowed && !Gateway.automaticRefreshAllowed({allowLayers: true})))) return state;
             render(state);
+            if (!busy) renderCodexStatus();
+            renderWizard(state);
             if (activeLayer === 'account' && state.accountReady) {
                 progress('account-progress', state.modelReady ? I18n.t('登录和模型连接检查均已通过。') : (state.modelError ? I18n.error(state.modelError, state.modelErrorCode) : I18n.t('ChatGPT 已登录，正在检查模型连接…')), state.modelReady ? '' : 'warning');
             }
-            if (activeLayer === 'tools' && state.toolsReady) progress('tools-progress', I18n.t('工具连接已全部完成，可以关闭此窗口。'));
+            if (activeLayer === 'tools' && state.toolsReady) progress('tools-progress', I18n.t('工具连接已验证。'));
             error('');
+            if (Gateway.notifyStateChange && !passive) Gateway.notifyStateChange('readiness');
+            restoreSavedConnector(state);
             return state;
         }
         catch (e) { if (!passive) error(e.message); return snapshot; }
-        finally { reading = false; if (!passive) byId('refresh').disabled = false; }
+        finally {
+            if (sequence === refreshSequence) { reading = false; if (!passive) byId('refresh').disabled = false; }
+        }
     }
 
     /** Observe the same queued command; its backend failure is authoritative, and polling never resubmits it. */
@@ -233,6 +380,7 @@
     /** Enqueue once, with a command-specific UI wait and optional polling cadence; other callers keep the existing default. */
     async function browserCommand(path, body, timeoutMs, pollIntervalMs = 100) {
         const queued = await Gateway.request(path, body || {});
+        if (path === '/api/browser/profile/reset' && queued?.id && Gateway.notifyStateChange) Gateway.notifyStateChange('profile-reset-started');
         if (queued && queued.id) return waitBrowserCommand(queued.id, timeoutMs, pollIntervalMs);
         if (path === '/api/browser/login' && queued && queued.status === 'starting') {
             // A worker reattachment may have no live start command. Observe it without issuing
@@ -262,30 +410,45 @@
     }
     function selectNetwork(mode) {
         networkMode = mode; byId('proxy-fields').hidden = mode !== 'manual';
+        byId('proxy-auth').hidden = mode !== 'manual';
         byId('network-direct').className = 'layui-btn ' + (mode === 'direct' ? '' : 'layui-btn-primary');
         byId('network-proxy').className = 'layui-btn ' + (mode === 'manual' ? '' : 'layui-btn-primary');
         progress('network-progress', mode === 'direct' ? I18n.t('将直接测试 ChatGPT 连接。') : I18n.t('填写代理 IP 和端口后保存并测试。'));
     }
-    function prepareNetworkLayer(preferred) {
+    function prepareNetworkFields(preferred) {
         const row = snapshot && snapshot.network && snapshot.network.saved;
         byId('proxy-host').value = row && row.mode === 'manual' ? (row.host || '') : '';
         byId('proxy-port').value = row && row.mode === 'manual' ? (row.port || '') : '';
+        byId('proxy-username').value = row && row.mode === 'manual' ? (row.username || '') : '';
+        byId('proxy-password').value = '';
+        byId('proxy-auth').open = Boolean(byId('proxy-username').value);
         selectNetwork(preferred || (row && row.mode === 'manual' ? 'manual' : 'direct'));
+    }
+    function prepareNetworkLayer(preferred) {
+        prepareNetworkFields(preferred);
         openLayer('network', I18n.t('网络连接'), false);
     }
     async function saveAndTestNetwork() {
         if (busy || !snapshot) return;
         const button = byId('network-confirm'), host = byId('proxy-host').value.trim(), port = Number(byId('proxy-port').value);
+        const username = networkMode === 'manual' ? byId('proxy-username').value : '';
+        const password = networkMode === 'manual' && username ? byId('proxy-password').value : '';
+        const submittedRevision = networkEditRevision;
         if (networkMode === 'manual' && (!host || !Number.isInteger(port) || port < 1 || port > 65535)) {
             progress('network-progress', I18n.t('请填写有效的代理 IP 和 1–65535 范围内的端口。'), 'warning'); return;
+        }
+        if (username && !password && !snapshot.network.saved.has_password) {
+            byId('proxy-auth').open = true;
+            progress('network-progress', I18n.t('请填写代理密码。'), 'warning'); return;
         }
         busy = true; loading(button, true, I18n.t('正在连接…')); progress('network-progress', I18n.t('正在保存网络设置…'));
         try {
             const saved = await Gateway.request('/api/network/save', {
                 expected_revision: Number(snapshot.network.saved.id), mode: networkMode, protocol: 'http',
                 host: networkMode === 'manual' ? host : '', port: networkMode === 'manual' ? port : 0,
-                username: '', password: '', password_action: 'clear'
+                username, password, password_action: username ? (password ? 'set' : 'keep') : 'clear'
             });
+            if (submittedRevision === networkEditRevision) byId('proxy-password').value = '';
             progress('network-progress', I18n.t('正在应用设置…'));
             await Gateway.request('/api/network/apply', {expected_revision: Number(saved.revision)});
             progress('network-progress', I18n.t('正在测试 https://chatgpt.com，请稍候…'));
@@ -318,7 +481,7 @@
     }
     async function refreshScreenshot() {
         const prefix = surfacePrefix();
-        if (!prefix || screenshotBusy || document.hidden) return;
+        if (!prefix || screenshotBusy || document.hidden || (Gateway.isPageActive && !Gateway.isPageActive())) return;
         screenshotBusy = true;
         try {
             const result = await Gateway.binary('/api/browser/screenshot');
@@ -341,7 +504,7 @@
         }, activeLayer === 'tools' ? 1600 : 900);
         stateTimer = setInterval(() => {
             if (!busy && Date.now() >= surfaceInteractionUntil) refresh({passive: true});
-        }, 10000);
+        }, 5000);
     }
     function stopScreenshotLoop() {
         surfaceActionRevision++;
@@ -408,8 +571,11 @@
             byId('account-surface-empty').querySelector('strong').textContent = I18n.t('当前未登录');
             byId('account-surface-empty').querySelector('span').textContent = I18n.t('点击“打开登录页面”重新登录。');
             byId('account-text').value = '';
+            autoConnectorAttempt = null;
+            if (Gateway.notifyStateChange) Gateway.notifyStateChange('profile-reset');
+            notifySetup('gateway-profile-reset', {phase: 'complete'});
             await refresh();
-            progress('account-progress', I18n.t('内置 Chrome 登录资料已清空，当前未登录。请手动点击“打开登录页面”重新登录。'));
+            progress('account-progress', I18n.t('登录资料已清空，请重新登录。登录后将自动同步模型并检查连接器。'));
         } catch (e) {
             await refresh();
             progress('account-progress', e.message, 'warning');
@@ -427,8 +593,8 @@
         layui.use('layer', () => {
             let confirmed = false;
             layui.layer.confirm(
-                I18n.t('这会关闭 RCMAKER 自有 Chrome，清除当前与旧版 RCMAKER 自有的全部 Chrome Profiles，以及其中的 ChatGPT、Google 登录记录。网关任务记录、Tunnel 配置和系统 Chrome 会保留。完成后需手动重新打开登录页面。是否继续？'),
-                {title: I18n.t('清空内置 Chrome 登录资料'), btn: [I18n.t('清空登录资料'), I18n.t('取消')], closeBtn: 1,
+                I18n.t('确认后清空 RCMAKER 私有浏览器的登录资料，并引导重新登录。任务和设置保留；请先结束正在运行的任务。'),
+                {title: I18n.t('清空内置 Chrome 登录资料'), area: [Math.min(520, window.innerWidth - 32) + 'px', 'auto'], maxHeight: window.innerHeight - 48, btn: [I18n.t('清空登录资料'), I18n.t('取消')], closeBtn: 1,
                     end: () => { if (!confirmed) { accountResetPending = false; byId('account-reset').disabled = false; } }},
                 index => { confirmed = true; layui.layer.close(index); resetBrowserProfile(); }
             );
@@ -524,7 +690,7 @@
                 if (Date.now() >= tunnelDeadline) throw new Error(I18n.t('工具隧道还在连接，请稍后再次检查。'));
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            progress('tools-progress', I18n.t('工具隧道已连接。继续第 3 项：打开 ChatGPT Plugins，按页面说明创建 Connector。'));
+            progress('tools-progress', I18n.t('隧道已连接，请在 ChatGPT 创建连接器。'));
             await refresh();
         } catch (e) { progress('tools-progress', e.message, 'warning'); await refresh(); }
         finally { busy = false; loading(button, false); }
@@ -548,7 +714,7 @@
             'tools-open-connector',
             'https://chatgpt.com/plugins',
             I18n.t('正在通过项目代理打开 ChatGPT Connector 设置…'),
-            I18n.t('请按第 3 项清单创建并保存 Connector，完成后点击“检查连接器”。'),
+            I18n.t('保存连接器后，点击“检查连接器”。'),
             true
         );
     }
@@ -581,6 +747,7 @@
     byId('usage-refresh').addEventListener('click', refreshUsage);
     window.addEventListener('gateway-language-changed', () => {
         if (snapshot) render(snapshot, true);
+        if (snapshot) renderWizard(snapshot);
         if (snapshot && activeLayer === 'account' && !busy && snapshot.accountReady && !snapshot.modelReady && snapshot.modelError) {
             progress('account-progress', I18n.error(snapshot.modelError, snapshot.modelErrorCode), 'warning');
         }
@@ -589,8 +756,11 @@
     });
     byId('use-direct').addEventListener('click', () => prepareNetworkLayer('direct'));
     byId('open-network').addEventListener('click', () => prepareNetworkLayer());
-    byId('network-direct').addEventListener('click', () => selectNetwork('direct'));
-    byId('network-proxy').addEventListener('click', () => selectNetwork('manual'));
+    byId('network-direct').addEventListener('click', () => { networkEditRevision++; selectNetwork('direct'); });
+    byId('network-proxy').addEventListener('click', () => { networkEditRevision++; selectNetwork('manual'); });
+    ['proxy-host', 'proxy-port', 'proxy-username', 'proxy-password'].forEach(id => {
+        byId(id).addEventListener('input', () => { networkEditRevision++; });
+    });
     byId('network-confirm').addEventListener('click', saveAndTestNetwork);
     byId('open-runtime').addEventListener('click', () => { progress('runtime-progress', snapshot && snapshot.runtimeReady ? I18n.t('运行组件已经准备完成。') : I18n.t('等待开始。')); openLayer('runtime', I18n.t('准备运行组件'), false); });
     byId('runtime-confirm').addEventListener('click', prepareRuntime);
@@ -604,14 +774,10 @@
     byId('account-reload').addEventListener('click', () => safeBrowserAction({action: 'reload'}));
     byId('account-reset').addEventListener('click', confirmBrowserProfileReset);
     byId('open-tools').addEventListener('click', () => {
-        if (snapshot) {
-            byId('setup-tunnel-id').value = snapshot.settings.tunnel_id || '';
-            byId('setup-api-key').value = '';
-            byId('setup-connector-suffix').value = (snapshot.settings.connector_name || 'RCMAKER Codex').replace(/^RCMAKER\s+/i, '');
-        }
+        fillToolFields();
         byId('tools-surface-panel').hidden = true;
         if (snapshot) renderToolsGuide(snapshot);
-        progress('tools-progress', snapshot && snapshot.toolsReady ? I18n.t('工具连接已经完成。') : I18n.t('从上到下完成 1 → 3；每一步都有直达入口和操作说明。'));
+        progress('tools-progress', snapshot && snapshot.toolsReady ? I18n.t('工具连接已验证。') : I18n.t('连接隧道，再创建并验证连接器。'));
         openLayer('tools', I18n.t('连接 Codex 工具'), true);
         readCodexStatus().catch(e => progress('codex-progress', e.message, 'error'));
     });
@@ -678,8 +844,63 @@
         else Gateway.openBrowser();
     });
     bindSurface('account'); bindSurface('tools');
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-    window.addEventListener('pagehide', stopScreenshotLoop);
+    byId('wizard-language').value = I18n.locale;
+    byId('wizard-language').addEventListener('change', async function () {
+        this.disabled = true;
+        try { await I18n.saveLocale(this.value); }
+        catch (failure) { this.value = I18n.locale; error(failure.message); }
+        finally { this.disabled = false; }
+    });
+    byId('wizard-back').addEventListener('click', () => {
+        if (busy) return;
+        const index = wizardSteps.indexOf(wizardStep);
+        if (index > 0) { wizardReview = true; showWizardStep(wizardSteps[index - 1]); renderWizard(snapshot); }
+    });
+    byId('wizard-next').addEventListener('click', async () => {
+        if (busy) return;
+        const state = await refresh();
+        const status = setupState(state, codexStatus);
+        if (wizardCompleted && status.ready) {
+            notifySetup('gateway-setup-complete');
+            if (window.parent === window) window.location.href = '../index.html';
+            return;
+        }
+        if (!status.completed[wizardStep]) return;
+        wizardReview = false;
+        showWizardStep(status.step);
+        renderWizard(state);
+    });
+    if (wizardMode) {
+        document.body.classList.add('setup-wizard-mode');
+        byId('setup-wizard').hidden = false;
+        ['codex-remove', 'codex-native'].forEach(id => { byId(id).hidden = true; });
+        for (const name of ['network', 'runtime', 'account', 'tools']) {
+            const panel = byId(name + '-layer'); panel.hidden = true; byId('wizard-content').appendChild(panel);
+        }
+        byId('wizard-content').appendChild(byId('error'));
+    }
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh({passive: true}); });
+    if (Gateway.onPageActivate) Gateway.onPageActivate(() => refresh({passive: true}));
+    window.addEventListener('gateway-profile-reset', () => { autoConnectorAttempt = null; refresh(); });
+    window.addEventListener('gateway:state-change', event => {
+        if (event.detail?.reason === 'profile-reset') { autoConnectorAttempt = null; refresh(); }
+        if (event.detail?.reason === 'setup-complete' && !wizardMode) {
+            if (setupDialogIndex !== null && activeLayer === 'account') layui.layer.close(setupDialogIndex);
+            refresh();
+        }
+    });
+    /** Resume one status poll after a cached-page return, without duplicating initial page timers. */
+    function startOverviewPolling() {
+        if (overviewTimer === null) overviewTimer = setInterval(() => { if (!stateTimer && !busy) refresh({passive: true}); }, 5000);
+    }
+    startOverviewPolling();
+    window.addEventListener('pagehide', () => { stopScreenshotLoop(); clearInterval(overviewTimer); overviewTimer = null; });
+    window.addEventListener('pageshow', event => {
+        if (!event.persisted) return;
+        startOverviewPolling();
+        if ((activeLayer === 'account' || activeLayer === 'tools') && screenshotTimer === null) startScreenshotLoop();
+        refresh({passive: true});
+    });
     refresh();
-    refreshUsage();
+    if (!wizardMode) refreshUsage();
 })();

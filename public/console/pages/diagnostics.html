@@ -7,17 +7,17 @@
     <link rel="stylesheet" href="../component/pear/css/pear.css">
     <link rel="stylesheet" href="../assets/gateway.css">
 </head>
-<body class="gateway-page">
+<body class="gateway-page diagnostics-page">
     <header class="page-heading">
-        <div>
-            <div class="eyebrow">DIAGNOSTICS</div>
+        <div class="page-heading-main"><span class="heading-icon"><i class="layui-icon layui-icon-file" aria-hidden="true"></i></span><div>
             <h1>运行日志</h1>
-            <p class="muted">遇到异常时，下载诊断包发给维护者，无需发送整个数据库。</p>
-        </div>
+            <p class="muted">遇到问题时，导出诊断包协助排查。</p>
+        </div></div>
     </header>
     <div id="diagnostics-error" class="notice error" role="alert" hidden></div>
+    <div class="diagnostics-layout">
     <section class="panel" aria-labelledby="export-heading">
-        <div class="panel-title"><h2 id="export-heading">导出运行日志</h2><span class="badge">只读采集</span></div>
+        <div class="panel-title"><h2 id="export-heading"><i class="layui-icon layui-icon-download-circle panel-heading-icon" aria-hidden="true"></i>导出运行日志</h2><span class="badge">只读采集</span></div>
         <form id="diagnostics-form" class="layui-form">
             <div class="field">
                 <label for="diagnostics-hours">排查时间范围</label>
@@ -28,7 +28,7 @@
                     <option value="168">最近 7 天</option>
                 </select>
             </div>
-            <p class="muted">默认导出最近 24 小时的有界记录和当前运行状态。诊断数据最多 4 MiB；超出部分、缺失日志和采样上限会在包内说明。</p>
+            <p class="muted">下载到本机，不会中断任务或自动上传。</p>
             <div class="actions">
                 <button id="download-diagnostics" type="submit" class="layui-btn"><i class="layui-icon layui-icon-download-circle"></i> <span id="diagnostics-button-label">下载诊断包</span></button>
                 <span id="diagnostics-progress" class="muted" role="status" aria-live="polite"></span>
@@ -37,12 +37,20 @@
         <div id="diagnostics-result" class="notice" role="status" hidden></div>
     </section>
     <section class="panel" aria-labelledby="contents-heading">
-        <div class="panel-title"><h2 id="contents-heading">诊断包包含什么</h2></div>
-        <p>程序版本、运行环境、任务与回合状态、压缩交接、工具调用状态、浏览器和连接器状态，以及近期文件日志的结构化错误信息。</p>
-        <p>不包含完整数据库、API Key、Cookie、登录资料、会话令牌、聊天正文、工具参数或返回正文、摘要正文和附件内容。</p>
-        <p class="muted">只读取现有记录，不会暂停任务、重发消息或调用模型。即使浏览器或模型尚未就绪，也可以导出。</p>
-        <p class="muted">文件仅下载到本机，不会自动上传。通常为 ZIP；运行环境缺少 ZIP 扩展时会下载 JSON。公开分享前请先检查内容。</p>
+        <div class="panel-title"><h2 id="contents-heading"><i class="layui-icon layui-icon-auz panel-heading-icon" aria-hidden="true"></i>诊断包包含什么</h2></div>
+        <dl class="diagnostic-inclusions">
+            <div><dt><i class="layui-icon layui-icon-ok-circle" aria-hidden="true"></i>运行信息</dt><dd>程序版本、环境、任务状态和近期错误。</dd></div>
+            <div><dt><i class="layui-icon layui-icon-ok-circle" aria-hidden="true"></i>连接状态</dt><dd>浏览器、连接器、工具调用和压缩交接记录。</dd></div>
+            <div><dt><i class="layui-icon layui-icon-password" aria-hidden="true"></i>隐私保护</dt><dd>不包含登录资料、密钥、聊天正文或附件内容。</dd></div>
+        </dl>
+        <details class="settings-disclosure"><summary>导出详情</summary>
+            <p class="muted">默认导出最近 24 小时的有界记录和当前运行状态。诊断数据最多 4 MiB；超出部分、缺失日志和采样上限会在包内说明。</p>
+            <p class="muted">不包含完整数据库、API Key、Cookie、登录资料、会话令牌、聊天正文、工具参数或返回正文、摘要正文和附件内容。</p>
+            <p class="muted">只读取现有记录，不会暂停任务、重发消息或调用模型。即使浏览器或模型尚未就绪，也可以导出。</p>
+            <p class="muted">文件仅下载到本机，不会自动上传。通常为 ZIP；运行环境缺少 ZIP 扩展时会下载 JSON。公开分享前请先检查内容。</p>
+        </details>
     </section>
+    </div>
     <script src="../assets/i18n-catalog.js"></script>
     <script src="../assets/i18n.js"></script>
     <script src="../component/layui/layui.js"></script>

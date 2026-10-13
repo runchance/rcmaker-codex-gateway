@@ -7,6 +7,9 @@
     const workingTurnStatuses = new Set(['queued', 'submit_intent', 'submitted', 'running']);
     const closeRejections = new Set(['surface_not_closable', 'INVALID_BROWSER_SURFACE', 'INVALID_FIELD', 'INVALID_JSON']);
     let reading = false;
+    let readSequence = 0;
+    let refreshTimer = null;
+    let screenshotTimer = null;
     let screenshotReading = false;
     let disposed = false;
     let selectedSurfaceId = null;
@@ -140,7 +143,7 @@
                 const pending = pendingClosures.get(page.surface_id);
                 if (pending) { pending.phase = 'accepted'; pending.version = ++closeVersion; }
             }
-            await refresh();
+            await refresh(true);
         } catch (error) {
             const rejected = closeRejections.has(error.code);
             if (rejected) pendingClosures.delete(page.surface_id);
@@ -186,7 +189,7 @@
                 clearScreenshot();
                 if (lastState) {
                     render(lastState);
-                    refreshScreenshot(lastState);
+                    refreshScreenshot(lastState, true);
                 }
             });
             wrapper.appendChild(button);
@@ -234,14 +237,17 @@
         byId('automation-task').textContent = I18n.t('任务 ') + String(page.task_id || '').slice(-12);
         byId('automation-title').textContent = pageTitle(page);
     }
-    async function refreshScreenshot(state) {
+    /** Skip hidden or actively manipulated views, including responses that arrive after a tab switch. */
+    async function refreshScreenshot(state, manual = false) {
         const surfaceId = selectedSurfaceId;
-        if (screenshotReading || disposed || document.hidden || !surfaceId
+        if (screenshotReading || disposed || !Gateway.isPageActive() || !surfaceId
+            || (!manual && !Gateway.automaticRefreshAllowed())
             || !taskPages(state).some(page => page.surface_id === surfaceId && !isClosingPage(page))) return;
         screenshotReading = true;
         try {
             const result = await Gateway.binary('/api/browser/monitor/screenshot?surface_id=' + encodeURIComponent(surfaceId));
-            if (selectedSurfaceId !== surfaceId || result.surfaceId !== surfaceId
+            if (disposed || !Gateway.isPageActive() || (!manual && !Gateway.automaticRefreshAllowed())
+                || selectedSurfaceId !== surfaceId || result.surfaceId !== surfaceId
                 || !lastState || !taskPages(lastState).some(page => page.surface_id === surfaceId && !isClosingPage(page))) return;
             if (result.sequence > 0 && result.sequence <= lastScreenshotSequence) return;
             if (result.blob.type && !result.blob.type.startsWith('image/')) throw new Error(I18n.t('自动化页面画面格式无效。'));
@@ -259,7 +265,8 @@
             image.hidden = false;
             byId('automation-empty').hidden = true;
         } catch (e) {
-            if (selectedSurfaceId !== surfaceId) return;
+            if (disposed || !Gateway.isPageActive() || selectedSurfaceId !== surfaceId
+                || (!manual && !Gateway.automaticRefreshAllowed())) return;
             if (e.code === 'NOT_READY') clearScreenshot();
             byId('automation-empty').querySelector('strong').textContent = I18n.t('任务页面正在准备');
             byId('automation-empty').querySelector('span').textContent = I18n.t('画面就绪后会自动显示，不影响任务继续执行。');
@@ -267,37 +274,62 @@
             screenshotReading = false;
         }
     }
-    async function refresh() {
-        if (disposed || reading || document.hidden) return;
+    /** Manual refresh supersedes an older poll; automatic commits preserve the user's current interaction. */
+    async function refresh(manual = false) {
+        if (disposed || !Gateway.isPageActive() || (!manual && (reading || !Gateway.automaticRefreshAllowed()))) return;
+        const sequence = ++readSequence;
         reading = true;
-        byId('refresh').disabled = true;
+        if (manual) byId('refresh').disabled = true;
         try {
             const ready = await Gateway.ensureReady({quietAfterAdmission: true});
-            if (!ready) return;
+            if (!ready || disposed || sequence !== readSequence || !Gateway.isPageActive()) return;
             const requested = new Map(Array.from(pendingClosures, ([surfaceId, pending]) =>
                 [surfaceId, {phase: pending.phase, version: pending.version}]));
             const ids = Array.from(requested.keys());
             const state = await Gateway.request('/api/browser' + (ids.length
                 ? '?closing_surfaces=' + encodeURIComponent(ids.join(',')) : ''));
+            if (disposed || sequence !== readSequence || !Gateway.isPageActive()
+                || (!manual && !Gateway.automaticRefreshAllowed())) return;
             applyCloseStates(state, requested);
             render(state);
             setError(closeError);
-            refreshScreenshot(state);
+            refreshScreenshot(state, manual);
         } catch (e) {
-            setError(e.message);
+            if (!disposed && sequence === readSequence && (manual || Gateway.automaticRefreshAllowed())) setError(e.message);
         } finally {
-            reading = false;
-            byId('refresh').disabled = false;
+            if (sequence === readSequence) {
+                reading = false;
+                byId('refresh').disabled = false;
+            }
         }
     }
-    byId('refresh').addEventListener('click', refresh);
+    byId('refresh').addEventListener('click', () => refresh(true));
     window.addEventListener('gateway-language-changed', () => {
         lastTabsSignature = '';
         if (lastState) render(lastState);
     });
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-    window.addEventListener('pagehide', () => { disposed = true; clearScreenshot(); });
-    setInterval(refresh, 3000);
-    setInterval(() => { if (lastState) refreshScreenshot(lastState); }, 1300);
-    refresh();
+    /** A cached Pear tab keeps its selected task and resumes current state without reloading its document. */
+    function startFollowing() {
+        clearInterval(refreshTimer);
+        clearInterval(screenshotTimer);
+        refreshTimer = setInterval(() => refresh(false), 3000);
+        screenshotTimer = setInterval(() => { if (lastState) refreshScreenshot(lastState); }, 1300);
+    }
+    Gateway.onPageActivate(() => refresh(false));
+    window.addEventListener('pagehide', () => {
+        disposed = true;
+        ++readSequence;
+        reading = false;
+        clearInterval(refreshTimer);
+        clearInterval(screenshotTimer);
+        clearScreenshot();
+    });
+    window.addEventListener('pageshow', () => {
+        if (!disposed) return;
+        disposed = false;
+        startFollowing();
+        refresh(true);
+    });
+    startFollowing();
+    refresh(true);
 })();

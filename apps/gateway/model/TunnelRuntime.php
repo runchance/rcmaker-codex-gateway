@@ -582,17 +582,26 @@ final class TunnelRuntime
     private static function cleanEnvironment(): array
     {
         $env = [];
-        foreach (['SystemRoot', 'WINDIR', 'SystemDrive', 'ComSpec', 'PATHEXT', 'LANG', 'LC_ALL', 'LC_CTYPE'] as $name) {
+        $copy = ['LANG', 'LC_ALL', 'LC_CTYPE'];
+        if (PHP_OS_FAMILY === 'Windows') {
+            $copy = [...$copy, 'SystemRoot', 'WINDIR', 'SystemDrive', 'ComSpec', 'PATHEXT'];
+        }
+        foreach ($copy as $name) {
             $value = getenv($name);
             if (is_string($value) && $value !== '') $env[$name] = $value;
         }
         $home = self::root() . '/home';
         $temp = self::root() . '/tmp';
-        foreach ([$home, $temp, $home . '/AppData/Roaming', $home . '/AppData/Local'] as $directory) {
+        $directories = [$home, $temp];
+        if (PHP_OS_FAMILY === 'Windows') $directories = [...$directories, $home . '/AppData/Roaming', $home . '/AppData/Local'];
+        foreach ($directories as $directory) {
             if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) throw new GatewayError('TUNNEL_STORAGE_FAILED', '无法创建工具隧道私有目录。', 503);
         }
-        $env['HOME'] = $home; $env['USERPROFILE'] = $home;
-        $env['APPDATA'] = $home . '/AppData/Roaming'; $env['LOCALAPPDATA'] = $home . '/AppData/Local';
+        $env['HOME'] = $home;
+        if (PHP_OS_FAMILY === 'Windows') {
+            $env['USERPROFILE'] = $home;
+            $env['APPDATA'] = $home . '/AppData/Roaming'; $env['LOCALAPPDATA'] = $home . '/AppData/Local';
+        }
         $env['TMP'] = $temp; $env['TEMP'] = $temp; $env['TMPDIR'] = $temp;
         $env['PATH'] = PHP_OS_FAMILY === 'Windows'
             ? ($env['SystemRoot'] ?? 'C:\\Windows') . '\\System32'
