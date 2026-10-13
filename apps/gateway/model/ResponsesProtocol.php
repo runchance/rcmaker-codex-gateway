@@ -657,12 +657,16 @@ final class ResponsesProtocol
         return 'base';
     }
 
-    /** @return array<int,array<string,mixed>> */
+    /**
+     * Normalize the complete current Codex tool inventory without an account-specific count limit.
+     * The request envelope is already bounded by MAX_BODY_BYTES; each supported tool still
+     * retains its namespace, schema and duplicate-name validation.
+     * @return array<int,array<string,mixed>>
+     */
     private static function tools(mixed $raw): array
     {
         if ($raw === null) return [];
         if (!is_array($raw)) throw new GatewayError('invalid_request_error', 'tools 必须是数组。', 400);
-        if (count($raw) > 256) throw new GatewayError('invalid_request_error', 'tools 数量超过当前上限。', 400);
         $tools = [];
         $wireNames = [];
         foreach ($raw as $entry) {
@@ -692,7 +696,6 @@ final class ResponsesProtocol
                     $innerType = (string) ($inner['type'] ?? 'function');
                     if ($innerType !== 'function' && !($namespaceName === 'functions' && $innerType === 'custom')) continue;
                     self::appendTool($tools, $wireNames, $inner, $innerType, $namespace);
-                    if (count($tools) > 256) throw new GatewayError('invalid_request_error', 'tools 数量超过当前上限。', 400);
                 }
                 continue;
             }

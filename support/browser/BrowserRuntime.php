@@ -1416,10 +1416,19 @@ final class BrowserRuntime
             'command_id'=>$commandId, 'connector_name'=>$connectorName,
             'session_id'=>$this->connectorProbeSessionId, 'target_id'=>$this->connectorProbeTargetId,
         ]];
-        $this->verifyModelSelection($selectionId, $mode, function () use ($selectionId, $after): void {
+        $this->verifyModelSelection($selectionId, $mode, function () use ($selectionId, $commandId, $connectorName, $after): void {
             if (!$this->modelSelectionActive($selectionId)) return;
             unset($this->connectorModelSelections[$selectionId]);
-            $after();
+            $this->evaluateConnectorProbe(WebModelPage::connectorSelectedExpression($connectorName),
+                function ($error, $selected) use ($commandId, $connectorName, $after): void {
+                    if ($error !== null || !is_array($selected) || empty($selected['selected'])
+                        || (int) ($selected['count'] ?? 0) > 1) {
+                        $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_SELECTION_FAILED',
+                            'ChatGPT 没有确认连接器已经选中。');
+                        return;
+                    }
+                    $after();
+                });
         });
     }
 
@@ -3370,6 +3379,13 @@ JS;
                 }
                 $staging = ChatGptTransport::stagingMode($capabilities, $remainingChars,
                     $remainingTokens, (int) $plan['staging_context_tokens'], $requested['family'] ?? null);
+                // Upgrade only new Free transactions. Acknowledged legacy stages retain
+                // their recorded physical mode so restart recovery cannot change their identity.
+                if (($capabilities['account_plan'] ?? '') === 'free' && empty($capabilities['sol_available'])
+                    && !empty($job['transport_transaction_id']) && ($job['transport_stage_effort'] ?? '') === 'low') {
+                    $staging = ChatGptTransport::requestedMode('low', $capabilities)
+                        + ['family'=>null, 'purpose'=>'context_stage'];
+                }
                 $this->chatGptTurns[$responseId]['staging_mode'] = $staging;
                 ResponseJob::configureMultipart(
                     $responseId,
@@ -3423,11 +3439,11 @@ JS;
         }
     }
 
-    /** Move the semantic slider one ARIA step at a time and prove the requested value. */
+    /** Select a verified Think toggle or move the semantic effort slider to the requested value. */
     private function selectTaskEffort(string $responseId, array $mode, ?array $slider, callable $after, bool $recover): void
     {
         if (!is_int($mode['ui_index'] ?? null)) {
-            $after();
+            $this->setTaskThinkMode($responseId, !empty($mode['think']), $after, $recover);
             return;
         }
         if (!is_array($slider) || empty($slider['ok'])) {
@@ -3685,21 +3701,7 @@ JS;
                 // Activate only that verified button and read its state back; keep
                 // the older slash-command flow for legacy pages without a toggle.
                 if ((int) ($state['count'] ?? 0) === 1) {
-                    $this->evaluateModelSelection($responseId, WebModelPage::focusThinkControlExpression(),
-                        function ($focusError, $focused) use ($responseId, $enabled, $after, $recover): void {
-                            if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
-                                $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法聚焦 ChatGPT Think 按钮。', $recover);
-                                return;
-                            }
-                            $this->dispatchModelSelectionKey($responseId, 'Enter',
-                                function ($keyError) use ($responseId, $enabled, $after, $recover): void {
-                                    if ($keyError !== null) {
-                                        $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法切换 ChatGPT Think 按钮。', $recover);
-                                        return;
-                                    }
-                                    $this->waitTaskThinkState($responseId, $enabled, $after, $recover, microtime(true) + 5.0);
-                                });
-                        });
+                    $this->activateTaskThinkControl($responseId, $enabled, $after, $recover);
                     return;
                 }
                 $this->evaluateModelSelection($responseId, WebModelPage::focusAndClearExpression(),
@@ -3752,16 +3754,39 @@ JS;
             });
     }
 
-    private function waitTaskThinkState(string $responseId, bool $enabled, callable $after, bool $recover, float $deadline): void
+    /** Activate only the real Think button, retaining any composed prompt, connector and attachments. */
+    private function activateTaskThinkControl(string $responseId, bool $enabled, callable $after, bool $recover): void
+    {
+        $this->evaluateModelSelection($responseId, WebModelPage::focusThinkControlExpression(),
+            function ($focusError, $focused) use ($responseId, $enabled, $after, $recover): void {
+                if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
+                    $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法聚焦 ChatGPT Think 按钮。', $recover);
+                    return;
+                }
+                if (($focused['pressed'] ?? null) === $enabled) { $after(); return; }
+                $this->dispatchModelSelectionKey($responseId, 'Enter',
+                    function ($keyError) use ($responseId, $enabled, $after, $recover): void {
+                        if ($keyError !== null) {
+                            $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法切换 ChatGPT Think 按钮。', $recover);
+                            return;
+                        }
+                        $this->waitTaskThinkState($responseId, $enabled, $after, $recover, microtime(true) + 5.0, false);
+                    });
+            });
+    }
+
+    /** Clear only a legacy slash command; a real button toggle never clears existing composer content. */
+    private function waitTaskThinkState(string $responseId, bool $enabled, callable $after, bool $recover, float $deadline, bool $clearCommand = true): void
     {
         $this->evaluateModelSelection($responseId, WebModelPage::thinkStateExpression(),
-            function ($error, $state) use ($responseId, $enabled, $after, $recover, $deadline): void {
+            function ($error, $state) use ($responseId, $enabled, $after, $recover, $deadline, $clearCommand): void {
                 if ($error === null && is_array($state) && !empty($state['ok']) && (int) ($state['count'] ?? 0) === 1 && !empty($state['pressed']) === $enabled) {
-                    $this->evaluateModelSelection($responseId, WebModelPage::focusAndClearExpression(), function () use ($after): void { $after(); });
+                    $expression = $clearCommand ? WebModelPage::focusAndClearExpression() : WebModelPage::focusComposerExpression();
+                    $this->evaluateModelSelection($responseId, $expression, function () use ($after): void { $after(); });
                     return;
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.10, fn() => $this->waitTaskThinkState($responseId, $enabled, $after, $recover, $deadline), null, false);
+                    Timer::add(0.10, fn() => $this->waitTaskThinkState($responseId, $enabled, $after, $recover, $deadline, $clearCommand), null, false);
                     return;
                 }
                 $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', 'ChatGPT 没有确认 Think 状态切换。', $recover);
@@ -4925,11 +4950,11 @@ JS;
     }
 
     /** Final readback shared by real task sends and the isolated non-Pro connector probe. */
-    private function verifyModelSelection(string $responseId, array $mode, callable $after): void
+    private function verifyModelSelection(string $responseId, array $mode, callable $after, bool $thinkRestored = false): void
     {
         if (!is_int($mode['ui_index'] ?? null)) {
             $this->evaluateModelSelection($responseId, WebModelPage::thinkStateExpression(),
-                function ($error, $state) use ($responseId, $mode, $after): void {
+                function ($error, $state) use ($responseId, $mode, $after, $thinkRestored): void {
                     if ($error !== null || !is_array($state) || empty($state['ok'])) {
                         $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN', '发送前无法复核 Luna / Think 状态。');
                         return;
@@ -4937,6 +4962,13 @@ JS;
                     $expected = !empty($mode['think']);
                     $actual = (int) ($state['count'] ?? 0) === 1 ? !empty($state['pressed']) : false;
                     if ($actual !== $expected) {
+                        // Free's App mention selection resets Think. Restore only the exact
+                        // requested toggle once, then re-read; never clear or downgrade the prompt.
+                        if (!$thinkRestored && (int) ($state['count'] ?? 0) === 1 && empty($state['disabled'])) {
+                            $this->activateTaskThinkControl($responseId, $expected,
+                                fn() => $this->verifyModelSelection($responseId, $mode, $after, true), false);
+                            return;
+                        }
                         $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_DRIFT', '发送前 Luna / Think 状态已经变化。');
                         return;
                     }

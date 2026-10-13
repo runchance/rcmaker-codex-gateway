@@ -572,9 +572,9 @@ final class ChatGptTransport
     }
 
     /**
-     * Use Medium for read-only history staging; final task execution selects its own requested effort.
+     * Use Think for Free history staging and Medium for paid staging; final execution keeps its requested effort.
      * @param int $stagingContextTokens Cumulative context, already bounded by the multipart planner.
-     * @return array Verified Medium mode; accumulated history never triggers an implicit Pro upgrade.
+     * @return array Verified physical staging mode; accumulated history never triggers an implicit Pro upgrade.
      * @throws GatewayError When the account or Medium cannot carry one complete stage.
      */
     public static function stagingMode(array $capabilities, int $maxStageChars, int $maxStageTokens = 0, int $stagingContextTokens = 0,
@@ -587,7 +587,8 @@ final class ChatGptTransport
                 throw new GatewayError('CHATGPT_MULTIPART_UNAVAILABLE', '当前账户没有可验证的分段模型能力。', 409);
             }
             if ($maxStageChars <= 500000 && $maxStageTokens <= 19808) {
-                return self::requestedMode('low', $capabilities) + ['family'=>null, 'purpose'=>'context_stage'];
+                $effort = ($capabilities['account_plan'] ?? '') === 'free' ? 'medium' : 'low';
+                return self::requestedMode($effort, $capabilities) + ['family'=>null, 'purpose'=>'context_stage'];
             }
             throw new GatewayError('CHATGPT_CONTEXT_TOO_LARGE', '分段超过 Luna 单条消息预算。', 400);
         }

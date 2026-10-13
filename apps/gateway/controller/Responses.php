@@ -117,6 +117,7 @@ final class Responses
             ResponseTransport::nonStream($connection, $responseId);
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
+            $this->logFreeModelSelectionFailure($error, $phase, $spec ?? [], is_array($body ?? null) ? $body : []);
             // Codex replaces these details with its generic context-window message.
             // Admission failures precede job creation, so keep structural evidence
             // in the existing diagnostic sink without logging any request content.
@@ -132,8 +133,8 @@ final class Responses
         }
     }
 
-    /** Record only structural failure evidence; exception messages and traces can contain request secrets. */
-    private function logUnexpectedCreateFailure(\Throwable $error, string $phase): string
+    /** Record only structural failure evidence; optional facts are prefiltered model-selection metadata. */
+    private function logUnexpectedCreateFailure(\Throwable $error, string $phase, array $facts = []): string
     {
         try {
             $diagnosticId = bin2hex(random_bytes(8));
@@ -143,7 +144,9 @@ final class Responses
         $class = preg_replace('/[^A-Za-z0-9_\\\\]/', '_', get_class($error));
         $file = preg_replace('/[^A-Za-z0-9_.-]/', '_', basename(str_replace('\\', '/', $error->getFile())));
         $line = date('c') . ' [responses.create] id=' . $diagnosticId . ' phase=' . $phase
-            . ' class=' . $class . ' file=' . $file . ' line=' . $error->getLine() . PHP_EOL;
+            . ' class=' . $class . ' file=' . $file . ' line=' . $error->getLine();
+        if ($facts !== []) $line .= ' selection=' . json_encode($facts, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $line .= PHP_EOL;
         try {
             $directory = runtime_path() . '/logs';
             if ((is_dir($directory) || @mkdir($directory, 0700, true))
@@ -155,6 +158,38 @@ final class Responses
         }
         error_log($line);
         return $diagnosticId;
+    }
+
+    /**
+     * Diagnose only Free-account selection failures before a job exists; never reroute or downgrade a request.
+     * Whitelist model/effort/operation facts and hash the thread ID; request text, schemas and credentials stay private.
+     * @param array $spec Already normalized request, or an empty array when parsing did not complete.
+     * @param array $body Decoded wire request used only for its model and requested reasoning effort.
+     */
+    private function logFreeModelSelectionFailure(GatewayError $error, string $phase, array $spec, array $body): void
+    {
+        if (!in_array($error->errorCode, ['CHATGPT_MODEL_FAMILY_UNAVAILABLE', 'CHATGPT_MODEL_UNAVAILABLE',
+            'model_not_supported', 'CHATGPT_MODEL_SELECTION_DRIFT'], true)) return;
+        try {
+            $routes = ModelCatalog::routes();
+            $capabilities = $routes[0]['capabilities'] ?? null;
+            if (($capabilities['account_plan'] ?? '') !== 'free' || !empty($capabilities['sol_available'])) return;
+            $facts = ['account_plan'=>'free', 'sol_available'=>false,
+                'think_available'=>!empty($capabilities['think_available'])];
+            foreach (['requested_model'=>$body['model'] ?? null, 'resolved_model'=>$spec['model'] ?? null] as $key=>$model) {
+                if (is_string($model) && preg_match('~\Achatgpt-web/[A-Za-z0-9/._-]{1,128}\z~D', $model) === 1) $facts[$key] = $model;
+            }
+            foreach (['requested_effort'=>$body['reasoning']['effort'] ?? null,
+                'resolved_effort'=>$spec['reasoning_effort'] ?? null] as $key=>$effort) {
+                if (in_array($effort, ['low','medium','high','xhigh','max','ultra'], true)) $facts[$key] = $effort;
+            }
+            $operation = $spec['operation_kind'] ?? null;
+            if (in_array($operation, ['response','compact_v1','compact_v2'], true)) $facts['operation'] = $operation;
+            if (is_string($spec['thread_id'] ?? null)) $facts['thread_hash'] = substr(hash('sha256', $spec['thread_id']), 0, 24);
+            $this->logUnexpectedCreateFailure($error, $phase . ':' . $error->errorCode, $facts);
+        } catch (\Throwable) {
+            // Diagnostic failure must preserve the original HTTP status and execution boundary.
+        }
     }
 
     /** Explicit HTTP fallback for Codex clients that probe Responses WebSocket transport. */
@@ -188,7 +223,10 @@ final class Responses
             $job = ContextCompaction::create($spec, $this->idempotencyKey($request));
             ResponseTransport::nonStream($connection, (string) $job['id']);
             return new DeferredResponse($request);
-        } catch (GatewayError $error) { return $this->error($request, $error); }
+        } catch (GatewayError $error) {
+            $this->logFreeModelSelectionFailure($error, 'compact', $spec ?? [], is_array($body ?? null) ? $body : []);
+            return $this->error($request, $error);
+        }
         catch (\Throwable) { return $request->json(ResponsesProtocol::error('上下文压缩请求无效。', 'invalid_compaction'))->withStatus(400); }
     }
 

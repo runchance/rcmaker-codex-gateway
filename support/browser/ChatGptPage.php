@@ -356,7 +356,7 @@ const controls=[...form.querySelectorAll('button[aria-pressed]')].filter(el=>vis
 if(controls.length>1)return {ok:false,code:'CHATGPT_THINK_CONTROL_INVALID',count:controls.length};
 if(controls.length===0)return {ok:true,count:0,pressed:false};
 const pressed=controls[0].getAttribute('aria-pressed');if(pressed!=='true'&&pressed!=='false')return {ok:false,code:'CHATGPT_THINK_STATE_INVALID',count:1};
-return {ok:true,count:1,pressed:pressed==='true'};
+return {ok:true,count:1,pressed:pressed==='true',disabled:controls[0].disabled||controls[0].getAttribute('aria-disabled')==='true'};
 JS);
     }
 
@@ -369,6 +369,7 @@ const thinkNames=new Set(['Think','思考']);
 const controls=[...form.querySelectorAll('button[aria-pressed]')].filter(el=>visible(el)&&thinkNames.has(String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').trim()));
 if(controls.length!==1)return {ok:false,code:'CHATGPT_THINK_CONTROL_INVALID',count:controls.length};
 const pressed=controls[0].getAttribute('aria-pressed');if(pressed!=='true'&&pressed!=='false')return {ok:false,code:'CHATGPT_THINK_STATE_INVALID'};
+if(controls[0].disabled||controls[0].getAttribute('aria-disabled')==='true')return {ok:false,code:'CHATGPT_THINK_CONTROL_DISABLED'};
 controls[0].focus();return {ok:document.activeElement===controls[0],pressed:pressed==='true'};
 JS);
     }
