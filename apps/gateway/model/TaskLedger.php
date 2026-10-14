@@ -2176,17 +2176,19 @@ final class TaskLedger
         string $incarnation, int $fence, string $documentNonce): bool
     {
         if (!in_array($state, ['stream_failed','recovery_visible','recovery_cleared','response_http',
-            'empty_candidate','empty_cleared','empty_settlement','empty_stream_recovery','stopped_thinking'], true)) return false;
+            'empty_candidate','empty_cleared','empty_settlement','empty_stream_recovery','stopped_thinking',
+            'stream_metrics','background_failed','background_finished'], true)) return false;
         $facts = ['state'=>$state];
         foreach (['canceled','generation_running','response_present','send_button_visible','send_button_disabled',
             'completion_action_visible','content_present','transport_recovery_visible','transport_failed',
             'transport_settled','ui_receipts_settled','request_finished','fence_drained',
-            'source_receipt_present','has_artifacts','stopped_thinking_visible','network_retry_available'] as $key) {
+            'source_receipt_present','has_artifacts','stopped_thinking_visible','network_retry_available','connection_reused'] as $key) {
             if (is_bool($metadata[$key] ?? null)) $facts[$key] = $metadata[$key];
         }
         if (is_int($metadata['elapsed_ms'] ?? null)) $facts['elapsed_ms'] = max(0, min(86400000, $metadata['elapsed_ms']));
         foreach (['answer_root_count','commentary_root_count','markdown_chars','visible_chars','candidate_age_ms','mcp_revision',
-            'tool_invocations_pending','tool_receipts_pending','mcp_activities_pending'] as $key) {
+            'tool_invocations_pending','tool_receipts_pending','mcp_activities_pending',
+            'request_bytes','received_bytes','encoded_bytes','data_events','last_data_age_ms'] as $key) {
             if (is_int($metadata[$key] ?? null)) $facts[$key] = max(0, min(2147483647, $metadata[$key]));
         }
         if (is_int($metadata['http_status'] ?? null) && $metadata['http_status'] >= 100 && $metadata['http_status'] <= 599) {
@@ -2199,13 +2201,21 @@ final class TaskLedger
         if (($metadata['page_error_code'] ?? null) === 'CHATGPT_STOPPED_THINKING') {
             $facts['page_error_code'] = 'CHATGPT_STOPPED_THINKING';
         }
+        if (in_array($metadata['endpoint'] ?? null, ['submission','stream_status','snapshot','resume'], true)) {
+            $facts['endpoint'] = $metadata['endpoint'];
+        }
         $requestFingerprint = $metadata['request_fingerprint'] ?? null;
         if (is_string($requestFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $requestFingerprint) === 1) $facts['request_fingerprint'] = $requestFingerprint;
         $responseFingerprint = $metadata['response_fingerprint'] ?? null;
         if (is_string($responseFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $responseFingerprint) === 1) $facts['response_fingerprint'] = $responseFingerprint;
         return Schema::transaction(function () use ($responseId, $facts, $incarnation, $fence, $documentNonce): bool {
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
-            if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
+            // Closing an immutable tool-call Response does not close the browser turn. Keep
+            // network evidence during host execution, without appending to its SSE or output.
+            $observable = $job['status'] === 'running'
+                || ($job['status'] === 'completed' && ($job['round_kind'] ?? '') === 'tool_call'
+                    && ($turn['response_id'] ?? '') === $job['id']);
+            if (!self::ownsCurrentGeneration($job, $turn) || !$observable
                 || !in_array($turn['status'], ['submit_intent','submitted','running'], true)
                 || $surface['status'] !== 'busy' || $documentNonce === ''
                 || !hash_equals((string)$surface['document_nonce'], $documentNonce)

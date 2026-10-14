@@ -119,8 +119,10 @@ function gatewayMcpBootstrap(): void
 function gatewayMcpEmit(array $response, ?array $request, int $sequence, float $started,
     string $lockPath, ?array $receipt = null): void
 {
+    $lockStarted = microtime(true);
     $lock = @fopen($lockPath, 'c+b');
     if (!is_resource($lock) || !flock($lock, LOCK_EX)) throw new RuntimeException('MCP output lock unavailable');
+    $lockWaitMs = (int) round((microtime(true) - $lockStarted) * 1000);
     try {
         $encoded = json_encode($response, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
         $length = strlen($encoded);
@@ -159,6 +161,8 @@ function gatewayMcpEmit(array $response, ?array $request, int $sequence, float $
         gatewayMcpTrace('response', [
             'method' => $method, 'tool' => $toolName, 'sequence' => $sequence,
             'duration_ms' => (int) round((microtime(true) - $started) * 1000),
+            'output_bytes' => $length, 'lock_wait_ms' => $lockWaitMs,
+            'memory_peak_bytes' => memory_get_peak_usage(true),
             'flushed' => $flushed,
             'error_code' => is_int($error['code'] ?? null) ? $error['code'] : null,
             'is_error' => !empty($result['isError']),
@@ -312,7 +316,7 @@ try {
             if ($method === 'initialize' && is_string($request['params']['protocolVersion'] ?? null)) {
                 $trace['protocol_version'] = $request['params']['protocolVersion'];
             }
-            gatewayMcpTrace('request', $trace);
+            gatewayMcpTrace('request', $trace + ['input_bytes' => strlen($line)]);
         }
         if ($method === 'notifications/cancelled') {
             // An already-delivered host operation may have an unknown side effect. Do not kill

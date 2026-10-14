@@ -260,6 +260,9 @@
                 recovery_visible: '网页正在自动恢复', recovery_cleared: '网页恢复提示已消失',
                 stream_failed: data.canceled === true ? '浏览器已关闭这条回答流' : '网页回答流发生中断',
                 response_http: '网页回答流已收到 HTTP 响应',
+                stream_metrics: '网页连接传输统计',
+                background_failed: '网页后台恢复连接失败',
+                background_finished: '网页后台恢复连接已返回',
                 empty_candidate: '正在核验空回答终态',
                 empty_cleared: '空回答终态条件已解除',
                 empty_settlement: '已核验回答流与工具状态',
@@ -274,6 +277,8 @@
             if (typeof data.fence_drained === 'boolean') parts.push(I18n.t(data.fence_drained
                 ? '工具和 MCP 回执已排空' : '工具或 MCP 回执尚未排空'));
             if (Number.isFinite(data.elapsed_ms)) parts.push((data.elapsed_ms / 1000).toFixed(1) + 's');
+            if (data.endpoint) parts.push(data.endpoint);
+            if (Number.isFinite(data.received_bytes)) parts.push((data.received_bytes / 1024).toFixed(1) + ' KiB');
             return parts.filter(Boolean).join(' · ');
         }
         if (event.type === 'mcp_completion_committed' && Number(data.revision) === 0) {

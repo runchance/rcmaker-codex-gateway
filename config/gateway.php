@@ -3,6 +3,10 @@
 $consolePort = (int) rcEnv('gateway.console_port', 28910);
 $apiPort = (int) rcEnv('gateway.api_port', 28911);
 $browserDebugPort = (int) rcEnv('gateway.browser_debug_port', 28912);
+$browserHttpProtocol = (string) rcEnv('gateway.browser_http_protocol', 'auto');
+if (!in_array($browserHttpProtocol, ['auto', 'http1'], true)) {
+    throw new RuntimeException('gateway.browser_http_protocol must be auto or http1.');
+}
 $databaseName = (string) rcEnv('gateway.database_name', 'gateway.sqlite');
 $gatewayTestMode = getenv('PHP_GATEWAY_TEST_MODE') === '1';
 $dataName = (string) rcEnv('gateway.data_directory', 'data');
@@ -48,6 +52,8 @@ return [
     'console_port' => $consolePort,
     'api_port' => $apiPort,
     'browser_debug_port' => $browserDebugPort,
+    // Opt-in compatibility for diagnosed HTTP/2 stream errors; never changes an active browser.
+    'browser_http_protocol' => $browserHttpProtocol,
     'console_origin' => 'http://127.0.0.1:' . $consolePort,
     'api_origin' => 'http://127.0.0.1:' . $apiPort,
     'database_file' => $dataDirectory . '/database/' . $databaseName,

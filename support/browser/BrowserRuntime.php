@@ -7661,6 +7661,21 @@ JS;
         $sessionId = (string) ($message['sessionId'] ?? '');
         if ($sessionId === '' || !isset($this->taskSessions[$sessionId])) return;
         $owner = $this->taskSessions[$sessionId];
+        // Passive metrics are deliberately independent of send/retry/completion decisions.
+        // They continue through closed tool Responses while this exact physical turn is alive.
+        $observedTurn = $this->chatGptTurns[(string) ($owner['response_id'] ?? '')] ?? [];
+        if ((float) ($observedTurn['sent_at'] ?? 0) > 0 || (int) ($observedTurn['transport_stage_sent'] ?? 0) > 0) {
+            try {
+                $trace = $this->taskSessions[$sessionId]['network_trace'] ??= new ResponseStreamTrace();
+                $observation = $trace->observe($method, $params, (string) ($owner['main_frame_id'] ?? ''),
+                    self::modelUrl(), microtime(true));
+                if ($observation !== null) $this->recordTaskTransportObservation((string) ($owner['response_id'] ?? ''),
+                    $observation['state'], $observation['metadata']);
+            } catch (\Throwable) {
+                // Observability cannot interrupt a task, its CDP events or an in-flight tool.
+            }
+        }
+        $owner = $this->taskSessions[$sessionId];
         if ($method === 'Network.requestWillBeSent') {
             $turn = $this->chatGptTurns[(string) ($owner['response_id'] ?? '')] ?? [];
             if (((float) ($turn['sent_at'] ?? 0) > 0 || (int) ($turn['transport_stage_sent'] ?? 0) > 0)
@@ -7761,6 +7776,7 @@ JS;
         if ($method !== 'Page.frameNavigated') return;
         $frame = $params['frame'] ?? null;
         if (!is_array($frame) || !empty($frame['parentId'])) return;
+        unset($this->taskSessions[$sessionId]['network_trace']);
         $this->taskSessions[$sessionId]['main_frame_id'] = (string) ($frame['id'] ?? '');
         try {
             TaskLedger::documentChanged(

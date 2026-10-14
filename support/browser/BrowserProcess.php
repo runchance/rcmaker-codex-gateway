@@ -116,6 +116,7 @@ final class BrowserProcess
             '--enable-logging',
             '--log-file=' . $chromeLog,
         ];
+        array_push($args, ...self::networkProtocolArguments((string) Config::get('gateway', 'browser_http_protocol')));
         if ($revision['mode'] === 'manual') {
             $host = str_contains((string) $revision['host'], ':') ? '[' . $revision['host'] . ']' : $revision['host'];
             $args[] = '--proxy-server=http://' . $host . ':' . (int) $revision['port'];
@@ -128,6 +129,23 @@ final class BrowserProcess
         $owned = \support\process\OwnedRuntime::launch($args, $environment,
             (string) Config::get('gateway', 'browser_runtime_dir'), 'chrome', $stderrTarget);
         return $owned + ['kind' => $browser['kind'], 'profile' => $profile, 'debug_port' => $debugPort, 'mode' => 'controlled', 'provider' => 'bundled'];
+    }
+
+    /**
+     * Optional native Chrome protocol compatibility; auto leaves existing negotiation untouched.
+     * Only a new owned Chrome process receives these flags. No active request is cancelled or
+     * replayed, and PHP/native Codex/MCP transports and product identity are unaffected.
+     * @param string $protocol auto (or missing legacy configuration), or http1.
+     * @return list<string> Validated Chrome switches, never arbitrary launch arguments.
+     * @throws \InvalidArgumentException For an unsupported deployment value.
+     */
+    public static function networkProtocolArguments(string $protocol): array
+    {
+        return match ($protocol) {
+            '', 'auto' => [],
+            'http1' => ['--disable-http2', '--disable-quic'],
+            default => throw new \InvalidArgumentException('Unsupported browser HTTP protocol.'),
+        };
     }
 
     /** Cleanup is scoped to the verified private executable identity, never a vendor-wide process name. */

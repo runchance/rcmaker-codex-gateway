@@ -471,6 +471,17 @@ Confirm the outcome of potentially executed writes before retrying. Clearing sig
 
 ### Include this in a problem report
 
+For recurring **connection interrupted** notices, the task timeline records the browser protocol,
+request duration and received byte counts. Matching background recovery requests and MCP reply sizes,
+output-lock waits and peak worker memory are included in diagnostic exports. Missing observations
+remain unknown; a flushed tool reply does not prove that the browser's separate answer stream is healthy.
+
+If the recorded error is `net::ERR_HTTP2_PROTOCOL_ERROR`, you can test `browser_http_protocol = http1`
+under `[gateway]` in `.env` after tasks finish and the private Chrome is restarted normally. The default
+`auto` preserves existing behavior. This option affects only private Chrome, not native Codex forwarding
+or MCP. It is a compatibility workaround, not a guarantee against server/proxy timeouts; compare long-task
+results before keeping it. Do not refresh or regenerate an active task just to change the protocol.
+
 ```text
 RCMAKER version:
 Operating system / CPU architecture:

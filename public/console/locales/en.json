@@ -1010,5 +1010,8 @@
     "工具返回结果后重新计时；已开始的任务沿用原设置。": "Waits restart after tool results. Tasks already started keep their original settings.",
     "更新模型目录": "Refresh the model catalog",
     "Codex 仍显示旧预算时，完全退出后重新打开。": "If Codex still shows old budgets, quit completely and reopen it.",
-    "更多分段需要更长传输时间；六段不等于六倍模型窗口。": "More parts take longer to transfer. Six parts do not give six times the model window."
+    "更多分段需要更长传输时间；六段不等于六倍模型窗口。": "More parts take longer to transfer. Six parts do not give six times the model window.",
+    "网页连接传输统计": "Browser connection transfer metrics",
+    "网页后台恢复连接失败": "Browser background recovery connection failed",
+    "网页后台恢复连接已返回": "Browser background recovery connection returned"
 }

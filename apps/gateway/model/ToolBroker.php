@@ -766,6 +766,7 @@ final class ToolBroker
         return is_array($binding) && self::recoveredReceiptOwnerReady($binding);
     }
 
+    /** Accept a submitted recovery page only with exact delivered receipts and a matching recovery event. */
     private static function recoveredReceiptOwnerReady(array $binding): bool
     {
         if ($binding['status'] !== 'awaiting_start' || $binding['sent_at'] === null
@@ -778,8 +779,15 @@ final class ToolBroker
             ->where('event_type', 'connector_no_start_retry_prepared')->select('data_json');
         foreach (is_array($events) ? $events : [] as $event) {
             $data = json_decode((string)$event['data_json'], true);
-            if (in_array($data['cause'] ?? '',
-                ['connector_unavailable_after_receipts','missing_surface_with_complete_receipts'], true)) return true;
+            // These page replacements all use the same receipt-verified recovery transaction.
+            // A final based on its preserved results need not start another MCP call.
+            if (in_array($data['cause'] ?? '', [
+                'connector_unavailable_after_receipts',
+                'missing_surface_with_complete_receipts',
+                'connector_unavailable_retained_page',
+                'network_error_after_confirmed_receipts',
+                'message_stream_error_after_confirmed_receipts',
+            ], true)) return true;
         }
         return false;
     }
