@@ -881,14 +881,16 @@ JS));
     }
 
     /**
-     * Observe only the bound assistant after its stable identity has been recorded.
-     * Native stream errors are scoped UI chrome; quoted transcript alerts remain content.
-     * Active native recovery chrome is returned only as transport_recovery_visible metadata.
-     * @param list<string> $baselineUserIds User IDs captured before submission.
-     * @param list<string> $baselineAssistantIds Assistant IDs captured before submission.
-     * @param string $continuationMarker Optional exact marker for a same-turn continuation.
-     * @param string $boundResponseId Stable assistant ID from the first accepted observation.
-     * @return string CDP expression returning the scoped response snapshot.
+     * Observe the fenced turn's visible response, including DIL messages with exact renderer references.
+     * Later public phases may lose legacy assistant-role/search-unit wrappers; matching selection,
+     * copy-source and DIL message IDs prove their origin without accepting arbitrary page prose.
+     * Native stream errors stay scoped UI chrome; quoted alerts remain content and active
+     * native recovery chrome is returned only as transport_recovery_visible metadata.
+     * @param array $baselineUserIds User identities captured before submitting this generation.
+     * @param array $baselineAssistantIds Historical assistants excluded from the current answer.
+     * @param string $continuationMarker Exact current continuation marker, or empty for initial work.
+     * @param string $boundResponseId Previously observed assistant identity; empty before first binding.
+     * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $continuationMarker = '', string $boundResponseId = ''): string
@@ -980,6 +982,7 @@ if(answer){
             return unit?(unit.matches('[data-content-search-unit-key$=":assistant"]')
                 ||[...unit.children].some(child=>child.getAttribute('data-conversation-role')==='assistant'))
                 :candidate.closest('[data-conversation-role="assistant"]')!==null
+                    ||ownedAssistantMessageRoot(candidate,answer.el)
                     ||activityContainers.some(container=>container.contains(candidate));
         });
     const statuses=[...answer.el.querySelectorAll('[data-streaming-response-status]')];
@@ -1047,9 +1050,14 @@ if(answer){
         const followingStatus=statuses.some(next=>!root.contains(next)&&!next.contains(root)
             &&publiclyVisible(next)&&!nativeRecoveryPanel(next)&&after(root,next));
         const complete=!running||followingSibling||followingStatus||allMarkdown.some(next=>next!==root&&after(root,next));
-        const text=(complete||activityRoots.includes(root))?toMarkdown(root,false):'';
+        // Keep the visible latest prose in the observation even before another DOM node
+        // appears. Only a verified native tool boundary may settle this incomplete prose;
+        // the snapshot itself never claims that generation or the paragraph is finished.
+        const publicProse=!publicSummary&&!activityRoots.includes(root);
+        const text=(complete||activityRoots.includes(root))?toMarkdown(root,false)
+            :(publicProse?toMarkdown(root,true):'');
         return text?{key:answer.id+':commentary:'+index,text,complete,public_summary:publicSummary,
-            public_status:activityRoots.includes(root)}:null;
+            public_status:activityRoots.includes(root),public_prose:publicProse}:null;
     }).filter(Boolean);
     // ChatGPT renders short, user-visible activity labels separately from Markdown. Keep
     // only text shown in the status chrome; the nested Markdown and private COT panels
@@ -1297,7 +1305,8 @@ const allMarkdown=[...answer.el.querySelectorAll('.markdown,[data-markdown-text-
         const unit=candidate.closest('[data-content-search-unit-key]');
         return unit?(unit.matches('[data-content-search-unit-key$=":assistant"]')
             ||[...unit.children].some(child=>child.getAttribute('data-conversation-role')==='assistant'))
-            :candidate.closest('[data-conversation-role="assistant"]')!==null;
+            :candidate.closest('[data-conversation-role="assistant"]')!==null
+                ||ownedAssistantMessageRoot(candidate,answer.el,true);
     });
 const statuses=[...answer.el.querySelectorAll('[data-streaming-response-status]')];
 const firstStatus=statuses[0]||null;
@@ -1359,6 +1368,30 @@ JS
             . <<<'JS'
 const visible=el=>{if(!el)return false;const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)!==0&&r.width>0&&r.height>0};
 const visibleOne=selector=>[...document.querySelectorAll(selector)].find(visible)||null;
+// DIL phase prose can sit outside role/search-unit wrappers within the bound assistant turn.
+// Require all three renderer message references; user/code and nested foreign groups never qualify.
+const ownedAssistantMessageRoot=(root,owner,requireRendered=false)=>{
+    if(root.getAttribute('data-markdown-text-style')!=='assistant-message'
+        ||root.closest('[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-content-search-unit-key$=":user"],pre,code'))return false;
+    const group=root.closest('[data-turn-key]');
+    if(group&&group!==owner)return false;
+    const selection=root.closest('[data-chatgpt-selection-message-id]');
+    if(!selection||!owner.contains(selection))return false;
+    // Response extraction retains hidden root identities so it cannot fall back to a whole
+    // transcript when all prose is collapsed; its existing visibility filters exclude their text.
+    // Download focus additionally requires a rendered root before authorizing an interaction.
+    if(requireRendered)for(let node=root;node&&owner.contains(node);node=node.parentElement){
+        const style=getComputedStyle(node);
+        if(node.hasAttribute('hidden')||node.hasAttribute('inert')||node.getAttribute('aria-hidden')==='true'
+            ||style.display==='none'||style.visibility==='hidden'||Number(style.opacity||1)===0)return false;
+    }
+    const id=String(selection.getAttribute('data-chatgpt-selection-message-id')||'');
+    if(!id)return false;
+    return [...root.querySelectorAll('[data-dil-message-id]')].some(message=>
+        message.getAttribute('data-dil-message-id')===id
+        &&message.closest('[data-chatgpt-selection-message-id]')===selection
+        &&message.closest('[data-dil-source-message-id]')?.getAttribute('data-dil-source-message-id')===id);
+};
 // Model controls can remain laid out while their advanced panel is inert. Keep
 // this stricter check local to model selection; streaming extraction is unchanged.
 const modelRendered=el=>{

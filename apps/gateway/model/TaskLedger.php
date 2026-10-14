@@ -15,7 +15,7 @@ final class TaskLedger
     private const CLIENT_TRANSPORT_EVENT_LIMIT = 256;
 
     /**
-     * List current turns for the local explicit-stop observer, including completed tool rounds.
+     * List owned turns for explicit-stop observation, including a host timeout after a missed stop.
      * @return list<array> Internal execution rows; never exposed through the console API.
      * @throws GatewayError If the active ledger cannot be read.
      */
@@ -23,17 +23,29 @@ final class TaskLedger
     {
         $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('status', 'IN', self::ACTIVE_TURNS)->select();
         if (!is_array($rows)) throw new GatewayError('storage_unavailable', '停止观察账本暂不可读取。', 503);
+        $unknown = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('status', 'needs_attention')
+            ->where('error_code', 'IN', ['TOOL_OUTCOME_UNKNOWN', 'CODEX_USER_STOP_PENDING'])->select();
+        if (!is_array($unknown)) throw new GatewayError('storage_unavailable', '停止观察的待确认回合暂不可读取。', 503);
+        foreach ($unknown as $row) {
+            // Historical unknown turns may retain large transcripts. Reject retired/replaced
+            // surfaces using metadata before loading an execution for the current stop observer.
+            $surface = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces')->where('id', $row['surface_id'])->find('status');
+            if (is_array($surface) && self::userStopEligible(['task_id'=>$row['task_id'], 'epoch_id'=>$row['epoch_id']], $row, $surface)) {
+                $rows[] = $row;
+            }
+        }
         $executions = [];
         foreach ($rows as $row) {
             if (empty($row['response_id'])) continue;
             $execution = self::execution((string) $row['response_id']);
-            if (self::ownsCurrentGeneration($execution['job'], $execution['turn'])) $executions[] = $execution;
+            if (self::ownsCurrentGeneration($execution['job'], $execution['turn'])
+                && self::userStopEligible($execution['job'], $execution['turn'], $execution['surface'])) $executions[] = $execution;
         }
         return $executions;
     }
 
     /**
-     * Find the exact native turn through synthetic post-compaction response ancestry.
+     * Find the exact native turn through Response ancestry or verified checkpoint derivation.
      * @param array $execution Current durable execution, not an arbitrary session's latest event.
      * @return ?string Native UUID, or null when readable same-task ancestry is unavailable.
      */
@@ -43,10 +55,72 @@ final class TaskLedger
         for ($depth = 0; $depth < 64; $depth++) {
             $id = (string) ($job['turn_id'] ?? '');
             if (CodexCancellation::uuid($id)) return $id;
+            if (str_starts_with($id, 'postcompact_')) {
+                $native = self::checkpointNativeTurn($job);
+                if ($native !== null) return $native;
+            }
             if (!str_starts_with($id, 'postcompact_') || empty($job['previous_response_id'])) return null;
-            $parent = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['previous_response_id'])->find();
+            $parent = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['previous_response_id'])
+                ->find('id,turn_id,previous_response_id,task_id,compaction_epoch');
             if (!is_array($parent) || $parent['task_id'] !== $execution['job']['task_id']) return null;
             $job = $parent;
+        }
+        return null;
+    }
+
+    /**
+     * Reverse only the exact committed checkpoint/hash chain used to derive postcompact IDs.
+     * A full post-checkpoint request has no previous_response_id. Its source epoch, producer,
+     * committed parent turn and derived hash must all agree; a session's latest stop is never used.
+     * @param array $job Internal job metadata from the current owned execution or same-task ancestor.
+     * @return string|null Original native UUID, or null without unambiguous durable proof.
+     */
+    private static function checkpointNativeTurn(array $job): ?string
+    {
+        $taskId = (string) ($job['task_id'] ?? '');
+        $clientTurn = (string) ($job['turn_id'] ?? '');
+        $epoch = (string) ($job['compaction_epoch'] ?? 'base');
+        if ($taskId === '' || $epoch === 'base') return null;
+        $seen = [];
+        while (str_starts_with($clientTurn, 'postcompact_') && !isset($seen[$clientTurn])) {
+            $seen[$clientTurn] = true;
+            $parent = null; $cursor = null;
+            do {
+                $query = SDB(null, 'medoo', 'sqlite')->table('gateway_context_checkpoints')->where('task_id', $taskId)
+                    ->where('state', 'committed')->where('protocol', 'compact_v2');
+                if ($cursor !== null) $query->where('id', '>', $cursor);
+                $checkpoints = $query->order([['id', 'ASC']])->limit(128)
+                    ->select('id,state,protocol,response_id,source_response_id,source_epoch_id,response_json');
+                if (!is_array($checkpoints)) throw new GatewayError('storage_unavailable', '停止观察的检查点关联暂不可读取。', 503);
+                foreach ($checkpoints as $checkpoint) {
+                    $cursor = (string) $checkpoint['id'];
+                    if (!ContextCompaction::matchesCommittedEpoch($checkpoint, $epoch)) continue;
+                    $producer = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $checkpoint['response_id'])
+                        ->find('id,status,operation_kind,task_id,compact_id,durable_turn_id');
+                    if (!is_array($producer) || $producer['task_id'] !== $taskId || $producer['status'] !== 'completed'
+                        || $producer['operation_kind'] !== 'compact_v2' || $producer['compact_id'] !== $checkpoint['id']) continue;
+                    $ids = array_values(array_filter([$checkpoint['response_id'], $checkpoint['source_response_id']]));
+                    $turns = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('task_id', $taskId)
+                        ->where('epoch_id', $checkpoint['source_epoch_id'])->where('status', 'committed')
+                        ->where('response_id', 'IN', $ids)->select('id,client_turn_id,response_id,epoch_id');
+                    if (!is_array($turns)) throw new GatewayError('storage_unavailable', '停止观察的源回合暂不可读取。', 503);
+                    foreach ($turns as $turn) {
+                        $producerOwns = $producer['durable_turn_id'] === $turn['id'] && $turn['response_id'] === $producer['id'];
+                        if (!$producerOwns && $turn['response_id'] !== $checkpoint['source_response_id']) continue;
+                        $derived = 'postcompact_' . substr(hash('sha256', (string) $turn['client_turn_id'] . "\0" . $checkpoint['id']), 0, 32);
+                        if (!hash_equals($derived, $clientTurn)) continue;
+                        if ($parent !== null && $parent['id'] !== $turn['id']) return null;
+                        $parent = $turn;
+                    }
+                }
+            } while ($parent === null && count($checkpoints) === 128);
+            if ($parent === null) return null;
+            $clientTurn = (string) $parent['client_turn_id'];
+            if (CodexCancellation::uuid($clientTurn)) return $clientTurn;
+            $parentEpoch = SDB(null, 'medoo', 'sqlite')->table('gateway_task_epochs')->where('id', $parent['epoch_id'])
+                ->where('task_id', $taskId)->find('compaction_epoch');
+            if (!is_array($parentEpoch)) return null;
+            $epoch = (string) $parentEpoch['compaction_epoch'];
         }
         return null;
     }
@@ -61,7 +135,7 @@ final class TaskLedger
     {
         return Schema::transaction(static function () use ($responseId, $evidence): bool {
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
-            if (!self::ownsCurrentGeneration($job, $turn) || !in_array($turn['status'], self::ACTIVE_TURNS, true)) return false;
+            if (!self::ownsCurrentGeneration($job, $turn) || !self::userStopEligible($job, $turn, $surface)) return false;
             $nativeTurn = self::cancellationNativeTurn(['job' => $job, 'turn' => $turn]);
             if ($nativeTurn === null || ($evidence['turn_id'] ?? '') !== $nativeTurn
                 || ($evidence['reason'] ?? '') !== 'interrupted' || !is_int($evidence['interrupted_at'] ?? null)
@@ -69,7 +143,7 @@ final class TaskLedger
             if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') return true;
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $turn['id'])
                 ->where('response_id', $responseId)->where('generation_id', $turn['generation_id'])
-                ->where('status', 'IN', self::ACTIVE_TURNS)->update(['error_code' => 'CODEX_USER_STOP_PENDING', 'updated_at' => time()]);
+                ->where('status', $turn['status'])->update(['error_code' => 'CODEX_USER_STOP_PENDING', 'updated_at' => time()]);
             if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '手动停止意图无法保存。', 503);
             ToolBroker::revokeTaskUnlocked((string) $turn['task_id'], 'codex_user_interrupted');
             self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'],
@@ -87,7 +161,7 @@ final class TaskLedger
     {
         $actual = self::execution((string) $expected['job']['id']);
         if (!self::ownsCurrentGeneration($actual['job'], $actual['turn'])
-            || !in_array($actual['turn']['status'], self::ACTIVE_TURNS, true)
+            || !self::userStopEligible($actual['job'], $actual['turn'], $actual['surface'])
             || ($actual['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_PENDING') return false;
         foreach (['id', 'generation_id', 'surface_id', 'response_id'] as $key) {
             if ($actual['turn'][$key] !== $expected['turn'][$key]) return false;
@@ -96,6 +170,21 @@ final class TaskLedger
             if ($actual['surface'][$key] !== $expected['surface'][$key]) return false;
         }
         return true;
+    }
+
+    /**
+     * Keep unknown host effects reviewable while permitting an exact native interruption to stop its page.
+     * Only the current unretired epoch's TOOL_OUTCOME_UNKNOWN branch is added; other failures,
+     * ordinary disconnects, retired pages and unrelated tasks keep their previous behavior.
+     */
+    private static function userStopEligible(array $job, array $turn, array $surface): bool
+    {
+        if (in_array($turn['status'], self::ACTIVE_TURNS, true)) return true;
+        if ($turn['status'] !== 'needs_attention'
+            || !in_array($turn['error_code'] ?? '', ['TOOL_OUTCOME_UNKNOWN', 'CODEX_USER_STOP_PENDING'], true)
+            || ($surface['status'] ?? '') === 'retired') return false;
+        $task = SDB(null, 'medoo', 'sqlite')->table('gateway_tasks')->where('id', $job['task_id'])->find('current_epoch_id');
+        return is_array($task) && ($task['current_epoch_id'] ?? null) === $job['epoch_id'];
     }
 
     /**
@@ -1896,6 +1985,30 @@ final class TaskLedger
     public static function execution(string $responseId): array
     {
         $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find();
+        return self::executionLedger($job);
+    }
+
+    /**
+     * Read the same fresh turn/surface fence as execution(), excluding large response payloads.
+     * @param string $responseId Logical Responses round being observed by the browser worker.
+     * @return array{job:array,turn:array,surface:array} Current metadata; never a cached ownership proof.
+     * @throws GatewayError If the response, turn or surface cannot be read.
+     */
+    public static function pollExecution(string $responseId): array
+    {
+        try {
+            $job = ResponseJob::pollState($responseId);
+        } catch (GatewayError $error) {
+            if ($error->errorCode !== 'response_not_found') throw $error;
+            // Preserve execution()'s missing-ledger diagnostic for browser observations.
+            throw new GatewayError('task_ledger_missing', 'Response 尚未绑定持久任务账本。', 503);
+        }
+        return self::executionLedger($job);
+    }
+
+    /** Resolve the existing turn and surface validation for either full or metadata-only job reads. */
+    private static function executionLedger(array|false|null $job): array
+    {
         if (!is_array($job) || empty($job['durable_turn_id']) || empty($job['surface_id'])) {
             throw new GatewayError('task_ledger_missing', 'Response 尚未绑定持久任务账本。', 503);
         }

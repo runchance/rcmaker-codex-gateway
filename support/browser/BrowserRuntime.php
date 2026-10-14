@@ -5453,7 +5453,8 @@ JS;
     /**
      * Observe the owned page and deliver durable native calls before settling or recovering it.
      * Explicit failed streams retain active work until receipts drain; UI disconnection alone
-     * never authorizes completion or replay of a running generation.
+     * never authorizes completion or replay of a running generation. Unchanged polls read
+     * fresh ledger metadata; full context is loaded only when adopting or settling a round.
      * @param string $responseId Physical observer key, mapped to the current logical response.
      * @return void
      */
@@ -5468,7 +5469,7 @@ JS;
         }
         try {
             $logicalResponseId = (string) ($turn['logical_response_id'] ?? $responseId);
-            $ledger = TaskLedger::execution($logicalResponseId);
+            $ledger = TaskLedger::pollExecution($logicalResponseId);
             if ((string) ($ledger['turn']['response_id'] ?? '') !== $logicalResponseId
                 && (string) ($ledger['turn']['surface_id'] ?? '') !== (string) ($turn['surface_id'] ?? '')) {
                 // This also fences turns without an MCP binding: the user replaced
@@ -5498,7 +5499,7 @@ JS;
                 if ((string) $next['status'] === 'queued') ResponseJob::start($currentResponse);
                 $this->chatGptTurns[$responseId]['logical_response_id'] = $currentResponse;
                 $this->chatGptTurns[$responseId]['operation_kind'] = (string) ($next['operation_kind'] ?? 'response');
-                $renewedTurn = TaskLedger::execution($currentResponse)['turn'];
+                $renewedTurn = TaskLedger::pollExecution($currentResponse)['turn'];
                 $this->chatGptTurns[$responseId]['deadline'] = (float)$renewedTurn['deadline_at'];
                 $this->chatGptTurns[$responseId]['emitted'] = (string) ($next['output_text'] ?? '');
                 $this->chatGptTurns[$responseId]['draft_emitted'] = ResponseJob::draftText($currentResponse);
@@ -5524,7 +5525,7 @@ JS;
         }
         $logicalResponseId = (string) ($turn['logical_response_id'] ?? $responseId);
         try {
-            $ledger = TaskLedger::execution($logicalResponseId);
+            $ledger = TaskLedger::pollExecution($logicalResponseId);
             // Tool receipts and verified same-page continuations each begin a
             // bounded new generation. Use its durable deadline before deciding
             // that the browser has timed out; the worker's cached value may predate
@@ -5804,16 +5805,16 @@ JS;
             }
             $this->chatGptTurns[$responseId]['artifact_observed_candidates'] = $observedArtifacts;
             try {
-                $logicalJob = ResponseJob::execution($logicalResponseId);
+                $logicalJob = ResponseJob::pollState($logicalResponseId);
                 $activeCompact = ($logicalJob['operation_kind'] ?? 'response') !== 'response'
                     && !empty($logicalJob['previous_response_id']);
-                if ((string) $logicalJob['status'] === 'completed' && (string) $logicalJob['round_kind'] === 'tool_call') {
-                    $this->scheduleTaskPoll($responseId, 0.10);
-                    return;
-                }
+                $invocations = ToolBroker::invocationsForResponse($logicalResponseId);
+                $nativeToolBoundary = ($logicalJob['operation_kind'] ?? 'response') === 'response'
+                    && ($invocations !== [] || ((string) $logicalJob['status'] === 'completed'
+                        && (string) $logicalJob['round_kind'] === 'tool_call'));
                 $progress = ChatGptTransport::settledCommentary(
                     (array) ($this->chatGptTurns[$responseId]['observed_commentary'] ?? []),
-                    (array) ($snapshot['commentary_blocks'] ?? []), $now
+                    (array) ($snapshot['commentary_blocks'] ?? []), $now, $nativeToolBoundary
                 );
                 $this->chatGptTurns[$responseId]['observed_commentary'] = $progress['observed'];
                 $publicSummaries = [];
@@ -5826,15 +5827,37 @@ JS;
                 }
                 foreach ($progress['ready'] as $key => $text) {
                     if (isset($this->chatGptTurns[$responseId]['emitted_commentary'][$key])) continue;
-                    $this->chatGptTurns[$responseId]['emitted_commentary'][$key] = true;
-                    $reasoning = isset($publicSummaries[$key]);
-                    $textHash = hash('sha256', ($reasoning ? 'reasoning' : 'commentary') . "\0" . $text);
-                    if (isset($this->chatGptTurns[$responseId]['emitted_commentary_text'][$textHash])) continue;
-                    if ($reasoning) ResponseJob::appendReasoningSummary($logicalResponseId, $text, $key);
-                    else ResponseJob::appendCommentary($logicalResponseId, $text, $key);
-                    $this->chatGptTurns[$responseId]['emitted_commentary_text'][$textHash] = true;
+                    if (($logicalJob['operation_kind'] ?? 'response') !== 'response') continue;
+                    // Keep settled public blocks across native tool execution. The completed
+                    // response is immutable; its next running round can publish these even
+                    // when the Web renderer remounts them before Codex returns its receipts.
+                    $pending = (array) ($this->chatGptTurns[$responseId]['pending_commentary'] ?? []);
+                    if (!isset($pending[$key]) && count($pending) >= 128) continue;
+                    $this->chatGptTurns[$responseId]['pending_commentary'][$key] = [
+                        'text' => $text, 'reasoning' => isset($publicSummaries[$key]),
+                    ];
                 }
-                $invocations = ToolBroker::invocationsForResponse($logicalResponseId);
+                if ((string) $logicalJob['status'] === 'completed' && (string) $logicalJob['round_kind'] === 'tool_call') {
+                    $this->scheduleTaskPoll($responseId, 0.10);
+                    return;
+                }
+                foreach ((array) ($this->chatGptTurns[$responseId]['pending_commentary'] ?? []) as $key => $block) {
+                    if ($logicalJob['status'] !== 'running' || ($logicalJob['operation_kind'] ?? 'response') !== 'response') break;
+                    $text = $block['text'];
+                    $reasoning = $block['reasoning'];
+                    $textHash = hash('sha256', ($reasoning ? 'reasoning' : 'commentary') . "\0" . $text);
+                    if (!isset($this->chatGptTurns[$responseId]['emitted_commentary_text'][$textHash])) {
+                        $accepted = $reasoning
+                            ? ResponseJob::appendReasoningSummary($logicalResponseId, $text, $key)
+                            : ResponseJob::appendCommentary($logicalResponseId, $text, $key);
+                        // A concurrent stop or round change must not mark unpublished prose
+                        // as delivered. The next valid poll retains its pending observation.
+                        if (!$accepted) continue;
+                    }
+                    $this->chatGptTurns[$responseId]['emitted_commentary'][$key] = true;
+                    $this->chatGptTurns[$responseId]['emitted_commentary_text'][$textHash] = true;
+                    unset($this->chatGptTurns[$responseId]['pending_commentary'][$key]);
+                }
                 if ($invocations !== []) {
                     $batchSignature = hash('sha256', json_encode(array_column($invocations, 'id'), JSON_THROW_ON_ERROR));
                     $pendingBoundaryId = $this->chatGptTurns[$responseId]['tool_boundary_pending_id'] ?? null;
@@ -5853,6 +5876,22 @@ JS;
                         return;
                     }
                     if ($now - (float) ($this->chatGptTurns[$responseId]['tool_boundary_pending_at'] ?? 0.0) < 0.15) {
+                        $this->scheduleTaskPoll($responseId, 0.05);
+                        return;
+                    }
+                    // The latest phase may have no following rendered status. Its exact
+                    // registered host call supplies a boundary, but still require the same
+                    // half-second unchanged-text evidence before sealing the tool response.
+                    // This grace is bounded: a continuously changing renderer cannot block tools.
+                    $waitingForProse = false;
+                    foreach (array_slice((array) ($snapshot['commentary_blocks'] ?? []), -128) as $block) {
+                        if (!is_array($block) || empty($block['public_prose']) || !empty($block['complete'])
+                            || !empty($block['public_summary']) || !empty($block['public_status'])) continue;
+                        $key = (string) ($block['key'] ?? ''); $text = (string) ($block['text'] ?? '');
+                        if ($key !== '' && $text !== '' && !isset($this->chatGptTurns[$responseId]['emitted_commentary'][
+                            $key . ':' . substr(hash('sha256', $text), 0, 16)])) { $waitingForProse = true; break; }
+                    }
+                    if ($waitingForProse && $now - (float) $this->chatGptTurns[$responseId]['tool_boundary_pending_at'] < 0.75) {
                         $this->scheduleTaskPoll($responseId, 0.05);
                         return;
                     }

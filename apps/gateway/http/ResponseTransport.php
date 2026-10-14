@@ -102,7 +102,7 @@ final class ResponseTransport
     }
 
     /**
-     * Wait for one durable JSON terminal while tracking disconnects without cancelling the job.
+     * Poll metadata until a JSON terminal needs decoding, without cancelling on disconnect.
      * @param TcpConnection $connection Current local HTTP subscriber.
      * @param string $responseId Durable response to await or reconnect.
      * @return void
@@ -119,6 +119,8 @@ final class ResponseTransport
                 return;
             }
             try {
+                $state = ResponseJob::pollState($responseId);
+                if (!in_array($state['status'], ['completed', 'failed'], true)) return;
                 $job = ResponseJob::get($responseId);
                 if (($job['status'] ?? '') === 'completed' && is_array($job['response'] ?? null)) {
                     $detach(true);

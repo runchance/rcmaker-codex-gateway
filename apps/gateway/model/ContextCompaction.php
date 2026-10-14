@@ -171,6 +171,20 @@ final class ContextCompaction
         return $spec;
     }
 
+    /**
+     * Verify the stored committed checkpoint item against its resumed epoch hash.
+     * Stop detection uses this alongside exact task/source/derived-turn proofs; the hash
+     * alone never authorizes cancellation or changes the compaction admission flow.
+     * @param array $checkpoint Owned ledger checkpoint, including its original response_json.
+     * @param string $epoch Hash recorded by the resumed job, not a guessed current epoch.
+     * @return bool Whether the committed v2 envelope is exactly the one consumed by this epoch.
+     */
+    public static function matchesCommittedEpoch(array $checkpoint, string $epoch): bool
+    {
+        return ($checkpoint['state'] ?? '') === 'committed' && ($checkpoint['protocol'] ?? '') === 'compact_v2'
+            && self::checkpointMatchesEpoch($checkpoint, $epoch);
+    }
+
     /** The native client may reorder the three fields of our exact checkpoint item. */
     private static function checkpointMatchesEpoch(array $checkpoint, string $epoch): bool
     {

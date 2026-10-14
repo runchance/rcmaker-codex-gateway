@@ -1071,13 +1071,18 @@ final class ToolBroker
             ? $patch : $input;
     }
 
-    /** Browser-worker view of every registered invocation for one still-running Responses round. */
+    /**
+     * Read registered calls for a live round, checking job status without loading its transcript.
+     * @param string $responseId Current logical round whose binding/catalog authorizes these calls.
+     * @return array Registered calls in durable order; terminal or unbound rounds return no calls.
+     * @throws GatewayError If the batch cannot be read or its registered tool is no longer allowed.
+     */
     public static function invocationsForResponse(string $responseId): array
     {
         Schema::initialize();
         $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
         if (!is_array($binding) || (string) $binding['status'] !== 'running') return [];
-        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find();
+        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find('status');
         if (!is_array($job) || !in_array((string) $job['status'], ['queued', 'running'], true)) return [];
         $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
             ->where('binding_id', (string) $binding['id'])->where('response_id', $responseId)
@@ -1817,9 +1822,14 @@ final class ToolBroker
         ];
     }
 
+    /**
+     * Resolve fresh native-round ownership without loading the binding's tool/context payloads.
+     * @param string $turnId Physical durable task-turn identifier.
+     * @return string|null Current native Responses ID, or null without a bound round.
+     */
     public static function currentResponseForTurn(string $turnId): ?string
     {
-        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('turn_id', $turnId)->find();
+        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('turn_id', $turnId)->find('current_response_id');
         if (!is_array($binding) || (string) ($binding['current_response_id'] ?? '') === '') return null;
         return (string) $binding['current_response_id'];
     }
@@ -2408,7 +2418,7 @@ final class ToolBroker
     {
         $responseId = (string)($binding['current_response_id'] ?? '');
         $db = SDB(null, 'medoo', 'sqlite');
-        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
+        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('budget_json');
         $budget = is_array($job) ? json_decode((string)($job['budget_json'] ?? ''), true) : [];
         if (empty($budget['original_context_required'])) return false;
         $archiveHash = (string)($budget['original_context_sha256'] ?? '');
