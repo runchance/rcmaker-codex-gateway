@@ -436,7 +436,9 @@ JS);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
-const witness=expected.tokens.length?expected.tokens.some(token=>String(latest?.innerText||latest?.textContent||'').includes(token))
+// A long user bubble may hide its tail when collapsed. Its exact transport witness
+// can remain in textContent even though innerText omits it; never search older turns.
+const witness=expected.tokens.length?expected.tokens.some(token=>[latest?.innerText,latest?.textContent].some(text=>String(text||'').includes(token)))
     :!!identity&&!expected.users.includes(identity);
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
 const temporary=sameOrigin&&temporaryChatPage(location.pathname,location.search);

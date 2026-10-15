@@ -1603,19 +1603,26 @@ final class TaskLedger
     }
 
     /**
-     * Record a delayed renderer observation without ending or extending the submitted turn.
-     * @param string $responseId Existing logical round. @return void
+     * Record a delayed renderer observation without ending or extending the owned turn.
+     * @param string $responseId Existing logical round. @param string $phase Observation stage.
+     * @param array $observation Allow-listed stop readiness flags, never page text or tokens.
+     * @return void
      * @throws GatewayError When the durable job/ledger is unavailable.
      */
-    public static function observationDelayed(string $responseId, string $phase = 'response'): void
+    public static function observationDelayed(string $responseId, string $phase = 'response', array $observation = []): void
     {
-        Schema::transaction(static function () use ($responseId, $phase): void {
+        Schema::transaction(static function () use ($responseId, $phase, $observation): void {
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             if (!self::ownsCurrentGeneration($job, $turn)) return;
-            if ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true)) return;
+            $steering = $phase === 'steering_stop' && SteeringContext::isDelta($job) && $turn['status'] === 'queued';
+            if (!$steering && ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true))) return;
+            $data = ['deadline_at' => (int) $turn['deadline_at'],
+                'phase' => $steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response')];
+            if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed'] as $key) {
+                $data[$key] = isset($observation[$key]) ? (bool) $observation[$key] : null;
+            }
             self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'],
-                'browser_observation_delayed', ['deadline_at' => (int) $turn['deadline_at'],
-                    'phase' => $phase === 'send_confirmation' ? 'send_confirmation' : 'response']);
+                'browser_observation_delayed', $data);
         });
     }
 

@@ -11,6 +11,7 @@ use app\gateway\model\AttachmentStore;
 use app\gateway\model\AdapterCapabilities;
 use app\gateway\model\ConnectorState;
 use app\gateway\model\ContextCompaction;
+use app\gateway\model\ContextHistory;
 use app\gateway\model\CodexCancellation;
 use app\gateway\model\GatewayError;
 use app\gateway\model\GatewaySettings;
@@ -3141,7 +3142,11 @@ JS;
             }, 3.0);
     }
 
-    /** Stop the proven source generation, observe idle twice, then submit a new user message on this page. */
+    /**
+     * Stop the proven source, observe idle twice, then submit the incremental user message.
+     * A slow stop observation retains this document until the existing durable deadline;
+     * only positively invalid/lost page evidence permits full-context recovery.
+     */
     private function prepareSteeringSurface(string $responseId, int $commandId, string $sessionId,
         float $deadline, bool $clicked = false, ?float $idleSince = null): void
     {
@@ -3178,8 +3183,24 @@ JS;
                         $idleSince ??= microtime(true);
                     } else $idleSince = null;
                 } else $idleSince = null;
-                if (microtime(true) >= $deadline || !empty($state['page_invalid'])) {
+                if (!empty($state['page_invalid'])) {
                     if ($this->recoverSteeringPreparation($responseId, $sessionId)) return;
+                }
+                if (microtime(true) >= $deadline) {
+                    $ledger = TaskLedger::execution($responseId);
+                    $targets = $this->discoverTargetsIfAvailable((int)(BrowserState::state()['debug_port'] ?? 0));
+                    if (is_array($targets) && !isset($targets[(string)$ledger['surface']['target_id']])
+                        && $this->recoverSteeringPreparation($responseId, $sessionId)) return;
+                    if (microtime(true) < (float)$ledger['turn']['deadline_at']) {
+                        // Missing DOM evidence is not a missing page. Keep the bounded
+                        // original deadline and expose why the stop could not be confirmed.
+                        TaskLedger::observationDelayed($responseId, 'steering_stop', (array)$state + [
+                            'stop_clicked'=>$clicked, 'observation_failed'=>$error !== null || !is_array($state)]);
+                        $deadline = min((float)$ledger['turn']['deadline_at'], microtime(true) + 30.0);
+                        Timer::add(0.25, fn() => $this->prepareSteeringSurface($responseId, $commandId, $sessionId,
+                            $deadline, $clicked, $idleSince), null, false);
+                        return;
+                    }
                     $this->taskFailTurn($responseId, 'steering_stop_unconfirmed', '未能确认插话原页已停止且历史仍在；未发送新消息或全量重发。', true);
                     $this->releaseSteeringPreparation($responseId, $sessionId);
                     return;
@@ -5743,6 +5764,7 @@ JS;
                 $this->chatGptTurns[$responseId]['completion_fence_signature'] = null;
                 $this->chatGptTurns[$responseId]['settle_text'] = null;
                 $this->chatGptTurns[$responseId]['settle_at'] = 0.0;
+                unset($this->chatGptTurns[$responseId]['pending_steering_stop']);
                 $turn = $this->chatGptTurns[$responseId];
             }
         } catch (GatewayError $error) {
@@ -5832,6 +5854,11 @@ JS;
             // checkpoint. Its plaintext token cannot be recovered or reissued.
             $this->taskFailTurn($responseId, 'compaction_handoff_outcome_unknown',
                 '摘要交接的原页面发送结果未知，不能再次提交；原上下文仍保留。', true);
+            return;
+        }
+        try { if ($this->stopForPendingSteering($responseId, $ledger)) return; }
+        catch (GatewayError $error) {
+            $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
             return;
         }
         $toolCapable = !empty($this->chatGptTurns[$responseId]['tool_capable']);
@@ -6241,7 +6268,11 @@ JS;
             $streamCompletion = $toolCapable ? ToolBroker::completionForResponse($logicalResponseId) : null;
             $canStream = $toolCapable ? ChatGptTransport::canStreamDraft($streamCompletion)
                 : ChatGptTransport::canStreamAnswer($streamCompletion);
-            if (!$activeCompact && $canStream && $stable !== null && !empty($snapshot['generation_running'])) {
+            // Both fresh summaries and retained handoffs are atomic checkpoint output.
+            // In-progress Markdown can change as lists/tables finish rendering; none of it
+            // has been streamed to Codex and it must not become an immutable text prefix.
+            if (($logicalJob['operation_kind'] ?? 'response') === 'response'
+                && $canStream && $stable !== null && !empty($snapshot['generation_running'])) {
                 if (!empty($logicalJob['checkpoint_marker'])) {
                     $stable = \app\gateway\model\LunaCheckpoint::visible($stable, $logicalJob['checkpoint_marker']);
                 }
@@ -7215,7 +7246,84 @@ JS;
         if (isset($this->chatGptTurns[$responseId])) Timer::add($delay, fn() => $this->pollTaskTurn($responseId), null, false);
     }
 
-    /** Deliver a registered host call after repeated DOM failures, retaining the last observed text boundary. */
+    /**
+     * Stop Web generation promptly for a queued human update while accepted host calls drain.
+     * This keeps the observer and capability alive, delivers already registered calls, and
+     * leaves exact results to the existing receipt/steering transaction. It never completes
+     * the old answer, revokes tools, or submits the new instruction before that transaction.
+     * @param string $responseId Physical source observer, whose prompt was actually submitted.
+     * @param array $ledger Fresh logical job and owned surface metadata.
+     * @return bool Whether this poll is reserved for draining the pending human update.
+     */
+    private function stopForPendingSteering(string $responseId, array $ledger): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || empty($turn['tool_capable'])
+            || ($ledger['job']['operation_kind'] ?? 'response') !== 'response'
+            || $ledger['turn']['response_id'] !== $ledger['job']['id']) return false;
+        $state = $turn['pending_steering_stop'] ?? ['checked_at'=>0.0, 'pending'=>false, 'clicked'=>false];
+        $now = microtime(true);
+        if ($now - $state['checked_at'] >= 1.0) {
+            $updates = TaskLedger::pendingOperationalContextUnlocked($ledger['job']);
+            $state['pending'] = false;
+            foreach ($updates['messages'] as $message) {
+                if (($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message)) {
+                    $state['pending'] = true;
+                    break;
+                }
+            }
+            $state['checked_at'] = $now;
+            if (!$state['pending']) $state['clicked'] = false;
+            $this->chatGptTurns[$responseId]['pending_steering_stop'] = $state;
+        }
+        if (!$state['pending']) return false;
+        // The page's Stop button affects its generator, not the native invocation ledger.
+        // Registered calls remain deliverable even after the Web stream disconnects.
+        $this->deliverPendingToolWithoutSnapshot($responseId);
+        if ($state['clicked']) {
+            $this->scheduleTaskPoll($responseId, 0.25);
+            return true;
+        }
+        $physical = ResponseJob::execution($responseId);
+        if (empty($physical['submitted_document_nonce'])
+            || $physical['submitted_document_nonce'] !== $ledger['surface']['document_nonce']) {
+            $this->scheduleTaskPoll($responseId, 0.25);
+            return true;
+        }
+        preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string)$physical['prompt'], $tokens);
+        $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$physical['prompt']];
+        if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
+        $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses, [], true, true),
+            function ($error, $snapshot) use ($responseId, $ledger): void {
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($turn)) return;
+                if (($turn['logical_response_id'] ?? $responseId) !== $ledger['job']['id']) {
+                    $this->scheduleTaskPoll($responseId, 0.25);
+                    return;
+                }
+                try { $fresh = TaskLedger::pollExecution((string)$ledger['job']['id']); }
+                catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    return;
+                }
+                if ($fresh['turn']['response_id'] !== $ledger['job']['id']
+                    || $fresh['turn']['generation_id'] !== $ledger['turn']['generation_id']
+                    || $fresh['surface']['document_nonce'] !== $ledger['surface']['document_nonce']
+                    || $fresh['surface']['fencing_version'] !== $ledger['surface']['fencing_version']) {
+                    // A native receipt can advance the logical round during this CDP call.
+                    // Let the normal poll adopt/fence it, without accepting this stale stop.
+                    $this->scheduleTaskPoll($responseId, 0.25);
+                    return;
+                }
+                if ($error === null && is_array($snapshot) && !empty($snapshot['owned']) && !empty($snapshot['stopped'])) {
+                    $this->chatGptTurns[$responseId]['pending_steering_stop']['clicked'] = true;
+                }
+                $this->scheduleTaskPoll($responseId, 0.25);
+            }, 3.0);
+        return true;
+    }
+
+    /** Deliver a registered host call during steering or DOM failure, retaining its observed text boundary. */
     private function deliverPendingToolWithoutSnapshot(string $responseId): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;

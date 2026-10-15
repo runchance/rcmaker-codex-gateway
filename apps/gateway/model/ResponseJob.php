@@ -879,13 +879,16 @@ final class ResponseJob
         return $draft === null ? '' : (string)($draft[1]['content'][0]['text'] ?? '');
     }
 
-    /** Append one irrevocable Markdown prefix delta, retaining the published output index on recovery. */
+    /**
+     * Append an ordinary response's irrevocable Markdown prefix, preserving its output index.
+     * Checkpoints publish only their final envelope; partial page text is never a wire prefix.
+     */
     public static function appendText(string $responseId, string $delta): void
     {
         if ($delta === '') return;
         Schema::transaction(function () use ($responseId, $delta): void {
             $job = self::row($responseId);
-            if ($job['status'] !== 'running') return;
+            if ($job['status'] !== 'running' || ($job['operation_kind'] ?? 'response') !== 'response') return;
             $output = self::streamOutput($job);
             $outputIndex = self::textOutputIndex($job, $output);
             $events = [];
@@ -894,7 +897,6 @@ final class ResponseJob
                 $job['output_started'] = 1;
             }
             $events[] = ResponsesProtocol::deltaEvent((string) $job['item_id'], $delta, $outputIndex);
-            if (($job['operation_kind'] ?? 'response') !== 'response') $events = [];
             self::appendEventsUnlocked($job, $events);
             $text = (string) $job['output_text'] . $delta;
             $output[$outputIndex] = ResponsesProtocol::messageItem((string) $job['item_id'], 'in_progress', $text);
@@ -908,7 +910,11 @@ final class ResponseJob
         TaskLedger::renewOnVisibleProgress($responseId);
     }
 
-    /** Complete with a final Markdown snapshot. Already streamed text must remain an exact prefix. */
+    /**
+     * Commit a final page snapshot. Ordinary streamed text must remain an exact prefix.
+     * Fresh checkpoints in older databases may contain private drafts without text events;
+     * validate and commit their final summary atomically instead of treating drafts as output.
+     */
     public static function complete(string $responseId, string $finalText): void
     {
         self::finishDraftText($responseId);
@@ -932,7 +938,7 @@ final class ResponseJob
                 if ((string) $job['output_text'] !== '' || (int) $job['output_started'] !== 0) {
                     throw new GatewayError('compaction_stream_conflict', '压缩交接之前已经提交了正文，未替换原上下文。', 409);
                 }
-            } else {
+            } elseif (($job['operation_kind'] ?? 'response') === 'response') {
                 $emitted = (string) $job['output_text'];
                 if (!str_starts_with($finalText, $emitted)) {
                     throw new GatewayError('response_changed_after_stream', 'ChatGPT 修改了已经流式提交的文本，已拒绝伪造一致结果。', 502);

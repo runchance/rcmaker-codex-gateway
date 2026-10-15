@@ -758,7 +758,7 @@ final class ToolBroker
         ]];
     }
 
-    /** A rebuilt page may audit completed host work without claiming a new Connector start. */
+    /** A recovery or steering page may acknowledge settled work without another Connector start. */
     public static function recoveredReceiptOwnerReadyForResponse(string $responseId): bool
     {
         $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')
@@ -766,19 +766,37 @@ final class ToolBroker
         return is_array($binding) && self::recoveredReceiptOwnerReady($binding);
     }
 
-    /** Accept a submitted recovery page only with exact delivered receipts and a matching recovery event. */
+    /**
+     * Accept a submitted recovery/steering page only with exact receipts and its rotation event.
+     * A retained steering suffix inherits already delivered history from its proven document;
+     * a replacement page must contain those receipts in the physical context it received.
+     */
     private static function recoveredReceiptOwnerReady(array $binding): bool
     {
         if ($binding['status'] !== 'awaiting_start' || $binding['sent_at'] === null
             || $binding['started_at'] !== null || self::invocationCountUnlocked((string)$binding['id']) === 0) return false;
         $db = SDB(null, 'medoo', 'sqlite');
         $job = $db->table('gateway_response_jobs')->where('id', $binding['current_response_id'])->find();
-        if (!is_array($job) || $job['status'] !== 'running' || !self::hasCompleteReceiptHistory($binding, $job)) return false;
+        if (!is_array($job) || $job['status'] !== 'running' || $job['mcp_binding_id'] !== $binding['id']) return false;
+        $receiptJob = $job;
+        if (SteeringContext::isDelta($job)) {
+            $surface = $db->table('gateway_browser_surfaces')->where('id', $job['surface_id'])->find();
+            if (!is_array($surface) || !SteeringContext::retained($job, $surface)) return false;
+            $receiptJob['transport_context_json'] = $job['context_json'];
+        }
+        if (!self::hasCompleteReceiptHistory($binding, $receiptJob)) return false;
         $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
             ->where('response_id', $binding['current_response_id'])
-            ->where('event_type', 'connector_no_start_retry_prepared')->select('data_json');
+            ->where('event_type', 'IN', ['connector_no_start_retry_prepared',
+                'mcp_steering_restart_prepared', 'mcp_mailbox_context_restart_prepared'])->select('event_type,data_json');
         foreach (is_array($events) ? $events : [] as $event) {
             $data = json_decode((string)$event['data_json'], true);
+            if (in_array($event['event_type'], ['mcp_steering_restart_prepared', 'mcp_mailbox_context_restart_prepared'], true)) {
+                if (($data['binding_id'] ?? '') === $binding['id']
+                    && !empty($job['previous_response_id'])
+                    && ($data['previous_response_id'] ?? '') === $job['previous_response_id']) return true;
+                continue;
+            }
             // These page replacements all use the same receipt-verified recovery transaction.
             // A final based on its preserved results need not start another MCP call.
             if (in_array($data['cause'] ?? '', [
