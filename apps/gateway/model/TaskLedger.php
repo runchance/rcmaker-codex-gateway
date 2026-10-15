@@ -2172,7 +2172,7 @@ final class TaskLedger
      * This observation never changes a deadline, receipt, retry, capability or completion state.
      * @param string $responseId Current logical response owning the exact browser document.
      * @param string $state Upload boundary, stream HTTP/failure/recovery or terminal observation.
-     * @param array $metadata Bounded protocol/error/timing facts; no URL, headers or response body.
+     * @param array $metadata Bounded timing/protocol facts and validated server IDs; no raw headers/body.
      * @param string $incarnation Browser worker owning the observed surface.
      * @param int $fence Exact surface ownership fence.
      * @param string $documentNonce Exact document identity at the time of observation.
@@ -2192,13 +2192,14 @@ final class TaskLedger
             'completion_action_visible','content_present','transport_recovery_visible','transport_failed',
             'transport_settled','ui_receipts_settled','request_finished','fence_drained',
             'source_receipt_present','has_artifacts','stopped_thinking_visible','network_retry_available','connection_reused',
-            'upload_pending','upload_error','duplicate'] as $key) {
+            'upload_pending','upload_error','duplicate','from_service_worker','from_disk_cache'] as $key) {
             if (is_bool($metadata[$key] ?? null)) $facts[$key] = $metadata[$key];
         }
         if (is_int($metadata['elapsed_ms'] ?? null)) $facts['elapsed_ms'] = max(0, min(86400000, $metadata['elapsed_ms']));
         foreach (['answer_root_count','commentary_root_count','markdown_chars','visible_chars','candidate_age_ms','mcp_revision',
             'tool_invocations_pending','tool_receipts_pending','mcp_activities_pending',
             'request_bytes','received_bytes','encoded_bytes','data_events','last_data_age_ms',
+            'browser_elapsed_ms','browser_last_data_age_ms','response_headers_ms','retry_after_seconds',
             'expected_count','matched_count','wait_budget_ms'] as $key) {
             if (is_int($metadata[$key] ?? null)) $facts[$key] = max(0, min(2147483647, $metadata[$key]));
         }
@@ -2219,6 +2220,11 @@ final class TaskLedger
         if (is_string($requestFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $requestFingerprint) === 1) $facts['request_fingerprint'] = $requestFingerprint;
         $responseFingerprint = $metadata['response_fingerprint'] ?? null;
         if (is_string($responseFingerprint) && preg_match('/\A[a-f0-9]{64}\z/D', $responseFingerprint) === 1) $facts['response_fingerprint'] = $responseFingerprint;
+        foreach (['edge_trace_id' => '/\A[a-f0-9]{16,32}-[A-Z]{3}\z/D',
+            'upstream_request_id' => '/\A(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\z/iD'] as $key => $pattern) {
+            if (is_string($metadata[$key] ?? null) && strlen($metadata[$key]) <= 64
+                && preg_match($pattern, $metadata[$key]) === 1) $facts[$key] = $metadata[$key];
+        }
         return Schema::transaction(function () use ($responseId, $facts, $incarnation, $fence, $documentNonce, $uploadObservation): bool {
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             // Closing an immutable tool-call Response does not close the browser turn. Keep

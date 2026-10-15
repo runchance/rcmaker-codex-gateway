@@ -76,6 +76,8 @@ final class DiagnosticExport
         'expected_count', 'matched_count', 'wait_budget_ms', 'upload_pending', 'upload_error', 'duplicate',
         'tool_invocations_pending', 'tool_receipts_pending', 'mcp_activities_pending',
         'received_bytes', 'encoded_bytes', 'data_events', 'last_data_age_ms', 'connection_reused',
+        'browser_elapsed_ms', 'browser_last_data_age_ms', 'response_headers_ms', 'retry_after_seconds',
+        'edge_trace_id', 'upstream_request_id', 'from_service_worker', 'from_disk_cache',
         'lock_wait_ms', 'memory_peak_bytes',
     ];
 

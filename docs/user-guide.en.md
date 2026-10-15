@@ -482,6 +482,11 @@ request duration and received byte counts. Matching background recovery requests
 output-lock waits and peak worker memory are included in diagnostic exports. Missing observations
 remain unknown; a flushed tool reply does not prove that the browser's separate answer stream is healthy.
 
+Diagnostics keep browser-clock durations separate from gateway observation times to help distinguish
+network interruption from delayed local event handling. When supplied by the server, validated request
+trace IDs, numeric `Retry-After` seconds and cache flags help investigate recovery rate limits. Raw
+headers, cookies and bodies are not stored. These observations do not trigger retries or change tasks.
+
 Attachment upload and processing wait for up to 10 minutes by default, within the current task deadline.
 Set `attachment_upload_timeout_seconds` (60–1800 seconds) under `[gateway]` in `.env` to adjust it;
 the setting takes effect after a normal restart. The task timeline records confirmed counts, elapsed time
