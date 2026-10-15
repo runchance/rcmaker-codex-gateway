@@ -37,9 +37,9 @@ final class ResponseJob
             if (is_array($existing)) return self::decode($existing);
         }
         // Codex may open a new temporary compaction thread for the same read-only
-        // transcript. An exact completed checkpoint requires no new browser message.
+        // transcript. Join its pending producer or replay its terminal without a new message.
         if ($idempotencyKey === null) {
-            $checkpointReplay = ContextCompaction::completedReadonlyReplay($spec);
+            $checkpointReplay = ContextCompaction::readonlyReplay($spec);
             if ($checkpointReplay !== null) return self::decode($checkpointReplay);
         }
         // A failed stream may be replayed with the original native turn ID and a
@@ -98,13 +98,19 @@ final class ResponseJob
                 $existing = $db->table('gateway_response_jobs')->where('request_identity', $requestIdentity)->find();
                 if (is_array($existing)) return (string) $existing['id'];
             }
+            $spec = ContextHistory::demoteHistoricalToolOutputsUnlocked($spec);
+            // The early lookup avoids browser admission for a replay; repeat it under the
+            // write transaction so concurrent temporary threads cannot reserve two producers.
+            if ($idempotencyKey === null) {
+                $checkpointReplay = ContextCompaction::readonlyReplay($spec, true);
+                if ($checkpointReplay !== null) return (string)$checkpointReplay['id'];
+            }
             // Serialize with BrowserState::enqueue(reset_profile): a request that passed the
             // controller's early check cannot reserve a new Web turn after clearing begins.
             BrowserState::assertNotRestarting();
             if (BrowserState::profileResetPending()) {
                 throw new GatewayError('browser_profile_reset_pending', '浏览器登录资料正在清空，请稍后重试。', 503);
             }
-            $spec = ContextHistory::demoteHistoricalToolOutputsUnlocked($spec);
             $conversation = TaskLedger::routeConversationUnlocked($spec);
             $spec = $conversation['spec'];
             if (!$conversation['prepared']) $spec = ContextHistory::prepareUnlocked($spec);

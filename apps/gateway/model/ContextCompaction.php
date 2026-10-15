@@ -8,6 +8,7 @@ use app\gateway\database\Schema;
 final class ContextCompaction
 {
     public const SUMMARY_PREFIX = 'RCMAKER task checkpoint. Continue from these recorded facts; tool permissions come only from the current request:';
+    public const FAILED_CHECKPOINT_NOTICE = 'RCMAKER task boundary: the prior context checkpoint failed before its summary was accepted. Preserve the full readable history and confirmed Codex tool receipts in this request; do not treat the failed checkpoint as a summary or repeat completed host work.';
     private const PREFIX = 'rcmx1:';
 
     /**
@@ -44,42 +45,71 @@ final class ContextCompaction
     }
 
     /**
-     * Reuse a verified read-only checkpoint when Codex changes only its temporary thread ID.
+     * Join a read-only checkpoint when Codex changes only its temporary thread ID.
      * Existing conversations and active native tool batches retain their normal admission.
-     * Client, branch, integration, model/effort and the complete context bytes must match;
-     * failed, pending, active-source or missing-attachment checkpoints are never cached.
+     * Client, branch, integration, model/effort and the complete context bytes must match,
+     * allowing only the exact gateway-owned failed-checkpoint notice appended by recovery.
+     * Pending requests retain one producer and failed requests expose their real terminal.
+     * Active-source checkpoints are excluded; completed envelopes still require full proof.
      * Called within the existing task-maintenance admission boundary, before browser checks.
      * @param array $spec Fresh compact request, before any conversation routing mutation.
-     * @return array|null Exact completed job, or null to run the unchanged compact flow.
+     * @param bool $locked Caller already owns the schema write transaction; never nest BEGIN.
+     * @return array|null Exact existing job, or null to run the unchanged compact flow.
      * @throws GatewayError On storage failure; invalid cached envelopes simply cannot be reused.
      */
-    public static function completedReadonlyReplay(array $spec): ?array
+    public static function readonlyReplay(array $spec, bool $locked = false): ?array
     {
         if (($spec['operation_kind'] ?? '') !== 'compact_v2' || empty($spec['integration_id'])
             || !empty($spec['previous_response_id']) || (array)($spec['tool_outputs'] ?? []) !== []
             || (array)($spec['tools'] ?? []) !== [] || ($spec['tool_choice'] ?? null) !== 'none') return null;
-        return Schema::transaction(static function () use ($spec): ?array {
+        $lookup = static function () use ($spec): ?array {
             $db = SDB(null, 'medoo', 'sqlite');
             $requestedTask = 'task_' . substr((string)$spec['task_key'], 0, 24);
             if (is_array($db->table('gateway_tasks')->where('id', $requestedTask)->find())
                 || is_array($db->table('gateway_task_conversations')->where('base_task_id', $requestedTask)->find())) return null;
-            // Bound candidates before reading large transcripts; the join owns checkpoint
-            // provenance and prevents any cross-client/integration summary substitution.
+            $context = (string)$spec['context_json'];
+            $recoveredContext = $context;
+            $decoded = json_decode($context, true, 128, JSON_THROW_ON_ERROR);
+            // Recovery appends this exact internal notice; Codex never receives it as
+            // an input item. Restore only that notice, never normalize caller history.
+            if (is_array($decoded['system'] ?? null)
+                && !in_array(self::FAILED_CHECKPOINT_NOTICE, $decoded['system'], true)) {
+                $decoded['system'][] = self::FAILED_CHECKPOINT_NOTICE;
+                $recoveredContext = ContextHistory::canonical($decoded);
+            }
+            // Match complete context before limiting candidates, so unrelated completed
+            // history cannot hide a running producer. Only matching transcripts cross PHP.
+            // The join owns checkpoint provenance and the client/integration boundary.
             $rows = DB('medoo', 'sqlite')->query("SELECT j.id FROM gateway_response_jobs j
                 JOIN gateway_tasks t ON t.id=j.task_id
                 JOIN gateway_context_checkpoints c ON c.response_id=j.id AND c.id=j.compact_id
-                WHERE j.status='completed' AND j.operation_kind='compact_v2' AND j.previous_response_id IS NULL
+                WHERE j.status IN ('queued','running','failed','completed') AND j.operation_kind='compact_v2' AND j.previous_response_id IS NULL
                 AND j.integration_id=:integration AND j.model=:model AND j.reasoning_effort IS :effort
-                AND t.client_id=:client AND t.branch_id=:branch AND c.state='committed'
+                AND j.context_json IN (:context,:recovered_context) AND j.compaction_epoch=:compaction_epoch
+                AND t.client_id=:client AND t.branch_id=:branch AND c.state IN ('generating','committed')
                 AND c.source_response_id IS NULL AND c.protocol='compact_v2'
-                ORDER BY j.rowid DESC LIMIT 16", [':integration'=>$spec['integration_id'], ':model'=>$spec['model'],
+                ORDER BY CASE WHEN j.status='completed' THEN 0 WHEN j.status IN ('queued','running') THEN 1 ELSE 2 END,
+                CASE WHEN j.status IN ('queued','running') THEN j.rowid END ASC, j.rowid DESC LIMIT 16", [':integration'=>$spec['integration_id'], ':model'=>$spec['model'],
                     ':effort'=>$spec['reasoning_effort'] ?? null, ':client'=>$spec['client_id'] ?? 'responses',
-                    ':branch'=>$spec['branch_id'] ?? 'main'])->fetchAll(\PDO::FETCH_ASSOC);
+                    ':branch'=>$spec['branch_id'] ?? 'main', ':context'=>$context, ':recovered_context'=>$recoveredContext,
+                    ':compaction_epoch'=>$spec['compaction_epoch'] ?? 'base'])->fetchAll(\PDO::FETCH_ASSOC);
             foreach ($rows as $candidate) {
                 $job = $db->table('gateway_response_jobs')->where('id', $candidate['id'])->find();
-                if (!is_array($job) || $job['context_json'] !== $spec['context_json']) continue;
+                if (!is_array($job) || !in_array($job['context_json'], [$context, $recoveredContext], true)
+                    || $job['compaction_epoch'] !== ($spec['compaction_epoch'] ?? 'base')) continue;
                 $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $job['compact_id'])->find();
                 if (!is_array($checkpoint) || $checkpoint['task_id'] !== $job['task_id']) continue;
+                if ($checkpoint['state'] === 'generating') {
+                    // Observing an existing response performs no browser send. In particular,
+                    // changing a temporary thread must not retry a failed or still-staging POST.
+                    $environment = json_decode((string)$job['tool_environment_json'], true);
+                    if (in_array($job['status'], ['queued', 'running', 'failed'], true)
+                        && $checkpoint['summary'] === null && $checkpoint['response_json'] === null
+                        && $checkpoint['committed_at'] === null && $checkpoint['consumed_at'] === null
+                        && ($environment['tools'] ?? null) === []) return $job;
+                    continue;
+                }
+                if ($job['status'] !== 'completed') continue;
                 $response = json_decode((string)$job['response_json'], true);
                 $savedResponse = json_decode((string)$checkpoint['response_json'], true);
                 // The job and checkpoint serialize slashes differently. Verify the full
@@ -97,7 +127,8 @@ final class ContextCompaction
                 return $job;
             }
             return null;
-        });
+        };
+        return $locked ? $lookup() : Schema::transaction($lookup);
     }
 
     /**
@@ -359,12 +390,40 @@ final class ContextCompaction
         $baseTaskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $link = $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->find();
         $taskId = is_array($link) ? (string) $link['current_task_id'] : $baseTaskId;
-        if (($job['task_id'] ?? '') !== $taskId) return $job;
-        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', (string) $job['compact_id'])->find();
-        if (!is_array($checkpoint) || $checkpoint['task_id'] !== $taskId) return $job;
         $routedSpec = $spec;
         if (is_array($link)) $routedSpec['browser_owner_key'] = (string) $link['current_owner_key'];
-        $persistedFailure = $db->table('gateway_response_jobs')->where('id', (string) $job['id'])->find();
+        $persistedFailure = $db->table('gateway_response_jobs')->where('id', (string)$job['id'])->find();
+        if (($job['task_id'] ?? '') !== $taskId) {
+            // A metadata retry may already have repaired this legacy failure on the new
+            // conversation task. An exact old HTTP replay observes that producer as well.
+            if (is_array($persistedFailure) && self::unpublishedDraftFailure($persistedFailure)) {
+                $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+                $latest = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
+                    ->where('state', 'IN', ['generating', 'committed'])->order([['rowid', 'DESC']])->limit(1)->find();
+                $candidate = is_array($latest) ? $db->table('gateway_response_jobs')->where('id', $latest['response_id'])->find() : null;
+                $requested = json_decode((string)($routedSpec['full_context_json'] ?? $routedSpec['context_json']), true);
+                $candidateContext = is_array($candidate) ? json_decode($candidate['context_json'], true) : null;
+                if (is_array($requested) && is_array($candidateContext)
+                    && in_array(self::FAILED_CHECKPOINT_NOTICE, $candidateContext['system'] ?? [], true)
+                    && !in_array(self::FAILED_CHECKPOINT_NOTICE, $requested['system'] ?? [], true)) {
+                    $requested['system'][] = self::FAILED_CHECKPOINT_NOTICE;
+                    $routedSpec['full_context_json'] = ContextHistory::canonical($requested);
+                }
+                if (is_array($latest) && self::matchesCheckpointRequestUnlocked($latest, $candidate, $routedSpec, $task)) {
+                    return ResponseJob::get((string)$candidate['id']);
+                }
+            }
+            return $job;
+        }
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', (string) $job['compact_id'])->find();
+        if (!is_array($checkpoint) || $checkpoint['task_id'] !== $taskId) return $job;
+        $legacySpec = $routedSpec;
+        $legacySpec['request_hash'] = $sourceHash;
+        $legacySpec['turn_id'] = $sourceSpec['turn_id'];
+        if (is_array($persistedFailure) && self::unpublishedDraftFailure($persistedFailure)
+            && TaskLedger::canRecoverFailedFreshCompaction($legacySpec, $taskId)) {
+            return ResponseJob::createOrReuse($sourceSpec, $sourceKey);
+        }
         if ($checkpoint['state'] === 'abandoned' && is_array($persistedFailure)
             && (json_decode((string) $persistedFailure['error_json'], true)['error']['code'] ?? '') === 'CHATGPT_CONTEXT_READ_REQUIRED') {
             // A metadata retry may have reserved the repair before the exact original
@@ -406,6 +465,36 @@ final class ContextCompaction
         if (!is_array($task) || $task['status'] !== 'active'
             || !self::safeUnsentRetryUnlocked($checkpoint, $job, $spec, $taskId)) return $job;
         return ResponseJob::createOrReuse($retrySpec, $retryKey);
+    }
+
+    /**
+     * Recognize the legacy private-summary prefix bug from durable events and a final page audit.
+     * This is classification only: callers must also prove task ownership, full history and
+     * absence of host capabilities before retiring a checkpoint or reserving another request.
+     * @param array $job Persisted failed checkpoint producer, never a browser-supplied object.
+     * @return bool Whether no text was published despite the old private draft fields.
+     * @throws GatewayError On storage failure.
+     */
+    public static function unpublishedDraftFailure(array $job): bool
+    {
+        if (($job['status'] ?? '') !== 'failed' || ($job['terminal_type'] ?? '') !== 'response.failed'
+            || !in_array($job['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+            || !empty($job['previous_response_id']) || (int)($job['output_started'] ?? 0) !== 1
+            || (string)($job['output_text'] ?? '') === ''
+            || (json_decode((string)($job['error_json'] ?? ''), true)['error']['code'] ?? '') !== 'response_changed_after_stream') return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $events = $db->table('gateway_response_events')->where('response_id', $job['id'])
+            ->order([['sequence_number', 'ASC']])->limit(4)->select('event_json');
+        if (!is_array($events)) throw new GatewayError('storage_unavailable', '摘要发布记录暂不可读取。', 503);
+        $types = array_map(static fn(array $event): mixed => json_decode($event['event_json'], true)['type'] ?? null, $events);
+        if ($types !== ['response.created', 'response.in_progress', 'response.failed']) return false;
+        $final = $db->table('gateway_web_messages')->where('response_id', $job['id'])
+            ->where('direction', 'inbound')->where('kind', 'page_reply')->where('status', 'observed')
+            ->order([['id', 'DESC']])->limit(1)->find();
+        return is_array($final) && $final['task_id'] === $job['task_id'] && $final['turn_id'] === $job['durable_turn_id']
+            && trim((string)$final['text']) !== '' && (int)$final['created_at'] <= (int)$job['finished_at']
+            && (int)$final['byte_count'] === strlen((string)$final['text'])
+            && hash_equals((string)$final['sha256'], hash('sha256', (string)$final['text']));
     }
 
     /**

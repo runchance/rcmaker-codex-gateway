@@ -380,7 +380,10 @@ final class TaskLedger
             $hasToolOutputs = false;
             $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
         }
-        if (is_array($task) && self::abandonFailedFreshCompactionUnlocked($spec, $task, $incoming)) {
+        $unpublishedDraftRecovered = false;
+        $failedFreshRecovered = is_array($task)
+            && self::abandonFailedFreshCompactionUnlocked($spec, $task, $incoming, true, $unpublishedDraftRecovered);
+        if ($failedFreshRecovered) {
             // The entire native transcript was verified against the failed read-only import.
             // Its trailing receipts remain history; no old host capability is resumed.
             $spec['tool_outputs'] = [];
@@ -471,8 +474,8 @@ final class TaskLedger
                 ['web_task_incomplete', 'web_task_self_report_incomplete', 'web_task_unverified'], true);
             $warning = $lateReceiptsRecovered
                 ? 'RCMAKER task boundary: the native host supplied the complete exact result batch after the prior transport wait timed out. These calls are settled evidence in the supplied history. The old capability remains revoked. Continue only the remaining authorized work without repeating those calls.'
-                : ($failedHandoffRecovered && !$unknownHostResult
-                ? 'RCMAKER task boundary: the prior context checkpoint failed before its summary was accepted. Preserve the full readable history and confirmed Codex tool receipts in this request; do not treat the failed checkpoint as a summary or repeat completed host work.'
+                : (($failedHandoffRecovered || $unpublishedDraftRecovered) && !$unknownHostResult
+                ? ContextCompaction::FAILED_CHECKPOINT_NOTICE
                 : ($knownIncompleteFinal && !$unknownHostResult
                 ? 'RCMAKER task boundary: the prior Web answer ended with unfinished work. Its delivered Codex host receipts are recorded; inspect the current project and continue only the remaining requirements. Do not treat the prior partial answer as completion.'
                 : ($detachedRestart && !$unknownHostResult
@@ -600,17 +603,20 @@ final class TaskLedger
     }
 
     /**
-     * Retire an accepted fresh read-only compact timeout only when a new request supplies its
+     * Retire a fresh read-only compact timeout or proven unpublished-draft failure when a request supplies its
      * complete original history. This is task routing, never a resend or host-result recovery.
      * Exact request replays remain behind ResponseJob's existing identity fence. The caller owns
      * the reservation transaction; the old job and turn retain their failed/unknown terminal.
      * @param array $spec New full native v2 compact request, with only verified historical outputs demoted.
      * @param array $task Current task selected by the conversation mapping.
      * @param array $incoming Parsed full context carried by this request.
-     * @return bool Whether the sole failed fresh checkpoint and its surface were retired.
+     * @param bool $retire False checks the proof without mutations for an exact-replay recovery identity.
+     * @param bool|null $unpublishedDraftRecovered Reports a verified private-draft retirement; timeouts retain their uncertainty notice.
+     * @return bool Whether the sole failed fresh checkpoint can be retired (and was, when requested).
      * @throws GatewayError If checkpoint retirement or its durable evidence cannot be saved.
      */
-    private static function abandonFailedFreshCompactionUnlocked(array &$spec, array $task, array $incoming): bool
+    private static function abandonFailedFreshCompactionUnlocked(array &$spec, array $task, array $incoming,
+        bool $retire = true, ?bool &$unpublishedDraftRecovered = null): bool
     {
         if (($spec['operation_kind'] ?? '') !== 'compact_v2' || $task['status'] !== 'needs_attention'
             || !empty($spec['input_is_delta']) || !empty($spec['previous_response_id'])
@@ -641,14 +647,16 @@ final class TaskLedger
             || $job['accepted_at'] === null || $job['submit_intent_at'] === null || $job['finished_at'] === null
             || !empty($job['previous_response_id']) || !empty($job['continuation_source_response_id'])
             || !empty($job['rolling_source_response_id']) || !empty($job['mcp_binding_id'])
-            || (int) $job['output_started'] !== 0 || (string) $job['output_text'] !== ''
             || $job['model'] !== $spec['model'] || $job['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)
             || $job['compaction_epoch'] !== ($spec['compaction_epoch'] ?? 'base')
             || !hash_equals((string) $checkpoint['request_hash'], (string) $job['request_hash'])
             || hash_equals((string) $job['request_hash'], (string) $spec['request_hash'])) return false;
         $error = json_decode((string) $job['error_json'], true);
+        $failureCode = (string)($error['error']['code'] ?? '');
+        $legacyDraft = ContextCompaction::unpublishedDraftFailure($job);
         $environment = json_decode((string) $job['tool_environment_json'], true);
-        if (($error['error']['code'] ?? '') !== 'CHATGPT_RESPONSE_TIMEOUT'
+        if ((!$legacyDraft && ($failureCode !== 'CHATGPT_RESPONSE_TIMEOUT'
+                || (int)$job['output_started'] !== 0 || (string)$job['output_text'] !== ''))
             || !is_array($environment) || !is_array($environment['tools'] ?? null)
             || $environment['tools'] !== []) return false;
         $turn = $db->table('gateway_task_turns')->where('id', (string) $job['durable_turn_id'])->find();
@@ -657,7 +665,7 @@ final class TaskLedger
         if (!is_array($turn) || !is_array($epoch) || !is_array($surface)
             || !self::ownsCurrentGeneration($job, $turn)
             || $turn['task_id'] !== $taskId || $turn['epoch_id'] !== $job['epoch_id']
-            || $turn['status'] !== 'needs_attention' || $turn['error_code'] !== 'CHATGPT_RESPONSE_TIMEOUT'
+            || $turn['status'] !== 'needs_attention' || $turn['error_code'] !== $failureCode
             || $turn['submit_intent_at'] === null || $turn['submitted_at'] === null || $turn['committed_at'] !== null
             || $epoch['task_id'] !== $taskId || $epoch['status'] !== 'needs_attention'
             || $task['current_epoch_id'] !== $epoch['id']
@@ -716,6 +724,7 @@ final class TaskLedger
         }
         if (ContextHistory::canonical($oldSystem) !== ContextHistory::canonical($newSystem)) return false;
         $incoming['system'] = $newSystem;
+        if (!$retire) return true;
         $updated = $db->table('gateway_context_checkpoints')->where('id', (string) $checkpoint['id'])
             ->where('response_id', (string) $job['id'])->where('state', 'generating')->update(['state' => 'abandoned']);
         if (!$updated || $updated->rowCount() !== 1) {
@@ -734,9 +743,28 @@ final class TaskLedger
         self::eventUnlocked($taskId, (string) $turn['id'], (string) $job['id'], (string) $surface['id'],
             'failed_fresh_compaction_abandoned', ['checkpoint_id' => $checkpoint['id'],
                 'source_context_sha256' => hash('sha256', (string) $job['context_json']),
-                'original_messages' => count($oldMessages), 'host_capabilities' => 0]);
+                'original_messages' => count($oldMessages), 'host_capabilities' => 0, 'failure_code' => $failureCode]);
         $spec['context_json'] = $spec['full_context_json'] = ContextHistory::canonical($incoming);
+        $unpublishedDraftRecovered = $legacyDraft;
         return true;
+    }
+
+    /**
+     * Check the same fresh-checkpoint retirement proof before crossing an exact HTTP replay fence.
+     * The eventual reservation revalidates every fact under its write transaction.
+     * @param array $spec Full request with a deterministic new recovery identity and routed owner.
+     * @param string $taskId Current task selected by the conversation link.
+     * @return bool Whether the complete source is recoverable without publishing or changing a row.
+     * @throws GatewayError On storage failure.
+     */
+    public static function canRecoverFailedFreshCompaction(array $spec, string $taskId): bool
+    {
+        return Schema::transaction(static function () use ($spec, $taskId): bool {
+            $task = SDB(null, 'medoo', 'sqlite')->table('gateway_tasks')->where('id', $taskId)->find();
+            $incoming = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true);
+            return is_array($task) && is_array($incoming)
+                && self::abandonFailedFreshCompactionUnlocked($spec, $task, $incoming, false);
+        });
     }
 
     /**
