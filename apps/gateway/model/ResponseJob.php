@@ -101,6 +101,7 @@ final class ResponseJob
             }
             // Serialize with BrowserState::enqueue(reset_profile): a request that passed the
             // controller's early check cannot reserve a new Web turn after clearing begins.
+            BrowserState::assertNotRestarting();
             if (BrowserState::profileResetPending()) {
                 throw new GatewayError('browser_profile_reset_pending', '浏览器登录资料正在清空，请稍后重试。', 503);
             }

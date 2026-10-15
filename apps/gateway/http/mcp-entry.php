@@ -87,13 +87,14 @@ function gatewayMcpBindingTrace(array $request): array
 
 /**
  * Initialize either stdio process, tolerating bounded initialization/SQLite lock contention.
+ * Reuse the Web worker's database/cache setup; the public ingress has no task bootstrap.
  * No tool has been dispatched at this point; retrying initialization cannot replay a host action.
  * STORAGE_BUSY means the operation never entered its transaction body. Schema validation,
  * other SQL failures, permissions and failures after a write remain final.
  */
 function gatewayMcpBootstrap(): void
 {
-    foreach ((array) RC\Config::get('process')['RC_GATEWAY_API']['bootstrap'] as $bootstrap) {
+    foreach ((array) RC\Config::get('process')['RC_GATEWAY_WEB_API']['bootstrap'] as $bootstrap) {
         if ($bootstrap !== app\gateway\bootstrap\Initialize::class) $bootstrap::start();
     }
     for ($attempt = 1; ; $attempt++) {

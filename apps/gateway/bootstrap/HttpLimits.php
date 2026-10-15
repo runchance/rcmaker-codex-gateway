@@ -10,7 +10,7 @@ use Workerman\Worker;
 final class HttpLimits implements \RC\Bootstrap
 {
     /**
-     * Bind the limit only to the API APP group, retaining any existing connection hook.
+     * Bind the limit to the ingress and both API APP groups, retaining connection hooks.
      * The installed framework does not apply independent APP package limits on Windows;
      * setting each connection avoids changing other workers or modifying vendor code.
      * Swoole receives the same package_max_length directly from process configuration.
@@ -19,10 +19,11 @@ final class HttpLimits implements \RC\Bootstrap
      */
     public static function start($worker = null): void
     {
-        if (!$worker instanceof Worker || $worker->name !== 'RC_GATEWAY_API') {
+        if (!$worker instanceof Worker || !in_array($worker->name,
+            ['RC_GATEWAY_API', 'RC_GATEWAY_NATIVE_API', 'RC_GATEWAY_WEB_API'], true)) {
             return;
         }
-        $limit = (int) Config::get('process', 'RC_GATEWAY_API')['package_max_length'];
+        $limit = (int) Config::get('process', $worker->name)['package_max_length'];
         $onConnect = $worker->onConnect;
         $worker->onConnect = static function (TcpConnection $connection) use ($limit, $onConnect): void {
             $connection->maxPackageSize = $limit;

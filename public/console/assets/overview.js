@@ -422,6 +422,9 @@
         byId('proxy-username').value = row && row.mode === 'manual' ? (row.username || '') : '';
         byId('proxy-password').value = '';
         byId('proxy-auth').open = Boolean(byId('proxy-username').value);
+        layui.use('form', function () {
+            Gateway.browserTimezones(byId('browser-timezone'), snapshot?.network?.browser_timezones, row?.browser_timezone, 'setup-timezone');
+        });
         selectNetwork(preferred || (row && row.mode === 'manual' ? 'manual' : 'direct'));
     }
     function prepareNetworkLayer(preferred) {
@@ -446,11 +449,16 @@
             const saved = await Gateway.request('/api/network/save', {
                 expected_revision: Number(snapshot.network.saved.id), mode: networkMode, protocol: 'http',
                 host: networkMode === 'manual' ? host : '', port: networkMode === 'manual' ? port : 0,
-                username, password, password_action: username ? (password ? 'set' : 'keep') : 'clear'
+                username, password, password_action: username ? (password ? 'set' : 'keep') : 'clear',
+                browser_timezone: byId('browser-timezone').value
             });
             if (submittedRevision === networkEditRevision) byId('proxy-password').value = '';
             progress('network-progress', I18n.t('正在应用设置…'));
-            await Gateway.request('/api/network/apply', {expected_revision: Number(saved.revision)});
+            const applied = await Gateway.request('/api/network/apply', {expected_revision: Number(saved.revision)});
+            if (applied.browser_command_id) {
+                progress('network-progress', I18n.t('正在重新初始化浏览器，登录资料会保留…'));
+                await Gateway.waitBrowserRestart(applied.browser_command_id);
+            }
             progress('network-progress', I18n.t('正在测试 https://chatgpt.com，请稍候…'));
             const test = await Gateway.request('/api/network/test', {revision: Number(saved.revision), target_id: 'model_site', source: 'active'});
             await waitNetworkTest(test.id); progress('network-progress', I18n.t('连接成功，网络准备已完成。')); await refresh();
@@ -758,6 +766,9 @@
     byId('open-network').addEventListener('click', () => prepareNetworkLayer());
     byId('network-direct').addEventListener('click', () => { networkEditRevision++; selectNetwork('direct'); });
     byId('network-proxy').addEventListener('click', () => { networkEditRevision++; selectNetwork('manual'); });
+    layui.use('form', function () {
+        layui.form.on('select(browser-timezone)', () => { networkEditRevision++; });
+    });
     ['proxy-host', 'proxy-port', 'proxy-username', 'proxy-password'].forEach(id => {
         byId(id).addEventListener('input', () => { networkEditRevision++; });
     });

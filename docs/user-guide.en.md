@@ -179,6 +179,12 @@ Select **Configure network**. Choose **Direct connection** when the services are
 
 The saved route is used by the application browser, component downloads and tool tunnel. It does not change your system proxy. A SOCKS-only port cannot be entered as an HTTP port.
 
+Choose the browser timezone in step 1 (network settings) or on the Network and proxy page, without editing configuration files. The default matches the proxy exit automatically. You can search for a city and select a timezone, such as Tokyo (`Asia/Tokyo`), or use the computer timezone. Automatic mode keeps the computer timezone for direct connections. Applying a new revision reinitializes a running private Chrome while preserving sign-in data. If Web tasks or browser operations are active, the revision is saved but remains pending until you apply it after the work finishes. A stopped browser uses the settings on its next launch. Return to step 1 whenever the timezone needs adjustment.
+
+Automatic detection uses the browser's selected HTTP proxy to contact `ipwho.is`, then `ipapi.co` on failure, without sign-in data or chat content. For domain-based routing, send these sites and ChatGPT through the same exit, or select the exit location's timezone manually. If both lookups fail, startup reports `BROWSER_TIMEZONE_LOOKUP_FAILED` without guessing or bypassing the proxy. The timezone applies before scripts run on sign-in, task and connector-check pages; the Windows timezone is unchanged. Matching timezones does not guarantee that the site's `Model not found` error is resolved; verify the actual model request separately.
+
+The timezone is resolved once per browser initialization and reused for new pages. A temporary page-control failure preserves healthy pages' overrides and rechecks the failed control sessions. New Web requests may report that the browser is not ready until recovery. `BROWSER_TIMEZONE_APPLY_FAILED` identifies a failure in the control workflow, not necessarily an invalid timezone; runtime logs record the specific CDP method and error. Recovery does not refresh pages, resend tasks or replay tools.
+
 **Success:** the network check passes. A target website returning HTTP 403 differs from a proxy refusing the tunnel; connectivity also does not establish sign-in. See the [network FAQ](faq.en.md#network).
 
 <details>
@@ -388,6 +394,8 @@ New requests use saved changes. Already-started work retains its budget and wait
 
 **Multipart delivery** sends longer history in batches. **Compaction** creates a summary for subsequent work. Both can add waiting time without implying failure. History includes instructions, skills and tool results, not just the few messages you typed.
 
+Instructions to pause tools and submit only a summary apply to that compaction operation. The next ordinary request labels the summary as handoff data and asks the model to continue the original human task's remaining steps while preserving completed results and exact tool receipts. Genuine user pauses, cancellations and approval requirements remain in force.
+
 For a new Free conversation without prior assistant/tool history, the complete first request is sent in one message when text, attachments and reserved context all fit. Larger requests still use multipart delivery without removing instructions or context. Existing tasks, compaction, started multipart transactions and paid models keep their established transport policy.
 
 Historical staging normally uses the selected family's non-Pro Medium mode; gateway summaries use non-Pro High. Actual tasks use your chosen model and effort. Inspect the recorded purpose and tier to confirm a submission. 3× does not triple memory, and a summary is not a verbatim copy of all previous records.
@@ -434,13 +442,17 @@ Use the console for preferences and credentials; ordinary operation does not req
 | `console_port` | `28910`, local console |
 | `api_port` | `28911`, Codex integration |
 | `browser_debug_port` | `28912`, private browser control |
+| `native_api_port` | `28913`, internal native API worker |
+| `web_api_port` | `28914`, internal Web API worker |
 | `data_directory` | `data`, a directory name beside the program, not an arbitrary absolute path |
 | `default_locale` | `en`, used before a language preference has been saved |
 | `codex_home` | Empty for automatic detection; can target another Codex configuration directory |
 
 Codex configuration is resolved in this order: `.env` → `[gateway] codex_home`, then `CODEX_HOME`, then the current user's `.codex` directory. Windows uses `USERPROFILE` or `HOMEDRIVE` + `HOMEPATH`; Linux/macOS use `HOME`, with the effective user's home as a fallback. The gateway reads `config.toml` from that directory, independently of its own `data/` directory. Browser installation selects the host OS and CPU package; it preserves Unix executable permissions and internal application-bundle links.
 
-All three ports must differ. Restart RCMAKER after deployment changes. If the Codex endpoint changes, preview/save integration again and restart Codex. Changing `data_directory` selects another store; **it does not migrate existing login state or tasks**.
+All five ports must differ and listen only on the local computer. Codex continues to use `api_port`, which routes requests and relays responses asynchronously. Native forwarding and Web task handling run in separate API processes while sharing the existing business code and data. The two internal ports do not need to be added to Codex configuration. Process isolation reduces mutual blocking; CPU, memory and the database remain shared resources.
+
+Fully stop and start RCMAKER after deployment changes so the new processes are loaded. If the Codex endpoint changes, preview/save integration again and restart Codex. Changing `data_directory` selects another store; **it does not migrate existing login state or tasks**.
 
 ### 9.4 Restore previous or official routing
 

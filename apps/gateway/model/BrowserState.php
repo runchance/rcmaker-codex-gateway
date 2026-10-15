@@ -82,56 +82,123 @@ final class BrowserState
     /** Enqueue an immutable command bound to the current surface/document. @return int @throws GatewayError */
     public static function enqueue(string $action, array $payload, bool $documentBound = true, string $requiredLease = 'manual'): int
     {
-        return Schema::transaction(function () use ($action, $payload, $documentBound, $requiredLease): int {
-            $state = self::state();
+        return Schema::transaction(fn(): int => self::enqueueUnlocked($action, $payload, $documentBound, $requiredLease));
+    }
+
+    /** Enqueue within the caller's existing writer transaction; never call outside Schema::transaction.
+     * @param string $action Existing worker command. @param array $payload Immutable command data.
+     * @param bool $documentBound Bind to the manual document. @param string $requiredLease Required owner.
+     * @return int Durable command ID. @throws GatewayError On unavailable, busy or stale browser state.
+     */
+    private static function enqueueUnlocked(string $action, array $payload, bool $documentBound, string $requiredLease = 'manual'): int
+    {
+        $state = self::state();
+        $db = SDB(null, 'medoo', 'sqlite');
+        self::assertNotRestarting();
+        if (!self::isWorkerReady($state)) {
+            throw new GatewayError('BROWSER_WORKER_UNAVAILABLE', '浏览器控制进程尚未就绪。', 503);
+        }
+        $reset = $db->table('gateway_browser_commands')->where('action', 'reset_profile')
+            ->where('status', 'IN', ['queued', 'running'])->find();
+        if ($reset === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作状态暂不可读取。', 503);
+        if (is_array($reset) || ($action !== 'reset_profile' && (int) ($state['profile_reset_required'] ?? 0) === 1)) {
+            throw new GatewayError('BROWSER_PROFILE_RESET_PENDING', '浏览器资料正在清空，请等待操作结束。', 409);
+        }
+        if ($action === 'reset_profile') {
+            if (isset($payload['login_reminder_id'])) BrowserLoginLifecycle::assertReminderUnlocked((string) $payload['login_reminder_id']);
+            self::assertProfileResetIdle();
+        }
+        if ($action === 'restart') self::assertRestartIdle();
+        if ($action === 'start') {
+            // Auto-start and a simultaneous login click must observe the same pending launch.
+            $pendingStart = $db->table('gateway_browser_commands')->where('action', 'start')
+                ->where('status', 'IN', ['queued', 'running'])->order([['id', 'ASC']])->find('id');
+            if ($pendingStart === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器启动状态暂不可读取。', 503);
+            if (is_array($pendingStart)) return (int) $pendingStart['id'];
+        }
+        if (!in_array($action, ['start', 'restart', 'install', 'reset_profile'], true) && $state['status'] === 'stopped') {
+            throw new GatewayError('BROWSER_NOT_RUNNING', '请先启动受控浏览器。', 409);
+        }
+        if ($documentBound && $state['lease_mode'] !== $requiredLease) {
+            if ($requiredLease === 'automation') {
+                throw new GatewayError('BROWSER_MANUAL_OWNS_SURFACE', '页面当前由人工控制，自动任务未取得控制权。', 409);
+            }
+            throw new GatewayError('BROWSER_AUTOMATION_OWNS_SURFACE', '自动任务正在控制页面，请先切换为人工接管。', 409);
+        }
+        $pending = $db->table('gateway_browser_commands')->where('status', 'queued')->count();
+        if ($pending === false || $pending === null || $pending > 24) {
+            throw new GatewayError('BROWSER_COMMAND_BUSY', '浏览器操作队列繁忙，请稍后重试。', 409);
+        }
+        $row = [
+            'action' => $action,
+            'surface_generation' => (int) $state['surface_generation'],
+            'document_nonce' => $documentBound ? $state['document_nonce'] : null,
+            'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            'status' => 'queued',
+            'created_at' => time(),
+        ];
+        if (!$db->table('gateway_browser_commands')->add($row)) {
+            throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作无法入队。', 503);
+        }
+        if ($action === 'reset_profile') self::write(['profile_reset_required' => 1, 'auto_start' => 0]);
+        return (int) $db->id();
+    }
+
+    /** Reserve a restart atomically with network application; caller owns the writer transaction.
+     * @param int $revision Immutable settings version. @return int|null Command to observe, or no live browser.
+     * @throws GatewayError If work is in progress; no running task is interrupted.
+     */
+    public static function restartForNetworkUnlocked(int $revision): ?int
+    {
+        $pending = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('action', 'restart')
+            ->where('status', 'IN', ['queued', 'running'])->find();
+        if ($pending === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作状态暂不可读取。', 503);
+        if (is_array($pending)) {
+            $payload = json_decode((string) $pending['payload_json'], true, 32, JSON_THROW_ON_ERROR);
+            if ((int) ($payload['revision'] ?? 0) === $revision) return (int) $pending['id'];
+            self::assertNotRestarting();
+        }
+        $state = self::state();
+        if ($state['status'] === 'stopped' && empty($state['browser_pid'])) return null;
+        if ($state['status'] === 'ready' && (int) $state['network_revision'] === $revision) return null;
+        if ($state['status'] === 'starting') {
+            throw new GatewayError('BROWSER_RESTART_BUSY', '浏览器正在启动，请等待完成后再应用网络设置。', 409);
+        }
+        return self::enqueueUnlocked('restart', ['revision' => $revision, 'browser' => 'bundled'], false);
+    }
+
+    /** Fence new browser work during a queued/running restart; admission callers hold the same writer lock.
+     * @return void @throws GatewayError Until the durable restart succeeds or fails.
+     */
+    public static function assertNotRestarting(): void
+    {
+        $row = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('action', 'restart')
+            ->where('status', 'IN', ['queued', 'running'])->find('id');
+        if ($row === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作状态暂不可读取。', 503);
+        if (is_array($row)) throw new GatewayError('BROWSER_RESTART_PENDING', '浏览器正在应用网络和时区设置，请等待重新初始化完成。', 409);
+    }
+
+    /** Require idle durable work at reservation and again before stopping Chrome.
+     * @param int|null $commandId Own restart command, excluded from the idle check.
+     * @return void @throws GatewayError While any Web turn or other command can still use Chrome.
+     */
+    public static function assertRestartIdle(?int $commandId = null): void
+    {
+        try {
+            self::assertProfileResetIdle($commandId);
             $db = SDB(null, 'medoo', 'sqlite');
-            if (!self::isWorkerReady($state)) {
-                throw new GatewayError('BROWSER_WORKER_UNAVAILABLE', '浏览器控制进程尚未就绪。', 503);
+            $activities = $db->table('gateway_mcp_activities')->where('status', 'active')->count();
+            $calls = $db->table('gateway_tool_invocations')->where('status', 'IN', ['registered', 'delivered'])->count();
+            if (!is_numeric($activities) || !is_numeric($calls)) {
+                throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器任务状态暂不可读取。', 503);
             }
-            $reset = $db->table('gateway_browser_commands')->where('action', 'reset_profile')
-                ->where('status', 'IN', ['queued', 'running'])->find();
-            if ($reset === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作状态暂不可读取。', 503);
-            if (is_array($reset) || ($action !== 'reset_profile' && (int) ($state['profile_reset_required'] ?? 0) === 1)) {
-                throw new GatewayError('BROWSER_PROFILE_RESET_PENDING', '浏览器资料正在清空，请等待操作结束。', 409);
+            if ((int) $activities > 0 || (int) $calls > 0) {
+                throw new GatewayError('BROWSER_PROFILE_BUSY', 'Active tool work still owns the browser.', 409);
             }
-            if ($action === 'reset_profile') {
-                if (isset($payload['login_reminder_id'])) BrowserLoginLifecycle::assertReminderUnlocked((string) $payload['login_reminder_id']);
-                self::assertProfileResetIdle();
-            }
-            if ($action === 'start') {
-                // Auto-start and a simultaneous login click must observe the same pending launch.
-                $pendingStart = $db->table('gateway_browser_commands')->where('action', 'start')
-                    ->where('status', 'IN', ['queued', 'running'])->order([['id', 'ASC']])->find('id');
-                if ($pendingStart === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器启动状态暂不可读取。', 503);
-                if (is_array($pendingStart)) return (int) $pendingStart['id'];
-            }
-            if (!in_array($action, ['start', 'install', 'reset_profile'], true) && $state['status'] === 'stopped') {
-                throw new GatewayError('BROWSER_NOT_RUNNING', '请先启动受控浏览器。', 409);
-            }
-            if ($documentBound && $state['lease_mode'] !== $requiredLease) {
-                if ($requiredLease === 'automation') {
-                    throw new GatewayError('BROWSER_MANUAL_OWNS_SURFACE', '页面当前由人工控制，自动任务未取得控制权。', 409);
-                }
-                throw new GatewayError('BROWSER_AUTOMATION_OWNS_SURFACE', '自动任务正在控制页面，请先切换为人工接管。', 409);
-            }
-            $pending = $db->table('gateway_browser_commands')->where('status', 'queued')->count();
-            if ($pending === false || $pending === null || $pending > 24) {
-                throw new GatewayError('BROWSER_COMMAND_BUSY', '浏览器操作队列繁忙，请稍后重试。', 409);
-            }
-            $row = [
-                'action' => $action,
-                'surface_generation' => (int) $state['surface_generation'],
-                'document_nonce' => $documentBound ? $state['document_nonce'] : null,
-                'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-                'status' => 'queued',
-                'created_at' => time(),
-            ];
-            if (!$db->table('gateway_browser_commands')->add($row)) {
-                throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作无法入队。', 503);
-            }
-            if ($action === 'reset_profile') self::write(['profile_reset_required' => 1, 'auto_start' => 0]);
-            return (int) $db->id();
-        });
+        } catch (GatewayError $error) {
+            if ($error->errorCode !== 'BROWSER_PROFILE_BUSY') throw $error;
+            throw new GatewayError('BROWSER_RESTART_BUSY', '仍有浏览器操作或网页任务在运行，设置已保存，请等待完成后再应用。', 409);
+        }
     }
 
     /** Reject profile clearing while a browser command or Web turn can still use the private Chrome. */
@@ -200,7 +267,7 @@ final class BrowserState
                     // of the start/install command that makes its own execution possible.
                     if ($state['status'] !== 'ready') {
                         // A queued login/native operation cannot overtake slow Chrome startup.
-                        $query->where('action', 'IN', ['install', 'start', 'stop', 'reset_profile']);
+                        $query->where('action', 'IN', ['install', 'start', 'restart', 'stop', 'reset_profile']);
                     }
                     $row = $query->order([['id', 'ASC']])->find();
                 }
@@ -211,7 +278,7 @@ final class BrowserState
             if (!is_array($row)) {
                 return null;
             }
-            $maxQueueAge = $row['action'] === 'reset_profile' ? 600
+            $maxQueueAge = in_array($row['action'], ['reset_profile', 'restart'], true) ? 600
                 : (in_array((string) $row['action'], ['chatgpt_text', 'verify_connector', 'probe_models'], true) ? 180 : 30);
             if ((int) $row['created_at'] < time() - $maxQueueAge) {
                 $rejected = ['command'=>$row, 'code'=>'BROWSER_COMMAND_EXPIRED', 'message'=>'浏览器操作等待过久，已取消。'];
@@ -220,9 +287,9 @@ final class BrowserState
             }
             // Connector verification navigates to its own check page. A harmless page change
             // after enqueue must not discard the automatic runtime recheck before it starts.
-            $documentBound = !in_array($row['action'], ['install', 'start', 'stop', 'reset_profile', 'lease', 'new_tab', 'switch_tab', 'close_tab', 'chatgpt_text', 'verify_connector', 'native_window'], true);
+            $documentBound = !in_array($row['action'], ['install', 'start', 'restart', 'stop', 'reset_profile', 'lease', 'new_tab', 'switch_tab', 'close_tab', 'chatgpt_text', 'verify_connector', 'native_window'], true);
             if ($row['action'] === 'probe_models') $documentBound = false;
-            $pageIndependent = in_array($row['action'], ['chatgpt_text', 'verify_connector', 'reset_profile'], true);
+            $pageIndependent = in_array($row['action'], ['chatgpt_text', 'verify_connector', 'reset_profile', 'restart'], true);
             if ((!$pageIndependent && (int) $row['surface_generation'] !== (int) $state['surface_generation'])
                 || ($documentBound && $row['document_nonce'] !== $state['document_nonce'])) {
                 $rejected = ['command'=>$row, 'code'=>'BROWSER_SURFACE_STALE', 'message'=>'页面已变化，旧操作未执行。'];
@@ -272,14 +339,14 @@ final class BrowserState
     /**
      * Record bounded startup diagnostics without changing the command lifecycle or admitting
      * downstream work. Terminal/recovered commands cannot be overwritten by late stage callbacks.
-     * @param int $id Running start command ID.
+     * @param int $id Running start or restart command ID.
      * @param array $progress Non-secret stage/elapsed/PID metadata from its owning browser worker.
      * @throws GatewayError When the diagnostic update cannot be persisted.
      */
     public static function startupProgress(int $id, array $progress): void
     {
         $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('id', $id)
-            ->where('action', 'start')->where('status', 'running')->update([
+            ->where('action', 'IN', ['start', 'restart'])->where('status', 'running')->update([
                 'result_json'=>json_encode($progress, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
             ]);
         if ($updated === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器启动诊断暂不可保存。', 503);
@@ -362,7 +429,7 @@ final class BrowserState
                 if (is_array($payload) && is_string($payload['response_id'] ?? null)
                     && self::finishUnknownToolCommandUnlocked((int) $row['id'], $payload['response_id'])) continue;
                 $result = ['code'=>'BROWSER_COMMAND_INTERRUPTED', 'message'=>'浏览器控制进程已重启，操作结果未知，请重新执行。'];
-                if ($row['action'] === 'start') {
+                if (in_array($row['action'], ['start', 'restart'], true)) {
                     $progress = json_decode((string) ($row['result_json'] ?? ''), true);
                     if (is_array($progress) && ($progress['status'] ?? '') === 'starting') $result['startup'] = $progress;
                 }

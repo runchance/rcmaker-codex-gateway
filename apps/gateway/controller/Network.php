@@ -34,12 +34,14 @@ final class Network
         return $this->respond($request, fn() => ['revision' => NetworkSettings::save($this->body($request))]);
     }
 
-    /** @param Request $request Current request. @return mixed Applied PHP revision, with other consumers unchanged. */
+    /** @param Request $request Current request. @return mixed Applied revision and optional browser reinitialization command. */
     public function apply(Request $request)
     {
         return $this->respond($request, function () use ($request): array {
             $data = $this->ids($request, ['expected_revision']);
-            return ['revision' => NetworkSettings::apply($data['expected_revision'])];
+            $commandId = null;
+            $revision = NetworkSettings::apply($data['expected_revision'], true, $commandId);
+            return ['revision' => $revision, 'browser_command_id' => $commandId];
         });
     }
 

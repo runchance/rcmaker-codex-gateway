@@ -17,6 +17,7 @@ use app\gateway\model\ContextCompaction;
 use app\gateway\model\ContextPortability;
 use app\gateway\model\GatewaySettings;
 use app\gateway\http\NativeTransport;
+use support\http\GatewayRoute;
 
 /** Loopback Responses-compatible text entry points backed by the owned ChatGPT browser. */
 final class Responses
@@ -67,7 +68,7 @@ final class Responses
             $raw = $this->decodedBody($request);
             $phase = 'route';
             $body = json_decode($raw, true);
-            if (is_array($body) && is_string($body['model'] ?? null) && !str_starts_with($body['model'], 'chatgpt-web/')) {
+            if (GatewayRoute::nativeModel($body)) {
                 return $this->forward($request, 'responses', $raw);
             }
             if (BrowserState::profileResetPending()) {
@@ -205,7 +206,7 @@ final class Responses
             Schema::initialize();
             $raw = $this->decodedBody($request);
             $body = json_decode($raw, true, 128, JSON_THROW_ON_ERROR);
-            if (!str_starts_with((string) ($body['model'] ?? ''), 'chatgpt-web/')) return $this->forward($request, 'responses/compact', $raw);
+            if (GatewayRoute::nativeModel($body, true)) return $this->forward($request, 'responses/compact', $raw);
             if (BrowserState::profileResetPending()) {
                 throw new GatewayError('browser_profile_reset_pending', '浏览器登录资料正在清空，请稍后重试。', 503);
             }
@@ -312,22 +313,7 @@ final class Responses
     /** Decode a bounded request for route selection without altering the native wire payload. */
     private function decodedBody(Request $request): string
     {
-        $raw = (string) $request->rawBody();
-        if (strlen($raw) > ResponsesProtocol::MAX_BODY_BYTES) {
-            throw new GatewayError('request_body_too_large', 'HTTP 请求正文超过网关字节上限。', 413);
-        }
-        $encoding = strtolower(trim((string) $request->header('content-encoding', '')));
-        if ($encoding !== '' && $encoding !== 'identity') {
-            if ($encoding === 'gzip') $decoded = @gzdecode($raw, ResponsesProtocol::MAX_BODY_BYTES + 1);
-            elseif ($encoding === 'zstd' && function_exists('zstd_uncompress')) $decoded = zstd_uncompress($raw);
-            else throw new GatewayError('unsupported_content_encoding', '当前 PHP 运行时不支持 ' . $encoding . ' 请求压缩，请通过接入配置关闭客户端请求压缩。', 415);
-            if (!is_string($decoded)) throw new GatewayError('invalid_compressed_body', '压缩请求损坏。', 400);
-            if (strlen($decoded) > ResponsesProtocol::MAX_BODY_BYTES) {
-                throw new GatewayError('request_body_too_large', '解压后的 HTTP 请求正文超过网关字节上限。', 413);
-            }
-            $raw = $decoded;
-        }
-        return $raw;
+        return GatewayRoute::decodedBody($request);
     }
 
     /** Preserve the real native client's HTTP metadata when it is not repeated in the JSON body. */

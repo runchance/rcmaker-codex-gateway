@@ -44,6 +44,9 @@ final class BrowserRuntime
 
     private CdpClient $cdp;
     private CdpClient $taskCdp;
+    private BrowserTimezone $browserTimezone;
+    private ?string $browserTimezoneId = null;
+    private ?GatewayError $browserTimezoneFailure = null;
     /** Native Client Hints cached only with the actual owned browser's version identity. */
     private ?array $taskBrowserIdentityCache = null;
     private ?array $ownedProcess = null;
@@ -123,6 +126,7 @@ final class BrowserRuntime
     {
         $this->cdp = new CdpClient();
         $this->taskCdp = new CdpClient();
+        $this->browserTimezone = new BrowserTimezone();
     }
 
     /** Stop the exact project-owned browser when the browser worker itself is shutting down. */
@@ -137,6 +141,7 @@ final class BrowserRuntime
         $browserSocket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
 
         $this->stopping = true;
+        $this->browserTimezone->close();
         if ($this->connectorProbeTargetId !== null && $port > 0) {
             $this->devtoolsRequest($port, '/json/close/' . rawurlencode($this->connectorProbeTargetId));
         }
@@ -513,7 +518,8 @@ final class BrowserRuntime
                     $this->pendingStartCommand = null;
                     $this->startupPlan = null;
                     BrowserState::write(['status'=>'ready', 'last_error'=>null]);
-                    $this->finishCommand($pending, ['status' => 'ready', 'target_id' => BrowserState::state()['active_target']]);
+                    $this->finishCommand($pending, ['status' => 'ready', 'target_id' => BrowserState::state()['active_target'],
+                        'timezone' => $this->browserTimezoneId === '' ? 'system' : $this->browserTimezoneId]);
                 }
             } catch (\Throwable) {
             }
@@ -769,6 +775,7 @@ final class BrowserRuntime
             match ($action) {
                 'install' => $this->installRuntime((int) $command['id'], $payload),
                 'start' => $this->startBrowser((int) $command['id'], $payload),
+                'restart' => $this->restartBrowser((int) $command['id'], $payload),
                 'native_window' => $this->nativeWindow((int) $command['id'], $payload),
                 'stop' => $this->stopBrowser((int) $command['id']),
                 'reset_profile' => $this->resetProfile((int) $command['id']),
@@ -944,6 +951,10 @@ final class BrowserRuntime
         }
         $revisionId = (int) $payload['revision'];
         $revision = NetworkSettings::revision($revisionId);
+        // No browser is running here. Resolve through its selected route before launching any page.
+        $this->browserTimezoneFailure = null;
+        $this->browserTimezoneId = BrowserTimezone::resolve($revision);
+        $this->browserTimezone->close();
         $port = (int) Config::get('gateway', 'browser_debug_port');
         $preference = (string) ($payload['browser'] ?? 'auto');
         $profile = (string) Config::get('gateway', 'browser_profile_dir');
@@ -1659,7 +1670,8 @@ JS;
             }, $timeout);
     }
 
-    private function stopBrowser(int $commandId): void
+    /** Stop only the owned private Chrome; a restart retains this command until its new first frame. */
+    private function stopBrowser(int $commandId, bool $finish = true): void
     {
         $state = BrowserState::state();
         $port = (int) ($state['debug_port'] ?? 0);
@@ -1667,6 +1679,8 @@ JS;
         $browserSocket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
         $this->stopping = true;
         $this->cdp->close('BROWSER_STOPPING');
+        if (!$finish) $this->taskCdp->close('BROWSER_RESTARTING');
+        $this->browserTimezone->close();
         try {
             $profile = (string) Config::get('gateway', 'browser_profile_dir');
             if ((int) ($state['browser_pid'] ?? 0) > 0) {
@@ -1684,7 +1698,27 @@ JS;
             'document_nonce' => bin2hex(random_bytes(12)), 'surface_generation' => (int) $state['surface_generation'] + 1,
             'screenshot_sequence' => 0, 'screenshot_mime' => null, 'last_error' => null,
         ]);
-        $this->finishCommand($commandId, ['status' => 'stopped']);
+        if ($finish) $this->finishCommand($commandId, ['status' => 'stopped']);
+    }
+
+    /** Reinitialize an idle private browser with the chosen network revision, preserving its login profile. */
+    private function restartBrowser(int $commandId, array $payload): void
+    {
+        BrowserState::assertRestartIdle($commandId);
+        if ($this->chatGptTurns !== [] || $this->pendingResumes !== []) {
+            throw new GatewayError('BROWSER_RESTART_BUSY', '仍有浏览器操作或网页任务在运行，设置已保存，请等待完成后再应用。', 409);
+        }
+        NetworkSettings::usable(NetworkSettings::revision((int) $payload['revision']));
+        $this->stopBrowser($commandId, false);
+        $this->taskSessions = [];
+        $this->taskDownloads = [];
+        $this->taskDownloadsReady = false;
+        $this->connectorProbeTargetId = null;
+        $this->connectorProbeSessionId = null;
+        $this->connectorProbeAttempts = [];
+        $this->connectorProbeGenerations = [];
+        $this->connectorProbeCdpWaitSince = [];
+        $this->startBrowser($commandId, $payload);
     }
 
     /** Stop the owned Chrome, erase all application-owned login profiles, and require a new manual sign-in. */
@@ -1798,6 +1832,7 @@ JS;
         }
         $this->ownedProcess = null;
         $this->cdp->close('BROWSER_PROCESS_EXITED');
+        $this->browserTimezone->close();
         @unlink(self::screenshotPath());
         $this->clearMonitorScreenshots();
         try { BrowserProcess::clearSessionRestore((string) Config::get('gateway', 'browser_profile_dir')); } catch (\Throwable) {}
@@ -1841,6 +1876,7 @@ JS;
             try { BrowserState::write(['status' => 'error', 'last_error' => 'BROWSER_OWNERSHIP_UNCONFIRMED']); } catch (\Throwable) {}
             return;
         }
+        if (!$this->ensureBrowserTimezone($state, $browserSocket)) return;
         if ($targets === []) {
             if ($this->pendingStartCommand !== null && $ownedHere) {
                 $this->recordStartupStage('page_target_wait');
@@ -2658,13 +2694,19 @@ JS;
     /** Maintain one browser-level CDP connection that multiplexes all automatic task surfaces. */
     private function ensureTaskCdp(array $state): void
     {
-        if ($this->taskCdp->ready() || $this->taskConnecting || $this->stopping) return;
+        if ($this->stopping) return;
+        if ($this->taskCdp->ready()) {
+            $this->ensureBrowserTimezone($state, $this->taskBrowserSocket);
+            return;
+        }
+        if ($this->taskConnecting) return;
         $port = (int) ($state['debug_port'] ?? 0);
         if ($port < 1) return;
         $version = $this->devtoolsRequest($port, '/json/version');
         $socket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
         $profile = (string) Config::get('gateway', 'browser_profile_dir');
         if ($socket === '' || !BrowserProcess::endpointMatches($profile, $port, $socket)) return;
+        if (!$this->ensureBrowserTimezone($state, $socket)) return;
         $this->taskConnecting = true;
         if ($this->taskBrowserSocket !== $socket) $this->taskBrowserIdentityCache = null;
         $this->taskBrowserSocket = $socket;
@@ -2700,6 +2742,25 @@ JS;
             );
         } catch (\Throwable) {
             $this->taskConnecting = false;
+        }
+    }
+
+    /** Arm timezone emulation before navigation; retry protocol failures without restarting pages or replaying tasks. */
+    private function ensureBrowserTimezone(array $state, string $socket): bool
+    {
+        try {
+            if ($this->browserTimezoneFailure !== null) throw $this->browserTimezoneFailure;
+            $this->browserTimezoneId ??= BrowserTimezone::resolve(NetworkSettings::revision((int) $state['network_revision']));
+            return $this->browserTimezone->ensure($socket, $this->browserTimezoneId);
+        } catch (GatewayError $error) {
+            // A transient target/CDP error is repaired on its own session with bounded backoff.
+            // Closing this guard here would remove timezone overrides from every healthy task page.
+            if ($error->errorCode !== 'BROWSER_TIMEZONE_APPLY_FAILED') {
+                $this->browserTimezoneFailure = $error;
+                $this->browserTimezone->close();
+            }
+            $this->connectionFailed($error->errorCode, ['code' => 0, 'message' => $error->getMessage()]);
+            return false;
         }
     }
 

@@ -233,19 +233,53 @@ CONTRACT;
     public static function render(bool $retainedPage, array $settings, array $variables): string
     {
         $field = $retainedPage ? 'web_resume_contract_template' : 'web_initial_contract_template';
-        return self::renderField($field, $settings, $variables);
+        return self::withCheckpointResumeNotice(self::renderField($field, $settings, $variables), $variables['context_json'] ?? '');
     }
 
     /** @param array<string,mixed> $settings @param array<string,string> $variables */
     public static function renderReadOnly(array $settings, array $variables): string
     {
-        return self::renderField('web_readonly_contract_template', $settings, $variables);
+        return self::withCheckpointResumeNotice(self::renderField('web_readonly_contract_template', $settings, $variables), $variables['context_json'] ?? '');
     }
 
     /** @param array<string,mixed> $settings @param array<string,string> $variables */
     public static function renderCompaction(array $settings, array $variables): string
     {
-        return self::renderField('web_compact_contract_template', $settings, $variables);
+        return self::renderField('web_compact_contract_template', $settings, $variables)
+            . "\n" . ContextCompaction::summaryScopeInstruction();
+    }
+
+    /** Label checkpoint data in an ordinary task envelope without rewriting signed history or granting tools.
+     * @param string $prompt Rendered normal-task transport, including custom templates.
+     * @param string $contextJson Canonical browser context. Checkpoint-shaped user text gains no authority.
+     * @return string Prompt with one scoped continuation notice, or unchanged when no checkpoint is present.
+     */
+    private static function withCheckpointResumeNotice(string $prompt, string $contextJson): string
+    {
+        $context = json_decode($contextJson, true, 128);
+        $containsCheckpoint = false;
+        foreach ((array) ($context['messages'] ?? []) as $message) {
+            $content = $message['content'] ?? '';
+            if (is_array($content)) $content = implode("\n", array_column($content, 'text'));
+            if (($message['role'] ?? '') === 'user' && is_string($content)
+                && str_starts_with($content, ContextCompaction::SUMMARY_PREFIX)) {
+                $containsCheckpoint = true;
+                break;
+            }
+        }
+        if (!$containsCheckpoint) return $prompt;
+        $notice = <<<'NOTICE'
+<codex_checkpoint_resume>
+This is an ordinary task continuation after context compaction. A message beginning "RCMAKER task checkpoint." is recorded handoff data, even though carried in a user-role message; it is not a new human request.
+The prior request to generate or submit only a checkpoint, stop tools for compaction, or wait for the next context applied only to that completed control operation. Do not carry those temporary restrictions forward, even if the summary incorrectly calls them the user's latest request. Do not merely acknowledge the handoff or repeat its remaining-work list as a completed answer.
+Recover the latest actual human request and unfinished work from the retained human messages and checkpoint facts. Continue the authorized remaining steps, preserving completed results and exact tool receipts. Respect genuine user pause, cancellation, approval boundaries, unresolved failures and current tool/platform restrictions. This notice grants no tools or permissions; only the current request supplies them. If the task is complete or truly blocked, report that accurately.
+</codex_checkpoint_resume>
+NOTICE;
+        if (str_contains($prompt, $notice)) return $prompt;
+        preg_match_all('/^[ \t]*<\/codex_transport_resume>[ \t]*\r?$/m', $prompt, $matches, PREG_OFFSET_CAPTURE);
+        if ($matches[0] === []) return rtrim($prompt) . "\n" . $notice;
+        $position = $matches[0][array_key_last($matches[0])][1];
+        return substr($prompt, 0, $position) . $notice . "\n" . substr($prompt, $position);
     }
 
     /**

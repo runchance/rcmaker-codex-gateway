@@ -41,7 +41,8 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
         const selected = snapshot && (byId('test-source').value === 'active' ? snapshot.active : snapshot.saved);
         const states = {
             save: busy || !snapshot,
-            apply: busy || !valid || dirty || Number(snapshot.active && snapshot.active.id) === Number(snapshot.saved.id),
+            apply: busy || !valid || dirty || (Number(snapshot.active && snapshot.active.id) === Number(snapshot.saved.id)
+                && !snapshot.consumers.some(consumer => consumer.id === 'browser' && ['pending', 'apply_failed'].includes(consumer.status))),
             test: busy || !selected || selected.mode === 'unconfigured' || !snapshot.probe_worker_ready || jobId !== null,
             restore: busy || !snapshot || !byId('restore-source').value,
             reload: busy
@@ -65,6 +66,7 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
         snapshot = value;
         const saved = value.saved;
         if (hydrate) {
+            Gateway.browserTimezones(byId('browser-timezone'), value.browser_timezones, saved.browser_timezone, 'network');
             form.val('network', {mode: saved.mode === 'direct' ? 'direct' : 'manual', protocol: 'http', host: saved.host || '', port: saved.port || '', username: saved.username || '', password: '', password_action: saved.has_password ? 'keep' : 'set', authentication: Boolean(saved.username)});
             dirty = false;
             visibility();
@@ -117,6 +119,10 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
         try {
             const outcome = await Gateway.request(path, payload);
             acknowledged = true;
+            if (outcome.browser_command_id) {
+                message(I18n.t('正在重新初始化浏览器，登录资料会保留…'));
+                await Gateway.waitBrowserRestart(outcome.browser_command_id);
+            }
             Gateway.notifyStateChange('network');
             if (path.endsWith('/save') && submittedEdit === editVersion) byId('password').value = '';
             message(success + ' r' + outcome.revision + (I18n.locale === 'en' ? '.' : '。'));
@@ -140,7 +146,11 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
             const saved = await Gateway.request('/api/network/save', payload);
             savedRevision = Number(saved.revision);
             if (submittedEdit === editVersion) byId('password').value = '';
-            await Gateway.request('/api/network/apply', {expected_revision: savedRevision});
+            const applied = await Gateway.request('/api/network/apply', {expected_revision: savedRevision});
+            if (applied.browser_command_id) {
+                message(I18n.t('正在重新初始化浏览器，登录资料会保留…'));
+                await Gateway.waitBrowserRestart(applied.browser_command_id);
+            }
             Gateway.notifyStateChange('network');
             message(I18n.t('网络配置 r') + savedRevision + I18n.t(' 已保存并应用，可以继续完成运行准备。'));
             await load(true, submittedEdit);
@@ -212,6 +222,7 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
     form.on('switch(authentication)', changed);
     form.on('select(password-action)', changed);
     form.on('select(protocol)', changed);
+    form.on('select(browser-timezone)', changed);
     form.on('select(test-source)', controls);
     form.on('select(restore-source)', controls);
     byId('network-form').addEventListener('input', changed);
@@ -230,7 +241,7 @@ layui.use(['form', 'table', 'layer', 'util'], function () {
             message(I18n.t('请填写认证用户名和密码。'), true);
             return false;
         }
-        saveAndApply({expected_revision: Number(snapshot.saved.id), mode: data.mode, protocol: 'http', host: manual ? data.host : '', port, username: auth ? data.username : '', password: auth && data.password_action === 'set' ? data.password : '', password_action: auth ? data.password_action : 'clear'});
+        saveAndApply({expected_revision: Number(snapshot.saved.id), mode: data.mode, protocol: 'http', host: manual ? data.host : '', port, username: auth ? data.username : '', password: auth && data.password_action === 'set' ? data.password : '', password_action: auth ? data.password_action : 'clear', browser_timezone: data.browser_timezone});
         return false;
     });
     byId('apply').addEventListener('click', function () {

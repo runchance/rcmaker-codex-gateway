@@ -396,6 +396,34 @@
         }
     }
 
-    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics,
+    /** Populate a searchable Layui timezone selector only when its owning form explicitly hydrates. */
+    function browserTimezones(select, zones, selected, filter) {
+        const options = [new Option(I18n.t('自动跟随代理出口（推荐）'), 'auto'), new Option(I18n.t('使用电脑时区'), 'system')];
+        const common = {'Asia/Tokyo': I18n.t('东京'), 'Asia/Shanghai': I18n.t('上海'), 'Asia/Hong_Kong': I18n.t('香港'),
+            'Asia/Singapore': I18n.t('新加坡'), 'America/New_York': I18n.t('纽约'), 'America/Los_Angeles': I18n.t('洛杉矶'), 'Europe/London': I18n.t('伦敦')};
+        const available = new Set(zones || []);
+        // Preserve a saved legacy IANA alias even when it is absent from the current primary catalog.
+        if (selected && !['auto', 'system'].includes(selected)) available.add(selected);
+        const ordered = [...Object.keys(common).filter(zone => available.has(zone)), ...[...available].filter(zone => !common[zone])];
+        ordered.forEach(zone => options.push(new Option(common[zone] ? common[zone] + ' · ' + zone : zone, zone)));
+        select.replaceChildren(...options);
+        select.value = selected || 'auto';
+        layui.form.render('select', filter);
+    }
+
+    /** Observe an already reserved restart; a timeout never resubmits it or reports false success. */
+    async function waitBrowserRestart(commandId) {
+        if (!commandId) return;
+        const deadline = Date.now() + 240000;
+        while (Date.now() < deadline) {
+            const command = await request('/api/browser/commands/' + commandId);
+            if (command.status === 'succeeded') return command.result;
+            if (command.status === 'failed') throw new Error(I18n.error(command.result?.message || I18n.t('浏览器操作失败。'), command.result?.code));
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        throw new Error(I18n.t('设置已应用，浏览器重新初始化仍在进行。请稍后刷新查看，不会重复重启。'));
+    }
+
+    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics, browserTimezones, waitBrowserRestart,
         isPageActive, automaticRefreshAllowed, onPageActivate, notifyStateChange};
 })();

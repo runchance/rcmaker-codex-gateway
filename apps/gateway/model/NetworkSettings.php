@@ -18,7 +18,7 @@ final class NetworkSettings
         $history = $request->AF([
             'type' => 'list', 'table' => 'gateway_network_revisions', 'name' => '网络配置',
             'db' => $request->SDB('medoo', 'sqlite'), 'order' => [['id', 'DESC']], 'limit' => 20,
-            'fields' => 'id,mode,protocol,host,port,username,restored_from,created_at',
+            'fields' => 'id,mode,protocol,host,port,username,browser_timezone,restored_from,created_at',
         ])->handle();
         $tests = $request->AF([
             'type' => 'list', 'table' => 'gateway_network_tests', 'name' => '最近检测',
@@ -62,6 +62,7 @@ final class NetworkSettings
         }
         return [
             'saved' => self::publicRevision($saved),
+            'browser_timezones' => \DateTimeZone::listIdentifiers(),
             'active' => $active === null ? null : self::publicRevision($active),
             'history' => $history,
             'last_test' => $lastTest,
@@ -99,7 +100,9 @@ final class NetworkSettings
         if ($data['username'] !== '' && $protected === null) {
             throw new GatewayError('CREDENTIAL_REQUIRED', '填写代理用户名后，需要同时提供密码。');
         }
-        $row = array_intersect_key($data, array_flip(['mode', 'protocol', 'host', 'port', 'username']));
+        $row = array_intersect_key($data, array_flip(['mode', 'protocol', 'host', 'port', 'username', 'browser_timezone']));
+        // Older console clients must not silently erase a timezone chosen in a newer client.
+        $row['browser_timezone'] ??= $current['browser_timezone'];
         $row['protected_password'] = $protected;
         $row['restored_from'] = null;
         return Schema::transaction(function () use ($data, $row): int {
@@ -108,8 +111,13 @@ final class NetworkSettings
         });
     }
 
-    /** Switch the shared outbound revision used by PHP probes and downloads; child runtimes bind it when prepared/launched. @return int @throws GatewayError */
-    public static function apply(int $expectedRevision): int
+    /** Apply the outbound revision and atomically reserve an idle browser restart when requested by the console.
+     * @param int $expectedRevision Saved immutable revision.
+     * @param bool $restartBrowser Reinitialize a running private browser using the same revision.
+     * @param int|null $browserCommandId Receives the durable command to observe; null if no browser is running.
+     * @return int Applied revision. @throws GatewayError Busy browsers leave the applied pointer unchanged.
+     */
+    public static function apply(int $expectedRevision, bool $restartBrowser = false, ?int &$browserCommandId = null): int
     {
         self::expectRevision($expectedRevision);
         $revision = self::revision($expectedRevision);
@@ -126,8 +134,9 @@ final class NetworkSettings
             });
             throw $error;
         }
-        return Schema::transaction(function () use ($expectedRevision): int {
+        return Schema::transaction(function () use ($expectedRevision, $restartBrowser, &$browserCommandId): int {
             self::expectRevision($expectedRevision);
+            $browserCommandId = $restartBrowser ? BrowserState::restartForNetworkUnlocked($expectedRevision) : null;
             self::writeState(['applied_php_revision' => $expectedRevision, 'last_apply_revision' => $expectedRevision, 'last_apply_error' => null]);
             return $expectedRevision;
         });
@@ -235,7 +244,7 @@ final class NetworkSettings
     /** Validate the request using RC Validator, then enforce protocol/authentication relationships. @return array @throws GatewayError */
     private static function validate(#[\SensitiveParameter] array $input): array
     {
-        $fields = ['expected_revision', 'mode', 'protocol', 'host', 'port', 'username', 'password', 'password_action'];
+        $fields = ['expected_revision', 'mode', 'protocol', 'host', 'port', 'username', 'password', 'password_action', 'browser_timezone'];
         if (array_diff(array_keys($input), $fields)) {
             throw new GatewayError('INVALID_FIELD', '请求包含不支持的设置字段。');
         }
@@ -250,12 +259,18 @@ final class NetworkSettings
                 'username' => ['rule' => 'string', 'len' => [0, 128], 'required' => false, 'name' => '用户名'],
                 'password' => ['rule' => 'string', 'len' => [0, 256], 'required' => false, 'name' => '密码'],
                 'password_action' => ['rule' => 'string', 'len' => [1, 8], 'name' => '密码操作'],
+                'browser_timezone' => ['rule' => 'string', 'len' => [1, 80], 'required' => false, 'name' => '浏览器时区'],
             ]);
         } catch (\Throwable $error) {
             throw new GatewayError('INVALID_SETTINGS', '请检查配置版本、地址、端口和各字段长度。');
         }
         // Validator omits optional null values. Normalize them before applying protocol relationships.
         $data += ['host' => '', 'username' => '', 'password' => ''];
+        if (array_key_exists('browser_timezone', $input)
+            && (!isset($data['browser_timezone']) || (!in_array($data['browser_timezone'], ['auto', 'system'], true)
+                && !\support\browser\BrowserTimezone::valid($data['browser_timezone'])))) {
+            throw new GatewayError('BROWSER_TIMEZONE_INVALID', '请选择有效的浏览器时区。');
+        }
         $data['expected_revision'] = (int) $data['expected_revision'];
         $data['port'] = (int) $data['port'];
         $data['host'] = trim((string) $data['host']);

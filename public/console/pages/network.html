@@ -38,6 +38,8 @@
                 </div>
             </div>
             <div id="direct-help" class="notice" hidden>RCMAKER 将直接访问外网。</div>
+            <div class="field"><label for="browser-timezone">浏览器时区</label><select id="browser-timezone" name="browser_timezone" lay-filter="browser-timezone" lay-search><option value="auto">自动跟随代理出口（推荐）</option><option value="system">使用电脑时区</option></select><p class="help">可搜索城市或时区。自动模式在直连时使用电脑时区。</p></div>
+            <p class="help">更改网络或时区后，内置浏览器会重新初始化，保留登录资料。请先等待网页任务完成。</p>
             <div class="actions"><button id="save" type="submit" class="layui-btn" lay-submit lay-filter="save-network"><i class="layui-icon layui-icon-ok" aria-hidden="true"></i>保存并使用</button><button id="continue-setup" type="button" class="layui-btn layui-btn-primary" hidden>继续准备运行组件</button><span class="help">保存后立即生效。</span></div>
         </form>
     </section>

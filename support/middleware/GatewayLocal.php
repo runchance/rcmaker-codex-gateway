@@ -15,7 +15,13 @@ final class GatewayLocal
         $path = (string) $request->path();
         $responsesApi = str_starts_with($path, '/v1/');
         $origin = (string) $request->header('origin', '');
-        $expectedHost = '127.0.0.1:' . $gateway['api_port'];
+        // Framework application ownership selects the port; caller-supplied Host cannot.
+        $portKey = match ($request->app['app'] ?? '') {
+            'gateway_native' => 'native_api_port',
+            'gateway' => 'web_api_port',
+            default => 'api_port',
+        };
+        $expectedHost = '127.0.0.1:' . $gateway[$portKey];
         $headers = [
             'Access-Control-Allow-Origin' => $gateway['console_origin'],
             'Access-Control-Allow-Methods' => 'GET, POST, OPTIONS',

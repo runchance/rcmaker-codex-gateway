@@ -338,6 +338,7 @@ final class DiagnosticExport
             'mcp' => $tunnel . '/mcp-events.jsonl', 'mcp_previous' => $tunnel . '/mcp-events.jsonl.1',
             'native' => $tunnel . '/native-events.jsonl', 'native_previous' => $tunnel . '/native-events.jsonl.1',
             'api' => $runtime . '/RC_GATEWAY_API.log', 'api_legacy' => $runtime . '/RC_GETWAY_API.log',
+            'native_api' => $runtime . '/RC_GATEWAY_NATIVE_API.log', 'web_api' => $runtime . '/RC_GATEWAY_WEB_API.log',
             'browser_runtime' => $browser . '/runtime-errors.log', 'browser_stderr' => $browser . '/stderr.log',
             'chrome' => $browser . '/chrome.log',
         ];
@@ -355,7 +356,8 @@ final class DiagnosticExport
             $size = (int) ($stat['size'] ?? 0);
             $offset = max(0, $size - $maxBytes);
             if (fseek($file, $offset) !== 0) return [[], $meta + ['error' => 'seek_failed']];
-            $text = (string) fread($file, min($size, $maxBytes));
+            // Fresh worker logs can be empty; PHP rejects a zero-length fread.
+            $text = $size > 0 ? (string) fread($file, min($size, $maxBytes)) : '';
         } finally { fclose($file); }
         $lines = explode("\n", $text);
         if ($offset > 0) array_shift($lines);

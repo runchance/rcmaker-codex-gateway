@@ -2,6 +2,8 @@
 /** Local appliance configuration. Editable network settings live in SQLite. */
 $consolePort = (int) rcEnv('gateway.console_port', 28910);
 $apiPort = (int) rcEnv('gateway.api_port', 28911);
+$nativeApiPort = (int) rcEnv('gateway.native_api_port', 28913);
+$webApiPort = (int) rcEnv('gateway.web_api_port', 28914);
 $browserDebugPort = (int) rcEnv('gateway.browser_debug_port', 28912);
 $browserHttpProtocol = (string) rcEnv('gateway.browser_http_protocol', 'auto');
 if (!in_array($browserHttpProtocol, ['auto', 'http1'], true)) {
@@ -26,9 +28,9 @@ $runtimeBoundary = PHP_OS_FAMILY === 'Windows' ? strtolower($runtimeNormalized) 
 $projectBoundary = PHP_OS_FAMILY === 'Windows' ? strtolower($projectRoot) : $projectRoot;
 $configuredCodexHome = trim((string) rcEnv('gateway.codex_home', ''));
 $codexHome = $configuredCodexHome !== '' ? $configuredCodexHome : \support\process\CodexEnvironment::detect();
-if ($consolePort < 1024 || $consolePort > 65535 || $apiPort < 1024 || $apiPort > 65535 || $browserDebugPort < 1024 || $browserDebugPort > 65535
-    || count(array_unique([$consolePort, $apiPort, $browserDebugPort])) !== 3) {
-    throw new RuntimeException('Gateway requires distinct console, API and browser-debug loopback ports between 1024 and 65535.');
+$ports = [$consolePort, $apiPort, $nativeApiPort, $webApiPort, $browserDebugPort];
+if (min($ports) < 1024 || max($ports) > 65535 || count(array_unique($ports)) !== 5) {
+    throw new RuntimeException('Gateway requires distinct console, ingress, native-API, Web-API and browser-debug loopback ports between 1024 and 65535.');
 }
 if (!preg_match('/\A[a-zA-Z0-9_-]+\.sqlite\z/', $databaseName)) {
     throw new RuntimeException('Invalid gateway database filename.');
@@ -53,9 +55,16 @@ return [
     'codex_home' => $codexHome,
     'console_port' => $consolePort,
     'api_port' => $apiPort,
+    'native_api_port' => $nativeApiPort,
+    'web_api_port' => $webApiPort,
     'browser_debug_port' => $browserDebugPort,
     // Opt-in compatibility for diagnosed HTTP/2 stream errors; never changes an active browser.
     'browser_http_protocol' => $browserHttpProtocol,
+    // Auto resolves the manual proxy's egress once per browser start, before page scripts run.
+    'browser_timezone_lookup_urls' => [
+        'https://ipwho.is/?fields=success,timezone.id',
+        'https://ipapi.co/json/',
+    ],
     // Upload/indexing may exceed one minute for a full image batch; never extends a task deadline.
     'attachment_upload_timeout_seconds' => max(60, min(1800, (int) rcEnv('gateway.attachment_upload_timeout_seconds', 600))),
     'console_origin' => 'http://127.0.0.1:' . $consolePort,

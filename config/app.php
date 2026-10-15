@@ -17,7 +17,19 @@ return [
     'app_name' => 'app',
     'app' => [
         'gateway' => [
+            'bind_process' => 'RC_GATEWAY_WEB_API',
+            'enable_static_file' => false,
+            'route' => false,
+            'with_custom_route' => true,
+        ],
+        'gateway_entry' => [
             'bind_process' => 'RC_GATEWAY_API',
+            'enable_static_file' => false,
+            'route' => false,
+            'with_custom_route' => true,
+        ],
+        'gateway_native' => [
+            'bind_process' => 'RC_GATEWAY_NATIVE_API',
             'enable_static_file' => false,
             'route' => false,
             'with_custom_route' => true,
