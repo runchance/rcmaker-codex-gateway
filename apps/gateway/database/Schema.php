@@ -486,6 +486,9 @@ final class Schema
             55 => [
                 "ALTER TABLE gateway_network_revisions ADD COLUMN browser_timezone TEXT NOT NULL DEFAULT 'auto'",
             ],
+            56 => [
+                'ALTER TABLE gateway_settings ADD COLUMN steering_full_context INTEGER NOT NULL DEFAULT 0',
+            ],
         ];
     }
 

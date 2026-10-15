@@ -126,7 +126,7 @@ final class TaskLedger
     }
 
     /**
-     * Fence a proven manual stop before clicking the page. Host effects already delivered stay unknown.
+     * Defer a proven manual stop until accepted tool calls and MCP receipts settle, then fence the page.
      * @param string $responseId Current logical response. @param array $evidence Exact local interruption metadata.
      * @return bool True when this generation is waiting for Web stop confirmation.
      * @throws GatewayError If the stop intent/capability revocation cannot commit atomically.
@@ -141,6 +141,31 @@ final class TaskLedger
                 || ($evidence['reason'] ?? '') !== 'interrupted' || !is_int($evidence['interrupted_at'] ?? null)
                 || $evidence['interrupted_at'] < (int) $turn['created_at'] || $evidence['interrupted_at'] > time() + 5) return false;
             if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') return true;
+            $superseded = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $turn['id'])
+                ->where('event_type', 'codex_user_stop_superseded')->order([['id', 'DESC']])->limit(1)->find();
+            if (is_array($superseded)) {
+                $handled = json_decode((string) $superseded['data_json'], true);
+                $sameEvent = isset($evidence['event_id'], $handled['event_id'])
+                    ? $evidence['event_id'] === $handled['event_id']
+                    : ($handled['interrupted_at'] ?? null) === $evidence['interrupted_at'];
+                if ($sameEvent) return false;
+            }
+            if (!empty($job['mcp_binding_id']) && ToolBroker::hasUnsettledCallsUnlocked((string) $job['mcp_binding_id'])) {
+                $last = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $turn['id'])
+                    ->where('event_type', 'codex_user_stop_waiting_tools')->order([['id', 'DESC']])->limit(1)->find();
+                $waiting = is_array($last) ? json_decode((string) $last['data_json'], true) : [];
+                if (($turn['error_code'] ?? '') !== 'CODEX_USER_STOP_WAITING_TOOLS'
+                    || ($waiting['event_id'] ?? null) !== ($evidence['event_id'] ?? null)
+                    || ($waiting['interrupted_at'] ?? null) !== $evidence['interrupted_at']) {
+                    $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $turn['id'])
+                        ->where('response_id', $responseId)->where('generation_id', $turn['generation_id'])
+                        ->update(['error_code' => 'CODEX_USER_STOP_WAITING_TOOLS', 'updated_at' => time()]);
+                    if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '等待工具完成的停止意图无法保存。', 503);
+                    self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId,
+                        (string) $surface['id'], 'codex_user_stop_waiting_tools', $evidence);
+                }
+                return false;
+            }
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $turn['id'])
                 ->where('response_id', $responseId)->where('generation_id', $turn['generation_id'])
                 ->where('status', $turn['status'])->update(['error_code' => 'CODEX_USER_STOP_PENDING', 'updated_at' => time()]);
@@ -293,11 +318,16 @@ final class TaskLedger
         $newUserMessage = ($lastMessage['role'] ?? '') === 'user'
             && !ContextHistory::isOperationalUserMessage($lastMessage);
         $operation = (string) ($spec['operation_kind'] ?? 'response');
-        if (is_array($task) && $task['status'] === 'active' && $newUserMessage && !$hasToolOutputs && $operation === 'response') {
+        if (is_array($task) && ($task['status'] === 'active'
+                || ($task['status'] === 'needs_attention' && empty(GatewaySettings::internal()['steering_full_context'])))
+            && $newUserMessage && !$hasToolOutputs && $operation === 'response') {
             $latestTurn = $db->table('gateway_task_turns')->where('task_id', $taskId)->order([['rowid', 'DESC']])->limit(1)->find();
             if (is_array($latestTurn) && $latestTurn['status'] === 'cancelled'
                 && ($latestTurn['error_code'] ?? '') === 'CODEX_USER_STOPPED'
                 && ($spec['turn_id'] ?? null) !== $latestTurn['client_turn_id']) {
+                if ($task['status'] === 'needs_attention') {
+                    throw new GatewayError('tool_outcome_unknown', '停止前的工具结果尚未确认；未全量重发或重新执行。', 409);
+                }
                 $parent = empty($spec['previous_response_id']) ? null
                     : $db->table('gateway_response_jobs')->where('id', $spec['previous_response_id'])->find();
                 if ($parent === null || (is_array($parent) && $parent['task_id'] === $taskId
@@ -315,6 +345,9 @@ final class TaskLedger
                     $spec['previous_response_id'] = null;
                     $spec['continuation_source_response_id'] = null;
                     $spec['rolling_source_response_id'] = null;
+                    // The setting also governs a confirmed manual stop followed by a new native turn.
+                    // Keep a separate source proof; the cancelled response is not a live tool handle.
+                    $spec['stopped_source_response_id'] = (string) $latestTurn['response_id'];
                     return ['spec' => $spec, 'prepared' => true];
                 }
             }
@@ -941,7 +974,7 @@ final class TaskLedger
                     'deadline_at' => $now + (int) ($spec['budget']['response_timeout_seconds'] ?? 600),
                     'updated_at' => $now,
                 ];
-                if (!$toolContinuation) {
+                if (!$toolContinuation || !empty($spec['steering_delta'])) {
                     $nextValues += [
                         'status' => 'queued',
                         'owner_incarnation' => (string) $surface['owner_incarnation'],
@@ -956,6 +989,25 @@ final class TaskLedger
                 }
                 $updated = $db->table('gateway_task_turns')->where('id', $existingTurn['id'])->where('status', (string) $existingTurn['status'])->update($nextValues);
                 if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '下一 Response Round 无法登记。', 503);
+                if ($steeringRestart && !empty($spec['steering_delta'])) {
+                    // Fence the old observer immediately, retaining only its physical document.
+                    $fence = (int) $surface['fencing_version'] + 1;
+                    $claimed = $db->table('gateway_browser_surfaces')->where('id', $surface['id'])
+                        ->where('fencing_version', (int) $surface['fencing_version'])->update([
+                            'status' => 'ready', 'session_id' => null, 'owner_incarnation' => 'unclaimed',
+                            'fencing_version' => $fence, 'updated_at' => $now,
+                        ]);
+                    if (!$claimed || $claimed->rowCount() !== 1) throw new GatewayError('surface_fence_lost', '插话原页所有权已变化。', 409);
+                    $updated = $db->table('gateway_task_turns')->where('id', $existingTurn['id'])->where('response_id', $responseId)
+                        ->update(['owner_incarnation' => 'unclaimed', 'fencing_version' => $fence]);
+                    if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('surface_fence_lost', '插话原页所有权已变化。', 409);
+                    self::eventUnlocked($taskId, (string) $existingTurn['id'], $responseId, (string) $surface['id'],
+                        'user_steering_queued', ['source_response_id' => $previous, 'generation_id' => $generationId,
+                            'transport' => 'same_page_delta']);
+                    return ['reused' => false, 'response_id' => null, 'task_id' => $taskId,
+                        'epoch_id' => (string) $existingTurn['epoch_id'], 'turn_id' => (string) $existingTurn['id'],
+                        'surface_id' => (string) $surface['id'], 'generation_id' => $generationId, 'round_no' => $roundNo];
+                }
                 if ($steeringRestart || $mailboxRestart) {
                     return self::rotateContextSurfaceUnlocked($spec, $responseId, $task, $existingTurn,
                         $surface, $roundNo, $generationId, $now, $previous);
@@ -989,7 +1041,8 @@ final class TaskLedger
             }
         }
         if (!is_array($epoch)) {
-            if ($currentEpochId !== '') self::retireEpochUnlocked($taskId, $currentEpochId, 'lease_changed');
+            if ($currentEpochId !== '') self::retireEpochUnlocked($taskId, $currentEpochId,
+                isset($spec['budget']['postcompact_page']) ? 'checkpoint_page_retained' : 'lease_changed');
             $activeSurfaces = $db->table('gateway_browser_surfaces')->where('status', '<>', 'retired')->count();
             if ($activeSurfaces === false || $activeSurfaces === null) {
                 throw new GatewayError('storage_unavailable', '任务页面池状态暂不可读取。', 503);
@@ -1025,6 +1078,7 @@ final class TaskLedger
                 'created_at' => $now,
                 'updated_at' => $now,
             ])) throw new GatewayError('storage_unavailable', '任务页面租约无法创建。', 503);
+            self::transferCheckpointPageUnlocked($spec, $taskId, $currentEpochId, $surfaceId, $now);
             $updated = $db->table('gateway_tasks')->where('id', $taskId)->update([
                 'current_epoch_id' => $epochId, 'status' => 'active', 'updated_at' => $now,
             ]);
@@ -1077,6 +1131,45 @@ final class TaskLedger
             'generation_id' => $generationId,
             'round_no' => 1,
         ];
+    }
+
+    /**
+     * Move only a proven completed checkpoint's physical document to its new logical epoch.
+     * Clearing the retired target in the same transaction prevents cleanup from closing the
+     * retained page; incrementing its fence invalidates every old observer. No host work is replayed.
+     * @param array $spec Prepared request with an optional exact checkpoint-page proof.
+     * @param string $taskId Owned task. @param string $oldEpochId Previous logical epoch.
+     * @param string $surfaceId Newly reserved destination. @param int $now Transaction timestamp.
+     * @throws GatewayError If the source changed before the atomic transfer.
+     */
+    private static function transferCheckpointPageUnlocked(array $spec, string $taskId,
+        string $oldEpochId, string $surfaceId, int $now): void
+    {
+        $proof = $spec['budget']['postcompact_page'] ?? null;
+        if (!is_array($proof) || ($proof['request_hash'] ?? '') !== $spec['request_hash']) return;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $old = $db->table('gateway_browser_surfaces')->where('id', $proof['source_surface_id'])->find();
+        if (!is_array($old) || $old['status'] !== 'retired' || $old['task_id'] !== $taskId
+            || $old['epoch_id'] !== $oldEpochId || $oldEpochId !== $proof['source_epoch_id']
+            || $old['target_id'] !== $proof['target_id'] || $old['document_nonce'] !== $proof['document_nonce']
+            || (int) $old['fencing_version'] !== $proof['fencing_version']) {
+            throw new GatewayError('surface_fence_lost', '压缩后续接的原页面所有权已变化。', 409);
+        }
+        $released = $db->table('gateway_browser_surfaces')->where('id', $old['id'])
+            ->where('target_id', $old['target_id'])->where('fencing_version', $old['fencing_version'])
+            ->update(['target_id' => null, 'session_id' => null, 'fencing_version' => (int) $old['fencing_version'] + 1]);
+        $claimed = $db->table('gateway_browser_surfaces')->where('id', $surfaceId)->where('status', 'reserved')->update([
+            'target_id' => $old['target_id'], 'document_nonce' => $old['document_nonce'],
+            'generation' => (int) $old['generation'] + 1, 'fencing_version' => (int) $old['fencing_version'] + 1,
+            'status' => 'ready', 'url' => $old['url'], 'title' => $old['title'], 'updated_at' => $now,
+        ]);
+        if (!$released || $released->rowCount() !== 1 || !$claimed || $claimed->rowCount() !== 1) {
+            throw new GatewayError('surface_fence_lost', '压缩后续接无法保留原页面。', 409);
+        }
+        self::eventUnlocked($taskId, null, null, $surfaceId, 'checkpoint_page_retained', [
+            'checkpoint_id' => $proof['checkpoint_id'], 'source_surface_id' => $old['id'],
+            'source_response_id' => $proof['source_response_id'],
+        ]);
     }
 
     /** A proven native human or mailbox revision owns a fresh physical page in the same Codex turn. */
@@ -2893,11 +2986,12 @@ final class TaskLedger
      * @param ?string $idempotencyKey Optional global Responses idempotency identity.
      * @param bool $mailboxJoin Permit agent records only after the full active-source mailbox proof.
      * @param bool $steeringJoin Permit human records only after the exact pending-tool source proof.
+     * @param bool $joinResponse False when a receipt request must reserve its own next batch.
      * @return void
      * @throws GatewayError If source ownership changed or a record does not belong to this channel.
      */
     public static function queueOperationalContextUnlocked(array $source, array $updates, string $requestHash,
-        ?string $idempotencyKey, bool $mailboxJoin = false, bool $steeringJoin = false): void
+        ?string $idempotencyKey, bool $mailboxJoin = false, bool $steeringJoin = false, bool $joinResponse = true): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $turn = $db->table('gateway_task_turns')->where('id', (string) $source['durable_turn_id'])->find();
@@ -2905,6 +2999,7 @@ final class TaskLedger
             || (string) $turn['response_id'] !== (string) $source['id']) {
             throw new GatewayError('context_update_source_closed', '环境更新的源回合已结束。', 409);
         }
+        if ($steeringJoin) self::supersedeDeferredStopUnlocked($source);
         $events = $db->table('gateway_task_events')->where('task_id', (string) $source['task_id'])
             ->where('turn_id', (string) $source['durable_turn_id'])->where('event_type', 'native_context_update_queued')->select();
         if (!is_array($events)) throw new GatewayError('storage_unavailable', '环境更新记录暂不可读取。', 503);
@@ -2931,14 +3026,38 @@ final class TaskLedger
             if (isset($known[$hash])) continue;
             self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
                 (string) $source['id'], (string) $source['surface_id'], 'native_context_update_queued',
-                ['record_hash' => $hash, 'message' => $message]);
+                ['record_hash' => $hash, 'message' => $message,
+                    ...($steeringJoin ? ['steering_full_context' => (bool) GatewaySettings::internal()['steering_full_context']] : [])]);
             $known[$hash] = true;
         }
+        if (!$joinResponse) return;
         self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
             (string) $source['id'], (string) $source['surface_id'], 'native_context_request_joined',
             ['request_hash' => $requestHash, 'idempotency_key' => $idempotencyKey,
                 ...($mailboxJoin ? ['mailbox_join' => true] : []),
                 ...($steeringJoin ? ['steering_join' => true] : [])]);
+    }
+
+    /**
+     * A proven newer human revision continues a manually stopped turn after its tools drain.
+     * @param array $source Exact owned source already proved by ContextHistory.
+     * @return void Records the handled native stop so its old rollout event cannot stop the new work.
+     * @throws GatewayError If the durable stop transition cannot be stored.
+     */
+    public static function supersedeDeferredStopUnlocked(array $source): void
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $turn = $db->table('gateway_task_turns')->where('id', $source['durable_turn_id'])->find();
+        if (!is_array($turn) || $turn['response_id'] !== $source['id']
+            || ($turn['error_code'] ?? '') !== 'CODEX_USER_STOP_WAITING_TOOLS') return;
+        $event = $db->table('gateway_task_events')->where('turn_id', $turn['id'])
+            ->where('event_type', 'codex_user_stop_waiting_tools')->order([['id', 'DESC']])->limit(1)->find();
+        if (!is_array($event)) throw new GatewayError('storage_unavailable', '等待工具完成的停止记录无法读取。', 503);
+        $updated = $db->table('gateway_task_turns')->where('id', $turn['id'])->where('response_id', $source['id'])
+            ->where('error_code', 'CODEX_USER_STOP_WAITING_TOOLS')->update(['error_code' => null, 'updated_at' => time()]);
+        if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '停止后的续发意图无法保存。', 503);
+        self::eventUnlocked((string) $source['task_id'], (string) $turn['id'], (string) $source['id'],
+            (string) $source['surface_id'], 'codex_user_stop_superseded', json_decode($event['data_json'], true, 32, JSON_THROW_ON_ERROR));
     }
 
     /** A reconnect of a coalesced request keeps its original response, even after the model advanced. */
@@ -3013,12 +3132,18 @@ final class TaskLedger
             ->order([['id', 'ASC']])->select();
         if (!is_array($events)) throw new GatewayError('storage_unavailable', '环境更新记录暂不可读取。', 503);
         $pending = [];
+        $policies = [];
         foreach ($events as $event) {
             $data = json_decode((string) $event['data_json'], true, 128, JSON_THROW_ON_ERROR);
-            if ($event['event_type'] === 'native_context_update_queued') $pending[(int) $event['id']] = $data['message'];
+            if ($event['event_type'] === 'native_context_update_queued') {
+                $pending[(int) $event['id']] = $data['message'];
+                if (isset($data['steering_full_context'])) $policies[(int) $event['id']] = (bool) $data['steering_full_context'];
+            }
             else foreach ((array) ($data['event_ids'] ?? []) as $id) unset($pending[(int) $id]);
         }
-        return ['messages' => array_values($pending), 'event_ids' => array_keys($pending)];
+        $policies = array_intersect_key($policies, $pending);
+        return ['messages' => array_values($pending), 'event_ids' => array_keys($pending),
+            ...($policies !== [] ? ['steering_full_context' => end($policies)] : [])];
     }
 
     /** The receipt job and update attachment are committed atomically; this is not an MCP delivery claim. */
@@ -3068,7 +3193,11 @@ final class TaskLedger
             $db->table('gateway_browser_surfaces')->where('id', $surface['id'])->update([
                 'status' => 'retired', 'session_id' => null, 'retired_at' => $now, 'updated_at' => $now,
             ]);
-            self::eventUnlocked($taskId, null, null, (string) $surface['id'], 'surface_retired', ['reason' => $reason]);
+            // A checkpoint advances the logical epoch while transferring the physical page.
+            // Its dedicated transfer event records both rows without reporting a page closure.
+            if ($reason !== 'checkpoint_page_retained') {
+                self::eventUnlocked($taskId, null, null, (string) $surface['id'], 'surface_retired', ['reason' => $reason]);
+            }
         }
     }
 

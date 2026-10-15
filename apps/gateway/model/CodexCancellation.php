@@ -16,7 +16,7 @@ final class CodexCancellation
      * Missing/inaccessible/ambiguous files and incomplete records provide no stop evidence.
      * @param string $threadId Native session UUID. @param string $turnId Native turn UUID.
      * @param int $notBefore Earliest gateway admission time for this native turn.
-     * @return ?array{turn_id:string,interrupted_at:int,reason:string} Verified event metadata only.
+     * @return ?array{turn_id:string,interrupted_at:int,reason:string,event_id:string} Verified event metadata only.
      */
     public function interruption(string $threadId, string $turnId, int $notBefore): ?array
     {
@@ -75,7 +75,10 @@ final class CodexCancellation
             if (!is_string($bytes)) return null;
             $end = strrpos($bytes, "\n");
             if ($end !== false) {
+                $lineOffset = $offset;
                 foreach (explode("\n", substr($bytes, 0, $end)) as $line) {
+                    $recordOffset = $lineOffset;
+                    $lineOffset += strlen($line) + 1;
                     // Avoid decoding large prompts, tool payloads or model reasoning.
                     if (strlen($line) > 16384 || !str_contains($line, 'turn_aborted')) continue;
                     $record = json_decode($line, true, 16);
@@ -85,7 +88,8 @@ final class CodexCancellation
                         || ($event['turn_id'] ?? '') !== $turnId) continue;
                     $at = is_string($record['timestamp'] ?? null) ? strtotime($record['timestamp']) : false;
                     if ($at !== false && $at >= $notBefore && $at <= time() + 5) {
-                        $cursor['event'] = ['turn_id' => $turnId, 'interrupted_at' => $at, 'reason' => 'interrupted'];
+                        $cursor['event'] = ['turn_id' => $turnId, 'interrupted_at' => $at, 'reason' => 'interrupted',
+                            'event_id' => hash('sha256', $threadId . '|' . $recordOffset . '|' . $line)];
                     }
                 }
                 $cursor['offset'] = $offset + $end + 1;

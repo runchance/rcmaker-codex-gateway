@@ -38,6 +38,10 @@
             <div class="panel-title"><h2><i class="layui-icon layui-icon-time panel-heading-icon" aria-hidden="true"></i>长任务与上下文</h2></div>
             <p class="muted">根据账号与模型自动分段和压缩，继续长任务。</p>
             <div class="field settings-confirmation-option">
+                <input id="steering-full-context" type="checkbox" title="插话时全量重发上下文">
+                <p class="muted">默认关闭：已受理工具结清后，停止原页生成并发送新增需求和必要回执。开启后沿用全量重发。重启、原页丢失或异常时，仍可验证完整上下文与准确回执后恢复。</p>
+            </div>
+            <div class="field settings-confirmation-option">
                 <input id="official-handoff-summary" type="checkbox" title="切换到 Web 时使用官方模型生成交接摘要">
                 <p class="muted">遇到不可读的加密历史时，使用官方模型补充摘要，会消耗官方模型额度。默认关闭。</p>
             </div>
@@ -102,6 +106,6 @@
     <script src="../component/layui/layui.js"></script>
     <script src="../assets/gateway.js"></script>
 <script src="../assets/login-reminder.js"></script>
-    <script src="../assets/settings.js?v=20261004-receipts"></script>
+    <script src="../assets/settings.js?v=20261015-steering"></script>
 </body>
 </html>

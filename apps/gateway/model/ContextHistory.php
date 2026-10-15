@@ -635,6 +635,12 @@ final class ContextHistory
                 if (str_starts_with((string) ($prior['turn_id'] ?? ''), 'postcompact_')) {
                     $spec['turn_id'] = (string) $prior['turn_id'];
                 }
+                $sourceTurn = $db->table('gateway_task_turns')->where('id', $prior['durable_turn_id'])->find();
+                if (is_array($sourceTurn) && $sourceTurn['response_id'] === $prior['id']
+                    && ($sourceTurn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
+                    // A new native turn may carry the exact receipt for work accepted before Stop.
+                    $spec['turn_id'] = (string) $prior['turn_id'];
+                }
                 // A receipt belongs to an already executing physical turn, including its budget.
                 // A temporary catalog refresh or subscription upgrade cannot discard that receipt.
                 $spec['budget'] = json_decode((string) $prior['budget_json'], true, 32, JSON_THROW_ON_ERROR);
@@ -671,6 +677,11 @@ final class ContextHistory
                     $spec['operational_context_event_ids'] = $pending['event_ids'];
                 }
                 $spec['steering_messages'] = $steering;
+                if ($steering !== []) {
+                    $spec['turn_id'] = (string) $prior['turn_id'];
+                    TaskLedger::supersedeDeferredStopUnlocked($prior);
+                }
+                if (isset($pending['steering_full_context'])) $spec['steering_full_context'] = $pending['steering_full_context'];
                 $spec['tool_context_updates'] = $contextUpdates;
                 $round['messages'] = array_merge($round['messages'], (array) ($contextUpdates['messages'] ?? []), $steering);
                 $transport = json_decode((string) ($prior['transport_context_json'] ?? $prior['context_json']), true, 128, JSON_THROW_ON_ERROR);
@@ -1017,7 +1028,8 @@ final class ContextHistory
                 ->where('client_turn_id', (string) $lineage['turn_id'])->where('status', 'committed')->find();
         }
         if (!is_array($turn)) return null;
-        if ((string) $turn['client_turn_id'] !== (string) $spec['turn_id']) {
+        if ((string) $turn['client_turn_id'] !== (string) $spec['turn_id']
+            && !($humanSteering && ($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS')) {
             if (!str_starts_with((string) $turn['client_turn_id'], 'postcompact_')) return null;
             // A derived active turn must belong to this original native turn's verified checkpoint.
             $lineage = $spec;
@@ -1044,7 +1056,7 @@ final class ContextHistory
         $running = in_array((string) $source['status'], ['queued', 'running'], true)
             && (string) $source['round_kind'] === 'text';
         $toolBoundary = (string) $source['status'] === 'completed' && (string) $source['round_kind'] === 'tool_call';
-        if ($humanSteering && !$toolBoundary) return null;
+        if ($humanSteering && !$toolBoundary && !$running) return null;
         if ($humanSteering) {
             $binding = $db->table('gateway_mcp_bindings')->where('id', (string) ($source['mcp_binding_id'] ?? ''))->find();
             if (!is_array($binding) || $binding['status'] !== 'running' || $binding['task_id'] !== $taskId
@@ -1061,7 +1073,7 @@ final class ContextHistory
         $activities = $db->table('gateway_mcp_activities')->where('binding_id', (string) ($source['mcp_binding_id'] ?? ''))
             ->where('status', 'active')->count();
         if (!is_numeric($pending) || !is_numeric($unknown) || !is_numeric($activities)
-            || (int) $unknown !== 0 || ($toolBoundary && (int) $pending === 0)) return null;
+            || (int) $unknown !== 0 || (($toolBoundary || $humanSteering) && (int) $pending === 0)) return null;
         if ($completedText) {
             $last = $db->table('gateway_response_jobs')->where('task_id', $taskId)
                 ->order([['rowid', 'DESC']])->limit(1)->find();
@@ -1075,6 +1087,12 @@ final class ContextHistory
         }
         $prior = json_decode((string) $source['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $known = (array) ($prior['messages'] ?? []);
+        if ($humanSteering && count($records) === 1 && ($records[0]['role'] ?? '') === 'user'
+            && ($previous === $sourceId || !empty($spec['input_is_delta']))) {
+            $records = array_merge($known, $records);
+            $incoming = $prior;
+            $incoming['messages'] = $records;
+        }
         $base = $prior['system'][0] ?? null;
         $lite = !empty($spec['native_responses_lite']);
         $offset = $lite && is_string($base) && $base !== ''
@@ -1253,6 +1271,7 @@ final class ContextHistory
             throw new GatewayError('task_surface_missing', '上下文续接的任务页面记录不一致。', 503);
         }
         $spec['browser_lease_key'] = (string) $surface['lease_key'];
+        if (ContextCompaction::retainedResumePage($spec, $surface)) return $spec;
         if (!empty($spec['tool_outputs'])) {
             $epoch = SDB(null, 'medoo', 'sqlite')->table('gateway_task_epochs')->where('id', $surface['epoch_id'])->find();
             if (!is_array($epoch) || $epoch['task_id'] !== $surface['task_id']) {
@@ -1261,7 +1280,7 @@ final class ContextHistory
             // A delta receipt may contain no checkpoint item; parsing it as "base" must not
             // reset the physical conversation's already established compaction identity.
             $spec['compaction_epoch'] = (string) $epoch['compaction_epoch'];
-            return $spec;
+            if (empty($spec['steering_delta'])) return $spec;
         }
         $context = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $continuation = $context['continuation'] ?? [];
@@ -1273,6 +1292,9 @@ final class ContextHistory
             return $spec;
         }
         $spec['continuation_source_response_id'] = null;
+        if (!empty($spec['steering_delta'])) {
+            unset($spec['steering_delta'], $spec['budget']['steering_delta']);
+        }
         $spec['context_json'] = (string) $spec['full_context_json'];
         $spec['transport_context_json'] = $spec['context_json'];
         $spec['prompt'] = ($spec['operation_kind'] ?? 'response') === 'response'
@@ -1292,6 +1314,10 @@ final class ContextHistory
     public static function retainedConnector(array $job, array $surface, string $connectorName): bool
     {
         if (empty($job['mcp_binding_id']) || !self::retainedContext($job, $surface)) return false;
+        if (SteeringContext::isDelta($job)) {
+            $budget = $job['budget'] ?? json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
+            return ($budget['steering_delta']['connector_name'] ?? '') === $connectorName;
+        }
         $db = SDB(null, 'medoo', 'sqlite');
         $source = $db->table('gateway_response_jobs')->where('id', $job['continuation_source_response_id'])->find();
         if (empty($source['mcp_binding_id'])) return false;
@@ -1313,6 +1339,8 @@ final class ContextHistory
      */
     public static function retainedContext(array $job, array $surface): bool
     {
+        if (SteeringContext::isDelta($job)) return SteeringContext::retained($job, $surface);
+        if (ContextCompaction::retainedResumePage($job, $surface)) return true;
         if (empty($job['continuation_source_response_id'])) return false;
         $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
             ->where('id', $job['continuation_source_response_id'])->find();

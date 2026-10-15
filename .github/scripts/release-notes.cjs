@@ -7,7 +7,8 @@
  * replaces the generated English body. Chinese notes are not published.
  * Publish every explicit Release-Note-EN line as a separate visible change.
  * Unmarked commit bodies stay private. English subjects remain a fallback;
- * Chinese subjects require English change notes or a committed English override.
+ * Chinese subjects require English change notes, a committed per-commit supplement,
+ * or a committed English release override. --check validates HEAD before tagging.
  *
  * CLI: RELEASE_TAG and GITHUB_REPOSITORY are required. RELEASE_COMMIT is an
  * optional full commit SHA assertion. RELEASE_OUTPUT_DIR is required. The
@@ -247,6 +248,57 @@ function readOverrides(repoRoot, tag, commit) {
     return content;
 }
 
+/** Read reviewed English details for an immutable historical commit from the release tree. */
+function readCommitNotes(repoRoot, tree, sha) {
+    const file = `${tree}:.github/release-notes/commits/${sha}.en.json`;
+    if (git(repoRoot, ['cat-file', '-e', file], [0, 1, 128]).status !== 0) return null;
+    let notes;
+    try { notes = JSON.parse(git(repoRoot, ['show', file]).stdout.replace(/^\uFEFF/, '')); }
+    catch (_) { throw new Error(`English supplement for ${sha.slice(0, 7)} must be a JSON array of English change details.`); }
+    if (!Array.isArray(notes) || !notes.length || notes.some((note) => typeof note !== 'string'
+        || !note.trim() || HAN_TEXT.test(note) || /[\u0000-\u001f\u007f]/.test(note))) {
+        throw new Error(`English supplement for ${sha.slice(0, 7)} must contain nonempty single-line English changes.`);
+    }
+    return notes.map((note) => note.trim());
+}
+
+/** Aggregate missing translations without exposing unmarked commit bodies or inventing summaries. */
+function validateEnglishCommits(commits) {
+    const missing = commits.filter((entry) => !entry.notes.length && HAN_TEXT.test(entry.subject));
+    if (missing.length) throw new Error(`Commits ${missing.map((entry) => entry.sha.slice(0, 7)).join(', ')} have no English change details. Add Release-Note-EN lines, committed .github/release-notes/commits/<full-sha>.en.json supplements, or a version .en.md override; incomplete release notes will not be published.`);
+}
+
+/** Shared committed-tree selection for CI and local preflight; no working-tree override is trusted. */
+function readEnglishCommits(repoRoot, tree, range, override = false) {
+    const commits = parseCommitLog(git(repoRoot, ['log', '--topo-order', '-z', '--format=%H%x00%s%x00%b', range, '--']).stdout, 3)
+        .map(([sha, subject, body]) => ({ sha, subject, ...classifyCommit(subject, body),
+            notes: override ? [] : (readCommitNotes(repoRoot, tree, sha) ?? englishNotes(body)) }));
+    if (!override) validateEnglishCommits(commits);
+    return commits;
+}
+
+/** Check HEAD and the most recent release range, including a just-tagged commit, without publishing. */
+function checkReleaseNotes(repoRoot) {
+    const head = git(repoRoot, ['rev-parse', '--verify', 'HEAD^{commit}']).stdout.trim();
+    if (git(repoRoot, ['rev-parse', '--is-shallow-repository']).stdout.trim() !== 'false') {
+        throw new Error('Complete Git history and tags are required for release-note preflight.');
+    }
+    const versions = git(repoRoot, ['tag', '--list']).stdout.split(/\r?\n/).map(parseVersion).filter(Boolean)
+        .sort((a, b) => compareVersions(b, a) || a.tag.localeCompare(b.tag));
+    const current = versions.find((version) => {
+        const sha = resolveTag(repoRoot, version.tag, false);
+        return sha && git(repoRoot, ['merge-base', '--is-ancestor', sha, head], [0, 1]).status === 0;
+    });
+    if (!current) return { commit: head, commit_count: readEnglishCommits(repoRoot, head, head).length };
+    const tagged = resolveTag(repoRoot, current.tag);
+    const previous = findPreviousRelease(repoRoot, current, tagged);
+    const released = readEnglishCommits(repoRoot, head, previous ? `${previous.commit}..${tagged}` : tagged,
+        Boolean(readOverrides(repoRoot, current.tag, head)));
+    // A version override covers only that release. New commits still need their own English details.
+    const unreleased = tagged === head ? [] : readEnglishCommits(repoRoot, head, `${tagged}..${head}`);
+    return { commit: head, commit_count: released.length + unreleased.length };
+}
+
 /** Render English summaries without inventing translations of Chinese commit titles. */
 function renderEnglish(model) {
     const { tag, previous, commit, commitCount, commits, categoryCounts, subsystemCounts, changedFileCount, breakingCount, baseUrl, changelogUrl } = model;
@@ -324,8 +376,7 @@ function generateReleaseNotes(options) {
     const previous = findPreviousRelease(repoRoot, current, commit);
     const range = previous ? `${previous.commit}..${commit}` : commit;
     const overrides = readOverrides(repoRoot, tag, commit);
-    const commits = parseCommitLog(git(repoRoot, ['log', '--topo-order', '-z', '--format=%H%x00%s%x00%b', range, '--']).stdout, 3)
-        .map(([sha, subject, body]) => ({ sha, subject, ...classifyCommit(subject, body), notes: overrides ? [] : englishNotes(body) }));
+    const commits = readEnglishCommits(repoRoot, commit, range, Boolean(overrides));
     const categoryCounts = Object.fromEntries(CATEGORIES.map(([key]) => [key, 0]));
     let breakingCount = 0;
     for (const entry of commits) {
@@ -394,11 +445,14 @@ function main(env = process.env) {
 }
 
 module.exports = { parseVersion, compareVersions, validateRepository, classifyCommit, classifyPath,
-    escapeMarkdown, englishNotes, findPreviousRelease, generateReleaseNotes, main };
+    escapeMarkdown, englishNotes, findPreviousRelease, generateReleaseNotes, checkReleaseNotes, main };
 
 if (require.main === module) {
     try {
-        main();
+        if (process.argv.includes('--check')) {
+            const checked = checkReleaseNotes(path.resolve(__dirname, '../..'));
+            process.stdout.write(`English release notes verified for ${checked.commit_count} commits at ${checked.commit}.\n`);
+        } else main();
     } catch (error) {
         process.stderr.write(`Release notes failed: ${error.message}\n`);
         process.exitCode = 1;

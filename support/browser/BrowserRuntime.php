@@ -2647,6 +2647,19 @@ JS;
     /** Do not submit the new instruction until the superseded Web page is physically gone. */
     private function settleSupersededTaskSurface(string $responseId, array $job, array $ledger): bool
     {
+        if (\app\gateway\model\SteeringContext::isDelta($job)) {
+            // Retire old observers, not the page. Their capabilities and ledger fence were
+            // revoked atomically when the incremental response was reserved.
+            foreach ($this->chatGptTurns as $oldResponseId => $turn) {
+                if ($oldResponseId === $responseId || ($turn['surface_id'] ?? '') !== $ledger['surface']['id']) continue;
+                $oldCommandId = (int) ($turn['command_id'] ?? 0);
+                $this->releaseTaskSession((string) $oldResponseId);
+                if ($oldCommandId > 0) {
+                    try { $this->finishCommand($oldCommandId, ['status' => 'superseded']); } catch (\Throwable) {}
+                }
+            }
+            return true;
+        }
         $previousId = (string) ($job['previous_response_id'] ?? '');
         if ($previousId === '') return true;
         try { $source = TaskLedger::execution($previousId); }
@@ -2834,7 +2847,7 @@ JS;
             $this->taskFailTurn($responseId, 'RECOVERY_OUTCOME_UNKNOWN', '原任务页面已经丢失，上一提交结果无法确认；不会自动重发。', true);
             return;
         }
-        if ($targetId !== '') {
+        if ($targetId !== '' || !empty($ledger['job']['continuation_source_response_id'])) {
             // A saved target id is not evidence that the physical page still exists. A fresh page
             // must receive canonical history, never the suffix prepared for the previous page.
             try {
@@ -2844,6 +2857,7 @@ JS;
                     return;
                 }
                 $this->releaseTaskSession($responseId);
+                $recover = false;
             } catch (GatewayError $error) {
                 $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
                 return;
@@ -2882,6 +2896,13 @@ JS;
                 }
                 try {
                     $ledger = TaskLedger::execution($responseId);
+                    if (\app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId))
+                        && ($ledger['turn']['response_id'] !== $responseId
+                            || $ledger['turn']['generation_id'] !== $ledger['job']['generation_id'])) {
+                        $this->detachTaskSessionRaw($sessionId);
+                        $this->finishCommand($commandId, ['status' => 'superseded']);
+                        return;
+                    }
                     $ownership = TaskLedger::claimSurface((string) $ledger['surface']['id'], $targetId, $sessionId, $url);
                     $this->taskSessions[$sessionId] = [
                         'surface_id' => (string) $ledger['surface']['id'],
@@ -3076,6 +3097,10 @@ JS;
     /** Ensure a fresh task owns an isolated Temporary Chat before any prompt state is observed. */
     private function prepareTaskTemporarySurface(string $responseId, int $commandId, string $sessionId, bool $recover): void
     {
+        if (!$recover && \app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId))) {
+            $this->prepareSteeringSurface($responseId, $commandId, $sessionId, microtime(true) + 30.0);
+            return;
+        }
         $surface = TaskLedger::execution($responseId)['surface'];
         $retainedDocument = WebModelPage::isTemporaryChatUrl((string)($surface['url'] ?? ''), self::modelUrl());
         $this->evaluateTaskSession($sessionId, WebModelPage::capabilityExpression(),
@@ -3114,6 +3139,116 @@ JS;
                         $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, false, microtime(true) + 60.0);
                     }, 60.0);
             }, 3.0);
+    }
+
+    /** Stop the proven source generation, observe idle twice, then submit a new user message on this page. */
+    private function prepareSteeringSurface(string $responseId, int $commandId, string $sessionId,
+        float $deadline, bool $clicked = false, ?float $idleSince = null): void
+    {
+        if (!$this->steeringSessionOwns($responseId, $sessionId)) {
+            $this->releaseSteeringPreparation($responseId, $sessionId);
+            return;
+        }
+        $job = ResponseJob::execution($responseId);
+        $surface = TaskLedger::execution($responseId)['surface'];
+        if (!\app\gateway\model\SteeringContext::retained($job, $surface)) {
+            if ($this->recoverSteeringPreparation($responseId, $sessionId)) return;
+            $this->taskFailTurn($responseId, 'steering_source_unavailable', '插话原页或压缩代次已变化；未发送新消息。', true);
+            $this->releaseSteeringPreparation($responseId, $sessionId);
+            return;
+        }
+        $source = ResponseJob::execution((string) $job['budget']['steering_delta']['witness_response_id']);
+        preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $source['prompt'], $tokens);
+        $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [(string) $source['prompt']];
+        if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
+        $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses, [], !$clicked, true);
+        $this->evaluateTaskSession($sessionId, $expression,
+            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince): void {
+                if (!$this->steeringSessionOwns($responseId, $sessionId)) {
+                    $this->releaseSteeringPreparation($responseId, $sessionId);
+                    return;
+                }
+                if ($error === null && is_array($state) && !empty($state['owned'])) {
+                    $clicked = $clicked || !empty($state['stopped']);
+                    if (empty($state['generation_running']) && !empty($state['editor_ready'])) {
+                        if ($idleSince !== null && microtime(true) - $idleSince >= 1.0) {
+                            $this->startTaskTurn($responseId, $commandId, $sessionId, false);
+                            return;
+                        }
+                        $idleSince ??= microtime(true);
+                    } else $idleSince = null;
+                } else $idleSince = null;
+                if (microtime(true) >= $deadline || !empty($state['page_invalid'])) {
+                    if ($this->recoverSteeringPreparation($responseId, $sessionId)) return;
+                    $this->taskFailTurn($responseId, 'steering_stop_unconfirmed', '未能确认插话原页已停止且历史仍在；未发送新消息或全量重发。', true);
+                    $this->releaseSteeringPreparation($responseId, $sessionId);
+                    return;
+                }
+                Timer::add(0.25, fn() => $this->prepareSteeringSurface($responseId, $commandId, $sessionId,
+                    $deadline, $clicked, $idleSince), null, false);
+            }, 3.0);
+    }
+
+    /** Recover an unsent steering request through full durable context and confirmed old-target closure. */
+    private function recoverSteeringPreparation(string $responseId, string $sessionId): bool
+    {
+        // This new instruction has not been sent. The existing recovery transaction proves
+        // that fact and rebuilds its complete durable history before any target is replaced.
+        try {
+            $repair = \app\gateway\model\ContextRecovery::repairUnsent($responseId, 'CHATGPT_SURFACE_MISSING');
+        } catch (GatewayError $error) {
+            $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
+            $this->releaseSteeringPreparation($responseId, $sessionId);
+            return true;
+        }
+        if ($repair === null) return false;
+        $this->releaseSteeringPreparation($responseId, $sessionId);
+        $generation = ResponseJob::execution($responseId)['generation_id'];
+        $resume = function () use ($responseId, $repair, $generation): void {
+            $ledger = TaskLedger::execution($responseId);
+            if ($ledger['turn']['response_id'] !== $responseId || $ledger['turn']['generation_id'] !== $generation
+                || $ledger['turn']['status'] !== 'queued') return;
+            $this->prepareTaskSurface($responseId, (int)$repair['command_id'], false);
+        };
+        if (empty($repair['target_id'])) $resume();
+        else $this->taskCdp->send('Target.closeTarget', ['targetId' => $repair['target_id']], null,
+            function ($error, $result) use ($responseId, $resume): void {
+                if ($error !== null || empty($result['success'])) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_REPAIR_CLOSE_FAILED', '原任务页未能关闭，停止恢复。');
+                    return;
+                }
+                $resume();
+            }, 3.0);
+        return true;
+    }
+
+    /** Reject late stop callbacks after another steer, compaction, cancellation or session claim wins. */
+    private function steeringSessionOwns(string $responseId, string $sessionId): bool
+    {
+        $session = $this->taskSessions[$sessionId] ?? null;
+        if (!is_array($session) || ($session['response_id'] ?? '') !== $responseId) return false;
+        $ledger = TaskLedger::execution($responseId);
+        $job = ResponseJob::execution($responseId);
+        return $ledger['turn']['response_id'] === $responseId && $ledger['turn']['generation_id'] === $job['generation_id']
+            && $ledger['turn']['status'] === 'queued' && empty($ledger['turn']['error_code'])
+            && in_array($job['status'], ['queued', 'running'], true) && empty($job['submit_intent_at'])
+            && $ledger['surface']['owner_incarnation'] === $session['owner_incarnation']
+            && (int) $ledger['surface']['fencing_version'] === (int) $session['fencing_version'];
+    }
+
+    /** Release a pre-composer observer without closing its target or detaching a newer surface owner. */
+    private function releaseSteeringPreparation(string $responseId, string $sessionId): void
+    {
+        $session = $this->taskSessions[$sessionId] ?? null;
+        if (!is_array($session) || ($session['response_id'] ?? '') !== $responseId) return;
+        try {
+            TaskLedger::detachSurface((string) $session['surface_id'], (string) $session['owner_incarnation'],
+                (int) $session['fencing_version']);
+        } catch (GatewayError $error) {
+            if ($error->errorCode !== 'surface_fence_lost') throw $error;
+        }
+        unset($this->taskSessions[$sessionId]);
+        $this->detachTaskSessionRaw($sessionId);
     }
 
     private function waitTaskSurfaceReady(string $responseId, int $commandId, string $sessionId, bool $recover, float $deadline): void
@@ -5688,6 +5823,10 @@ JS;
             return;
         }
         if ($compactionPhase === 'preparing') return;
+        if ($compactionPhase === 'stopping_source') {
+            $this->stopCompactionSource($responseId, $logicalResponseId);
+            return;
+        }
         if (ContextCompaction::retainedHandoffState($logicalResponseId) !== null) {
             // The original worker may have died after reserving the one-shot
             // checkpoint. Its plaintext token cannot be recovered or reissued.
@@ -6271,6 +6410,13 @@ JS;
                         && !$sourceTransportSettled,
                 ], $now);
             $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = $uiSettlement['observation'];
+            if ($activeCompact && $toolCapable && !empty($snapshot['generation_running']) && empty($snapshot['error'])) {
+                // Keep all post-receipt/Retry evidence before Stop attempts. If its
+                // message witness cannot be proved, ordinary settlement still works.
+                $this->chatGptTurns[$responseId]['compaction_phase'] = 'stopping_source';
+                $this->stopCompactionSource($responseId, $logicalResponseId);
+                return;
+            }
             $answerTransportSettled = !empty($terminalSession['submission_request_id'])
                 && !empty($terminalSession['submission_finished']) && empty($terminalSession['submission_failed'])
                 && (!is_string($postToolBaseline) || $sourceTransportSettled);
@@ -6669,7 +6815,102 @@ JS;
             && (float)($session['submission_request_started_at'] ?? 0.0) > $deliveredAtUs / 1000000;
     }
 
-    /** Keep the original Web answer intact, then request a separate control-only checkpoint. */
+    /**
+     * Drain accepted host receipts, stop the exact old generation, then request only a checkpoint.
+     * This never reports the interrupted partial answer as completion of the human task.
+     * @param string $responseId Physical source observer.
+     * @param string $logicalResponseId Its currently reserved compact response.
+     * @return void Polling retains the durable deadline and never cancels a host invocation.
+     */
+    private function stopCompactionSource(string $responseId, string $logicalResponseId): void
+    {
+        if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
+        $turn = $this->chatGptTurns[$responseId];
+        try {
+            $revision = ToolBroker::beginCompletionFenceForResponse($logicalResponseId);
+            if ($revision === null) {
+                $this->scheduleTaskPoll($responseId, 0.2);
+                return;
+            }
+            $compact = ResponseJob::execution($logicalResponseId);
+            $source = ResponseJob::execution((string)$compact['previous_response_id']);
+            preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string)$source['prompt'], $tokens);
+            $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$source['prompt']];
+            if (!empty($source['transport_transaction_id'])) $witnesses[] = (string)$source['transport_transaction_id'];
+            $surface = TaskLedger::execution($logicalResponseId)['surface'];
+            $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
+                (array)$turn['baseline_users'], empty($turn['compaction_stop_clicked']), true);
+        } catch (GatewayError $error) {
+            $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
+            return;
+        }
+        $this->evaluateTask($responseId, $expression, function ($error, $state) use ($responseId, $logicalResponseId, $revision): void {
+            if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
+            if ($error !== null || !is_array($state) || empty($state['owned'])) {
+                $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                // No owned Stop action occurred. Keep observing the existing page so
+                // its ordinary completion/error recovery remains available; never let
+                // a missing witness turn into a permanently latched stopping phase.
+                if (empty($this->chatGptTurns[$responseId]['compaction_stop_clicked'])) {
+                    $this->chatGptTurns[$responseId]['compaction_phase'] = null;
+                }
+                $this->scheduleTaskPoll($responseId, 0.25);
+                return;
+            }
+            if (!empty($state['stopped'])) $this->chatGptTurns[$responseId]['compaction_stop_clicked'] = true;
+            if (!empty($state['generation_running']) || empty($state['editor_ready'])) {
+                $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                $this->scheduleTaskPoll($responseId, 0.25);
+                return;
+            }
+            $idle = $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] ?? null;
+            if ($idle === null || microtime(true) - $idle < 1.0) {
+                $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = $idle ?? microtime(true);
+                $this->scheduleTaskPoll($responseId, 0.25);
+                return;
+            }
+            $turn = $this->chatGptTurns[$responseId];
+            $read = WebModelPage::responseExpression((array)$turn['baseline_users'], (array)$turn['baseline_assistants'],
+                '', (string)($turn['bound_assistant_id'] ?? ''));
+            $this->evaluateTask($responseId, $read, function ($readError, $snapshot) use ($responseId, $logicalResponseId, $revision): void {
+                if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
+                if ($readError !== null || !is_array($snapshot) || !empty($snapshot['generation_running'])) {
+                    $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                    $this->scheduleTaskPoll($responseId, 0.25);
+                    return;
+                }
+                try {
+                    $completion = ToolBroker::completionForResponse($logicalResponseId);
+                    $answer = ($completion['status'] ?? '') === 'completed' ? (string)$completion['final_answer']
+                        : (string)($snapshot['markdown'] ?? $snapshot['visible_text'] ?? '');
+                    if (!ToolBroker::commitCompletionFenceForResponse($logicalResponseId, $revision, $answer)) {
+                        $this->scheduleTaskPoll($responseId, 0.2);
+                        return;
+                    }
+                    $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, $answer);
+                } catch (GatewayError $error) {
+                    $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
+                }
+            });
+        });
+    }
+
+    /** Fence asynchronous stop callbacks against newer work, page claims and compaction generations. */
+    private function compactionStopOwns(string $responseId, string $logicalResponseId): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || ($turn['compaction_phase'] ?? null) !== 'stopping_source'
+            || ($turn['logical_response_id'] ?? $responseId) !== $logicalResponseId) return false;
+        $ledger = TaskLedger::execution($logicalResponseId);
+        return $ledger['turn']['response_id'] === $logicalResponseId
+            && in_array($ledger['turn']['status'], ['submitted', 'running'], true)
+            && $ledger['surface']['target_id'] === $turn['target_id']
+            && $ledger['surface']['document_nonce'] === $turn['document_nonce']
+            && $ledger['surface']['owner_incarnation'] === $turn['owner_incarnation']
+            && (int)$ledger['surface']['fencing_version'] === (int)$turn['fencing_version'];
+    }
+
+    /** Keep the stopped Web answer as evidence, then request a separate control-only checkpoint. */
     private function beginRetainedCompactionHandoff(string $responseId, string $logicalResponseId,
         string $sourceAnswer): void
     {

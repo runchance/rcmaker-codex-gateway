@@ -208,6 +208,44 @@ try {
         assert.match(generate(repoRoot, 'v2.2.2').files['release-notes.md'], /Restore task continuity/);
     });
 
+    test('committed per-commit supplements repair old histories without rewriting commits', () => {
+        const repoRoot = fixture();
+        commit(repoRoot, 'seed'); git(repoRoot, ['tag', 'v1.0.0']);
+        const sha = commit(repoRoot, 'feat: 中文改动', {}, 'Private-Prompt: KEEP_PRIVATE');
+        git(repoRoot, ['tag', 'v1.1.0']);
+        assert.throws(() => notes.checkReleaseNotes(repoRoot), /no English change details/);
+        const supplement = `.github/release-notes/commits/${sha}.en.json`;
+        fs.mkdirSync(path.dirname(path.join(repoRoot, supplement)), { recursive: true });
+        fs.writeFileSync(path.join(repoRoot, supplement), JSON.stringify(['Uncommitted text must not be used.']));
+        assert.throws(() => generate(repoRoot, 'v1.1.0'), /no English change details/);
+        // Replace only the fixture's failed tag so the same version includes the repair tree.
+        commit(repoRoot, 'docs: supply reviewed historical release notes', {
+            [supplement]: JSON.stringify(['Split the API processes.', 'Preserve task progress and exact tool receipts.']),
+        });
+        git(repoRoot, ['tag', '-f', 'v1.1.0']);
+        const result = generate(repoRoot, 'v1.1.0');
+        assert.match(result.files['release-notes.md'], /Split the API processes/);
+        assert.match(result.files['release-notes.md'], /Preserve task progress/);
+        assert.ok(!result.files['release-notes.md'].includes('KEEP_PRIVATE'));
+        assert.equal(notes.checkReleaseNotes(repoRoot).commit_count, 2);
+    });
+
+    test('preflight aggregates missing English details and validates committed supplements', () => {
+        const repoRoot = fixture(); commit(repoRoot, 'seed');git(repoRoot, ['tag', 'v1.0.0']);
+        const a = commit(repoRoot, 'fix: 第一处'); const b = commit(repoRoot, 'fix: 第二处');
+        assert.throws(() => notes.checkReleaseNotes(repoRoot), (e) => e.message.includes(a.slice(0,7)) && e.message.includes(b.slice(0,7)));
+        commit(repoRoot, 'docs: invalid supplemental details', { [`.github/release-notes/commits/${a}.en.json`]: '[]' });
+        git(repoRoot, ['tag', 'v1.1.0']);
+        assert.throws(() => generate(repoRoot, 'v1.1.0'), /nonempty single-line English/);
+        commit(repoRoot, 'docs: fix supplemental details', {
+            [`.github/release-notes/commits/${a}.en.json`]: JSON.stringify(['Fix first behavior.']),
+            [`.github/release-notes/commits/${b}.en.json`]: JSON.stringify(['Fix second behavior.']),
+        });
+        git(repoRoot, ['tag', '-f', 'v1.1.0']);
+        assert.equal(notes.checkReleaseNotes(repoRoot).commit_count, 4);
+        assert.match(generate(repoRoot, 'v1.1.0').files['release-notes.md'], /Fix second behavior/);
+    });
+
     test('prereleases use earlier same-version prereleases and ignore another line', () => {
         const repoRoot = fixture();
         commit(repoRoot, 'seed');
@@ -359,6 +397,16 @@ try {
         assert.throws(() => generate(repoRoot, 'v6.0.1', { outputDir }), /Git rev-parse failed/);
         assert.ok(!fs.existsSync(outputDir));
         assert.ok(!fs.existsSync(path.join(repoRoot, 'marker')));
+    });
+
+    test('preflight honors a released version override without hiding missing notes in newer commits', () => {
+        const repoRoot = fixture();
+        commit(repoRoot, 'feat: 旧版说明', {'.github/release-notes/v6.0.0.en.md': 'Complete reviewed English release details.'});
+        git(repoRoot, ['tag', 'v6.0.0']);
+        commit(repoRoot, 'fix: an English follow-up');
+        assert.equal(notes.checkReleaseNotes(repoRoot).commit_count, 2);
+        const missing = commit(repoRoot, 'fix: 新改动缺少说明');
+        assert.throws(() => notes.checkReleaseNotes(repoRoot), new RegExp(missing.slice(0, 7)));
     });
 
     test('shallow history cannot silently produce an incorrect first release', () => {

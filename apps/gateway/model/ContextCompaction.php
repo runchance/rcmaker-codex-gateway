@@ -172,6 +172,115 @@ final class ContextCompaction
     }
 
     /**
+     * Resume a committed Codex checkpoint on its still-owned Web document. Logical
+     * checkpoint epochs advance independently of Chrome targets: a checkpoint is not
+     * evidence that the Web context overflowed. Preserve the complete client context
+     * for recovery, but send only current instructions, new records and a resume notice.
+     * @param array $spec Prepared normal request inside the reservation transaction.
+     * @return array Request with an exact document transfer proof, or unchanged full recovery.
+     * @throws GatewayError On unreadable checkpoint or ledger data.
+     */
+    public static function preparePageResumeUnlocked(array $spec): array
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response'
+            || !empty($spec['previous_response_id']) || !empty($spec['steering_restart'])
+            || !empty($spec['stopped_source_response_id']) || !empty($spec['tool_outputs'])
+            || ($spec['compaction_epoch'] ?? 'base') === 'base') return $spec;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
+        $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+        $source = $db->table('gateway_response_jobs')->where('task_id', $taskId)
+            ->order([['rowid', 'DESC']])->limit(1)->find();
+        if (!is_array($task) || $task['status'] !== 'active' || !is_array($source)
+            || $source['status'] !== 'completed' || $source['operation_kind'] !== 'compact_v2'
+            || $source['model'] !== $spec['model']
+            || $source['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)
+            || $source['epoch_id'] !== $task['current_epoch_id']) return $spec;
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $source['compact_id'])->find();
+        $surface = $db->table('gateway_browser_surfaces')->where('id', $source['surface_id'])->find();
+        $epoch = $db->table('gateway_task_epochs')->where('id', $source['epoch_id'])->find();
+        $turn = $db->table('gateway_task_turns')->where('id', $source['durable_turn_id'])->find();
+        if (!is_array($checkpoint) || $checkpoint['task_id'] !== $taskId
+            || $checkpoint['response_id'] !== $source['id']
+            || !self::matchesCommittedEpoch($checkpoint, (string) $spec['compaction_epoch'])
+            || !is_array($epoch) || $epoch['status'] !== 'active'
+            || !is_array($surface) || $surface['status'] !== 'ready' || empty($surface['target_id'])
+            || $surface['task_id'] !== $taskId || $surface['epoch_id'] !== $source['epoch_id']
+            || empty($source['submitted_document_nonce'])
+            || $source['submitted_document_nonce'] !== $surface['document_nonce']
+            || !is_array($turn) || $turn['status'] !== 'committed' || $turn['response_id'] !== $source['id']) return $spec;
+        $full = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $sourceContext = json_decode((string) $source['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        if (ContextHistory::canonical($full['system'] ?? []) !== ContextHistory::canonical($sourceContext['system'] ?? [])) return $spec;
+        $wire = json_decode((string) $checkpoint['response_json'], true, 128, JSON_THROW_ON_ERROR);
+        $expected = ResponsesProtocol::retireTransportHandles(ContextHistory::compile($wire['output'], ''));
+        $records = (array) ($full['messages'] ?? []);
+        // Responses Lite may prepend the current model.base_instructions before our envelope.
+        // Forward those current instructions; only the exact emitted checkpoint prefix is omitted.
+        $leading = [];
+        while (($records[0]['role'] ?? '') === 'developer') $leading[] = array_shift($records);
+        $count = count($expected['messages']);
+        if (ContextHistory::canonical(array_slice($records, 0, $count)) !== ContextHistory::canonical($expected['messages'])) return $spec;
+        $suffix = array_slice($records, $count);
+        $spec['postcompact_user_input'] = (bool) array_filter($suffix, static fn(array $message): bool =>
+            ($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message));
+        $delta = ['version' => 3, 'system' => [], 'messages' => array_merge($leading, [
+            ['role' => 'developer', 'content' => 'Codex has finished its context checkpoint. This existing Web conversation remains the working context. The temporary summary-only control has ended. Resume the outstanding authorized task from the confirmed progress and exact tool receipts already in this conversation. Do not repeat completed work or treat the checkpoint as task completion. Apply the current tool contract and any new instructions below; respect actual user stop, cancellation and approval requirements.'],
+        ], $suffix), 'continuation' => [
+            'mode' => 'exact_prefix', 'source_response_id' => $source['id'],
+            'source_surface_id' => $surface['id'], 'source_epoch_id' => $surface['epoch_id'],
+            'source_document_nonce' => $surface['document_nonce'],
+            'current_tool_environment_sha256' => $spec['tool_environment_hash'],
+        ]];
+        $spec['budget']['postcompact_page'] = ['request_hash' => $spec['request_hash'],
+            'checkpoint_id' => $checkpoint['id'], 'source_response_id' => $source['id'],
+            'source_surface_id' => $surface['id'], 'source_epoch_id' => $surface['epoch_id'],
+            'target_id' => $surface['target_id'], 'document_nonce' => $surface['document_nonce'],
+            'fencing_version' => (int) $surface['fencing_version']];
+        $spec['full_context_json'] = ContextHistory::canonical($full);
+        $spec['browser_lease_key'] = hash('sha256', $surface['lease_key'] . '|checkpoint|' . $checkpoint['id']);
+        $spec['context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($delta);
+        $spec['prompt'] = ContextHistory::plainPrompt($delta);
+        $spec['continuation_source_response_id'] = $source['id'];
+        return $spec;
+    }
+
+    /**
+     * Prove a transferred checkpoint document before sending its resume delta. Old surface
+     * rows keep their immutable source identity but no longer own a physical target.
+     * @param array $job Current job or normalized request with its persisted transfer proof.
+     * @param array $surface Destination document after reservation or CDP attachment.
+     * @return bool Whether this exact request still owns the committed checkpoint page.
+     */
+    public static function retainedResumePage(array $job, array $surface): bool
+    {
+        $budget = $job['budget'] ?? json_decode((string) ($job['budget_json'] ?? '{}'), true);
+        $proof = $budget['postcompact_page'] ?? null;
+        if (!is_array($proof) || ($proof['request_hash'] ?? '') !== ($job['request_hash'] ?? null)
+            || ($proof['source_response_id'] ?? '') !== ($job['continuation_source_response_id'] ?? null)
+            || ($proof['target_id'] ?? '') !== ($surface['target_id'] ?? null)
+            || ($proof['document_nonce'] ?? '') !== ($surface['document_nonce'] ?? null)
+            || !in_array($surface['status'], ['ready', 'busy'], true)
+            || (isset($job['task_id']) && $job['task_id'] !== $surface['task_id'])
+            || (isset($job['surface_id']) && $job['surface_id'] !== $surface['id'])
+            || (isset($job['epoch_id']) && $job['epoch_id'] !== $surface['epoch_id'])
+            || (int) $surface['fencing_version'] <= (int) ($proof['fencing_version'] ?? 0)) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', $proof['source_response_id'])->find();
+        $old = $db->table('gateway_browser_surfaces')->where('id', $proof['source_surface_id'])->find();
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $proof['checkpoint_id'])->find();
+        return is_array($source) && $source['status'] === 'completed' && $source['operation_kind'] === 'compact_v2'
+            && $source['task_id'] === $surface['task_id'] && $source['surface_id'] === $proof['source_surface_id']
+            && $source['epoch_id'] === $proof['source_epoch_id']
+            && $source['submitted_document_nonce'] === $surface['document_nonce']
+            && is_array($old) && $old['status'] === 'retired' && $old['target_id'] === null
+            && $old['document_nonce'] === $surface['document_nonce']
+            && is_array($checkpoint) && $checkpoint['response_id'] === $source['id']
+            && $checkpoint['task_id'] === $surface['task_id']
+            && self::matchesCommittedEpoch($checkpoint, (string) ($job['compaction_epoch'] ?? 'base'));
+    }
+
+    /**
      * Verify the stored committed checkpoint item against its resumed epoch hash.
      * Stop detection uses this alongside exact task/source/derived-turn proofs; the hash
      * alone never authorizes cancellation or changes the compaction admission flow.
@@ -351,14 +460,14 @@ final class ContextCompaction
             . 'Preserve genuine user pause/cancellation requests, actual tool refusals and unresolved approval requirements exactly; do not invent authority to bypass them.';
     }
 
-    /** Stop only later host calls while the original source response settles ordinarily. */
+    /** Pause later host calls while the browser drains receipts and stops the source generation. */
     public static function activeCompactionInstruction(): string
     {
         return '<rcmaker_active_compaction>Codex requested a context checkpoint for this turn. '
             . 'This temporary control is not a new human task request and must not become a restriction in the next ordinary task turn. '
-            . 'Previously completed host-tool results are exact and already delivered. This later host call '
-            . 'was stopped before execution. Do not call another tool. Finish this response with its ordinary '
-            . 'answer, stating unfinished work and uncertain outcomes truthfully. Do not create or submit a '
+            . 'Accepted host-tool calls and their exact receipts are being preserved. This new host action '
+            . 'is paused before execution. Do not call another tool or declare the human task complete. '
+            . 'The gateway will stop this generation after accepted tool receipts settle. Do not create or submit a '
             . 'checkpoint in this response. A separate control-only message on this same conversation will '
             . 'request the checkpoint.</rcmaker_active_compaction>';
     }
@@ -2028,10 +2137,18 @@ final class ContextCompaction
             // Codex can restore an omitted native screenshot detail as High in a
             // later history. It changes the presentation, not the returned image.
             // Remove only that proven default; text, image identity, fields and
-            // list order remain exact. Explicit native details are never ignored.
+            // list order remain exact. Codex Lite also omits display hints from
+            // image receipts; compare image identity and all remaining fields.
             if (is_array($output) && is_array($projected) && array_is_list($output)
                 && array_is_list($projected) && count($output) === count($projected)) {
                 foreach ($projected as $index => $part) {
+                    if (is_array($part) && ($part['type'] ?? '') === 'image_attachment'
+                        && in_array($part['detail'] ?? null, ['auto', 'low', 'high'], true)
+                        && is_array($output[$index])
+                        && ($output[$index]['type'] ?? '') === 'image_attachment'
+                        && !array_key_exists('detail', $output[$index])) {
+                        unset($projected[$index]['detail']);
+                    }
                     if (is_array($part) && ($part['type'] ?? '') === 'image_attachment'
                         && !array_key_exists('detail', $part)
                         && is_array($output[$index])

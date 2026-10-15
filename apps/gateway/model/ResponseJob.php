@@ -59,9 +59,8 @@ final class ResponseJob
         // enqueue another browser command. The durable binding/surface checks below
         // validate that continuation. A brief worker event-loop stall must not reject
         // the host receipt before the browser has a chance to resume polling it.
-        if ($browser['status'] !== 'ready'
-            || (!$isToolContinuation && !$activeSteeringCandidate
-                && !BrowserState::isWorkerReady($browser))) {
+        if (!$isToolContinuation && !$activeSteeringCandidate
+            && ($browser['status'] !== 'ready' || !BrowserState::isWorkerReady($browser))) {
             throw new GatewayError('browser_not_ready', '受控浏览器尚未就绪。', 503);
         }
         if (!$isToolContinuation) {
@@ -113,6 +112,7 @@ final class ResponseJob
             // Prove that receipt and acknowledge its original submission before reserving the next
             // round; later validation failures roll back both changes in this same transaction.
             ToolBroker::acknowledgeHostReceiptUnlocked($spec);
+            $spec = SteeringContext::deferToolsUnlocked($spec);
             if (!empty($spec['operational_context_source_response_id'])) {
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
                 TaskLedger::queueOperationalContextUnlocked($source, $spec['operational_context_updates'],
@@ -120,12 +120,14 @@ final class ResponseJob
                     !empty($spec['steering_context_join']));
                 return (string) $source['id'];
             }
+            // Steering policy is selected once per request, never inherited from an older round.
+            unset($spec['budget']['steering_delta']);
             if (($spec['operation_kind'] ?? 'response') === 'response'
                 && (array) ($spec['steering_messages'] ?? []) !== []
                 && ((array) ($spec['tool_outputs'] ?? []) !== [] || !empty($spec['steering_restart']))) {
-                // A newer native user item supersedes the physical Web generation.
-                // Its host receipt remains in the canonical history, but a fresh page
-                // must receive that history as an actual new user submission.
+                // A newer native user item needs an actual new Web submission. Preserve
+                // its full history first; the configured policy below can derive an
+                // owned-page suffix after all accepted tool receipts have settled.
                 $spec['steering_restart'] = true;
                 $fresh = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
                 unset($fresh['continuation']);
@@ -189,6 +191,11 @@ final class ResponseJob
                 }
                 $budget = $spec['budget'];
             }
+            if ((!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id']))
+                && !($spec['steering_full_context'] ?? GatewaySettings::internal()['steering_full_context'])) {
+                $spec = SteeringContext::prepareUnlocked($spec);
+                $budget = $spec['budget'];
+            }
             $logicalContext = (string) ($spec['full_context_json'] ?? $spec['context_json']);
             $physical = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
             $exactPrefix = ($physical['continuation']['mode'] ?? null) === 'exact_prefix';
@@ -228,7 +235,8 @@ final class ResponseJob
                     $budget, (string) $spec['prompt'], $compactAttachmentTokens,
                     !empty($spec['verified_compaction_source']) ? null : $transportContext);
             }
-            $spec = ContextWindow::prepare($spec, $attachmentTokens);
+            if (empty($spec['steering_delta'])) $spec = ContextWindow::prepare($spec, $attachmentTokens);
+            $spec = ContextCompaction::preparePageResumeUnlocked($spec);
             $budget = $spec['budget'];
             $transportContext = (string)($spec['transport_context_json'] ?? $transportContext);
             $reservation = TaskLedger::reserveTurnUnlocked($spec, $responseId);
@@ -258,7 +266,9 @@ final class ResponseJob
                 if ($outputControl !== '') $prompt = $outputControl . "\n" . $prompt;
             }
             $prompt = WebContract::withSteeringNotice($prompt,
-                ($spec['operation_kind'] ?? 'response') === 'response' && !empty($spec['steering_restart']));
+                ($spec['operation_kind'] ?? 'response') === 'response'
+                    && (!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id'])
+                        || !empty($spec['postcompact_user_input'])));
             $roundInfo = $bridge;
             if (!$db->table('gateway_response_jobs')->add([
                 'id' => $responseId,
@@ -478,6 +488,7 @@ final class ResponseJob
             'item_id' => (string) $row['item_id'],
             'model' => (string) $row['model'],
             'prompt' => (string) $row['prompt'],
+            'request_hash' => (string) $row['request_hash'],
             'continuation_source_response_id' => $row['continuation_source_response_id'] ?? null,
             'submitted_document_nonce' => $row['submitted_document_nonce'] ?? null,
             'budget' => json_decode((string) ($row['budget_json'] ?? '{}'), true) ?: [],

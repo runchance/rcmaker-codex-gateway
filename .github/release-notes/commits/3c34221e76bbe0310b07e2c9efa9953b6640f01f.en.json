@@ -1,0 +1,8 @@
+[
+  "Keep one Codex API entry while asynchronously routing native models and Web tasks to separate API processes, preserving existing routes, streaming backpressure, cancellation and shared persistent data.",
+  "Add searchable browser timezone selection to setup step one and network settings, with automatic proxy-exit detection or an explicit IANA timezone stored in the network revision.",
+  "Apply network and timezone changes through an atomically reserved browser restart that preserves sign-in data and refuses to interrupt active tasks or tool operations.",
+  "Retry transient timezone emulation failures per browser session while retaining healthy page overrides, and record the CDP method and error without refreshing pages or replaying tasks.",
+  "Scope summary-only instructions to context compaction and identify checkpoints as handoff data during ordinary continuation, preserving completed work, exact tool receipts and explicit user stop or approval boundaries.",
+  "Update English and Chinese console text and user guides, and fix diagnostic exports for empty process logs."
+]

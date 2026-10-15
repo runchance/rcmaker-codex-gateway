@@ -11,7 +11,7 @@ namespace app\gateway\model;
  */
 final class WebContract
 {
-    /** Execution-context metadata only for proven mid-turn input; ordinary templates remain unchanged. */
+    /** Prior persisted notice retained for upgrade/recovery recognition; new sends use steeringNotice(). */
     private const STEERING_NOTICE = <<<'NOTICE'
 <codex_transport_steering>
 Additional messages arrived while this outer Codex turn was already executing. Treat them as input to the in-progress work, not automatically as a separate standalone turn.
@@ -26,21 +26,25 @@ Do not mention this transport notice in the user-facing answer.
 NOTICE;
 
     /**
-     * Add proven mid-turn provenance without modifying roles, user text, capabilities or normal contracts.
+     * Add proven steering or post-stop provenance without changing user roles or capabilities.
+     * Upgrade the exact earlier gateway notice when recovering an old unsent prompt.
      * The multipart planner carries this outer notice into its executable commit, never an inert stage.
      * @param string $prompt Rendered physical prompt; a custom template may omit the resume element.
-     * @param bool $midTurnInput True only after the existing active-turn steering path proves ownership.
+     * @param bool $midTurnInput True after steering or manual-stop continuation proves ownership.
      * @return string Unchanged ordinary prompt, or an idempotently annotated steering prompt.
      */
     public static function withSteeringNotice(string $prompt, bool $midTurnInput): string
     {
-        if (!$midTurnInput || self::hasSteeringNotice($prompt)) return $prompt;
+        if (!$midTurnInput) return $prompt;
+        $notice = self::steeringNotice();
+        if (str_contains($prompt, $notice)) return $prompt;
+        if (str_contains($prompt, self::STEERING_NOTICE)) return str_replace(self::STEERING_NOTICE, $notice, $prompt);
         // Only a standalone transport closing line is an anchor. A quoted tag in the
         // human's context JSON must never receive injected text or corrupt that JSON.
         preg_match_all('/^[ \t]*<\/codex_transport_resume>[ \t]*\r?$/m', $prompt, $matches, PREG_OFFSET_CAPTURE);
-        if ($matches[0] === []) return rtrim($prompt) . "\n" . self::STEERING_NOTICE;
+        if ($matches[0] === []) return rtrim($prompt) . "\n" . $notice;
         $position = $matches[0][array_key_last($matches[0])][1];
-        return substr($prompt, 0, $position) . self::STEERING_NOTICE . "\n" . substr($prompt, $position);
+        return substr($prompt, 0, $position) . $notice . "\n" . substr($prompt, $position);
     }
 
     /**
@@ -50,7 +54,19 @@ NOTICE;
      */
     public static function hasSteeringNotice(string $prompt): bool
     {
-        return str_contains($prompt, self::STEERING_NOTICE);
+        return str_contains($prompt, self::STEERING_NOTICE) || str_contains($prompt, self::steeringNotice());
+    }
+
+    /** Current public-reply and intent-adjustment policy, also applied over older custom templates. */
+    private static function steeringNotice(): string
+    {
+        return str_replace(
+            'Additional messages arrived while this outer Codex turn was already executing. Treat them as input to the in-progress work, not automatically as a separate standalone turn.',
+            'The human user has added input to an existing task, either during execution or after a manual stop. Treat it as an update to that task unless the user requests a different goal.' . "\n"
+                . 'Respond publicly to what the user actually said before continuing work: answer their question directly, or briefly acknowledge the requested change. A generic progress update alone does not answer a question. Do not silently absorb the message and continue.' . "\n"
+                . 'If the user changes the goal, scope, priorities, constraints or intended result, adjust the remaining plan and actions to that latest intent and briefly state what changes. Preserve completed work that still applies; do not continue superseded steps or repeat finished actions. When the intent is clear, proceed without asking for confirmation again. Ask a focused question only if a necessary ambiguity blocks the next action.',
+            self::STEERING_NOTICE
+        );
     }
 
     /** Browser-only envelope with stable version/system/messages key order. */

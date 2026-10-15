@@ -329,6 +329,9 @@ final class ContextRecovery
             if (!is_array($turn) || $turn['status'] !== 'queued' || (int) $turn['deadline_at'] <= time()
                 || !is_array($surface) || !in_array($surface['status'], ['ready','attaching','reserved','busy'], true)) return null;
             $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
+            // Steering's normal delivery preference never disables proven unsent recovery.
+            // A replacement document receives durable full history, not the old page's suffix.
+            unset($budget['steering_delta'], $budget['postcompact_page']);
             if ($staging && $code === 'CHATGPT_MESSAGE_TOO_LARGE') {
                 $budget['context_min_parts'] = min((int) $budget['context_max_parts'], (int) $job['transport_parts_total'] + 1);
                 // The observed staging envelope was rejected. Retry with smaller messages,

@@ -34,6 +34,7 @@ final class GatewaySettings
             'compaction_timeout_seconds' => (int) $row['compaction_timeout_seconds'],
             'skill_transport' => (string) $row['skill_transport'],
             'official_handoff_summary' => (bool) $row['official_handoff_summary'],
+            'steering_full_context' => (bool) $row['steering_full_context'],
             'web_initial_contract_template' => self::effectiveContract($row, 'web_initial_contract_template'),
             'web_resume_contract_template' => self::effectiveContract($row, 'web_resume_contract_template'),
             'web_readonly_contract_template' => self::effectiveContract($row, 'web_readonly_contract_template'),
@@ -63,7 +64,7 @@ final class GatewaySettings
             'tunnel_id', 'runtime_key', 'runtime_key_action',
             'context_transport', 'context_max_parts', 'context_extended', 'response_timeout_seconds',
             'context_stage_timeout_seconds', 'compaction_timeout_seconds',
-            'skill_transport', 'official_handoff_summary',
+            'skill_transport', 'official_handoff_summary', 'steering_full_context',
             'web_initial_contract_template', 'web_resume_contract_template',
             'web_readonly_contract_template', 'web_compact_contract_template',
         ];
@@ -75,7 +76,7 @@ final class GatewaySettings
         $input['pro_weekly_budget'] ??= $current['pro_weekly_budget'] ?? 0;
         foreach (['context_transport', 'context_max_parts', 'context_extended', 'response_timeout_seconds',
             'context_stage_timeout_seconds', 'compaction_timeout_seconds', 'skill_transport',
-            'official_handoff_summary', 'web_initial_contract_template', 'web_resume_contract_template',
+            'official_handoff_summary', 'steering_full_context', 'web_initial_contract_template', 'web_resume_contract_template',
             'web_readonly_contract_template', 'web_compact_contract_template'] as $field) {
             $input[$field] ??= $current[$field];
         }
@@ -110,6 +111,7 @@ final class GatewaySettings
                 'compaction_timeout_seconds' => ['rule' => 'pint', 'range' => [30, 86400], 'name' => '上下文压缩超时'],
                 'skill_transport' => ['rule' => 'string', 'len' => [4, 6], 'name' => '技能传输方式'],
                 'official_handoff_summary' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '官方交接摘要'],
+                'steering_full_context' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '插话全量重发'],
                 'web_initial_contract_template' => ['rule' => 'string', 'len' => [0, 32768], 'required' => false, 'name' => '首轮 Web 契约'],
                 'web_resume_contract_template' => ['rule' => 'string', 'len' => [0, 32768], 'required' => false, 'name' => '后续 Web 契约'],
                 'web_readonly_contract_template' => ['rule' => 'string', 'len' => [0, 32768], 'required' => false, 'name' => '无宿主工具 Web 契约'],
@@ -167,7 +169,7 @@ final class GatewaySettings
         $data['auto_approve_tool_calls'] = (int) $data['auto_approve_tool_calls'];
         foreach (['mcp_invoke_timeout_ms', 'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'context_max_parts', 'context_extended', 'response_timeout_seconds', 'context_stage_timeout_seconds',
-            'compaction_timeout_seconds', 'official_handoff_summary', 'pro_weekly_budget'] as $field) {
+            'compaction_timeout_seconds', 'official_handoff_summary', 'steering_full_context', 'pro_weekly_budget'] as $field) {
             $data[$field] = (int) $data[$field];
         }
         $data['protected_runtime_key'] = $protected;

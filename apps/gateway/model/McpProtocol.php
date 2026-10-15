@@ -536,7 +536,7 @@ final class McpProtocol
                 $toolArguments,
                 $toolInput
             );
-            return self::waitHostToolResult($token, (string) $invocation['call_id']);
+            return !empty($invocation['paused']) ? $invocation : self::waitHostToolResult($token, (string) $invocation['call_id']);
         } finally {
             ToolBroker::completeActivity((string) $activity['binding_id'], (string) $activity['activity_id']);
         }
@@ -799,7 +799,7 @@ AWK;
                 $arguments,
                 $input
             );
-            return self::waitHostToolResult($token, (string) $invocation['call_id']);
+            return !empty($invocation['paused']) ? $invocation : self::waitHostToolResult($token, (string) $invocation['call_id']);
         } finally {
             ToolBroker::completeActivity((string) $activity['binding_id'], (string) $activity['activity_id']);
         }

@@ -913,7 +913,11 @@ final class ToolBroker
      * Register one generic Codex host call. The returned call_id is the exact Responses identity.
      * Calls beyond a serial round's first invocation, and calls arriving after a batch is sealed,
      * wait unassigned for a later round. Repeated call keys retain their original identity.
-     * @return array{id:string,call_id:string,binding_id:string,response_id:?string}
+     * @param string $token Current turn capability. @param string $wireName Registered host tool name.
+     * @param string $callKey Stable caller operation identity. @param mixed $arguments Function arguments.
+     * @param string|null $input Freeform tool input, when applicable.
+     * @return array Accepted call identity, or a successful paused control with no call_id or host effect.
+     * @throws GatewayError On invalid arguments, ownership, conflicting identity or unavailable storage.
      */
     public static function registerInvocation(string $token, string $wireName, string $callKey, mixed $arguments = null, ?string $input = null): array
     {
@@ -986,10 +990,24 @@ final class ToolBroker
                 ];
             }
             $currentResponseId = (string) $binding['current_response_id'];
+            $turn = $db->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
+            if (is_array($turn) && ($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
+                return ['ok' => true, 'paused' => true,
+                    'instruction' => 'The user stopped this turn. This new action was not registered or executed. Finish waiting for existing call_id receipts with the same turn_token; do not create more actions. Await a new user instruction.'];
+            }
             if (is_array(self::activeCompactionCheckpointUnlocked($binding, $currentResponseId))) {
-                throw new GatewayError('compaction_requested', ContextCompaction::activeCompactionInstruction(), 409);
+                return ['ok' => true, 'paused' => true, 'instruction' => ContextCompaction::activeCompactionInstruction()];
             }
             $job = $db->table('gateway_response_jobs')->where('id', $currentResponseId)->find();
+            if (is_array($job)) {
+                $updates = TaskLedger::pendingOperationalContextUnlocked($job);
+                foreach ($updates['messages'] as $message) {
+                    if (($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message)) {
+                        return ['ok' => true, 'paused' => true,
+                            'instruction' => 'A newer user instruction is queued. This new action was not registered or executed. Finish waiting for existing call_id receipts with the same turn_token; the gateway will then deliver the new instruction. Do not create additional actions or report task completion.'];
+                    }
+                }
+            }
             $closedToolRound = is_array($job)
                 && (string) $job['status'] === 'completed'
                 && (string) ($job['round_kind'] ?? '') === 'tool_call';
@@ -1881,6 +1899,26 @@ final class ToolBroker
     }
 
     /**
+     * A manual stop must not revoke accepted calls or an MCP request still delivering their receipts.
+     * @param string $bindingId Exact binding selected from the current owned response.
+     * @return bool Whether host work, undelivered receipts or active MCP requests remain.
+     * @throws GatewayError If the ledger cannot be read.
+     */
+    public static function hasUnsettledCallsUnlocked(string $bindingId): bool
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $pending = $db->table('gateway_tool_invocations')->where('binding_id', $bindingId)
+            ->where('status', 'IN', ['registered', 'delivered'])->count();
+        $receipts = $db->table('gateway_tool_invocations')->where('binding_id', $bindingId)
+            ->where('status', 'completed')->where('result_delivered_at', null)->count();
+        $active = $db->table('gateway_mcp_activities')->where('binding_id', $bindingId)->where('status', 'active')->count();
+        if (!is_numeric($pending) || !is_numeric($receipts) || !is_numeric($active)) {
+            throw new GatewayError('storage_unavailable', '等待工具完成的状态暂不可读取。', 503);
+        }
+        return (int) $pending > 0 || (int) $receipts > 0 || (int) $active > 0;
+    }
+
+    /**
      * Retire capabilities left by a failed browser setup that never reached ChatGPT or Codex.
      * A compact request can follow later successful turns in the same task; an old unsent
      * capability must not be mistaken for live tool work. Caller owns the ledger transaction.
@@ -1972,7 +2010,7 @@ final class ToolBroker
             static fn(array $message): bool => !ContextHistory::isOperationalUserMessage($message)));
         if (!is_array($context) || !is_array($context['messages'] ?? null)
             || ($mailbox && (array) ($spec['mailbox_context_messages'] ?? []) === [])
-            || isset($context['continuation']) || count($instructionTail) < count($steering)
+            || (isset($context['continuation']) && empty($spec['steering_delta'])) || count($instructionTail) < count($steering)
             || (!$mailbox && ContextHistory::canonical(array_slice($instructionTail, -count($steering)))
                 !== ContextHistory::canonical($steering))) {
             throw new GatewayError('tool_steering_context_incomplete', '新网页缺少完整的用户指令历史。', 409);
@@ -1992,6 +2030,9 @@ final class ToolBroker
         foreach ($rows as $row) {
             $callId = (string) $row['call_id'];
             $byCallId[$callId] = $row;
+            if ((string) $row['status'] === 'registered') {
+                throw new GatewayError('tool_outcome_pending', '插话正在等待已登记的工具完成。', 409);
+            }
             if ($mailbox && in_array((string) $row['status'], ['registered', 'delivered'], true)) {
                 throw new GatewayError('tool_outcome_pending', '代理消息必须等待已发出的宿主工具回执，不能重新执行。', 409);
             }
@@ -2079,16 +2120,7 @@ final class ToolBroker
                 'canonical_handoff' => true,
             ]);
         }
-        // Registered calls have not crossed the native host boundary. Retire every one;
-        // none may be assigned to the replacement page after its token rotates.
-        $cancelled = $db->table('gateway_tool_invocations')->where('binding_id', (string) $binding['id'])
-            ->where('status', 'registered')->update([
-                'status' => 'cancelled',
-                'result_json' => json_encode(['steering_interrupted' => true,
-                    'retired_token_hash' => $oldTokenHash], JSON_THROW_ON_ERROR),
-                'updated_at' => $now,
-            ]);
-        if ($cancelled === false) throw new GatewayError('storage_unavailable', '旧网页工具队列无法取消。', 503);
+        // All accepted calls are settled before rotation; steering never cancels a queued host action.
         $activities = $db->table('gateway_mcp_activities')->where('binding_id', (string) $binding['id'])
             ->where('status', 'active')->update(['status' => 'completed', 'updated_at' => $now]);
         if ($activities === false) throw new GatewayError('storage_unavailable', '旧网页工具活动无法结束。', 503);
@@ -2119,7 +2151,7 @@ final class ToolBroker
         self::eventUnlocked((string) $binding['task_id'], (string) $binding['turn_id'], $newResponseId,
             $mailbox ? 'mcp_mailbox_context_restart_prepared' : 'mcp_steering_restart_prepared', [
                 'binding_id' => (string) $binding['id'], 'previous_response_id' => $previousResponseId,
-                'receipt_count' => count($outputs), 'registered_cancelled' => $cancelled->rowCount(),
+                'receipt_count' => count($outputs), 'registered_cancelled' => 0,
                 'old_activities_closed' => $activities->rowCount(),
             ]);
         return [
@@ -2981,7 +3013,18 @@ final class ToolBroker
     {
         $binding = self::bindingByIdUnlocked((string) $job['mcp_binding_id']);
         if ($binding['status'] !== 'awaiting_start' || $binding['sent_at'] !== null || $binding['started_at'] !== null
-            || self::invocationCountUnlocked($binding['id']) !== 0 || self::activeCountUnlocked($binding['id']) !== 0) return null;
+            || $binding['current_response_id'] !== $job['id'] || self::activeCountUnlocked($binding['id']) !== 0) return null;
+        if (self::invocationCountUnlocked($binding['id']) !== 0) {
+            // Steering rotates the token but retains historical calls in the same binding.
+            // Those known effects must not be mistaken for use of this unsent capability.
+            $rotation = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+                ->where('task_id', $job['task_id'])->where('turn_id', $job['durable_turn_id'])
+                ->where('response_id', $job['id'])->where('event_type', 'IN',
+                    ['mcp_steering_restart_prepared', 'mcp_mailbox_context_restart_prepared'])->find();
+            $evidence = is_array($rotation) ? json_decode($rotation['data_json'], true) : [];
+            $full = array_replace($job, ['transport_context_json' => $job['context_json']]);
+            if (($evidence['binding_id'] ?? '') !== $binding['id'] || !self::hasCompleteReceiptHistory($binding, $full)) return null;
+        }
         preg_match_all('/(?<![A-Za-z0-9_-])(?:turn_[A-Za-z0-9_-]{32}|request_[A-Za-z0-9_-]{24,128})(?![A-Za-z0-9_-])/', (string) $job['prompt'], $matches);
         $tokens = array_values(array_unique(array_filter($matches[0], static fn($token)=>hash_equals((string)$binding['token_hash'],hash('sha256',$token)))));
         if (count($tokens) !== 1) return null;

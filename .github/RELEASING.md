@@ -34,14 +34,16 @@ Extract the archive for your system. Run `rcmaker-codex-gateway.exe` on Windows 
 ### Notes and reruns
 
 - The first version gets initial-release notes. Later versions compare with the highest lower ancestral SemVer tag; unrelated development tags are ignored. Stable releases ignore prerelease baselines. `v1.1.0-beta.1` is automatically marked as a prerelease.
-- Default notes contain English subsystem summaries and change categories. English commit titles are retained. Chinese titles use an English category and a commit link instead of publishing Chinese or inventing a translation.
-- For a precise English description, optionally add this field to a commit body; no Chinese counterpart is required:
+- Default notes display every English change directly, without truncating the commit range. English commit titles remain a fallback. Chinese titles require reviewed English details; empty category placeholders and invented translations are not published.
+- Add one `Release-Note-EN:` field per public change to every product commit; no Chinese counterpart is required:
 
   ```text
   Release-Note-EN: Preserve tool receipts when a stream is interrupted.
   ```
 
 - To replace the generated prose for a particular version, commit `.github/release-notes/v1.0.0.en.md` **before** creating its tag. An empty override or Chinese text in this English file is rejected. Legacy `.zh-CN.md` overrides are ignored.
+- To repair missing or incorrect notes on an immutable historical commit, add `.github/release-notes/commits/<full-sha>.en.json`, a nonempty JSON array of single-line English changes. The release reads it from the tagged tree; it overrides that commit's note fields without exposing its private body or rewriting history. A version override still takes precedence.
+- Run `node .github/scripts/release-notes.cjs --check` after committing and before tagging. The lightweight `release-note-preflight.yml` also checks pushes and pull requests, including the most recent release range and a just-tagged HEAD. Missing notes are reported together. Fixes must be committed into the tree selected by the release tag: rerunning an old tag does not load newer branch files. Do not move an already published release tag to repair its notes.
 - In Actions, choose **Release encrypted binaries → Run workflow**, enter an existing tag, and leave **publish** disabled for a full build rehearsal. Enable it to retry a failed publication. An incomplete draft can resume. A published Release is verified against its existing manifest and never overwritten with newly encrypted bytes, including schema-1 releases with a standalone Windows EXE and older bilingual releases.
 - `release-checks.yml` runs isolated CI contract tests for changes to the automation or version entry points. Dependabot opens monthly PRs for pinned Action updates; it does not auto-merge them.
 
@@ -78,7 +80,11 @@ Release 共 12 个附件：四份 Unix 可执行文件、五份压缩包、一�
 
 启动 Banner 和 `--version` 显示完整 tag。Windows 解压后运行 `rcmaker-codex-gateway.exe`；Linux/macOS 运行 `./rcmaker-codex-gateway`。直接下载 Unix 可执行文件时先执行 `chmod +x`。
 
-首版自动生成首发说明；后续按上一合法祖先版本计算变更，忽略开发标签。预发布标签如 `v1.1.0-beta.1` 自动标记预发布。默认生成英文模块摘要和分类；中文提交标题改为英文分类加提交链接，不伪造翻译。需要具体英文说明时，可在提交正文使用 `Release-Note-EN`，或在打 tag 前提供 `.github/release-notes/<tag>.en.md`，无需中文文件。
+首版自动生成首发说明；后续按上一合法祖先版本计算变更，忽略开发标签。预发布标签如 `v1.1.0-beta.1` 自动标记预发布。发布页直接展开全部英文修改，不截断提交范围，也不退成空分类或“查看提交详情”。每个产品提交须按公开修改逐条填写 `Release-Note-EN:`。英文标题可直接显示；中文标题须提供英文说明，不伪造翻译或公开未标记正文。
+
+已存在提交遗漏说明时，可补交 `.github/release-notes/commits/<完整SHA>.en.json`，内容为非空英文单行说明数组，覆盖该提交的说明字段，无需改写历史。整版 `.github/release-notes/<tag>.en.md` 仍具有最高优先级。两种文件只从发布 tag 对应的已提交树读取。
+
+提交后、打 tag 前运行 `node .github/scripts/release-notes.cjs --check`；独立轻量预检也会在 push 和 PR 时运行，覆盖最近版本范围和刚打 tag 的 HEAD，一次列出所有缺项。修复必须包含在发布 tag 指向的提交中，重跑旧 tag 不会加载分支上的新文件；不要为补说明移动已经正式发布的 tag。
 
 Actions 中可手动运行 **Release encrypted binaries**：输入已有 tag，关闭 **publish** 可先做完整构建演练；开启则进行发布或失败重试。草稿可以续传，已经公开的版本只验证、不覆盖。工作流检查自动运行，依赖 Action 固定 SHA，Dependabot 每月提交更新 PR。
 
