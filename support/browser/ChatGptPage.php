@@ -1514,17 +1514,22 @@ const turnId=(el,index,role)=>el.hasAttribute('data-turn-key')
     ||el.getAttribute('data-content-search-turn-key')||('turn-'+index);
 // ChatGPT promotes a streaming message into a stable user/assistant group. Preserve the
 // original identity only through one exact native anchor in the accepted user's fresh
-// group. Selection IDs, assistant search units and fallback turns are different renderer
+// group. A provisional group:assistant:fallback-turn-N keeps that same inner fallback
+// anchor when its outer data-turn-key becomes permanent; other group IDs never alias.
+// Selection IDs, assistant search units and fallback turns are different renderer
 // identities; visible text, DOM position or a merely similar answer cannot establish one.
 const promotedAssistant=(assistants,beforeAssistants,boundId,sameGroupId)=>{
-    if(!boundId||!sameGroupId||boundId.startsWith('group:')||beforeAssistants.has(boundId)
+    const provisionalGroup=/^group:assistant:(fallback-turn-\d+)$/.exec(boundId||'');
+    if(!boundId||!sameGroupId||(boundId.startsWith('group:')&&!provisionalGroup)||beforeAssistants.has(boundId)
         ||/^(?:conversation-turn|turn)-\d+$/.test(boundId))return null;
-    const fallback=/^fallback-turn-\d+$/.test(boundId);
+    const anchorId=provisionalGroup?provisionalGroup[1]:boundId;
+    const fallback=/^fallback-turn-\d+$/.test(anchorId);
     const attribute=fallback?'data-content-search-turn-key'
         :boundId.endsWith(':assistant')?'data-content-search-unit-key':'data-chatgpt-selection-message-id';
-    const aliases=assistants.filter(entry=>entry.id.startsWith('group:assistant:')&&!beforeAssistants.has(entry.id))
+    const aliases=assistants.filter(entry=>entry.id.startsWith('group:assistant:')&&!beforeAssistants.has(entry.id)
+        &&!entry.el.parentElement?.closest('[data-turn-key]'))
         .flatMap(entry=>[...entry.el.querySelectorAll('['+attribute+']')]
-            .filter(node=>node.getAttribute(attribute)===boundId
+            .filter(node=>node.getAttribute(attribute)===anchorId
                 &&node.closest('[data-turn-key]')===entry.el
                 &&!node.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-content-search-unit-key$=":user"]')
                 &&(fallback||node.closest('[data-content-search-unit-key$=":assistant"],[data-message-author-role="assistant"],[data-conversation-role="assistant"]')))
