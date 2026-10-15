@@ -79,7 +79,9 @@ final class BrowserState
         self::write(['worker_heartbeat' => time()]);
     }
 
-    /** Enqueue an immutable command bound to the current surface/document. @return int @throws GatewayError */
+    /** Enqueue an immutable command; concurrent connector checks reuse the same runtime's active check.
+     * @return int New or matching active command ID. @throws GatewayError On unavailable browser state.
+     */
     public static function enqueue(string $action, array $payload, bool $documentBound = true, string $requiredLease = 'manual'): int
     {
         return Schema::transaction(fn(): int => self::enqueueUnlocked($action, $payload, $documentBound, $requiredLease));
@@ -124,6 +126,26 @@ final class BrowserState
                 throw new GatewayError('BROWSER_MANUAL_OWNS_SURFACE', '页面当前由人工控制，自动任务未取得控制权。', 409);
             }
             throw new GatewayError('BROWSER_AUTOMATION_OWNS_SURFACE', '自动任务正在控制页面，请先切换为人工接管。', 409);
+        }
+        if ($action === 'verify_connector') {
+            // Admission and lookup share the writer lock, including automatic/manual races.
+            // Never adopt a different connector, an old runtime, or an expired queued check.
+            $generation = ConnectorState::runtimeGeneration();
+            $payload['runtime_generation'] ??= $generation;
+            $checks = $db->table('gateway_browser_commands')->where('action', 'verify_connector')
+                ->where('status', 'IN', ['queued', 'running'])->order([['id', 'ASC']])->limit(32)->select();
+            if ($checks === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作状态暂不可读取。', 503);
+            foreach ($checks as $check) {
+                $pendingPayload = json_decode((string) $check['payload_json'], true);
+                if (!is_array($pendingPayload)
+                    || ($check['status'] === 'queued' && (int) $check['created_at'] < time() - 180)) continue;
+                if (hash_equals($generation, (string) $payload['runtime_generation'])
+                    && isset($pendingPayload['runtime_generation'])
+                    && hash_equals($generation, (string) $pendingPayload['runtime_generation'])
+                    && hash_equals((string) ($payload['connector_name'] ?? ''), (string) ($pendingPayload['connector_name'] ?? ''))) {
+                    return (int) $check['id'];
+                }
+            }
         }
         $pending = $db->table('gateway_browser_commands')->where('status', 'queued')->count();
         if ($pending === false || $pending === null || $pending > 24) {

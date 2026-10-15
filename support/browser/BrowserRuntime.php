@@ -1185,6 +1185,7 @@ final class BrowserRuntime
         });
     }
 
+    /** Prepare the exact connector mention; retain safe CDP failure details before any probe is sent. */
     private function beginConnectorProbe(int $commandId, string $connectorName, int $attempt): void
     {
         $this->evaluateConnectorProbe(WebModelPage::focusAndClearExpression(), function ($error, $cleared) use ($commandId, $connectorName, $attempt): void {
@@ -1195,7 +1196,16 @@ final class BrowserRuntime
             $this->typeConnectorMention($this->taskCdp, $this->connectorProbeSessionId,
                 function ($insertError) use ($commandId, $connectorName, $attempt): void {
                     if ($insertError !== null) {
-                        $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_TRIGGER_FAILED', 'ChatGPT 未接受连接器检查指令。');
+                        $reason = (string) ($insertError['message'] ?? '');
+                        $timedOut = in_array($reason, ['CONNECTOR_MENTION_TIMEOUT', 'BROWSER_CDP_TIMEOUT'], true);
+                        $this->connectorVerifyFail($commandId, $connectorName,
+                            $timedOut ? 'CHATGPT_CONNECTOR_INPUT_TIMEOUT' : 'CHATGPT_CONNECTOR_TRIGGER_FAILED',
+                            $timedOut ? '浏览器未及时响应连接器输入，检查消息尚未发送。' : 'ChatGPT 未接受连接器检查指令。',
+                            ['stage'=>'connector_mention', 'cdp_code'=>(int) ($insertError['code'] ?? 0),
+                                'cause'=>in_array($reason, ['CONNECTOR_MENTION_TIMEOUT', 'BROWSER_CDP_TIMEOUT',
+                                    'BROWSER_CDP_CLOSED', 'BROWSER_CDP_NOT_READY', 'BROWSER_CDP_SEND_FAILED'], true)
+                                    ? $reason : 'CDP_PROTOCOL_ERROR',
+                                'key_index'=>(int) ($insertError['mention_key_index'] ?? 0)]);
                         return;
                     }
                     $this->waitConnectorProbeMenu($commandId, $connectorName, $attempt, microtime(true) + 2.5);
@@ -1488,8 +1498,8 @@ final class BrowserRuntime
         ]);
     }
 
-    /** Finish a connector probe and retain only a safe first automatic failure for one retry. */
-    private function connectorVerifyFail(int $commandId, string $connectorName, string $code, string $message): void
+    /** Finish a connector probe with optional allow-listed diagnostics; only safe first automatic failures retry. */
+    private function connectorVerifyFail(int $commandId, string $connectorName, string $code, string $message, array $diagnostics = []): void
     {
         $generation = $this->connectorProbeGenerations[$commandId] ?? null;
         // A first automatic check that never reached the local MCP can retry
@@ -1498,7 +1508,7 @@ final class BrowserRuntime
             try { ConnectorState::failed($connectorName, $message, $generation); } catch (\Throwable) {}
         }
         $this->closeConnectorProbeSurface();
-        $this->failCommand($commandId, $code, $message);
+        $this->failCommand($commandId, $code, $message, $diagnostics === [] ? [] : ['diagnostics'=>$diagnostics]);
     }
 
     /** Close only the probe's background tab, leaving the user's active tab and URL untouched. */
@@ -2355,10 +2365,12 @@ JS;
         $query = str_starts_with($connectorName, 'RCMAKER ') ? '@RCMAKER' : '@codex';
         $index = 0; $deadline = microtime(true) + $timeout;
         $advance = function () use ($client, $sessionId, $callback, $query, &$index, $deadline, &$advance): void {
-            if (microtime(true) >= $deadline) { $callback(['code' => -2, 'message' => 'CONNECTOR_MENTION_TIMEOUT']); return; }
+            // Once the final key was acknowledged, a slow callback does not undo successful input.
             if ($index >= strlen($query)) { $callback(null); return; }
-            $this->dispatchCdpKey($client, $sessionId, $query[$index++], function ($error) use ($callback, &$advance): void {
-                if ($error !== null) { $callback($error); return; }
+            if (microtime(true) >= $deadline) { $callback(['code' => -2, 'message' => 'CONNECTOR_MENTION_TIMEOUT', 'mention_key_index'=>$index]); return; }
+            $key = $query[$index++];
+            $this->dispatchCdpKey($client, $sessionId, $key, function ($error) use ($callback, $index, &$advance): void {
+                if ($error !== null) { $callback($error + ['mention_key_index'=>$index]); return; }
                 Timer::add(0.025, $advance, null, false);
             });
         };
@@ -8351,10 +8363,11 @@ JS;
         $this->commandBusy = false;
     }
 
-    private function failCommand(int $id, string $code, string $message): void
+    /** Persist a command failure and optional sanitized details, then release its worker slot. */
+    private function failCommand(int $id, string $code, string $message, array $details = []): void
     {
         unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id]);
-        BrowserState::finish($id, false, ['code' => $code, 'message' => $message]);
+        BrowserState::finish($id, false, ['code' => $code, 'message' => $message] + $details);
         $this->commandBusy = false;
     }
 

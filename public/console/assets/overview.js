@@ -18,6 +18,9 @@
     // A model probe may wait up to 180 seconds in the existing browser queue,
     // then spend 45 seconds reading the website. This is a UI wait, not a task deadline.
     const MODEL_PROBE_WAIT_MS = 240000;
+    // Connector verification includes queued work and up to three MCP receipt waits.
+    // This only bounds observation; it neither cancels nor resubmits the backend check.
+    const CONNECTOR_PROBE_WAIT_MS = 600000;
 
     /** Saved server evidence defines resumable setup; no local completion flag grants readiness. */
     function setupState(state, codex) {
@@ -375,7 +378,9 @@
             if (row.status === 'failed') throw new Error(row.result ? I18n.error(row.result.message || I18n.t('浏览器操作失败。'), row.result.code) : I18n.t('浏览器操作失败。'));
             await sleep(pollIntervalMs);
         }
-        throw new Error(I18n.t('操作等待超时，请稍后重试。'));
+        const error = new Error(I18n.t('操作等待超时，请稍后重试。'));
+        error.code = 'BROWSER_COMMAND_WAIT_PENDING';
+        throw error;
     }
     /** Enqueue once, with a command-specific UI wait and optional polling cadence; other callers keep the existing default. */
     async function browserCommand(path, body, timeoutMs, pollIntervalMs = 100) {
@@ -738,16 +743,21 @@
             progress('tools-progress', I18n.t('连接器名称已复制：') + value);
         } catch (_) { progress('tools-progress', I18n.t('复制失败，请手动复制连接器名称：') + value, 'warning'); }
     }
+    /** Observe the shared connector check until its real result; a local wait limit is not failure. */
     async function verifyConnector() {
         if (busy) return;
         const button = byId('tools-verify'); busy = true; loading(button, true, I18n.t('正在检查…'));
         progress('tools-progress', I18n.t('正在检查当前 ChatGPT 连接器…'));
         try {
-            await browserCommand('/api/browser/connector/verify', {}, 45000);
+            await browserCommand('/api/browser/connector/verify', {}, CONNECTOR_PROBE_WAIT_MS, 500);
             const state = await refresh();
             if (!state || !state.toolsReady) throw new Error(I18n.t('连接器尚未通过检查，请确认已经创建并保存。'));
             progress('tools-progress', I18n.t('连接器检查通过，运行准备已全部完成。'));
-        } catch (e) { progress('tools-progress', e.message, 'warning'); await refresh(); }
+        } catch (e) {
+            progress('tools-progress', e.code === 'BROWSER_COMMAND_WAIT_PENDING'
+                ? I18n.t('连接器检查尚未结束。可稍后查看结果，再次检查会复用仍在执行的检查。') : e.message, 'warning');
+            await refresh();
+        }
         finally { busy = false; loading(button, false); }
     }
 

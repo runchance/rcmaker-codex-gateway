@@ -139,7 +139,7 @@ final class ConnectorState
      */
     public static function retryableRuntimeCheckFailure(int $commandId, string $code): bool
     {
-        if (!in_array($code, ['BROWSER_NOT_READY', 'CHATGPT_CONNECTOR_ACTION_NOT_STARTED',
+        if (!in_array($code, ['BROWSER_NOT_READY', 'CHATGPT_CONNECTOR_ACTION_NOT_STARTED', 'CHATGPT_CONNECTOR_INPUT_TIMEOUT',
             'CHATGPT_EDITOR_NOT_READY'], true)) return false;
         $row = self::row();
         if ((int) $row['recheck_required'] !== 1 || (int) ($row['recheck_command_id'] ?? 0) !== $commandId) {

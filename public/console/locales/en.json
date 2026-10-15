@@ -413,6 +413,8 @@
     "控制台需要启用 JavaScript。全部页面资源均随本机应用提供。": "JavaScript is required. All page resources are provided by the local application.",
     "操作": "Actions",
     "操作等待超时，请稍后重试。": "The operation timed out. Retry shortly.",
+    "连接器检查尚未结束。可稍后查看结果，再次检查会复用仍在执行的检查。": "The connector check has not finished. Check back later; checking again will reuse the check still in progress.",
+    "浏览器未及时响应连接器输入，检查消息尚未发送。": "The browser did not respond to connector input in time. The check message has not been sent.",
     "新任务：": "New task: ",
     "新对话": "New conversation",
     "新建 Connector，类型/来源选择": "Create a connector and choose this source/type:",
