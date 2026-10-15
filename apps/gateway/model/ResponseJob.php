@@ -52,6 +52,7 @@ final class ResponseJob
         $spec['budget'] = $budget;
         $isToolContinuation = (array) ($spec['tool_outputs'] ?? []) !== [];
         $activeSteeringCandidate = !$isToolContinuation && (self::potentialActiveUserSteering($spec)
+            || ContextHistory::activeToolBoundarySteeringUnlocked($spec) !== null
             || ContextHistory::activeMailboxContextUpdateUnlocked($spec) !== null);
         $browser = BrowserState::state();
         // A tool-result round resumes the already-submitted browser turn; it does not
@@ -114,7 +115,8 @@ final class ResponseJob
             if (!empty($spec['operational_context_source_response_id'])) {
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
                 TaskLedger::queueOperationalContextUnlocked($source, $spec['operational_context_updates'],
-                    (string) $spec['request_hash'], $idempotencyKey, !empty($spec['mailbox_context_join']));
+                    (string) $spec['request_hash'], $idempotencyKey, !empty($spec['mailbox_context_join']),
+                    !empty($spec['steering_context_join']));
                 return (string) $source['id'];
             }
             if (($spec['operation_kind'] ?? 'response') === 'response'

@@ -568,6 +568,13 @@ final class ContextHistory
         }
         $outputs = (array) ($spec['tool_outputs'] ?? []);
         if ($outputs === [] && ($spec['operation_kind'] ?? 'response') === 'response') {
+            $steeringJoin = self::activeToolBoundarySteeringUnlocked($spec, $taskId);
+            if ($steeringJoin !== null) {
+                $spec['operational_context_source_response_id'] = (string) $steeringJoin['source']['id'];
+                $spec['operational_context_updates'] = $steeringJoin['updates'];
+                $spec['steering_context_join'] = true;
+                return $spec;
+            }
             $mailbox = self::activeMailboxContextUpdateUnlocked($spec, $taskId);
             if ($mailbox !== null) {
                 if ($mailbox['restart']) {
@@ -647,10 +654,19 @@ final class ContextHistory
                 if ($pending['messages'] !== []) {
                     $contextUpdates = $contextUpdates ?: ['version' => 3, 'system' => [], 'messages' => []];
                     $queued = [];
+                    $queuedSteering = [];
                     foreach ($pending['messages'] as $message) {
+                        // Human revisions queued at tool publication still require the ordinary
+                        // steering restart after the exact host receipt, even for delta clients.
+                        if (($message['role'] ?? '') === 'user' && !self::isOperationalUserMessage($message)) {
+                            if (!self::containsRecord($priorFull['messages'], $message)) $queuedSteering[] = $message;
+                            continue;
+                        }
                         if (!self::containsRecord($priorFull['messages'], $message)
                             && !self::containsRecord($contextUpdates['messages'], $message)) $queued[] = $message;
                     }
+                    $steering = array_merge($queuedSteering, array_values(array_filter($steering,
+                        static fn(array $message): bool => !self::containsRecord($queuedSteering, $message))));
                     $contextUpdates['messages'] = array_merge($queued, $contextUpdates['messages']);
                     $spec['operational_context_event_ids'] = $pending['event_ids'];
                 }
@@ -945,11 +961,33 @@ final class ContextHistory
      */
     public static function activeMailboxContextUpdateUnlocked(array $spec, ?string $taskId = null): ?array
     {
+        return self::activeNativeContextUpdateUnlocked($spec, $taskId, false);
+    }
+
+    /**
+     * Prove a new human revision racing an already published tool batch. Rejoin its exact
+     * response until native receipts arrive; do not cancel, duplicate or infer host effects.
+     * @param array $spec Full native history with no fresh host receipt.
+     * @param ?string $taskId Already routed task ID, or null during readiness checks.
+     * @return ?array Verified source and role-preserving updates, or null for any mismatch.
+     * @throws GatewayError If durable source evidence is unreadable.
+     */
+    public static function activeToolBoundarySteeringUnlocked(array $spec, ?string $taskId = null): ?array
+    {
+        return self::activeNativeContextUpdateUnlocked($spec, $taskId, true);
+    }
+
+    /** Shared exact-source proof; human joins are restricted to a pending published tool batch. */
+    private static function activeNativeContextUpdateUnlocked(array $spec, ?string $taskId, bool $humanSteering): ?array
+    {
         if (($spec['operation_kind'] ?? 'response') !== 'response'
             || (array) ($spec['tool_outputs'] ?? []) !== [] || empty($spec['turn_id'])) return null;
         $incoming = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
         $records = (array) ($incoming['messages'] ?? []);
-        if (!self::containsAgentMessage($incoming)) return null;
+        if ($humanSteering) {
+            $last = $records[array_key_last($records)] ?? [];
+            if (($last['role'] ?? '') !== 'user' || self::isOperationalUserMessage($last)) return null;
+        } elseif (!self::containsAgentMessage($incoming)) return null;
         $db = SDB(null, 'medoo', 'sqlite');
         $owner = $spec['browser_owner_key'] ?? null;
         $link = null;
@@ -968,6 +1006,7 @@ final class ContextHistory
             || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')) return null;
         $turn = $db->table('gateway_task_turns')->where('task_id', $taskId)
             ->where('status', 'IN', ['queued', 'submit_intent', 'submitted', 'running'])->find();
+        if ($humanSteering && !is_array($turn)) return null;
         if (!is_array($turn)) {
             $lineage = $spec;
             $lineage['task_key'] = (string) ($link['current_task_key'] ?? $spec['task_key']);
@@ -1005,6 +1044,12 @@ final class ContextHistory
         $running = in_array((string) $source['status'], ['queued', 'running'], true)
             && (string) $source['round_kind'] === 'text';
         $toolBoundary = (string) $source['status'] === 'completed' && (string) $source['round_kind'] === 'tool_call';
+        if ($humanSteering && !$toolBoundary) return null;
+        if ($humanSteering) {
+            $binding = $db->table('gateway_mcp_bindings')->where('id', (string) ($source['mcp_binding_id'] ?? ''))->find();
+            if (!is_array($binding) || $binding['status'] !== 'running' || $binding['task_id'] !== $taskId
+                || $binding['turn_id'] !== $turn['id'] || $binding['current_response_id'] !== $sourceId) return null;
+        }
         $completedText = (string) $turn['status'] === 'committed'
             && (string) $source['status'] === 'completed' && (string) $source['round_kind'] === 'text';
         if (!$running && !$toolBoundary && !$completedText) return null;
@@ -1053,6 +1098,11 @@ final class ContextHistory
         $commentaryIndex = 0;
         $updates = [];
         $hasMailbox = false;
+        $hasHuman = false;
+        $knownUserIds = [];
+        foreach ($known as $record) {
+            if (($record['role'] ?? '') === 'user' && !empty($record['id'])) $knownUserIds[(string) $record['id']] = true;
+        }
         foreach (array_slice($records, count($known) + $offset) as $record) {
             if (($record['role'] ?? '') === 'assistant') {
                 if (!isset($commentary[$commentaryIndex])
@@ -1062,11 +1112,18 @@ final class ContextHistory
                 $hasMailbox = true;
             } elseif (self::isOperationalUserMessage($record)) {
                 $updates[] = $record;
+            } elseif ($humanSteering && ($record['role'] ?? '') === 'user') {
+                $id = (string) ($record['id'] ?? '');
+                if (($id !== '' && isset($knownUserIds[$id])) || self::containsRecord($known, $record)
+                    || self::containsRecord($updates, $record)) return null;
+                if ($id !== '') $knownUserIds[$id] = true;
+                $updates[] = $record;
+                $hasHuman = true;
             } else {
                 return null;
             }
         }
-        if (!$hasMailbox || $commentaryIndex === 0) return null;
+        if ($humanSteering ? !$hasHuman : (!$hasMailbox || $commentaryIndex === 0)) return null;
         return ['source' => $source, 'restart' => (int) $pending === 0,
             'client_turn_id' => (string) $turn['client_turn_id'],
             'updates' => ['version' => 3, 'system' => [], 'messages' => $updates]];

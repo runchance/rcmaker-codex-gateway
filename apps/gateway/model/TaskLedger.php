@@ -2875,15 +2875,16 @@ final class TaskLedger
     /**
      * Journal proven native context without another browser submission or a renewed lease.
      * @param array $source Exact active response proven by ContextHistory.
-     * @param array $updates Role-preserving environment or proven mailbox records.
+     * @param array $updates Role-preserving environment, mailbox or proven human revisions.
      * @param string $requestHash Exact native request identity for reconnects.
      * @param ?string $idempotencyKey Optional global Responses idempotency identity.
      * @param bool $mailboxJoin Permit agent records only after the full active-source mailbox proof.
+     * @param bool $steeringJoin Permit human records only after the exact pending-tool source proof.
      * @return void
      * @throws GatewayError If source ownership changed or a record does not belong to this channel.
      */
     public static function queueOperationalContextUnlocked(array $source, array $updates, string $requestHash,
-        ?string $idempotencyKey, bool $mailboxJoin = false): void
+        ?string $idempotencyKey, bool $mailboxJoin = false, bool $steeringJoin = false): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $turn = $db->table('gateway_task_turns')->where('id', (string) $source['durable_turn_id'])->find();
@@ -2895,16 +2896,25 @@ final class TaskLedger
             ->where('turn_id', (string) $source['durable_turn_id'])->where('event_type', 'native_context_update_queued')->select();
         if (!is_array($events)) throw new GatewayError('storage_unavailable', '环境更新记录暂不可读取。', 503);
         $known = [];
+        $humanIds = [];
         foreach ($events as $event) {
             $data = json_decode((string) $event['data_json'], true, 128, JSON_THROW_ON_ERROR);
             $known[(string) ($data['record_hash'] ?? '')] = true;
+            $message = $data['message'] ?? [];
+            if (($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message)
+                && !empty($message['id'])) $humanIds[(string) $message['id']] = (string) $data['record_hash'];
         }
         foreach ((array) ($updates['messages'] ?? []) as $message) {
             if (!ContextHistory::isOperationalUserMessage($message)
-                && !($mailboxJoin && ($message['role'] ?? '') === 'agent_message')) {
+                && !(($mailboxJoin || $steeringJoin) && ($message['role'] ?? '') === 'agent_message')
+                && !($steeringJoin && ($message['role'] ?? '') === 'user')) {
                 throw new GatewayError('invalid_context_update', '此通道只接收 Codex 环境信息。', 400);
             }
             $hash = hash('sha256', ContextHistory::canonical($message));
+            $messageId = (string) ($message['id'] ?? '');
+            if ($steeringJoin && $messageId !== '' && isset($humanIds[$messageId]) && $humanIds[$messageId] !== $hash) {
+                throw new GatewayError('turn_identity_conflict', '同一用户消息 ID 的插话内容发生变化。', 409);
+            }
             if (isset($known[$hash])) continue;
             self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
                 (string) $source['id'], (string) $source['surface_id'], 'native_context_update_queued',
@@ -2914,7 +2924,8 @@ final class TaskLedger
         self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
             (string) $source['id'], (string) $source['surface_id'], 'native_context_request_joined',
             ['request_hash' => $requestHash, 'idempotency_key' => $idempotencyKey,
-                ...($mailboxJoin ? ['mailbox_join' => true] : [])]);
+                ...($mailboxJoin ? ['mailbox_join' => true] : []),
+                ...($steeringJoin ? ['steering_join' => true] : [])]);
     }
 
     /** A reconnect of a coalesced request keeps its original response, even after the model advanced. */
@@ -2946,7 +2957,7 @@ final class TaskLedger
             $source = $db->table('gateway_response_jobs')->where('id', (string) $event['response_id'])->find();
             if (is_array($source) && $source['task_id'] === $taskId && $source['model'] === $spec['model']
                 && ($source['reasoning_effort'] ?? null) === ($spec['reasoning_effort'] ?? null)) {
-                if (!empty($data['mailbox_join'])) {
+                if (!empty($data['mailbox_join']) || !empty($data['steering_join'])) {
                     $unknown = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
                         ->where('turn_id', (string) $source['durable_turn_id'])->where('status', 'unknown')->count();
                     if (!is_numeric($unknown)) throw new GatewayError('storage_unavailable', '代理请求的宿主结果状态暂不可读取。', 503);
