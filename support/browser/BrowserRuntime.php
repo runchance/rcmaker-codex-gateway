@@ -7049,9 +7049,11 @@ JS;
     }
 
     /**
-     * Activate the owned ordinary-task Retry after host tools and MCP replies have drained.
-     * A recovery banner or running generation never reaches this operation. The existing
-     * fresh-page recovery remains the fallback for errors without a verified native control.
+     * Recover a stopped ordinary network error after host tools and MCP replies drain.
+     * Completed tool work uses the existing exact-receipt recovery and retires the old page;
+     * only tasks without completed host work may activate native Retry. A recovery banner or
+     * running generation never reaches this operation. Missing native controls keep using
+     * the same fresh-page fallback.
      * @param string $responseId Physical observer mapped to the current logical response.
      * @param array $snapshot Stopped native network-error card with exact response identities.
      * @return bool Whether this native recovery path handled polling, activation or failure.
@@ -7063,12 +7065,7 @@ JS;
         $descriptor = $snapshot['network_retry'] ?? null;
         if (!is_array($descriptor) || empty($descriptor['failure_id']) || empty($descriptor['fingerprint'])) return false;
         if (!empty($snapshot['generation_running'])) return false;
-        if (empty($descriptor['available'])) {
-            // Native Retry can become disabled while the browser's request is pending.
-            if ((string)($descriptor['button_label'] ?? '') === '') return false;
-            $this->scheduleTaskPoll($responseId, 0.5);
-            return true;
-        }
+        $nativeControlAvailable = !empty($descriptor['available']);
         $logicalResponseId = (string)($turn['logical_response_id'] ?? $responseId);
         $failureKey = hash('sha256', (string)$descriptor['failure_id'].'|'.(string)$descriptor['fingerprint']);
         try {
@@ -7076,14 +7073,21 @@ JS;
             if ($job['operation_kind'] !== 'response') return false;
             $reservation = TaskLedger::reserveTaskNetworkRetry($logicalResponseId,
                 (string)$turn['owner_incarnation'], (int)$turn['fencing_version'],
-                (string)$turn['document_nonce'], $failureKey);
+                (string)$turn['document_nonce'], $failureKey, $nativeControlAvailable);
+            if (!empty($reservation['recover'])) {
+                // Revalidate and rotate atomically; a tool arriving after the decision
+                // still blocks recovery, and the old token cannot act on the new page.
+                $this->recoverFailedMessageStream($responseId, true);
+                return true;
+            }
             if (!empty($reservation['exhausted'])) {
                 $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
                     'ChatGPT 网页连续出现网络错误，自动重试已达三次；原上下文和工具回执仍保留。', true);
                 return true;
             }
             if (empty($reservation['retry'])) {
-                if (!empty($reservation['waiting']) || !empty($reservation['attempt'])) {
+                if (!empty($reservation['waiting']) || !empty($reservation['attempt'])
+                    || (!$nativeControlAvailable && (string)($descriptor['button_label'] ?? '') !== '')) {
                     $this->scheduleTaskPoll($responseId, 0.5);
                     return true;
                 }

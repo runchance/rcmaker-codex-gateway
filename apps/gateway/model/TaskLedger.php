@@ -2063,25 +2063,28 @@ final class TaskLedger
     }
 
     /**
-     * Reserve one native Retry on a stopped ordinary task page, without resending context.
-     * Exact ownership and drained host/MCP work are required. A failed old wait must have
-     * its real receipt covered by the retained context, without inventing delivery. The intent and
-     * page-local latch prevent duplicate activation after a lost CDP acknowledgement.
+     * Choose recovery for a stopped ordinary task page after host/MCP work has drained.
+     * Completed host work requires the existing exact-receipt fresh-page recovery, never
+     * native regeneration with unproven history. This decision alone does not rotate a page
+     * or token: the recovery transaction must recheck receipts and ownership. With no completed
+     * work, the intent and page-local latch bound native Retry after lost acknowledgements.
      * @param string $responseId Current logical ordinary Responses round.
      * @param string $incarnation Browser worker owning the exact surface.
      * @param int $fence Surface ownership version.
      * @param string $documentNonce Exact retained page identity.
      * @param string $failureKey SHA-256 of the observed native error-card identity.
-     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int}
+     * @param bool $nativeControlAvailable Whether the observed native Retry can be clicked now.
+     * A disabled button cannot reserve a click or prevent receipt-based page recovery.
+     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool}
      * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
      */
     public static function reserveTaskNetworkRetry(string $responseId, string $incarnation,
-        int $fence, string $documentNonce, string $failureKey): array
+        int $fence, string $documentNonce, string $failureKey, bool $nativeControlAvailable = true): array
     {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $failureKey) !== 1) {
             throw new GatewayError('task_network_retry_invalid', '网页网络重试标识无效。', 400);
         }
-        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey): array {
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey, $nativeControlAvailable): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
@@ -2112,6 +2115,7 @@ final class TaskLedger
                 throw new GatewayError('storage_unavailable', '网页重试的工具状态暂不可读取。', 503);
             }
             $waiting = false;
+            $hasCompletedWork = false;
             $closedWaitFailure = null;
             foreach ($calls as $call) {
                 if ($call['status'] === 'unknown') {
@@ -2124,6 +2128,7 @@ final class TaskLedger
                     }
                 }
                 if (in_array($call['status'], ['registered','delivered'], true)) $waiting = true;
+                if ($call['status'] === 'completed') $hasCompletedWork = true;
                 if ($call['status'] === 'completed' && ($call['result_delivered_at'] === null || $call['result_json'] === null)) {
                     $closedWaitFailure ??= ToolBroker::settledWaitTransportFailureForResponse($responseId);
                     if ($call['binding_id'] === ($binding['id'] ?? null)
@@ -2142,6 +2147,8 @@ final class TaskLedger
                     && in_array($candidate['status'], ['awaiting_start','running'], true))) $waiting = true;
             }
             if ($waiting) return array_replace($idle, ['waiting'=>true]);
+            if ($hasCompletedWork) return array_replace($idle, ['recover'=>true]);
+            if (!$nativeControlAvailable) return $idle;
             $events = $db->table('gateway_task_events')->where('turn_id', $turn['id'])
                 ->where('event_type', 'page_network_retry_intent')->order([['id','ASC']])->select('data_json');
             if (!is_array($events)) throw new GatewayError('storage_unavailable', '网页重试次数暂不可读取。', 503);

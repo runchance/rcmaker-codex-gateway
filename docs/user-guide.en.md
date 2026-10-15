@@ -473,6 +473,8 @@ Follow the confirmation/save flow and fully restart Codex. Restoring a route doe
 
 Confirm the outcome of potentially executed writes before retrying. Clearing sign-in data, deleting a database or repeatedly recreating plugins is not a general recovery procedure.
 
+When an ordinary task encounters an explicit page network error after making tool progress, the gateway waits for in-flight tools and receipts to settle, then restores the complete context and exact receipts on a new page and revokes the old page's tool token. Recovery may continue only the remaining authorized work; incomplete receipts or unknown outcomes prevent automatic replay. Tasks without tool progress may still use native page Retry. Context compaction keeps its separate recovery rules.
+
 ### Include this in a problem report
 
 For recurring **connection interrupted** notices, the task timeline records the browser protocol,
