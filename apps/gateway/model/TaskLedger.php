@@ -46,6 +46,8 @@ final class TaskLedger
 
     /**
      * Find the exact native turn through Response ancestry or verified checkpoint derivation.
+     * Shared by stop observation and detached-request routing; a checkpoint-derived turn
+     * is still the same native turn when deciding whether new input is steering.
      * @param array $execution Current durable execution, not an arbitrary session's latest event.
      * @return ?string Native UUID, or null when readable same-task ancestry is unavailable.
      */
@@ -567,6 +569,11 @@ final class TaskLedger
         if (!is_array($job) || $job['task_id'] !== $taskId || ($job['operation_kind'] ?? '') !== 'response'
             || !in_array($job['status'], ['queued', 'running'], true) || !self::ownsCurrentGeneration($job, $turn)
             || ($job['turn_id'] ?? null) !== $turn['client_turn_id']) return false;
+        // Codex keeps its native turn ID when steering after automatic compaction.
+        // A detached HTTP stream does not turn its verified postcompact descendant
+        // into a new human turn. Leave it to the existing steering/settings path.
+        if (str_starts_with((string) $turn['client_turn_id'], 'postcompact_')
+            && self::cancellationNativeTurn(['job' => $job, 'turn' => $turn]) === $spec['turn_id']) return false;
         $source = json_decode((string)$job['context_json'], true);
         if (!is_array($source) || !is_array($source['messages'] ?? null)
             || count($messages) <= count($source['messages'])
