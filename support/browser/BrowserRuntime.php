@@ -5702,6 +5702,8 @@ JS;
      * Explicit failed streams retain active work until receipts drain; UI disconnection alone
      * never authorizes completion or replay of a running generation. Unchanged polls read
      * fresh ledger metadata; full context is loaded only when adopting or settling a round.
+     * A replacement browser command retires the old observer even when steering keeps the
+     * same page. Only native receipt rounds sharing this physical command may be adopted.
      * @param string $responseId Physical observer key, mapped to the current logical response.
      * @return void
      */
@@ -5718,12 +5720,16 @@ JS;
             $logicalResponseId = (string) ($turn['logical_response_id'] ?? $responseId);
             $ledger = TaskLedger::pollExecution($logicalResponseId);
             if ((string) ($ledger['turn']['response_id'] ?? '') !== $logicalResponseId
-                && (string) ($ledger['turn']['surface_id'] ?? '') !== (string) ($turn['surface_id'] ?? '')) {
-                // This also fences turns without an MCP binding: the user replaced
-                // the generating Web page before it made any tool call.
+                && ((string) ($ledger['turn']['surface_id'] ?? '') !== (string) ($turn['surface_id'] ?? '')
+                    || (string) ($ledger['surface']['owner_incarnation'] ?? '') !== (string) ($turn['owner_incarnation'] ?? '')
+                    || (int) ($ledger['surface']['fencing_version'] ?? 0) !== (int) ($turn['fencing_version'] ?? 0))) {
+                // Same-page steering releases the prior owner before the new command
+                // claims the page. This also retires observers without an MCP binding.
+                $replacement = ResponseJob::pollState((string) $ledger['turn']['response_id']);
                 $oldCommandId = (int) ($turn['command_id'] ?? 0);
                 $this->releaseTaskSession($responseId);
-                if ($oldCommandId > 0) {
+                // A reattached receipt observer can still own the same physical command.
+                if ($oldCommandId > 0 && (int) ($replacement['command_id'] ?? 0) !== $oldCommandId) {
                     try { $this->finishCommand($oldCommandId, ['status' => 'superseded']); }
                     catch (\Throwable) {}
                 }
@@ -5732,12 +5738,13 @@ JS;
             $currentResponse = ToolBroker::currentResponseForTurn((string) ($turn['durable_turn_id'] ?? ''));
             if (is_string($currentResponse) && $currentResponse !== '' && $currentResponse !== (string) ($turn['logical_response_id'] ?? $responseId)) {
                 $next = ResponseJob::execution($currentResponse);
-                if ((string) ($next['surface_id'] ?? '') !== (string) ($turn['surface_id'] ?? '')) {
-                    // A newer native user instruction owns a fresh page. The old
-                    // observer must not adopt or fail that response after retirement.
+                if ((string) ($next['surface_id'] ?? '') !== (string) ($turn['surface_id'] ?? '')
+                    || (int) ($next['command_id'] ?? 0) !== (int) ($turn['command_id'] ?? 0)) {
+                    // Receipt continuations reuse this command. A new submission,
+                    // including one still awaiting enqueue, belongs to its own observer.
                     $oldCommandId = (int) ($turn['command_id'] ?? 0);
                     $this->releaseTaskSession($responseId);
-                    if ($oldCommandId > 0) {
+                    if ($oldCommandId > 0 && (int) ($next['command_id'] ?? 0) !== $oldCommandId) {
                         try { $this->finishCommand($oldCommandId, ['status' => 'superseded']); }
                         catch (\Throwable) {}
                     }

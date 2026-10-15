@@ -890,6 +890,8 @@ JS));
      * copy-source and DIL message IDs prove their origin without accepting arbitrary page prose.
      * Native stream errors stay scoped UI chrome; quoted alerts remain content and active
      * native recovery chrome is returned only as transport_recovery_visible metadata.
+     * A new group wrapper may retain the bound answer through its unique native inner
+     * message anchor, but never through another user's group or model-authored markup.
      * @param array $baselineUserIds User identities captured before submitting this generation.
      * @param array $baselineAssistantIds Historical assistants excluded from the current answer.
      * @param string $continuationMarker Exact current continuation marker, or empty for initial work.
@@ -950,16 +952,8 @@ const unboundAnswer=sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAn
     :answerCandidates.length===1?answerCandidates[0]
         :((newUser||users.length===0)&&identityAssistants.length===1?identityAssistants[0]:null);
 const boundMatches=boundResponseId?assistants.filter(entry=>entry.id===boundResponseId):[];
-// ChatGPT can wrap an existing fallback agent turn in its persistent data-turn-key
-// when generation settles. Keep the original bound identity only when its exact
-// inner anchor survives in one fresh group belonging to this accepted user.
-// A missing anchor, duplicate alias or another user's group is never a rebind.
-const promotedAliases=boundResponseId&&/^fallback-turn-\d+$/.test(boundResponseId)&&boundMatches.length===0
-    ?assistants.filter(entry=>entry.id.startsWith('group:assistant:')&&!beforeAssistants.has(entry.id)
-        &&[...entry.el.querySelectorAll('[data-content-search-turn-key]')]
-            .filter(node=>node.getAttribute('data-content-search-turn-key')===boundResponseId).length===1):[];
-const promoted=promotedAliases.length===1&&promotedAliases[0].id===sameGroupResponseId
-    ?{...promotedAliases[0],id:boundResponseId}:null;
+const promoted=boundMatches.length===0
+    ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
 const running=!!generationStop();
 // An empty composer normally disables Send after generation. Its visible semantic
@@ -1255,6 +1249,7 @@ JS));
     /**
      * Focus one exact artifact anchor or named download control in the current assistant answer.
      * Baseline turn IDs exclude historical answers; ambiguous matches fail without activating UI.
+     * Group promotion uses the same exact inner-anchor proof as response observation.
      * @param list<string> $baselineUserIds
      * @param list<string> $baselineAssistantIds
      * @param string $href Observed URL, or empty for a file card without a public href.
@@ -1298,7 +1293,9 @@ const answerCandidates=newUser?assistants.filter(entry=>after(newUser.el,entry.e
 const sameGroupResponseId=newUser?.id.startsWith('group:user:')
     ?'group:assistant:'+newUser.id.slice('group:user:'.length):null;
 const sameGroupAnswers=sameGroupResponseId?assistants.filter(entry=>entry.id===sameGroupResponseId&&!beforeAssistants.has(entry.id)):[];
-const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:null)
+const promoted=boundMatches.length===0
+    ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId):null;
+const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted)
     :sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAnswers[0]:null)
     :answerCandidates.length===1?answerCandidates[0]
         :(!newUser&&users.length===0&&identityAssistants.length===1?identityAssistants[0]:null);
@@ -1515,6 +1512,25 @@ const turnId=(el,index,role)=>el.hasAttribute('data-turn-key')
     ||el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids')?.split(/\s+/)[0]
     ||el.getAttribute('data-testid')||el.getAttribute('data-content-search-unit-key')
     ||el.getAttribute('data-content-search-turn-key')||('turn-'+index);
+// ChatGPT promotes a streaming message into a stable user/assistant group. Preserve the
+// original identity only through one exact native anchor in the accepted user's fresh
+// group. Selection IDs, assistant search units and fallback turns are different renderer
+// identities; visible text, DOM position or a merely similar answer cannot establish one.
+const promotedAssistant=(assistants,beforeAssistants,boundId,sameGroupId)=>{
+    if(!boundId||!sameGroupId||boundId.startsWith('group:')||beforeAssistants.has(boundId)
+        ||/^(?:conversation-turn|turn)-\d+$/.test(boundId))return null;
+    const fallback=/^fallback-turn-\d+$/.test(boundId);
+    const attribute=fallback?'data-content-search-turn-key'
+        :boundId.endsWith(':assistant')?'data-content-search-unit-key':'data-chatgpt-selection-message-id';
+    const aliases=assistants.filter(entry=>entry.id.startsWith('group:assistant:')&&!beforeAssistants.has(entry.id))
+        .flatMap(entry=>[...entry.el.querySelectorAll('['+attribute+']')]
+            .filter(node=>node.getAttribute(attribute)===boundId
+                &&node.closest('[data-turn-key]')===entry.el
+                &&!node.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-content-search-unit-key$=":user"]')
+                &&(fallback||node.closest('[data-content-search-unit-key$=":assistant"],[data-message-author-role="assistant"],[data-conversation-role="assistant"]')))
+            .map(()=>entry));
+    return aliases.length===1&&aliases[0].id===sameGroupId?{...aliases[0],id:boundId}:null;
+};
 // Network-error cards are native alert chrome, never prose in an assistant answer or user bubble.
 // The current stopped-generation error component is identified by its owned alert shell
 // and sole non-navigation retry action, independently of its localized timeout/error text.
