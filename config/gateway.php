@@ -44,6 +44,8 @@ return [
     'data_directory' => $dataDirectory,
     'presentation_file' => $gatewayTestMode ? $testRuntimeRoot . '/presentation.json' : $dataDirectory . '/presentation.json',
     'default_locale' => $defaultLocale,
+    // Optional metadata-only release notices. Never downloads updates or restarts a process.
+    'update_check_enabled' => filter_var(rcEnv('gateway.update_check_enabled', true), FILTER_VALIDATE_BOOLEAN),
     'default_context_max_parts' => 6,
     'default_context_extended' => true,
     'default_connector_name' => 'RCMAKER Codex',
@@ -54,6 +56,8 @@ return [
     'browser_debug_port' => $browserDebugPort,
     // Opt-in compatibility for diagnosed HTTP/2 stream errors; never changes an active browser.
     'browser_http_protocol' => $browserHttpProtocol,
+    // Upload/indexing may exceed one minute for a full image batch; never extends a task deadline.
+    'attachment_upload_timeout_seconds' => max(60, min(1800, (int) rcEnv('gateway.attachment_upload_timeout_seconds', 600))),
     'console_origin' => 'http://127.0.0.1:' . $consolePort,
     'api_origin' => 'http://127.0.0.1:' . $apiPort,
     'database_file' => $dataDirectory . '/database/' . $databaseName,

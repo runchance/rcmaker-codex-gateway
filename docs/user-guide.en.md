@@ -398,6 +398,10 @@ Historical staging normally uses the selected family's non-Pro Medium mode; gate
 
 ## 9. Upgrades, configuration and recovery
 
+Release builds check GitHub for a newer stable version in the background after startup, then every six hours, using the applied network/proxy settings. A new version produces one shell notice and a dismissible **Update available** link in the console header. Dismissing it hides that version in this browser; a later version can appear again. Checks do not open dialogs, download files, restart services or interrupt tasks. Offline or rate-limited checks retry quietly after an hour.
+
+To disable checks, set `update_check_enabled = false` under `[gateway]` in `.env` and restart RCMAKER when idle. Source builds marked `dev` do not guess a release version and skip checks. Use the steps below to upgrade when convenient.
+
 ### 9.1 Update a binary in place
 
 1. Finish active tasks and approvals, stop RCMAKER, and privately back up `.env` and the full `data/` directory.
@@ -475,6 +479,11 @@ For recurring **connection interrupted** notices, the task timeline records the 
 request duration and received byte counts. Matching background recovery requests and MCP reply sizes,
 output-lock waits and peak worker memory are included in diagnostic exports. Missing observations
 remain unknown; a flushed tool reply does not prove that the browser's separate answer stream is healthy.
+
+Attachment upload and processing wait for up to 10 minutes by default, within the current task deadline.
+Set `attachment_upload_timeout_seconds` (60–1800 seconds) under `[gateway]` in `.env` to adjust it;
+the setting takes effect after a normal restart. The task timeline records confirmed counts, elapsed time
+and upload status. The gateway does not send partial batches or automatically upload them again.
 
 If the recorded error is `net::ERR_HTTP2_PROTOCOL_ERROR`, you can test `browser_http_protocol = http1`
 under `[gateway]` in `.env` after tasks finish and the private Chrome is restarted normally. The default

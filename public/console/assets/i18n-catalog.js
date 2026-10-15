@@ -1,5 +1,8 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "新版可用": "Update available",
+    "空闲时查看更新说明": "View release notes when convenient",
+    "忽略此版本提醒": "Dismiss this version notice",
     "收到 Codex 手动停止，正在确认网页停止": "Codex manual stop received; confirming Web stop",
     "手动停止已确认，保留标签与历史": "Manual stop confirmed; tab and history retained",
     "网页已停止思考，未确认完成": "The webpage stopped thinking; completion is unconfirmed",
@@ -1011,5 +1014,15 @@ window.GatewayTranslations = {
     "工具返回结果后重新计时；已开始的任务沿用原设置。": "Waits restart after tool results. Tasks already started keep their original settings.",
     "更新模型目录": "Refresh the model catalog",
     "Codex 仍显示旧预算时，完全退出后重新打开。": "If Codex still shows old budgets, quit completely and reopen it.",
-    "更多分段需要更长传输时间；六段不等于六倍模型窗口。": "More parts take longer to transfer. Six parts do not give six times the model window."
+    "更多分段需要更长传输时间；六段不等于六倍模型窗口。": "More parts take longer to transfer. Six parts do not give six times the model window.",
+    "网页连接传输统计": "Browser connection transfer metrics",
+    "网页后台恢复连接失败": "Browser background recovery connection failed",
+    "网页后台恢复连接已返回": "Browser background recovery connection returned",
+    "正在等待附件上传": "Waiting for attachment upload",
+    "全部附件已确认": "All attachments confirmed",
+    "附件确认等待超时": "Attachment confirmation timed out",
+    "已确认附件": "Confirmed attachments",
+    "仍在上传或处理": "Still uploading or processing",
+    "网页报告附件错误": "The page reported an attachment error",
+    "发现重复附件": "Duplicate attachments detected"
 };

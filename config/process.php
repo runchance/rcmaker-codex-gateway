@@ -23,13 +23,13 @@ return [
         'memory_limit' => '512M',
         'package_max_length' => app\gateway\model\ResponsesProtocol::MAX_BODY_BYTES + 16384 + 4,
         // Inherit max_request from config/worker.php (or the selected engine).
-        'bootstrap' => [app\gateway\bootstrap\HttpLimits::class, RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
+        'bootstrap' => [app\gateway\bootstrap\HttpLimits::class, RC\Helper\Db\Medoo::class, RC\Helper\Cache\Raw::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_GATEWAY_PROBE' => [
         'handler' => support\process\GatewayProbe::class,
         'count' => 1,
         'reloadable' => false,
-        'bootstrap' => [RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
+        'bootstrap' => [RC\Helper\Db\Medoo::class, RC\Helper\Cache\Raw::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_GATEWAY_MAINTENANCE' => [
         'handler' => support\process\GatewayMaintenance::class,

@@ -19,7 +19,14 @@
                 <li class="collapse layui-nav-item"><a href="#" class="layui-icon layui-icon-shrink-right" aria-label="展开或收起菜单" title="展开或收起菜单"></a></li>
             </ul>
             <div id="control" class="layui-layout-control"></div>
-            <div class="gateway-local-badge"><span><i class="layui-icon layui-icon-console"></i> 本机 · 免登录</span><select id="console-language" data-language-choice aria-label="控制台语言"><option value="en">English</option><option value="zh-CN">简体中文</option></select></div>
+            <div class="gateway-local-badge">
+                <aside id="gateway-update-notice" class="gateway-update-notice" hidden>
+                    <a target="_blank" rel="noopener noreferrer"><i class="layui-icon layui-icon-download-circle" aria-hidden="true"></i><span data-update-label></span></a>
+                    <button type="button" aria-label="忽略此版本提醒"><i class="layui-icon layui-icon-close" aria-hidden="true"></i></button>
+                </aside>
+                <span><i class="layui-icon layui-icon-console"></i> 本机 · 免登录</span>
+                <select id="console-language" data-language-choice aria-label="控制台语言"><option value="en">English</option><option value="zh-CN">简体中文</option></select>
+            </div>
         </header>
         <aside class="layui-side layui-bg-black">
             <div class="layui-logo"><i class="gateway-brand-mark layui-icon layui-icon-link" aria-hidden="true"></i><img class="logo" alt=""><span class="title"></span></div>
@@ -45,6 +52,7 @@
     <script src="component/layui/layui.js"></script>
     <script src="component/pear/pear.js"></script>
     <script src="assets/gateway.js"></script>
+    <script src="assets/update-notice.js"></script>
     <script src="assets/login-reminder.js"></script>
     <script src="assets/shell.js"></script>
 </body>

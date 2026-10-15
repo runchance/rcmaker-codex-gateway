@@ -4970,7 +4970,7 @@ JS;
                 if ($stateError === null && is_array($state) && ((int) ($state['matched_count'] ?? 0) > 0
                     || !empty($state['duplicate']) || !empty($state['upload_pending']) || !empty($state['upload_error']))) {
                     $this->waitTaskAttachmentsAccepted($responseId, $expected, $imageOnly,
-                        min((float) $this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0));
+                        $this->taskAttachmentDeadline($responseId));
                     return;
                 }
                 if ($stateError !== null || !is_array($state) || (int) ($state['input_count'] ?? 0) !== 1
@@ -5014,18 +5014,46 @@ JS;
                         $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', 'ChatGPT 附件输入节点已经失效。');
                         return;
                     }
+                    if (!isset($this->chatGptTurns[$responseId])) return;
+                    $deadline = $this->taskAttachmentDeadline($responseId);
                     $this->taskCdp->send('DOM.setFileInputFiles', ['files' => array_values($files), 'nodeId' => $nodeId], $sessionId,
-                        function ($setError) use ($responseId, $expected, $imageOnly): void {
+                        function ($setError) use ($responseId, $expected, $imageOnly, $deadline): void {
                             if ($setError !== null && ($setError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                                 $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_UPLOAD_FAILED', 'ChatGPT 未接受本地附件输入。');
                                 return;
                             }
                             if (!isset($this->chatGptTurns[$responseId])) return;
-                            $deadline = min((float) $this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0);
                             $this->waitTaskAttachmentsAccepted($responseId, $expected, $imageOnly, $deadline);
                         }, 10.0);
                 }, 5.0);
             }, 5.0);
+    }
+
+    /** Start one upload budget per physical turn; callbacks and partial chips never renew it. */
+    private function taskAttachmentDeadline(string $responseId): float
+    {
+        $turn = &$this->chatGptTurns[$responseId];
+        if (!isset($turn['attachment_wait_deadline'])) {
+            $now = microtime(true);
+            $seconds = max(60, min(1800, (int) (Config::get('gateway', 'attachment_upload_timeout_seconds') ?? 600)));
+            $turn['attachment_wait_started_at'] = $now;
+            $turn['attachment_wait_deadline'] = min((float) $turn['deadline'], $now + $seconds);
+            $this->recordTaskAttachmentObservation($responseId, 'attachment_wait', []);
+        }
+        return min((float) $turn['deadline'], (float) $turn['attachment_wait_deadline']);
+    }
+
+    /** Record upload boundaries only, with numeric/boolean facts; never filenames or file contents. */
+    private function recordTaskAttachmentObservation(string $responseId, string $phase, array $state): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $started = (float) ($turn['attachment_wait_started_at'] ?? microtime(true));
+        $facts = array_intersect_key($state, array_flip(['matched_count', 'upload_pending', 'upload_error', 'duplicate']));
+        $facts += ['expected_count' => count((array) ($turn['attachments'] ?? [])),
+            'elapsed_ms' => (int) round(max(0.0, microtime(true) - $started) * 1000),
+            'wait_budget_ms' => (int) round(max(0.0, (float) ($turn['attachment_wait_deadline'] ?? $started) - $started) * 1000)];
+        $this->recordTaskTransportObservation($responseId, $phase, $facts);
     }
 
     /** Wait for exact files and finished upload UI within the same bounded attachment deadline. */
@@ -5036,6 +5064,7 @@ JS;
             function ($error, $state) use ($responseId, $expected, $imageOnly, $deadline): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if ($error === null && is_array($state) && !empty($state['ok'])) {
+                    $this->recordTaskAttachmentObservation($responseId, 'attachment_ready', $state);
                     // File chips appear before upload/indexing enables Send. Preserve the
                     // original upload deadline instead of imposing a new five-second cutoff.
                     $this->waitTaskSendReady($responseId, $deadline);
@@ -5046,6 +5075,7 @@ JS;
                     return;
                 }
                 $alerts = is_array($state['alerts'] ?? null) ? implode(' | ', array_slice($state['alerts'], -3)) : '';
+                $this->recordTaskAttachmentObservation($responseId, 'attachment_timeout', $error === null && is_array($state) ? $state : []);
                 $message = 'ChatGPT 没有确认全部任务附件。';
                 if ($alerts !== '') $message .= ' ' . mb_substr($alerts, 0, 300);
                 $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_ACCEPTANCE_FAILED', $message);

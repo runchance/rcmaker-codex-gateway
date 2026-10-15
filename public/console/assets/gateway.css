@@ -353,6 +353,17 @@ p { line-height: 1.65; }
 .gateway-shell #content .layui-tab-title > .layui-this { color: var(--gateway-accent); background: #f2f9f7; }
 .gateway-local-badge { font-size: 12px; gap: 12px; }
 .gateway-local-badge select { min-height: 32px; border-color: var(--gateway-line); }
+.gateway-update-notice { display: inline-flex; align-items: center; gap: 2px; height: 32px; padding: 0 3px 0 9px; border: 1px solid var(--gateway-line); border-radius: 16px; background: var(--gateway-accent-soft); line-height: 1.3; white-space: nowrap; }
+.gateway-update-notice[hidden] { display: none; }
+.gateway-update-notice a { display: inline-flex; align-items: center; gap: 6px; color: var(--gateway-accent); }
+.gateway-update-notice a span { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.gateway-update-notice button { display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--gateway-muted); cursor: pointer; }
+.gateway-update-notice button:hover { background: var(--gateway-line); color: var(--gateway-ink); }
+.gateway-update-notice a:focus-visible, .gateway-update-notice button:focus-visible { outline: 2px solid var(--gateway-accent); outline-offset: 2px; }
+@media (max-width: 480px) {
+    .gateway-local-badge { gap: 6px; }
+    .gateway-update-notice a span { max-width: 105px; }
+}
 
 /* Workbench and records give the task itself the largest usable area. */
 .browser-page .automation-workbench { padding: 20px; }

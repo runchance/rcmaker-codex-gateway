@@ -9,8 +9,10 @@ use app\gateway\controller\Codex;
 use app\gateway\controller\Artifacts;
 use app\gateway\controller\Adapters;
 use app\gateway\controller\Diagnostics;
+use app\gateway\controller\Updates;
 
 Route::get('/api/status', [Network::class, 'status']);
+Route::get('/api/updates', [Updates::class, 'status']);
 Route::get('/api/diagnostics/export', [Diagnostics::class, 'export']);
 Route::get('/api/network', [Network::class, 'read']);
 Route::post('/api/network/save', [Network::class, 'save']);

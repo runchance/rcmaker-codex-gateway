@@ -263,6 +263,9 @@
                 stream_metrics: '网页连接传输统计',
                 background_failed: '网页后台恢复连接失败',
                 background_finished: '网页后台恢复连接已返回',
+                attachment_wait: '正在等待附件上传',
+                attachment_ready: '全部附件已确认',
+                attachment_timeout: '附件确认等待超时',
                 empty_candidate: '正在核验空回答终态',
                 empty_cleared: '空回答终态条件已解除',
                 empty_settlement: '已核验回答流与工具状态',
@@ -279,6 +282,11 @@
             if (Number.isFinite(data.elapsed_ms)) parts.push((data.elapsed_ms / 1000).toFixed(1) + 's');
             if (data.endpoint) parts.push(data.endpoint);
             if (Number.isFinite(data.received_bytes)) parts.push((data.received_bytes / 1024).toFixed(1) + ' KiB');
+            if (Number.isInteger(data.expected_count)) parts.push(I18n.t('已确认附件') + ' '
+                + (Number.isInteger(data.matched_count) ? data.matched_count : '?') + '/' + data.expected_count);
+            if (data.upload_pending === true) parts.push(I18n.t('仍在上传或处理'));
+            if (data.upload_error === true) parts.push(I18n.t('网页报告附件错误'));
+            if (data.duplicate === true) parts.push(I18n.t('发现重复附件'));
             return parts.filter(Boolean).join(' · ');
         }
         if (event.type === 'mcp_completion_committed' && Number(data.revision) === 0) {
