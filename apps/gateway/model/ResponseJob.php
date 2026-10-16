@@ -275,7 +275,14 @@ final class ResponseJob
             $prompt = WebContract::withSteeringNotice($prompt,
                 ($spec['operation_kind'] ?? 'response') === 'response'
                     && (!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id'])
-                        || !empty($spec['postcompact_user_input'])));
+                        || !empty($spec['postcompact_user_input'])),
+                !empty($spec['stopped_source_response_id']) ? 'stopped_followup' : 'interjection');
+            if ($bridge['is_continuation'] && ($spec['operation_kind'] ?? 'response') === 'response' && is_array($prior)) {
+                // Receipts do not submit another Web message. Preserve the physical
+                // request's scope in durable round metadata for any later page recovery.
+                $prompt = WebContract::withSteeringNotice($prompt, WebContract::hasSteeringNotice((string) $prior['prompt']),
+                    WebContract::steeringScope((string) $prior['prompt']));
+            }
             $roundInfo = $bridge;
             if (!$db->table('gateway_response_jobs')->add([
                 'id' => $responseId,
@@ -782,6 +789,92 @@ final class ResponseJob
     }
 
     /**
+     * Stream a stable snapshot of still-growing public prose as provisional commentary.
+     * Each source retains its exact delivered prefix across native receipt rounds. Only
+     * the new suffix is appended; closed Responses items are never reopened. A rewrite
+     * starts a separate progress item rather than changing already delivered events.
+     * @param string $responseId Running ordinary round; checkpoints cannot accept progress.
+     * @param string $text Exact visible, settled Markdown supplied by the owned adapter.
+     * @param string $sourceKey Physical assistant/block identity, without a content hash.
+     * @return bool Whether this round accepted or had already delivered the snapshot.
+     * @throws GatewayError If its durable progress history or events cannot be saved.
+     */
+    public static function appendProgressSnapshot(string $responseId, string $text, string $sourceKey): bool
+    {
+        if ($text === '' || $sourceKey === '') return false;
+        $published = Schema::transaction(function () use ($responseId, $text, $sourceKey): ?bool {
+            $job = self::row($responseId);
+            if ($job['status'] !== 'running' || ($job['operation_kind'] ?? 'response') !== 'response') return null;
+            $source = 'msg_p_' . substr(hash('sha256', (string) ($job['durable_turn_id'] ?? $responseId) . "\0" . $sourceKey), 0, 32) . '_';
+            $output = self::streamOutput($job);
+            $prefix = ''; $number = 0; $open = null;
+            $collect = static function (array $items, bool $current) use ($source, &$prefix, &$number, &$open): void {
+                foreach ($items as $index => $item) {
+                    $id = (string) ($item['id'] ?? '');
+                    if (!str_starts_with($id, $source)) continue;
+                    $parts = explode('_', substr($id, strlen($source)));
+                    if (count($parts) !== 2 || !ctype_digit($parts[0]) || !ctype_digit($parts[1])) continue;
+                    $number = max($number, (int) $parts[0] + 1);
+                    $offset = (int) $parts[1];
+                    $value = (string) ($item['content'][0]['text'] ?? '');
+                    if ($offset === 0) $prefix = $value;
+                    elseif ($offset === strlen($prefix)) $prefix .= $value;
+                    if ($current && ($item['status'] ?? '') === 'in_progress') $open = [$index, $item];
+                }
+            };
+            // A source starting in this round needs no history scan on each text delta.
+            $localStart = false;
+            foreach ($output as $item) {
+                $id = (string) ($item['id'] ?? '');
+                if (str_starts_with($id, $source)) { $localStart = str_ends_with($id, '_0'); break; }
+            }
+            if (!$localStart) {
+                $cursor = -1;
+                do {
+                    $rounds = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+                        ->where('durable_turn_id', $job['durable_turn_id'])->where('status', 'completed')
+                        ->where('round_no', '>', $cursor)->order([['round_no', 'ASC']])->limit(128)
+                        ->select('round_no,response_json');
+                    if ($rounds === false) throw new GatewayError('storage_unavailable', 'Responses 进度历史无法读取。', 503);
+                    foreach ($rounds as $round) { $cursor = (int) $round['round_no']; $collect(self::streamOutput($round), false); }
+                } while (count($rounds) === 128);
+            }
+            $collect($output, true);
+            if ($prefix === $text) return false;
+            // A temporarily shortened DOM observation is not a new model-authored revision.
+            if ($text !== '' && str_starts_with($prefix, $text)) return false;
+            $events = [];
+            if (!str_starts_with($text, $prefix)) {
+                if ($open !== null) {
+                    [$index, $item] = $open;
+                    $value = (string) ($item['content'][0]['text'] ?? '');
+                    $events = array_slice(ResponsesProtocol::completionEvents($responseId, $item['id'], $value, $index, 'commentary'), 0, 3);
+                    $output[$index] = ResponsesProtocol::messageItem($item['id'], 'completed', $value, 'commentary');
+                }
+                $prefix = ''; $open = null;
+            }
+            $delta = substr($text, strlen($prefix));
+            if ($open === null) {
+                $index = count($output); $itemId = $source . $number . '_' . strlen($prefix); $value = $delta;
+                $events = array_merge($events, ResponsesProtocol::openOutputEvents($itemId, $index, 'commentary'));
+            } else {
+                [$index, $item] = $open; $itemId = $item['id'];
+                $value = (string) ($item['content'][0]['text'] ?? '') . $delta;
+            }
+            $events[] = ResponsesProtocol::deltaEvent($itemId, $delta, $index);
+            $output[$index] = ResponsesProtocol::messageItem($itemId, 'in_progress', $value, 'commentary');
+            self::appendEventsUnlocked($job, $events);
+            $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->where('status', 'running')->update([
+                'response_json' => self::streamResponseJson($job, $output), 'sequence_next' => (int) $job['sequence_next'],
+            ]);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Responses 进度无法保存。', 503);
+            return true;
+        });
+        if ($published) TaskLedger::renewOnVisibleProgress($responseId);
+        return $published !== null;
+    }
+
+    /**
      * Publish one settled, visibly rendered ChatGPT reasoning summary as native Responses
      * reasoning events. The caller must prove the source is public DOM content; neither
      * hidden chain of thought nor an invented encrypted envelope is accepted here.
@@ -867,20 +960,23 @@ final class ResponseJob
         TaskLedger::renewOnVisibleProgress($responseId);
     }
 
-    /** Close the current provisional answer before another Web attempt or terminal reply. */
+    /** Close provisional answer and public-prose items before a tool boundary, retry or terminal reply. */
     public static function finishDraftText(string $responseId): void
     {
         Schema::transaction(function () use ($responseId): void {
             $job = self::row($responseId);
             if ($job['status'] !== 'running') return;
             $output = self::streamOutput($job);
-            $draft = self::draftItem($output);
-            if ($draft === null) return;
-            [$index, $item] = $draft;
-            $id = (string)$item['id'];
-            $text = (string)($item['content'][0]['text'] ?? '');
-            $events = array_slice(ResponsesProtocol::completionEvents($responseId, $id, $text, $index, 'commentary'), 0, 3);
-            $output[$index] = ResponsesProtocol::messageItem($id, 'completed', $text, 'commentary');
+            $events = [];
+            foreach ($output as $index => $item) {
+                $id = (string) ($item['id'] ?? '');
+                if (($item['status'] ?? '') !== 'in_progress'
+                    || (!str_starts_with($id, 'msg_d_') && !str_starts_with($id, 'msg_p_'))) continue;
+                $text = (string) ($item['content'][0]['text'] ?? '');
+                $events = array_merge($events, array_slice(ResponsesProtocol::completionEvents($responseId, $id, $text, $index, 'commentary'), 0, 3));
+                $output[$index] = ResponsesProtocol::messageItem($id, 'completed', $text, 'commentary');
+            }
+            if ($events === []) return;
             self::appendEventsUnlocked($job, $events);
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)
                 ->where('status', 'running')->update([

@@ -365,27 +365,32 @@ final class ChatGptTransport
      * Missing or changed DOM blocks reset their evidence; no reasoning is synthesized.
      * Keep the newest bounded window so old activity cannot starve later long-task progress.
      * @param array $previous Prior public block text and its first unchanged observation time.
-     * @param array $blocks Owned, visible page progress; incomplete prose is only observed at a tool boundary.
+     * @param array $blocks Owned, visible page progress; untyped unfinished/private blocks stay excluded.
      * @param float $now Browser observation timestamp, consistently measured in seconds.
      * @param bool $nativeToolBoundary Whether this exact round has verified calls or is their immutable receipt-waiting round.
-     * @return array{observed:array,ready:array}
+     * @param bool $provisionalProse Allow typed public prose through the separate mutable commentary stream.
+     * @return array{observed:array,ready:array,drafts:array}
      */
-    public static function settledCommentary(array $previous, array $blocks, float $now, bool $nativeToolBoundary = false): array
+    public static function settledCommentary(array $previous, array $blocks, float $now, bool $nativeToolBoundary = false,
+        bool $provisionalProse = false): array
     {
-        $observed = []; $ready = [];
+        $observed = []; $ready = []; $drafts = [];
         foreach (array_slice($blocks, -128) as $block) {
             if (!is_array($block)) continue;
             $key = (string) ($block['key'] ?? ''); $text = (string) ($block['text'] ?? '');
             if ($key === '' || $text === '') continue;
-            $boundaryProse = $nativeToolBoundary && !empty($block['public_prose'])
+            $publicProse = !empty($block['public_prose'])
                 && empty($block['public_summary']) && empty($block['public_status']);
-            if (empty($block['complete']) && empty($block['public_status']) && !$boundaryProse) continue;
+            if (empty($block['complete']) && empty($block['public_status'])
+                && !(($nativeToolBoundary || $provisionalProse) && $publicProse)) continue;
             $old = $previous[$key] ?? null;
             $since = is_array($old) && ($old['text'] ?? '') === $text ? (float) $old['since'] : $now;
             $observed[$key] = ['text' => $text, 'since' => $since];
-            if ($now - $since >= 0.5) $ready[$key . ':' . substr(hash('sha256', $text), 0, 16)] = $text;
+            if ($now - $since < 0.5) continue;
+            if ($provisionalProse && $publicProse) $drafts[$key] = $text;
+            else $ready[$key . ':' . substr(hash('sha256', $text), 0, 16)] = $text;
         }
-        return ['observed' => $observed, 'ready' => $ready];
+        return ['observed' => $observed, 'ready' => $ready, 'drafts' => $drafts];
     }
 
     /**

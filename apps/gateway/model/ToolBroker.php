@@ -633,7 +633,8 @@ final class ToolBroker
             !empty($binding['parallel_tool_calls']), self::hostShellFromContext((string)$job['context_json']),
             (array)($budget['output_control'] ?? []));
         $newPrompt = WebContract::withSteeringNotice($newPrompt,
-            $job['operation_kind'] === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']));
+            $job['operation_kind'] === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']),
+            WebContract::steeringScope((string)$job['prompt']));
         if ($missingSurface) $newPrompt .= "\nThe prior page could not continue with the Connector. Resume exactly the same user turn, including any plan-only or no-edit boundary. Recovery does not authorize a deferred phase. The durable original history preserves every confirmed host call and its exact result. When execution is authorized, continue only remaining work; do not repeat completed effects. Inspect current files/state and consult archived receipts before any further authorized mutation.\n";
         if (!$missingSurface && !str_contains($newPrompt, '<codex_tool_execution_retry>')) {
             $newPrompt .= "\n<codex_tool_execution_retry>\n"
@@ -3080,7 +3081,8 @@ final class ToolBroker
             !empty($binding['parallel_tool_calls']), self::hostShellFromContext((string)$job['context_json']),
             (array)((json_decode($job['budget_json'], true) ?: [])['output_control'] ?? []));
         return WebContract::withSteeringNotice($prompt,
-            ($job['operation_kind'] ?? 'response') === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']));
+            ($job['operation_kind'] ?? 'response') === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']),
+            WebContract::steeringScope((string)$job['prompt']));
     }
 
     /**

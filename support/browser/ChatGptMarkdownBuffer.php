@@ -78,9 +78,10 @@ final class ChatGptMarkdownBuffer
      *
      * @param string $prefix Exact full physical-turn prefix already delivered or used as a boundary.
      * @param array $blocks Current scoped semantic blocks.
+     * @param bool $allowDraftTail False when recovering provisional progress that may end in a growing block.
      * @return array|null Recovered per-turn state, or null when evidence is incomplete.
      */
-    public static function restore(string $prefix, array $blocks): ?array
+    public static function restore(string $prefix, array $blocks, bool $allowDraftTail = true): ?array
     {
         $blocks = self::normalizeBlocks($blocks);
         if ($blocks === null) return null;
@@ -88,7 +89,7 @@ final class ChatGptMarkdownBuffer
         if ($prefix === '') return $state;
         foreach ($blocks as $block) {
             self::commit($state, $block);
-            if ($state['markdown'] === $prefix) return $state;
+            if ($state['markdown'] === $prefix) return ($allowDraftTail || $block['streamable']) ? $state : null;
             if (!str_starts_with($prefix, $state['markdown'])) return null;
         }
         return null;

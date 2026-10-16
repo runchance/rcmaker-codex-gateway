@@ -6131,7 +6131,9 @@ JS;
                         && (string) $logicalJob['round_kind'] === 'tool_call'));
                 $progress = ChatGptTransport::settledCommentary(
                     (array) ($this->chatGptTurns[$responseId]['observed_commentary'] ?? []),
-                    (array) ($snapshot['commentary_blocks'] ?? []), $now, $nativeToolBoundary
+                    (array) ($snapshot['commentary_blocks'] ?? []), $now, $nativeToolBoundary,
+                    $toolCapable && ($logicalJob['operation_kind'] ?? 'response') === 'response'
+                        && ChatGptTransport::canStreamDraft(ToolBroker::completionForResponse($logicalResponseId))
                 );
                 $this->chatGptTurns[$responseId]['observed_commentary'] = $progress['observed'];
                 $publicSummaries = [];
@@ -6154,6 +6156,18 @@ JS;
                         'text' => $text, 'reasoning' => isset($publicSummaries[$key]),
                     ];
                 }
+                foreach ($progress['drafts'] as $sourceKey => $text) {
+                    $key = $sourceKey . ':' . substr(hash('sha256', $text), 0, 16);
+                    if (isset($this->chatGptTurns[$responseId]['emitted_commentary'][$key])) continue;
+                    $pending = (array) ($this->chatGptTurns[$responseId]['pending_commentary'] ?? []);
+                    $pendingKey = 'prose:' . $sourceKey;
+                    if (!isset($pending[$pendingKey]) && count($pending) >= 128) continue;
+                    // A growing source replaces its queued snapshot; it must not enqueue
+                    // every intermediate full paragraph while Codex executes a host tool.
+                    $this->chatGptTurns[$responseId]['pending_commentary'][$pendingKey] = [
+                        'text' => $text, 'reasoning' => false, 'prose_source' => $sourceKey, 'observation_key' => $key,
+                    ];
+                }
                 if ((string) $logicalJob['status'] === 'completed' && (string) $logicalJob['round_kind'] === 'tool_call') {
                     $this->scheduleTaskPoll($responseId, 0.10);
                     return;
@@ -6164,14 +6178,18 @@ JS;
                     $reasoning = $block['reasoning'];
                     $textHash = hash('sha256', ($reasoning ? 'reasoning' : 'commentary') . "\0" . $text);
                     if (!isset($this->chatGptTurns[$responseId]['emitted_commentary_text'][$textHash])) {
-                        $accepted = $reasoning
-                            ? ResponseJob::appendReasoningSummary($logicalResponseId, $text, $key)
-                            : ResponseJob::appendCommentary($logicalResponseId, $text, $key);
+                        $accepted = isset($block['prose_source'])
+                            ? ResponseJob::appendProgressSnapshot($logicalResponseId, $text, $block['prose_source'])
+                            : ($reasoning ? ResponseJob::appendReasoningSummary($logicalResponseId, $text, $key)
+                                : ResponseJob::appendCommentary($logicalResponseId, $text, $key));
                         // A concurrent stop or round change must not mark unpublished prose
                         // as delivered. The next valid poll retains its pending observation.
                         if (!$accepted) continue;
                     }
                     $this->chatGptTurns[$responseId]['emitted_commentary'][$key] = true;
+                    if (isset($block['observation_key'])) {
+                        $this->chatGptTurns[$responseId]['emitted_commentary'][$block['observation_key']] = true;
+                    }
                     $this->chatGptTurns[$responseId]['emitted_commentary_text'][$textHash] = true;
                     unset($this->chatGptTurns[$responseId]['pending_commentary'][$key]);
                 }
@@ -6316,12 +6334,18 @@ JS;
                 return;
             }
 
+            // A tool-capable answer is provisional commentary. Its last plain paragraph
+            // can be visible long before a following block or host call exists; preview it
+            // without committing that mutable tail to the strict final-answer ledger.
+            $draftMarkdown = $toolCapable && isset($aligned['draft_markdown'])
+                ? (string) WebModelPage::markdownAfterToolBoundary($aligned['draft_markdown'], $prefix)['markdown']
+                : $roundMarkdown;
             $observed = $this->chatGptTurns[$responseId]['observed_markdown'];
             $stable = WebModelPage::stableMarkdownPrefix(
                 is_string($observed) ? $observed : null,
                 (bool) $this->chatGptTurns[$responseId]['observed_content'],
-                $roundMarkdown,
-                $contentPresent && $roundMarkdown !== ''
+                $draftMarkdown,
+                $contentPresent && $draftMarkdown !== ''
             );
             // Completion UI and file cards can settle after the stop button disappears.
             // Let the completion transaction append that last suffix after its settle window.
@@ -6341,7 +6365,7 @@ JS;
                 if (!str_starts_with($stable, $emitted)) {
                     // A partial DOM remount can temporarily shorten the stable prefix. Wait for
                     // a full observation; the completion fence still verifies the final text.
-                    $this->chatGptTurns[$responseId]['observed_markdown'] = $roundMarkdown;
+                    $this->chatGptTurns[$responseId]['observed_markdown'] = $draftMarkdown;
                     $this->chatGptTurns[$responseId]['observed_content'] = $contentPresent;
                     $this->scheduleTaskPoll($responseId, 0.10);
                     return;
@@ -6359,8 +6383,8 @@ JS;
                     $this->chatGptTurns[$responseId][$toolCapable ? 'draft_emitted' : 'emitted'] = $stable;
                 }
             }
-            $this->chatGptTurns[$responseId]['observed_markdown'] = $roundMarkdown;
-            $this->chatGptTurns[$responseId]['observed_content'] = $contentPresent && $roundMarkdown !== '';
+            $this->chatGptTurns[$responseId]['observed_markdown'] = $draftMarkdown;
+            $this->chatGptTurns[$responseId]['observed_content'] = $contentPresent && $draftMarkdown !== '';
 
             $hasArtifacts = $observedArtifacts !== [];
             $postToolBaseline = $this->chatGptTurns[$responseId]['post_tool_answer_baseline'] ?? null;
@@ -6697,7 +6721,7 @@ JS;
      * @param array $turn Observer state, updated only for a correctly bound ordinary answer.
      * @param array $snapshot Fresh scoped adapter observation; its raw Markdown is not modified.
      * @param float $now Observation time in seconds.
-     * @return array{markdown:string,consistent:bool,terminal_error:bool}
+     * @return array{markdown:string,consistent:bool,terminal_error:bool,draft_markdown?:string}
      */
     private static function alignTaskMarkdownObservation(array &$turn, array $snapshot, float $now): array
     {
@@ -6713,6 +6737,8 @@ JS;
         $blocks = (array) $snapshot['markdown_segments'];
         $prefix = (string) ($turn['round_prefix'] ?? '');
         $projection = WebModelPage::markdownAfterToolBoundary($raw, $prefix);
+        // Provisional prose can end inside a live block. It is not evidence that this
+        // block was irreversibly committed, including after a browser-worker restart.
         $emitted = (string) (!empty($turn['tool_capable'])
             ? ($turn['draft_emitted'] ?? '') : ($turn['emitted'] ?? ''));
         if (!is_array($saved) || ($saved['scope'] ?? null) !== $scope
@@ -6721,7 +6747,10 @@ JS;
             // Replacement of a prior tool round is allowed only before this round has
             // published text. A partial already-published paragraph cannot be guessed.
             $durable = ($projection['boundary_replaced'] ? '' : $prefix) . $emitted;
-            $restored = ChatGptMarkdownBuffer::restore($durable, $blocks);
+            $restored = ChatGptMarkdownBuffer::restore($durable, $blocks, empty($turn['tool_capable']) || $emitted === '');
+            if ($restored === null && !empty($turn['tool_capable']) && $emitted !== '') {
+                $restored = ChatGptMarkdownBuffer::restore($projection['boundary_replaced'] ? '' : $prefix, $blocks);
+            }
             if ($restored === null) return $legacy;
             $saved = ['scope' => $scope, 'state' => $restored,
                 'restored_boundary' => $prefix !== '' && !$projection['boundary_replaced'],
@@ -6747,7 +6776,27 @@ JS;
         $saved['error_signature'] = null;
         $saved['error_since'] = 0.0;
         $turn['markdown_buffer'] = $saved;
-        return ['markdown' => $result['markdown'], 'consistent' => true, 'terminal_error' => false];
+        $aligned = ['markdown' => $result['markdown'], 'consistent' => true, 'terminal_error' => false];
+        $proseTags = ['p', 'root', 'inline', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
+        $proseTail = true;
+        foreach ((array) ($saved['state']['latest'] ?? []) as $block) {
+            if (!in_array($block['tag'] ?? '', $proseTags, true)) { $proseTail = false; break; }
+        }
+        foreach ($blocks as $block) {
+            if (!empty($block['pending_links'])) { $proseTail = false; break; }
+        }
+        $tail = $blocks === [] ? null : $blocks[array_key_last($blocks)];
+        if (!empty($turn['tool_capable']) && $running && $proseTail && is_array($tail)
+            && in_array($tail['tag'] ?? '', $proseTags, true) && ($tail['markdown'] ?? '') !== ''
+            && str_ends_with($raw, $tail['markdown'])) {
+            // Preview on a copy: preserve committed/virtualized blocks and Markdown
+            // separators, while the real ledger continues to buffer unfinished tails.
+            // Running adapter text must contain the whole tail, so unresolved citation,
+            // ordinal, code, list and table rendering cannot bypass its existing guards.
+            $preview = ChatGptMarkdownBuffer::align($saved['state'], $blocks, $raw, false, $now);
+            if ($preview['consistent']) $aligned['draft_markdown'] = $preview['markdown'];
+        }
+        return $aligned;
     }
 
     /**

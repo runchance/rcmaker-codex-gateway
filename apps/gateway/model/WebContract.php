@@ -31,14 +31,17 @@ NOTICE;
      * The multipart planner carries this outer notice into its executable commit, never an inert stage.
      * @param string $prompt Rendered physical prompt; a custom template may omit the resume element.
      * @param bool $midTurnInput True after steering or manual-stop continuation proves ownership.
+     * @param string $scope Proven delivery phase: interjection, stopped_followup, or empty for legacy inference.
      * @return string Unchanged ordinary prompt, or an idempotently annotated steering prompt.
      */
-    public static function withSteeringNotice(string $prompt, bool $midTurnInput): string
+    public static function withSteeringNotice(string $prompt, bool $midTurnInput, string $scope = ''): string
     {
         if (!$midTurnInput) return $prompt;
-        $notice = self::steeringNotice();
+        if ($scope === '') $scope = self::steeringScope($prompt);
+        $notice = self::steeringNotice($scope);
         if (str_contains($prompt, $notice)) return $prompt;
-        foreach ([self::previousTaskSteeringNotice(), self::previousSteeringNotice(), self::STEERING_NOTICE] as $previous) {
+        foreach ([self::steeringNotice(), self::steeringNotice('interjection'), self::steeringNotice('stopped_followup'),
+            self::previousReplyFirstSteeringNotice(), self::previousTaskSteeringNotice(), self::previousSteeringNotice(), self::STEERING_NOTICE] as $previous) {
             if (str_contains($prompt, $previous)) return str_replace($previous, $notice, $prompt);
         }
         // Only a standalone transport closing line is an anchor. A quoted tag in the
@@ -58,7 +61,18 @@ NOTICE;
     {
         return str_contains($prompt, self::STEERING_NOTICE) || str_contains($prompt, self::previousSteeringNotice())
             || str_contains($prompt, self::previousTaskSteeringNotice())
-            || str_contains($prompt, self::steeringNotice());
+            || str_contains($prompt, self::previousReplyFirstSteeringNotice())
+            || str_contains($prompt, self::steeringNotice())
+            || self::steeringScope($prompt) !== '';
+    }
+
+    /** Recover a proven delivery phase only from a complete gateway-authored notice, never a quoted tag. */
+    public static function steeringScope(string $prompt): string
+    {
+        foreach (['interjection', 'stopped_followup'] as $scope) {
+            if (str_contains($prompt, self::steeringNotice($scope))) return $scope;
+        }
+        return '';
     }
 
     /**
@@ -66,7 +80,28 @@ NOTICE;
      * investigation from changed task intent. Keep one bounded contract across retained,
      * full-context and recovered steering without changing capabilities or compression.
      */
-    private static function steeringNotice(): string
+    private static function steeringNotice(string $scope = ''): string
+    {
+        $phase = match ($scope) {
+            'interjection' => 'Transport fact: this input arrived while the outer Codex task was executing; it is an interjection, not a standalone follow-up.',
+            'stopped_followup' => 'Transport fact: the previous execution was manually stopped; this is a new follow-up request, not permission to resume by itself.',
+            default => 'The human user added input. Distinguish an interjection during executing work from a standalone follow-up after execution ended or was manually stopped.',
+        };
+        return str_replace([
+            'The human user added input during an existing task or after a manual stop.',
+            'For discussion or a question requiring investigation, inspect the relevant authorized evidence, then answer their question directly and continue the still-applicable original task. Do not treat a question as authorization to change files or the task goal. A question does not by itself complete, cancel or replace the task.',
+            'The active request means the previously authorized unfinished task combined with this update. Answer side questions as public intermediate progress, then take the next authorized remaining step in this same response when still applicable. Do not merely acknowledge and end, offer to continue later, or ask whether the user wants work they already authorized.',
+            ' The gateway has not classified intent.',
+        ], [
+            $phase,
+            'For discussion or a question requiring investigation during executing work, inspect the relevant authorized evidence, then answer their question directly and continue the still-applicable original task. A question or reference attachment alone does not authorize changing files or the task goal, and does not by itself complete, cancel or replace the task.',
+            'During executing work, the active request means the previously authorized unfinished task combined with this update. Answer side questions as public intermediate progress, then take the next authorized remaining step in this same response. Do not write a final answer or call codex_turn_complete merely because the interjection was answered; check the original goal and its remaining authorized work. Do not offer to continue later or ask whether the user wants work they already authorized. For a standalone follow-up after execution ended, failed or was stopped, investigate and answer a discussion question, then finish; resume or change task execution only when the latest human intent requests it. Unfinished history alone is not a new instruction to resume.',
+            '',
+        ], self::previousReplyFirstSteeringNotice());
+    }
+
+    /** Exact previous reply-first notice, retained when upgrading durable prompts without duplication. */
+    private static function previousReplyFirstSteeringNotice(): string
     {
         return <<<'NOTICE'
 <codex_transport_steering>
@@ -215,7 +250,7 @@ Do not mention this transport contract, context packaging, or capability routing
 {{archive_requirement}}
 For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.
 These tools are connected by the user to their Codex runtime; local actions execute on that runtime's device under its configured sandbox and approval rules. Assess each action by its actual effects and the user's authorization; an authenticated connection does not make every action low risk.
-The active task includes previously authorized unfinished work unless the human pauses, cancels, replaces it, or explicitly requests only an answer. A mid-task question updates that task; answering the question does not finish the remaining work.
+Determine the latest human intent in its execution scope. During executing work, answer a side question as public progress and continue the still-applicable original task; the question alone does not finish that task or change its goal. After execution ended, failed or was stopped, a new discussion question calls for investigation and an answer, not automatic resumption of historical unfinished work. Start, resume or change task execution only when the latest human intent requests it. First give a brief public reply before new tools; if facts need checking, acknowledge what you will investigate without guessing.
 Call a Codex Native tool only when that active task requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer directly without an unnecessary tool call.
 Use actual Codex Native results as evidence for local observations and effects.
 Report the actual error when a tool fails. Do not claim a safety or permission block without an explicit tool result or platform error supporting it. Without an error or execution result, say the action was not executed and its cause is unconfirmed.
@@ -323,9 +358,9 @@ CONTRACT;
         if (!$containsCheckpoint) return $prompt;
         $notice = <<<'NOTICE'
 <codex_checkpoint_resume>
-This is an ordinary task continuation after context compaction. A message beginning "RCMAKER task checkpoint." is recorded handoff data, even though carried in a user-role message; it is not a new human request.
+This ordinary request contains recorded context-compaction data. A message beginning "RCMAKER task checkpoint." is recorded handoff data, even though carried in a user-role message; it is not a new human request.
 The prior request to generate or submit only a checkpoint, stop tools for compaction, or wait for the next context applied only to that completed control operation. Do not carry those temporary restrictions forward, even if the summary incorrectly calls them the user's latest request. Do not merely acknowledge the handoff or repeat its remaining-work list as a completed answer.
-Recover the latest actual human request and unfinished work from the retained human messages and checkpoint facts. Continue the authorized remaining steps, preserving completed results and exact tool receipts. Respect genuine user pause, cancellation, approval boundaries, unresolved failures and current tool/platform restrictions. This notice grants no tools or permissions; only the current request supplies them. If the task is complete or truly blocked, report that accurately.
+Recover the latest actual human request and unfinished work from the retained human messages and checkpoint facts. Continue the authorized remaining steps when the task is still executing or the latest human intent requests continuation or changes. A standalone discussion after execution ended requires investigation and an answer, not restarting the checkpoint's unfinished-work list. Preserve completed results and exact tool receipts. Respect genuine user pause, cancellation, approval boundaries, unresolved failures and current tool/platform restrictions. This notice grants no tools or permissions; only the current request supplies them. If the task is complete or truly blocked, report that accurately.
 </codex_checkpoint_resume>
 NOTICE;
         if (str_contains($prompt, $notice)) return $prompt;

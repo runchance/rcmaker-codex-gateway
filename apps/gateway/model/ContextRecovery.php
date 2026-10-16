@@ -206,7 +206,8 @@ final class ContextRecovery
             }
         }
         $prompt = WebContract::withSteeringNotice($prompt,
-            $job['operation_kind'] === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']));
+            $job['operation_kind'] === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']),
+            WebContract::steeringScope((string)$job['prompt']));
         return ['binding_id'=>$binding['binding_id'], 'prompt'=>$prompt, 'job_fields'=>[
             'mcp_binding_id'=>$binding['binding_id'], 'transport_context_json'=>$transport,
             'budget_json'=>json_encode($spec['budget'], JSON_THROW_ON_ERROR),

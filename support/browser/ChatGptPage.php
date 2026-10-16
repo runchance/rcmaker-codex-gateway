@@ -1068,8 +1068,8 @@ if(answer){
             &&publiclyVisible(next)&&!nativeRecoveryPanel(next)&&after(root,next));
         const complete=!running||followingSibling||followingStatus||allMarkdown.some(next=>next!==root&&after(root,next));
         // Keep the visible latest prose in the observation even before another DOM node
-        // appears. Only a verified native tool boundary may settle this incomplete prose;
-        // the snapshot itself never claims that generation or the paragraph is finished.
+        // appears. The transport may settle it as provisional public progress before a
+        // tool boundary; this snapshot never claims generation or the paragraph is finished.
         const publicProse=!publicSummary&&!activityRoots.includes(root);
         const text=(complete||activityRoots.includes(root))?toMarkdown(root,false)
             :(publicProse?toMarkdown(root,true):'');
