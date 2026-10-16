@@ -2198,6 +2198,35 @@ final class TaskLedger
     }
 
     /**
+     * Preserve the actual Page.enable failure without storing browser content or CDP payloads.
+     * @param string $responseId Physical observer or current response on this generation.
+     * @param array $error CDP error; only its numeric code and known transport reason are retained.
+     * @param float $waitSeconds Preparation budget used, bounded by the existing turn deadline.
+     * @param string $incarnation Browser worker owning the claimed surface.
+     * @param int $fence Exact ownership fence; stale diagnostics must not cross generations.
+     * @return bool Whether the diagnostic belongs to the still-owned task generation.
+     * @throws GatewayError On unavailable storage or changed ownership.
+     */
+    public static function browserPageInitializationFailed(string $responseId, array $error, float $waitSeconds,
+        string $incarnation, int $fence): bool
+    {
+        $reason = (string) ($error['message'] ?? '');
+        $facts = ['method'=>'Page.enable', 'cdp_code'=>max(-2147483648, min(2147483647, (int) ($error['code'] ?? 0))),
+            'cause'=>in_array($reason, ['BROWSER_CDP_TIMEOUT','BROWSER_CDP_DISCONNECTED','BROWSER_CDP_ERROR','BROWSER_CDP_SEND_FAILED'], true)
+                ? $reason : 'CDP_PROTOCOL_ERROR',
+            'wait_budget_ms'=>(int) round(max(0.0, min(600.0, $waitSeconds)) * 1000)];
+        return Schema::transaction(function () use ($responseId, $facts, $incarnation, $fence): bool {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if ($job['generation_id'] !== $turn['generation_id'] || $job['surface_id'] !== $turn['surface_id']
+                || in_array($turn['status'], ['failed','cancelled','superseded','committed','needs_attention'], true)) return false;
+            self::assertFence($surface, $incarnation, $fence);
+            self::eventUnlocked($job['task_id'], $turn['id'], $responseId, $surface['id'],
+                'browser_page_initialization_failed', $facts);
+            return true;
+        });
+    }
+
+    /**
      * Choose recovery for a stopped ordinary task page after host/MCP work has drained.
      * Completed host work can reserve a bounded same-page continuation when every receipt
      * was delivered; otherwise it requires exact-receipt fresh-page recovery. Native Retry

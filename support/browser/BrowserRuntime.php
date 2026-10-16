@@ -2909,6 +2909,7 @@ JS;
             }, 15.0);
     }
 
+    /** Attach the owned task page; Page.enable uses the preparation budget without renewing its turn deadline. */
     private function attachTaskSurface(string $responseId, int $commandId, string $targetId, string $url, bool $recover): void
     {
         $this->taskCdp->send('Target.attachToTarget', ['targetId' => $targetId, 'flatten' => true], null,
@@ -2947,8 +2948,39 @@ JS;
                     $this->taskFailTurn($responseId, $ledgerError->errorCode, $ledgerError->getMessage(), $recover);
                     return;
                 }
-                $this->taskCdp->send('Page.enable', [], $sessionId, function ($pageError) use ($responseId, $commandId, $sessionId, $recover): void {
+                // Page.enable is a local control subscription, not a model response. A busy
+                // renderer may acknowledge it late. Reuse the configured preparation budget,
+                // capped by this turn's existing deadline, without extending the task lifetime.
+                $pageOwner = $this->taskSessions[$sessionId];
+                $pageGeneration = (string) $ledger['job']['generation_id'];
+                $pageDeadline = min((float) $ledger['turn']['deadline_at'], microtime(true)
+                    + (float) Config::get('gateway', 'browser_start_timeout_seconds'));
+                $pageWait = max(0.0, $pageDeadline - microtime(true));
+                $pageEnabled = function ($pageError) use ($responseId, $commandId, $sessionId, $recover, $pageOwner, $pageGeneration, $pageWait): void {
+                    $currentOwner = $this->taskSessions[$sessionId] ?? [];
+                    foreach (['response_id','surface_id','owner_incarnation','fencing_version'] as $key) {
+                        if (($currentOwner[$key] ?? null) !== ($pageOwner[$key] ?? null)) return;
+                    }
+                    if (!$this->taskCdp->ready()) return;
+                    try { $currentLedger = TaskLedger::pollExecution($responseId); }
+                    catch (GatewayError) { return; }
+                    if ((string) $currentLedger['turn']['generation_id'] !== $pageGeneration
+                        || (string) $currentLedger['surface']['owner_incarnation'] !== (string) $pageOwner['owner_incarnation']
+                        || (int) $currentLedger['surface']['fencing_version'] !== (int) $pageOwner['fencing_version']
+                        || in_array($currentLedger['turn']['status'], ['failed','cancelled','superseded','committed','needs_attention'], true)) return;
+                    if (in_array($currentLedger['turn']['error_code'] ?? '', ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS'], true)) {
+                        unset($this->taskSessions[$sessionId]);
+                        $this->detachTaskSessionRaw($sessionId);
+                        $this->finishCommand($commandId, ['status'=>'user_stop_pending']);
+                        return;
+                    }
                     if ($pageError !== null) {
+                        try {
+                            if (!TaskLedger::browserPageInitializationFailed($responseId, $pageError, $pageWait,
+                                (string) $pageOwner['owner_incarnation'], (int) $pageOwner['fencing_version'])) return;
+                        } catch (GatewayError $observationError) {
+                            if (in_array($observationError->errorCode, ['surface_fence_lost','response_superseded','task_ledger_missing'], true)) return;
+                        } catch (\Throwable) { /* Diagnostic failure must not replace the original CDP failure. */ }
                         $this->taskFailTurn($responseId, 'CHATGPT_PAGE_ENABLE_FAILED', '任务页面控制能力初始化失败。', $recover);
                         return;
                     }
@@ -2978,7 +3010,12 @@ JS;
                                 }, 3.0);
                         }, 3.0);
                     }, 3.0);
-                }, 3.0);
+                };
+                if ($pageWait <= 0.0) {
+                    $pageEnabled(['code'=>-2, 'message'=>'BROWSER_CDP_TIMEOUT']);
+                    return;
+                }
+                $this->taskCdp->send('Page.enable', [], $sessionId, $pageEnabled, $pageWait);
             }, 5.0);
     }
 
