@@ -46,7 +46,11 @@ final class McpProtocol
         return $receipt;
     }
 
-    /** @return array<string,mixed>|null Null means JSON-RPC notification: no reply frame. */
+    /**
+     * Dispatch one MCP request. Proven retired steering capabilities receive a terminal
+     * control notice without regaining host access; unknown capabilities remain errors.
+     * @return array<string,mixed>|null Null means JSON-RPC notification: no reply frame.
+     */
     public static function handle(array $request): ?array
     {
         self::$hostReceipt = null;
@@ -79,6 +83,22 @@ final class McpProtocol
             };
         } catch (GatewayError $error) {
             if ($method === 'tools/call') {
+                $arguments = $params['arguments'] ?? [];
+                if ($arguments instanceof \stdClass) $arguments = get_object_vars($arguments);
+                $token = is_array($arguments) ? ($arguments['turn_token'] ?? null) : null;
+                $retired = false;
+                if ($error->errorCode === 'mcp_capability_invalid' && is_string($token)) {
+                    // An unavailable advisory journal must preserve the original fenced error.
+                    try { $retired = ToolBroker::isRetiredSteeringToken($token); }
+                    catch (\Throwable) {}
+                }
+                if ($retired) {
+                    $notice = ['ok' => false, 'status' => 'superseded', 'dispatched' => false,
+                        'instruction' => 'This Web generation was superseded by a newer user instruction. This request did not start a host action. Stop this generation and do not retry the action or guess another turn_token. The gateway will deliver the new instruction with its own capability. Previously accepted host calls and their exact receipts are preserved.'];
+                    return self::ok($id, ['content' => [['type' => 'text', 'text' => json_encode($notice,
+                        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)]],
+                        'structuredContent' => $notice, 'isError' => false]);
+                }
                 return self::ok($id, [
                     'content' => [['type' => 'text', 'text' => $error->getMessage()]],
                     'structuredContent' => ['ok' => false, 'code' => $error->errorCode,

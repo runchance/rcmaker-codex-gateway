@@ -2169,6 +2169,7 @@ final class ToolBroker
         self::eventUnlocked((string) $binding['task_id'], (string) $binding['turn_id'], $newResponseId,
             $mailbox ? 'mcp_mailbox_context_restart_prepared' : 'mcp_steering_restart_prepared', [
                 'binding_id' => (string) $binding['id'], 'previous_response_id' => $previousResponseId,
+                'retired_token_hash' => $oldTokenHash,
                 'receipt_count' => count($outputs), 'registered_cancelled' => 0,
                 'old_activities_closed' => $activities->rowCount(),
             ]);
@@ -2376,6 +2377,29 @@ final class ToolBroker
         if ($requireReady && ($binding['sent_at'] === null || $binding['started_at'] === null || (string) $binding['status'] !== 'running')) {
             throw new GatewayError('mcp_capability_not_ready', 'ChatGPT 页面发送与连接器绑定尚未同时确认。', 409);
         }
+    }
+
+    /**
+     * Recognize a superseded generation without reauthorizing its tools or revealing its successor.
+     * Rotation remains atomic before the new prompt; a late old-page RPC receives a stop notice
+     * instead of being asked to guess a new token. Exact pending receipts keep their separate path.
+     * @param string $token Unmatched MCP capability, never retained as plaintext here.
+     * @return bool True only for an exact recent steering/mailbox retirement journal entry.
+     */
+    public static function isRetiredSteeringToken(string $token): bool
+    {
+        if (preg_match('/\Aturn_[A-Za-z0-9_-]{32}\z/D', $token) !== 1) return false;
+        $hash = hash('sha256', $token);
+        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('event_type', 'IN', ['mcp_steering_restart_prepared', 'mcp_mailbox_context_restart_prepared'])
+            ->where('created_at', '>=', time() - 86400)
+            ->where('data_json', 'LIKE', '%"retired_token_hash":"' . $hash . '"%')
+            ->order([['id', 'DESC']])->limit(1)->select('data_json');
+        foreach (is_array($rows) ? $rows : [] as $row) {
+            $data = json_decode((string) $row['data_json'], true);
+            if (is_string($data['retired_token_hash'] ?? null) && hash_equals($data['retired_token_hash'], $hash)) return true;
+        }
+        return false;
     }
 
     private static function bindingByTokenUnlocked(string $token): array

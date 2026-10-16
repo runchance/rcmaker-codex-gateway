@@ -424,7 +424,7 @@ JS);
     /**
      * Stop/read only a manually interrupted task's verified document and user-message witness.
      * @param string $url Persisted target URL. @param array $tokens Current task/part transport identities, never logged.
-     * @param array $users Pre-send user identities for tasks without a Connector token.
+     * @param array $users Exact pre-send user identities, also fencing truncated long-message witnesses.
      * @param bool $click False reads acknowledgement; true may click the unique semantic Stop control.
      * @param bool $requireWitness Require the exact task message even when the composer is idle.
      * @return string CDP expression returning ownership, composer readiness and generation state.
@@ -438,8 +438,17 @@ const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
 // A long user bubble may hide its tail when collapsed. Its exact transport witness
 // can remain in textContent even though innerText omits it; never search older turns.
-const witness=expected.tokens.length?expected.tokens.some(token=>[latest?.innerText,latest?.textContent].some(text=>String(text||'').includes(token)))
-    :!!identity&&!expected.users.includes(identity);
+const tokenWitness=expected.tokens.some(token=>[latest?.innerText,latest?.textContent].some(text=>String(text||'').includes(token)));
+// ChatGPT truncates long user bubbles in the DOM, not merely their visible layout.
+// On the exact retained URL, one fresh native group after still-present baseline
+// groups proves the submitted user turn without requiring its hidden token tail.
+// Never accept positional/fallback IDs, a missing baseline, or another new message.
+const ids=rows.map((el,index)=>turnId(el,index,'user'));
+const fresh=ids.filter(id=>!expected.users.includes(id));
+const retainedIdentityWitness=String(location.href||'')===expected.url&&expected.users.length>0
+    &&ids.some(id=>expected.users.includes(id))&&fresh.length===1&&fresh[0]===identity
+    &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
+const witness=tokenWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
 const temporary=sameOrigin&&temporaryChatPage(location.pathname,location.search);
 if(!temporary)return {owned:false,page_invalid:true,generation_running:false,editor_ready:!!composer,stopped:false};
@@ -896,10 +905,11 @@ JS));
      * @param array $baselineAssistantIds Historical assistants excluded from the current answer.
      * @param string $continuationMarker Exact current continuation marker, or empty for initial work.
      * @param string $boundResponseId Previously observed assistant identity; empty before first binding.
+     * @param bool $legacyCitations Preserve bytes when resuming a generation with already published old citation markup.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
-        string $continuationMarker = '', string $boundResponseId = ''): string
+        string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1209,7 +1219,7 @@ JS;
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__'],
             [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound],
             $body
-        ));
+        ), $legacyCitations);
     }
 
     /**
@@ -1359,13 +1369,15 @@ JS
         ));
     }
 
-    private static function wrap(string $body): string
+    /** Compose shared DOM readers, retaining old citation bytes only for a resumed published generation. */
+    private static function wrap(string $body, bool $legacyCitations = false): string
     {
         $composer = json_encode(self::COMPOSER, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $user = json_encode(self::USER, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistant = json_encode(self::ASSISTANT, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $effortControl = json_encode(self::EFFORT_CONTROL, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         return '(function(){const COMPOSER=' . $composer . ',USER=' . $user . ',ASSISTANT=' . $assistant . ',MODEL_CONTROL=' . $effortControl . ';'
+            . 'const legacyCitations=' . ($legacyCitations ? 'true' : 'false') . ';'
             . <<<'JS'
 const visible=el=>{if(!el)return false;const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)!==0&&r.width>0&&r.height>0};
 const visibleOne=selector=>[...document.querySelectorAll(selector)].find(visible)||null;
@@ -1690,11 +1702,45 @@ const listNumbers=(list,items)=>{
     let current=parse(list.getAttribute('start'))??1;
     return items.map(item=>{current=parse(item.getAttribute('value'))??current;return current++;});
 };
-const imageTarget=el=>{const src=String(el.getAttribute('src')||'').trim();return /^https?:\/\//i.test(src)&&!/\/backend-api\//i.test(src)?src:'';};
+// Search citations contain decorative site favicons, not assistant-authored images.
+// Recognize the observed icon endpoint without treating every small image as chrome.
+const citationIcon=el=>{
+    if(legacyCitations)return false;
+    if(el.tagName?.toLowerCase()!=='img')return false;
+    try{const url=new URL(String(el.getAttribute('src')||''));return url.hostname==='www.google.com'&&url.pathname==='/s2/favicons';}catch(_error){return false;}
+};
+const imageTarget=el=>{if(citationIcon(el))return '';const src=String(el.getAttribute('src')||'').trim();return /^https?:\/\//i.test(src)&&!/\/backend-api\//i.test(src)?src:'';};
+// Compact inline citation widgets may contain block-styled label/count descendants.
+// Keep them atomic and inline; only an actual visible source anchor can supply a URL.
+const citationWidget=el=>{
+    if(legacyCitations)return null;
+    const tag=el.tagName?.toLowerCase();
+    if(!['span','a','div'].includes(tag)||tag==='div'&&!String(getComputedStyle(el).display).startsWith('inline'))return null;
+    if(tag==='a'&&artifactAnchor(el))return null;
+    if(String(el.textContent||'').length>160)return null;
+    const images=[...el.querySelectorAll('img')];
+    if(!images.some(citationIcon)||images.some(image=>!citationIcon(image))
+        ||el.querySelector('p,pre,table,ul,ol,blockquote'))return null;
+    const read=node=>{
+        if(node.nodeType===Node.TEXT_NODE)return String(node.nodeValue||'');
+        if(node.nodeType!==Node.ELEMENT_NODE||ignored(node)||node.tagName?.toLowerCase()==='img'
+            ||node.tagName?.toLowerCase()==='a'&&artifactAnchor(node))return '';
+        const value=[...node.childNodes].map(read).join('');
+        return node.tagName?.toLowerCase()==='div'?' '+value+' ':value;
+    };
+    const label=read(el).replace(/\s+/g,' ').trim();
+    if(!label)return null;
+    const anchors=[...(tag==='a'?[el]:[]),...el.querySelectorAll('a')].filter(anchor=>{
+        for(let parent=anchor;parent;parent=parent.parentElement){if(ignored(parent))return false;if(parent===el)break;}
+        return /^https?:\/\//i.test(String(anchor.getAttribute('href')||''))&&!artifactAnchor(anchor);
+    });
+    const targets=[...new Set(anchors.map(anchor=>String(anchor.getAttribute('href'))))];
+    return {label,href:targets.length===1?targets[0]:''};
+};
 // Image/divider-only answers have no innerText. Require an actual visible content node;
 // empty emphasis/code shells must not become completion evidence merely from delimiters.
 const hasNonTextContent=root=>[root,...root.querySelectorAll('img'),...root.querySelectorAll('hr')].some(node=>{
-    if(!['img','hr'].includes(node.tagName.toLowerCase()))return false;
+    if(!['img','hr'].includes(node.tagName.toLowerCase())||citationIcon(node))return false;
     for(let parent=node;parent;parent=parent.parentElement){if(ignored(parent)||artifactAnchor(parent))return false;if(parent===root)break;}
     return true;
 });
@@ -1754,11 +1800,18 @@ const md=(node,tail=false)=>{
     const el=node;
     if(ignored(el))return '';
     const tag=el.tagName.toLowerCase();
+    const citation=citationWidget(el);
+    if(citation){
+        if(markdownRunning&&tail)return '';
+        const label=markdownLiteral(citation.label,!!el.closest('td,th'));
+        return citation.href?' ['+label+']('+markdownTarget(citation.href)+')':' ('+label+')';
+    }
     if(tag==='br')return '  \n';
     if(tag==='hr')return '\n\n---\n\n';
     const formula=mathSource(el);
     if(formula)return formula.display?'\n\n$$\n'+formula.value+'\n$$\n\n':'$'+formula.value+'$';
     if(tag==='img'){
+        if(citationIcon(el))return '';
         if(markdownRunning&&tail)return '';
         const alt=markdownLiteral(String(el.getAttribute('alt')||''),!!el.closest('td,th')),src=imageTarget(el);
         return src?'!['+alt+']('+markdownTarget(src)+markdownTitle(el)+')':alt;
@@ -1839,8 +1892,9 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
     const text=node=>{
         if(node.nodeType===Node.TEXT_NODE)return String(node.nodeValue||'').replace(/\u00a0/g,' ');
         if(node.nodeType!==Node.ELEMENT_NODE||ignored(node)||node.tagName?.toLowerCase()==='a'&&artifactAnchor(node))return '';
+        const citation=citationWidget(node);if(citation)return ' '+citation.label;
         if(node.tagName?.toLowerCase()==='br')return '\n';
-        if(node.tagName?.toLowerCase()==='img')return String(node.getAttribute('alt')||'');
+        if(node.tagName?.toLowerCase()==='img')return citationIcon(node)?'':String(node.getAttribute('alt')||'');
         const formula=mathSource(node);if(formula)return formula.value;
         const value=children(node).map(text).join('');
         return blockTags.has(String(node.tagName||'').toLowerCase())?'\n'+value+'\n':value;
@@ -1869,7 +1923,7 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
         if(nativeRecoveryPanel(root))return;
         // Only layout containers may be flattened. A root list/quote/math block owns its
         // delimiters too; flattening its children would drop them from the streamed answer.
-        if(!['div','section','article'].includes(root.tagName.toLowerCase())||root.hasAttribute('data-footnotes')||mathSource(root)){
+        if(!['div','section','article'].includes(root.tagName.toLowerCase())||root.hasAttribute('data-footnotes')||mathSource(root)||citationWidget(root)){
             push(root,root.tagName.toLowerCase(),toMarkdown(root,false));return;
         }
         const nodes=children(root);
@@ -1893,7 +1947,7 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
             inline=[];
         };
         for(const node of nodes){
-            if(node.nodeType!==Node.ELEMENT_NODE||!blockTags.has(node.tagName.toLowerCase())){inline.push(node);continue;}
+            if(node.nodeType!==Node.ELEMENT_NODE||!blockTags.has(node.tagName.toLowerCase())||citationWidget(node)){inline.push(node);continue;}
             flush();const tag=node.tagName.toLowerCase();
             const wrapper=['div','section','article'].includes(tag)&&!node.hasAttribute('data-footnotes')&&!mathSource(node)&&!('source_start' in range(node))
                 &&children(node).some(child=>child.nodeType===Node.ELEMENT_NODE&&blockTags.has(child.tagName.toLowerCase()));

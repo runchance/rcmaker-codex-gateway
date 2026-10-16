@@ -3178,7 +3178,8 @@ JS;
         preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $source['prompt'], $tokens);
         $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [(string) $source['prompt']];
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
-        $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses, [], !$clicked, true);
+        $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
+            (array) $source['baseline_users'], !$clicked, true);
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
@@ -5851,6 +5852,16 @@ JS;
             $this->taskFailTurn($responseId, 'CHATGPT_RESPONSE_TIMEOUT', 'ChatGPT 网页生成超过本回合截止时间；结果无法确认且不会自动重发。', true);
             return;
         }
+        if (!empty($this->chatGptTurns[$responseId]['response_observation_pending'])) {
+            // A slow renderer read stays in flight. Its monitor still adopts native
+            // receipts and drains registered tools; do not overlap browser actions
+            // or queue another DOM read while that same renderer is stalled.
+            try { $this->deliverPendingToolWithoutSnapshot($responseId); }
+            catch (GatewayError $error) {
+                $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
+            }
+            return;
+        }
         if ($compactionPhase === 'waiting') {
             if (self::shouldCheckTaskToolConfirmation($this->chatGptTurns[$responseId])) {
                 $this->checkTaskToolConfirmation($responseId);
@@ -5886,8 +5897,9 @@ JS;
             return;
         }
         $expression = WebModelPage::responseExpression((array) $turn['baseline_users'], (array) $turn['baseline_assistants'],
-            (string)($turn['continuation_marker'] ?? ''), (string)($turn['bound_assistant_id'] ?? ''));
-        $this->evaluateTask($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
+            (string)($turn['continuation_marker'] ?? ''), (string)($turn['bound_assistant_id'] ?? ''),
+            self::hasLegacyCitationPrefix($turn));
+        $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
             if ($error !== null || !is_array($snapshot)) {
@@ -6921,7 +6933,7 @@ JS;
             }
             $turn = $this->chatGptTurns[$responseId];
             $read = WebModelPage::responseExpression((array)$turn['baseline_users'], (array)$turn['baseline_assistants'],
-                '', (string)($turn['bound_assistant_id'] ?? ''));
+                '', (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn));
             $this->evaluateTask($responseId, $read, function ($readError, $snapshot) use ($responseId, $logicalResponseId, $revision): void {
                 if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
                 if ($readError !== null || !is_array($snapshot) || !empty($snapshot['generation_running'])) {
@@ -7265,6 +7277,48 @@ JS;
         if (isset($this->chatGptTurns[$responseId])) Timer::add($delay, fn() => $this->pollTaskTurn($responseId), null, false);
     }
 
+    /** Keep an already published physical generation byte-compatible across a gateway upgrade. */
+    private static function hasLegacyCitationPrefix(array $turn): bool
+    {
+        foreach (['round_prefix', 'emitted', 'draft_emitted'] as $key) {
+            if (preg_match('~!\[[^\]\r\n]*\]\(https://www\.google\.com/s2/favicons\?~', (string)($turn[$key] ?? ''))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Keep one response read alive through renderer stalls without delaying host tools.
+     * The normal 3s UI-action timeout would discard valid 4-10s observations forever.
+     * After 3s, the existing fenced poll adopts receipts and drains tools while this
+     * read waits up to 15s. Session replacement invalidates both the read and monitor.
+     * @param callable(?array,mixed):void $callback Same read-only snapshot contract as evaluateTask.
+     */
+    private function observeTaskResponse(string $responseId, string $expression, callable $callback): void
+    {
+        $sessionId = (string) $this->chatGptTurns[$responseId]['session_id'];
+        $sequence = (int) ($this->chatGptTurns[$responseId]['response_observation_sequence'] ?? 0) + 1;
+        $this->chatGptTurns[$responseId]['response_observation_sequence'] = $sequence;
+        $this->chatGptTurns[$responseId]['response_observation_pending'] = $sequence;
+        $started = microtime(true);
+        $monitor = Timer::add(0.25, function () use ($responseId, $sessionId, $sequence, $started, &$monitor): void {
+            $turn = $this->chatGptTurns[$responseId] ?? null;
+            if (($turn['session_id'] ?? '') !== $sessionId
+                || ($turn['response_observation_pending'] ?? null) !== $sequence) {
+                Timer::del($monitor);
+                return;
+            }
+            if (microtime(true) - $started >= 3.0) $this->pollTaskTurn($responseId);
+        });
+        $this->evaluateTask($responseId, $expression, function ($error, $snapshot) use (
+            $responseId, $sequence, $monitor, $callback
+        ): void {
+            Timer::del($monitor);
+            if (($this->chatGptTurns[$responseId]['response_observation_pending'] ?? null) !== $sequence) return;
+            unset($this->chatGptTurns[$responseId]['response_observation_pending']);
+            $callback($error, $snapshot);
+        }, 15.0);
+    }
+
     /**
      * Stop Web generation promptly for a queued human update while accepted host calls drain.
      * This keeps the observer and capability alive, delivers already registered calls, and
@@ -7312,7 +7366,8 @@ JS;
         preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string)$physical['prompt'], $tokens);
         $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$physical['prompt']];
         if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
-        $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses, [], true, true),
+        $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
+            (array)$physical['baseline_users'], true, true),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
