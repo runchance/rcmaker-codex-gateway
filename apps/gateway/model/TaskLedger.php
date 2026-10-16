@@ -2203,6 +2203,8 @@ final class TaskLedger
      * was delivered; otherwise it requires exact-receipt fresh-page recovery. Native Retry
      * remains limited to tasks without completed host work. Terminal historical bindings
      * with no active RPC cannot keep an unrelated current turn waiting indefinitely.
+     * A closed historical wait is drained only when the current context proves its exact
+     * saved receipt; this never acknowledges delivery to the retired Web page.
      * @param string $responseId Current logical ordinary Responses round.
      * @param string $incarnation Browser worker owning the exact surface.
      * @param int $fence Surface ownership version.
@@ -2270,6 +2272,12 @@ final class TaskLedger
                 if ($call['status'] === 'completed') $hasCompletedWork = true;
                 if ($call['status'] === 'completed' && $call['binding_id'] === ($binding['id'] ?? null)) $currentCompletedCalls++;
                 if ($call['status'] === 'completed' && ($call['result_delivered_at'] === null || $call['result_json'] === null)) {
+                    if ($call['binding_id'] !== ($binding['id'] ?? null)
+                        && ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $job, (string)$job['task_id'])) {
+                        // The old wait is conclusively closed, and this turn already carries
+                        // its exact result. It is not in-flight work on the current page.
+                        continue;
+                    }
                     $allReceiptsDelivered = false;
                     $closedWaitFailure ??= ToolBroker::settledWaitTransportFailureForResponse($responseId);
                     if ($call['binding_id'] === ($binding['id'] ?? null)

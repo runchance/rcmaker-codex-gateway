@@ -422,6 +422,8 @@ New requests use saved changes. Already-started work retains its budget and wait
 
 While waiting for a native tool result, a normal tool-round transition does not end the wait. Before reporting that the wait scope changed, the gateway rechecks the exact call and current turn in one short transaction. An already saved result remains usable without executing the tool again or claiming that the Web page has received it. Actual cancellation, invalid ownership and unknown results retain their existing safeguards.
 
+If an older turn's result-wait connection failed conclusively, its unacknowledged result does not keep a later stopped page waiting forever when the current context or a verified checkpoint covers the exact receipt. The gateway verifies that the old turn is terminal and has no pending tools or active MCP requests, then applies the current turn's normal recovery checks. It preserves the old delivery record; current pending work still blocks recovery.
+
 Instructions to pause tools and submit only a summary apply to that compaction operation. The next ordinary request labels the summary as handoff data and asks the model to continue the original human task's remaining steps while preserving completed results and exact tool receipts. Genuine user pauses, cancellations and approval requirements remain in force.
 
 For a new Free conversation without prior assistant/tool history, the complete first request is sent in one message when text, attachments and reserved context all fit. Larger requests still use multipart delivery without removing instructions or context. Already started transactions and native tool continuations keep their pinned transport budget.

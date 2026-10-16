@@ -1571,13 +1571,14 @@ final class ToolBroker
 
     /**
      * Distinguish a known native result from live work after its Web wait transport ended.
-     * Only the exact failed and revoked capability is eligible. The compaction request must
-     * still carry the real receipt, or a verified checkpoint already covering it. This is a
+     * Only the exact failed and revoked capability is eligible. The current request must
+     * still carry the real receipt, or a verified checkpoint already covering it. The same
+     * proof also applies to a later ordinary task's stopped-stream recovery. This is a
      * read-only proof: it never acknowledges delivery to the old Web page or replays a call.
-     * @param array $call Persisted completed invocation examined by the compact reservation.
-     * @param array $spec Normalized compact request with its complete readable context.
+     * @param array $call Persisted completed invocation examined by context recovery.
+     * @param array $spec Normalized compact request or ordinary job with complete readable context.
      * @param string $taskId Exact routed task owning the reservation.
-     * @return bool Whether the closed wait receipt is safe to include in this compaction.
+     * @return bool Whether this closed wait is covered for compaction or current task recovery.
      * @throws GatewayError When an eligible receipt is missing, altered or cannot be read.
      */
     public static function closedWaitReceiptForCompactionUnlocked(array $call, array $spec, string $taskId): bool
