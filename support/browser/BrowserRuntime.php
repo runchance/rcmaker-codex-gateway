@@ -429,7 +429,8 @@ final class BrowserRuntime
         $users = json_decode((string) ($expected['job']['baseline_users_json'] ?? '[]'), true) ?: [];
         $url = (string) $expected['surface']['url'];
         if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl();
-        $expression = WebModelPage::userStopExpression($url, $witnesses, $users, !$stop['clicked']);
+        $expression = WebModelPage::userStopExpression($url, $witnesses, $users, !$stop['clicked'], false,
+            self::acceptedInitialUser($expected['job'], $expected['surface']));
         $this->evaluateTaskSession((string) $stop['session_id'], $expression,
             function ($error, $result) use ($responseId, $expected): void {
                 if (!isset($this->codexUserStops[$responseId])) return;
@@ -3179,7 +3180,7 @@ JS;
         $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [(string) $source['prompt']];
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
-            (array) $source['baseline_users'], !$clicked, true);
+            (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface));
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
@@ -6901,7 +6902,8 @@ JS;
             if (!empty($source['transport_transaction_id'])) $witnesses[] = (string)$source['transport_transaction_id'];
             $surface = TaskLedger::execution($logicalResponseId)['surface'];
             $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
-                (array)$turn['baseline_users'], empty($turn['compaction_stop_clicked']), true);
+                (array)$turn['baseline_users'], empty($turn['compaction_stop_clicked']), true,
+                self::acceptedInitialUser($source, $surface));
         } catch (GatewayError $error) {
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
             return;
@@ -7277,6 +7279,33 @@ JS;
         if (isset($this->chatGptTurns[$responseId])) Timer::add($delay, fn() => $this->pollTaskTurn($responseId), null, false);
     }
 
+    /**
+     * Prove an intentionally empty baseline from the accepted physical submission, including
+     * logical receipt rounds whose own submit/accept fields are empty. Ownership and current
+     * generation remain checked by each stop caller; an unsent job alone grants no DOM witness.
+     * @param array $job Current logical job or the pinned physical source, raw or decoded.
+     * @param array $surface Fenced destination document already verified by the caller.
+     * @return bool Whether this exact document durably accepted its first user message.
+     */
+    private static function acceptedInitialUser(array $job, array $surface): bool
+    {
+        if (empty($surface['document_nonce']) || ($job['surface_id'] ?? null) !== ($surface['id'] ?? null)
+            || ($job['task_id'] ?? null) !== ($surface['task_id'] ?? null)) return false;
+        $query = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+            ->where('task_id', $job['task_id'])->where('surface_id', $surface['id'])
+            ->where('submitted_document_nonce', $surface['document_nonce'])
+            ->where('submit_intent_at', '<>', null)->where('accepted_at', '<>', null);
+        // Read the original JSON: decoded compatibility defaults cannot distinguish []
+        // from missing or malformed legacy metadata and must not grant a first-send proof.
+        $source = $query->order([['rowid', 'DESC']])->limit(1)
+            ->find('id,submit_intent_at,accepted_at,submitted_document_nonce,baseline_users_json');
+        if (!is_array($source) || empty($source['submit_intent_at']) || empty($source['accepted_at'])
+            || ($source['submitted_document_nonce'] ?? null) !== $surface['document_nonce']) return false;
+        if (!empty($job['submit_intent_at']) && !empty($job['accepted_at']) && $source['id'] !== $job['id']) return false;
+        $users = json_decode((string)($source['baseline_users_json'] ?? ''));
+        return is_array($users) && $users === [];
+    }
+
     /** Keep an already published physical generation byte-compatible across a gateway upgrade. */
     private static function hasLegacyCitationPrefix(array $turn): bool
     {
@@ -7367,7 +7396,7 @@ JS;
         $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$physical['prompt']];
         if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
         $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
-            (array)$physical['baseline_users'], true, true),
+            (array)$physical['baseline_users'], true, true, self::acceptedInitialUser($physical, $ledger['surface'])),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;

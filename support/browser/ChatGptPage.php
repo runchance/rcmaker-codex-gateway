@@ -427,12 +427,15 @@ JS);
      * @param array $users Exact pre-send user identities, also fencing truncated long-message witnesses.
      * @param bool $click False reads acknowledgement; true may click the unique semantic Stop control.
      * @param bool $requireWitness Require the exact task message even when the composer is idle.
+     * @param bool $acceptedInitialUser Durable proof that the current document accepted its first user submission.
      * @return string CDP expression returning ownership, composer readiness and generation state.
      */
-    public static function userStopExpression(string $url, array $tokens, array $users, bool $click, bool $requireWitness = false): string
+    public static function userStopExpression(string $url, array $tokens, array $users, bool $click,
+        bool $requireWitness = false, bool $acceptedInitialUser = false): string
     {
         $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users),
-            'click' => $click, 'requireWitness' => $requireWitness], JSON_THROW_ON_ERROR);
+            'click' => $click, 'requireWitness' => $requireWitness,
+            'acceptedInitialUser' => $acceptedInitialUser], JSON_THROW_ON_ERROR);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
@@ -442,11 +445,15 @@ const tokenWitness=expected.tokens.some(token=>[latest?.innerText,latest?.textCo
 // ChatGPT truncates long user bubbles in the DOM, not merely their visible layout.
 // On the exact retained URL, one fresh native group after still-present baseline
 // groups proves the submitted user turn without requiring its hidden token tail.
-// Never accept positional/fallback IDs, a missing baseline, or another new message.
+// A proven first submission has an intentionally empty baseline. It must still be
+// the document's only user group, with a native ID, on the exact retained URL.
+// Never infer that first-send proof from an empty baseline alone.
 const ids=rows.map((el,index)=>turnId(el,index,'user'));
 const fresh=ids.filter(id=>!expected.users.includes(id));
-const retainedIdentityWitness=String(location.href||'')===expected.url&&expected.users.length>0
-    &&ids.some(id=>expected.users.includes(id))&&fresh.length===1&&fresh[0]===identity
+const baselineWitness=expected.users.length>0&&ids.some(id=>expected.users.includes(id));
+const initialWitness=expected.acceptedInitialUser&&expected.users.length===0&&ids.length===1;
+const retainedIdentityWitness=String(location.href||'')===expected.url&&(baselineWitness||initialWitness)
+    &&fresh.length===1&&fresh[0]===identity
     &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
 const witness=tokenWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
