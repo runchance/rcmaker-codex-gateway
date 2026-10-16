@@ -5208,7 +5208,7 @@ JS;
         if (!is_array($turn)) return;
         $attachments = (array) ($turn['attachments'] ?? []);
         if ($attachments === []) {
-            $this->waitTaskSendReady($responseId, microtime(true) + 3.0);
+            $this->waitTaskSendReady($responseId, min((float) $turn['deadline'], microtime(true) + 60.0));
             return;
         }
         $expected = [];
@@ -5350,36 +5350,47 @@ JS;
             });
     }
 
-    private function waitTaskSendReady(string $responseId, float $deadline): void
+    /** Wait within one preparation budget; callbacks and timers stay on their original document and generation. */
+    private function waitTaskSendReady(string $responseId, float $deadline, ?array $owner = null): void
     {
-        if (!isset($this->chatGptTurns[$responseId])) return;
-        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(), function ($error, $state) use ($responseId, $deadline): void {
-            if (!isset($this->chatGptTurns[$responseId])) return;
-            if ($error === null && is_array($state) && !empty($state['ready'])) {
-                Timer::add(0.25, fn() => $this->verifySettledTaskSend($responseId, microtime(true) + 3.0), null, false);
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $keys = array_flip(['surface_id', 'target_id', 'session_id', 'document_nonce', 'owner_incarnation',
+            'fencing_version', 'logical_response_id', 'transport_transaction_id', 'transport_stage_sent', 'transport_stage_acked']);
+        $owner ??= array_intersect_key($turn, $keys);
+        if (array_intersect_key($turn, $keys) !== $owner) return;
+        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(), function ($error, $state) use ($responseId, $deadline, $keys, $owner): void {
+            $current = $this->chatGptTurns[$responseId] ?? null;
+            if (!is_array($current) || array_intersect_key($current, $keys) !== $owner) return;
+            if ($error === null && is_array($state) && !empty($state['ready']) && microtime(true) < $deadline) {
+                Timer::add(0.25, fn() => $this->verifySettledTaskSend($responseId, $deadline, $owner), null, false);
                 return;
             }
             if (microtime(true) < $deadline) {
-                Timer::add(0.08, fn() => $this->waitTaskSendReady($responseId, $deadline), null, false);
+                Timer::add(0.25, fn() => $this->waitTaskSendReady($responseId, $deadline, $owner), null, false);
                 return;
             }
             $code = is_array($state) ? (string) ($state['code'] ?? 'CHATGPT_SEND_NOT_READY') : 'CHATGPT_SEND_NOT_READY';
             $this->taskFailTurn($responseId, $code, 'ChatGPT 发送控件在限定时间内未进入可点击状态。');
-        });
+        }, min(15.0, max(0.1, $deadline - microtime(true))));
     }
 
-    /** Re-check the settled tool-capable composer immediately before sending. */
-    private function verifySettledTaskSend(string $responseId, float $deadline): void
+    /** Re-check the settled composer using the same preparation budget and original page ownership. */
+    private function verifySettledTaskSend(string $responseId, float $deadline, ?array $owner = null): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        $keys = array_flip(['surface_id', 'target_id', 'session_id', 'document_nonce', 'owner_incarnation',
+            'fencing_version', 'logical_response_id', 'transport_transaction_id', 'transport_stage_sent', 'transport_stage_acked']);
+        $owner ??= array_intersect_key($turn, $keys);
+        if (array_intersect_key($turn, $keys) !== $owner) return;
         $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(),
-            function ($readyError, $ready) use ($responseId, $deadline): void {
+            function ($readyError, $ready) use ($responseId, $deadline, $keys, $owner): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
-                if (!is_array($turn)) return;
-                if ($readyError !== null || !is_array($ready) || empty($ready['ready'])) {
+                if (!is_array($turn) || array_intersect_key($turn, $keys) !== $owner) return;
+                if ($readyError !== null || !is_array($ready) || empty($ready['ready']) || microtime(true) >= $deadline) {
                     if (microtime(true) < $deadline) {
-                        Timer::add(0.08, fn() => $this->verifySettledTaskSend($responseId, $deadline), null, false);
+                        Timer::add(0.25, fn() => $this->verifySettledTaskSend($responseId, $deadline, $owner), null, false);
                         return;
                     }
                     $code = is_array($ready) ? (string) ($ready['code'] ?? 'CHATGPT_SEND_NOT_READY') : 'CHATGPT_SEND_NOT_READY';
@@ -5400,7 +5411,7 @@ JS;
                     }
                     $this->verifySettledTaskConnector($responseId, $connectorName);
                 });
-            });
+            }, min(15.0, max(0.1, $deadline - microtime(true))));
     }
 
     /** Final submission is allowed only if ChatGPT still reports the exact requested effort. */
