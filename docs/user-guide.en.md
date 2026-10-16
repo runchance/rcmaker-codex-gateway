@@ -334,7 +334,7 @@ Start RCMAKER first and let it restore readiness before using Codex. Saved sign-
 
 While a task runs, send corrections or questions in the **same Codex conversation**. Related changes guide the task; explicitly say when you want to stop or replace the goal. **Settings → Long tasks and context → Resend full context when steering** controls delivery. It is off by default: after confirming that the original page stopped, send only new instructions, instruction updates and required tool receipts while retaining completed progress. Enabling it preserves the existing full-context flow.
 
-A side question is answered as intermediate progress, then the previously authorized unfinished work continues in the same response. Answering it alone does not finish the task or require renewed permission. Explicit pause, cancellation, replacement and answer-only requests still take priority.
+Every interjection requires a brief public reply in your language before deciding the next action or calling a new tool. If a question needs investigation, the model first acknowledges what it will check, then investigates and answers from evidence; a question does not authorize changing files or the task goal. An already verified short answer may itself be the first reply. When authorized work resumes, reuse supplied exact tool receipts; if needed, query the original calls through the current Connector or original-context reader with a valid current capability. Wait for pending work and verify unknown or failed outcomes instead of resubmitting accepted calls because of an interjection.
 
 Stop a task in Codex and check its Task center status. Before closing the gateway, finish tasks and pending approvals, then use **Ctrl+C** in the startup terminal. Closing a running Web page is not a substitute for cancelling a task.
 
@@ -348,7 +348,7 @@ Repeating the same read-only compaction request with a different temporary conve
 
 A standalone “Connection interrupted / Waiting for the full response” notice does not invalidate the page or finish the task. The gateway continues observing tool receipts, generation state and the Send control. Once Send returns, tools must also be settled and the answer stable, or an actual request failure established, before the turn can finish or enter recovery.
 
-Both delivery modes require the model to respond to the new user input first: answer the question or briefly acknowledge the requested change. When the user changes the goal, scope, priorities or constraints, the model should explain the adjustment and continue the remaining steps according to that latest intent, preserving completed work that still applies and dropping superseded requirements. The same policy applies to continuation after a manual stop.
+Both delivery modes and continuation after a manual stop follow this order. Changes to goals, scope, priorities or constraints require a brief explanation of the adjustment before the remaining steps, preserving completed work that still applies. After ordinary discussion or a side question, continue the still-applicable original task. An explicit stop ends new task actions, followed by a factual account of completed work, unfinished work and tools still settling. Respect explicit cancellations, replacements and investigation-only requests. This compact contract replaces earlier wording without accumulating each round or changing tool receipts, context budgets or compaction.
 
 ### Browser workspace
 
