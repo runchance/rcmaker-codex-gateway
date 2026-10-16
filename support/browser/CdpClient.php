@@ -93,7 +93,16 @@ final class CdpClient
         $connection->connect();
     }
 
-    /** Send one bounded CDP request. Callback receives nullable protocol error and result. @return int */
+    /**
+     * Send one bounded CDP request. Callback receives nullable protocol error and result.
+     * Timeout error data identifies the method, budget and scope without exposing session IDs or payloads.
+     * @param string $method CDP method name.
+     * @param array $params Protocol parameters, omitted on the wire when empty.
+     * @param string|null $sessionId Flattened target session, or null for browser scope.
+     * @param callable(?array,array):void $callback One protocol result, send error or timeout.
+     * @param float $timeout Maximum response wait in seconds, on the existing event loop.
+     * @return int Request identity, or zero when the transport cannot send.
+     */
     public function send(string $method, array $params, ?string $sessionId, callable $callback, float $timeout = 5.0): int
     {
         if (!$this->ready || $this->connection === null) {
@@ -105,11 +114,13 @@ final class CdpClient
         // CDP expects params to be an object. Omitting empty params avoids encoding PHP [] as JSON [].
         if ($params !== []) $message['params'] = $params;
         if ($sessionId !== null && $sessionId !== '') $message['sessionId'] = $sessionId;
-        $timer = Timer::add($timeout, function () use ($id): void {
+        $sessionScoped = $sessionId !== null && $sessionId !== '';
+        $timer = Timer::add($timeout, function () use ($id, $method, $timeout, $sessionScoped): void {
             $pending = $this->pending[$id] ?? null;
             if ($pending === null) return;
             unset($this->pending[$id]);
-            ($pending['callback'])(['code' => -2, 'message' => 'BROWSER_CDP_TIMEOUT'], []);
+            ($pending['callback'])(['code' => -2, 'message' => 'BROWSER_CDP_TIMEOUT',
+                'data' => ['method' => $method, 'timeout_seconds' => $timeout, 'session_scoped' => $sessionScoped]], []);
         }, null, false);
         $this->pending[$id] = ['callback' => $callback, 'timer' => $timer];
         $encoded = json_encode($message, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);

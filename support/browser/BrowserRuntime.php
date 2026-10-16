@@ -379,7 +379,11 @@ final class BrowserRuntime
         foreach (array_keys($this->codexUserStops) as $id) $this->pollCodexUserStop($id);
     }
 
-    /** Click once, then read back idle state; retain the target and never resend an interrupted request. */
+    /**
+     * Stop only the owned generation, then confirm idle without resending its request.
+     * A renderer timeout keeps its CDP session and requires read-back before another click;
+     * only a protocol/session error reattaches. Slow observations share the normal 15s read budget.
+     */
     private function pollCodexUserStop(string $responseId): void
     {
         $stop = $this->codexUserStops[$responseId] ?? null;
@@ -429,28 +433,33 @@ final class BrowserRuntime
         $users = json_decode((string) ($expected['job']['baseline_users_json'] ?? '[]'), true) ?: [];
         $url = (string) $expected['surface']['url'];
         if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl();
-        $expression = WebModelPage::userStopExpression($url, $witnesses, $users, !$stop['clicked'], false,
+        $expression = WebModelPage::userStopExpression($url, $witnesses, $users,
+            !$stop['clicked'] && empty($stop['verify_only']), false,
             self::acceptedInitialUser($expected['job'], $expected['surface']));
-        $this->evaluateTaskSession((string) $stop['session_id'], $expression,
-            function ($error, $result) use ($responseId, $expected): void {
-                if (!isset($this->codexUserStops[$responseId])) return;
+        $sessionId = (string) $stop['session_id'];
+        $this->evaluateTaskSession($sessionId, $expression,
+            function ($error, $result) use ($responseId, $expected, $sessionId): void {
+                if (($this->codexUserStops[$responseId]['session_id'] ?? null) !== $sessionId) return;
                 $this->codexUserStops[$responseId]['busy'] = false;
                 if (!TaskLedger::userStopOwns($expected)) { $this->releaseCodexStopObserver($responseId); return; }
-                if ($error !== null) {
-                    // Browser-level reconnect invalidates flattened CDP sessions, not the retained tab.
-                    $sessionId = (string) ($this->codexUserStops[$responseId]['session_id'] ?? '');
-                    $this->codexUserStops[$responseId]['session_id'] = null;
+                if ($error !== null || !is_array($result)) {
                     $this->codexUserStops[$responseId]['idle_since'] = null;
+                    $this->codexUserStops[$responseId]['verify_only'] = true;
+                    // A timeout says nothing about session validity or whether Stop was clicked.
+                    // Read this same owned page before deciding whether another click is needed.
+                    if ($error === null || ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT') return;
+                    // Browser-level reconnect invalidates flattened CDP sessions, not the retained tab.
+                    $this->codexUserStops[$responseId]['session_id'] = null;
                     if ($sessionId !== '') $this->detachTaskSessionRaw($sessionId);
                     return;
                 }
-                if (!is_array($result)) return;
                 if (($result['page_invalid'] ?? null) === true) {
                     TaskLedger::confirmUserStop($expected, false, true);
                     $this->releaseCodexStopObserver($responseId);
                     return;
                 }
                 if (empty($result['owned'])) return;
+                $this->codexUserStops[$responseId]['verify_only'] = false;
                 if (!empty($result['stopped'])) $this->codexUserStops[$responseId]['clicked'] = true;
                 if (!empty($result['generation_running']) || empty($result['editor_ready'])) {
                     $this->codexUserStops[$responseId]['idle_since'] = null;
@@ -461,7 +470,7 @@ final class BrowserRuntime
                 if (microtime(true) - $since < 1.0) return;
                 TaskLedger::confirmUserStop($expected);
                 $this->releaseCodexStopObserver($responseId);
-            });
+            }, 15.0);
     }
 
     /** Release only the stop observer; the Chrome tab remains available for the user's next turn. */
