@@ -101,7 +101,8 @@ final class Browser
                 throw new GatewayError('INVALID_BROWSER_INSTALL', '请选择有效的网络配置。');
             }
             NetworkSettings::revision($revision);
-            return ['id' => BrowserState::enqueue('install', ['revision' => $revision], false), 'status' => 'queued'];
+            return ['id' => BrowserState::enqueue('install', ['revision' => $revision], false), 'status' => 'queued',
+                'wait_timeout_seconds' => ChromeForTestingRuntime::installWaitTimeoutSeconds()];
         }, 202);
     }
 

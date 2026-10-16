@@ -935,11 +935,17 @@ final class BrowserRuntime
         });
     }
 
-    /** Install and fully verify the private browser runtime without opening a browser window. */
+    /** Install/verify without opening a window, retaining a bounded worker heartbeat through synchronous download progress. */
     private function installRuntime(int $commandId, array $payload): void
     {
         $revision = NetworkSettings::revision((int) ($payload['revision'] ?? 0));
-        $runtime = BrowserProcess::select('bundled', $revision);
+        $lastHeartbeat = 0.0;
+        $runtime = BrowserProcess::select('bundled', $revision, static function (array $event) use (&$lastHeartbeat): void {
+            $now = microtime(true);
+            if ($now - $lastHeartbeat < 5.0) return;
+            BrowserState::heartbeat();
+            $lastHeartbeat = $now;
+        });
         BrowserState::write(['last_error' => null, 'worker_heartbeat' => time()]);
         $this->finishCommand($commandId, [
             'installed' => true,

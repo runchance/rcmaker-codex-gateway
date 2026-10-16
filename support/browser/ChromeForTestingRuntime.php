@@ -13,7 +13,19 @@ final class ChromeForTestingRuntime
     private const CHANNEL = 'Stable';
     private const MAX_MANIFEST_BYTES = 4_000_000;
     private const MAX_ARCHIVE_BYTES = 1_000_000_000;
+    private const DOWNLOAD_TIMEOUT_SECONDS = 7200;
+    private const DOWNLOAD_STALL_SECONDS = 120;
     private const INTEGRITY_FILE = '.rcmaker-integrity.json';
+
+    /**
+     * Share the install command's observation budget with the console; download and stall limits stay independent.
+     * @return int Seconds covering download, lock, manifest, publication and a ten-minute local verification margin.
+     */
+    public static function installWaitTimeoutSeconds(): int
+    {
+        return self::DOWNLOAD_TIMEOUT_SECONDS + (int) Config::get('gateway', 'browser_runtime_lock_timeout_seconds')
+            + 30 + (int) Config::get('gateway', 'browser_runtime_publish_timeout_seconds') + 600;
+    }
 
     /** @return array{os:string,arch:string,cft_platform:?string} */
     public static function platform(): array
@@ -300,6 +312,7 @@ final class ChromeForTestingRuntime
         } finally { $client->close(); }
     }
 
+    /** Download atomically with independent connection, stalled-transfer and total limits; report byte progress even without a total. */
     private static function download(array $revision, string $url, string $archive, array $platform, ?callable $progress): void
     {
         $part = $archive . '.part';
@@ -314,16 +327,22 @@ final class ChromeForTestingRuntime
         $file = @fopen($part, 'wb');
         if ($file === false) self::fail('BROWSER_RUNTIME_DOWNLOAD_FAILED', '无法创建浏览器下载临时文件。', $platform, 'downloading');
         $client = null; $lastPercent = -1; $completed = false;
+        $startedAt = microtime(true); $lastProgressAt = 0.0; $receivedBytes = 0;
         try {
             $client = curl();
-            NetworkTransport::configure($client, $revision, $url, 900, 15, false);
+            NetworkTransport::configure($client, $revision, $url, self::DOWNLOAD_TIMEOUT_SECONDS, 15, false);
+            $client->setOpt(CURLOPT_LOW_SPEED_LIMIT, 1);
+            $client->setOpt(CURLOPT_LOW_SPEED_TIME, self::DOWNLOAD_STALL_SECONDS);
             $client->setFile($file);
-            $client->progress(function ($resource, $total, $downloaded) use ($progress, $platform, &$lastPercent) {
+            $client->progress(function ($resource, $total, $downloaded) use ($progress, $platform, &$lastPercent, &$lastProgressAt, &$receivedBytes) {
+                $receivedBytes = (int) $downloaded;
                 if ($downloaded > self::MAX_ARCHIVE_BYTES || ($total > 0 && $total > self::MAX_ARCHIVE_BYTES)) return 1;
                 $percent = $total > 0 ? min(100.0, ($downloaded / $total) * 100) : null;
                 $bucket = $percent === null ? -1 : (int) floor($percent);
-                if ($bucket !== $lastPercent) {
+                $now = microtime(true);
+                if ($bucket !== $lastPercent || $now - $lastProgressAt >= 2.0) {
                     $lastPercent = $bucket;
+                    $lastProgressAt = $now;
                     self::emit($progress, ['stage' => 'downloading', 'downloaded' => (int) $downloaded, 'total' => (int) $total, 'percent' => $percent] + $platform);
                 }
                 return 0;
@@ -331,7 +350,11 @@ final class ChromeForTestingRuntime
             self::log('download started', $platform);
             $client->get($url);
             $errno = (int) $client->curlErrorCode; $http = (int) $client->httpStatusCode;
-            if ($errno !== 0 || $http !== 200) self::fail('BROWSER_RUNTIME_DOWNLOAD_FAILED', 'Chrome for Testing 下载失败；请检查当前网络配置。', $platform, 'downloading');
+            if ($errno !== 0 || $http !== 200) {
+                self::log('download failed errno=' . $errno . ' http=' . $http . ' downloaded_bytes=' . $receivedBytes
+                    . ' elapsed_seconds=' . (int) (microtime(true) - $startedAt), $platform);
+                self::fail('BROWSER_RUNTIME_DOWNLOAD_FAILED', 'Chrome for Testing 下载失败；请检查当前网络配置。', $platform, 'downloading');
+            }
             $completed = true;
         } finally {
             if ($client !== null) $client->close();

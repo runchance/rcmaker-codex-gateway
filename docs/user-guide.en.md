@@ -200,6 +200,8 @@ The screenshot port is illustrative. Use your own proxy's port.
 
 Select **Prepare runtime components → Start preparation** and wait for private Chrome and the tool tunnel components. Configure networking before downloading components.
 
+The browser archive download allows up to two hours in total; connecting is limited to 15 seconds, and a transfer below one byte per second for two minutes fails early. The console follows the backend installation budget and observes the same command. Reaching 60% does not trigger a timeout. Slow transfers keep the worker heartbeat active, including when the server does not provide a total file size. Failed partial downloads are removed; check the error and network settings before retrying.
+
 **Success:** the Runtime card reports ready. If a download fails, inspect networking, disk space and the exact error before continuing; creating another connector does not repair missing components.
 
 <details>
@@ -417,6 +419,8 @@ New requests use saved changes. Already-started work retains its budget and wait
 ### Context parts, compaction and Pro
 
 **Multipart delivery** sends longer history in batches. **Compaction** creates a summary for subsequent work. Both can add waiting time without implying failure. History includes instructions, skills and tool results, not just the few messages you typed.
+
+While waiting for a native tool result, a normal tool-round transition does not end the wait. Before reporting that the wait scope changed, the gateway rechecks the exact call and current turn in one short transaction. An already saved result remains usable without executing the tool again or claiming that the Web page has received it. Actual cancellation, invalid ownership and unknown results retain their existing safeguards.
 
 Instructions to pause tools and submit only a summary apply to that compaction operation. The next ordinary request labels the summary as handoff data and asks the model to continue the original human task's remaining steps while preserving completed results and exact tool receipts. Genuine user pauses, cancellations and approval requirements remain in force.
 

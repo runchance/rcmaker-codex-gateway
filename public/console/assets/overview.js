@@ -386,7 +386,17 @@
     async function browserCommand(path, body, timeoutMs, pollIntervalMs = 100) {
         const queued = await Gateway.request(path, body || {});
         if (path === '/api/browser/profile/reset' && queued?.id && Gateway.notifyStateChange) Gateway.notifyStateChange('profile-reset-started');
-        if (queued && queued.id) return waitBrowserCommand(queued.id, timeoutMs, pollIntervalMs);
+        if (queued && queued.id) {
+            if (path === '/api/browser/install') {
+                // Installation includes a large download. Follow its backend budget rather than
+                // announcing failure at ten minutes while the same command is still downloading.
+                const seconds = Number(queued.wait_timeout_seconds);
+                timeoutMs = Math.max(timeoutMs, Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 86400
+                    ? seconds * 1000 : 20 * 60 * 1000);
+                pollIntervalMs = Math.max(pollIntervalMs, 500);
+            }
+            return waitBrowserCommand(queued.id, timeoutMs, pollIntervalMs);
+        }
         if (path === '/api/browser/login' && queued && queued.status === 'starting') {
             // A worker reattachment may have no live start command. Observe it without issuing
             // another login/navigation operation or announcing the page ready prematurely.

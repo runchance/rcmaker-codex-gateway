@@ -49,13 +49,20 @@ final class BrowserProcess
         ]];
     }
 
-    /** Resolve only the project-private Runtime. System browsers are never part of the product runtime chain. */
-    public static function select(string $preference, ?array $revision = null): array
+    /**
+     * Resolve only the project-private Runtime. System browsers are never inspected.
+     * @param string $preference Existing auto/bundled selection.
+     * @param array|null $revision Saved immutable network revision; null permits installed files only.
+     * @param callable|null $progress Optional installer observer, forwarded without changing route or verification.
+     * @return array Verified runtime metadata.
+     * @throws GatewayError When selection, installation or verification fails.
+     */
+    public static function select(string $preference, ?array $revision = null, ?callable $progress = null): array
     {
         if (!in_array($preference, ['auto', 'bundled'], true)) {
             throw new GatewayError('BROWSER_RUNTIME_PRIVATE_ONLY', '当前单机版只允许使用项目私有 Chrome for Testing Runtime。', 422);
         }
-        if ($revision !== null) return self::ensureBundled($revision);
+        if ($revision !== null) return self::ensureBundled($revision, $progress);
         $installed = ChromeForTestingRuntime::installed();
         if ($installed !== null) return $installed;
         throw new GatewayError('BROWSER_NOT_FOUND', '项目私有 Chrome for Testing Runtime 尚未安装。', 422);
@@ -244,10 +251,13 @@ final class BrowserProcess
         }
         return $environment;
     }
-    private static function ensureBundled(array $revision): array
+    /** Preserve bounded terminal logging while forwarding installer observations to the owning worker. */
+    private static function ensureBundled(array $revision, ?callable $progress = null): array
     {
         $lastPercent = -1;
-        $runtime = ChromeForTestingRuntime::ensure($revision, static function (array $event) use (&$lastPercent): void {
+        $lastStage = '';
+        $runtime = ChromeForTestingRuntime::ensure($revision, static function (array $event) use (&$lastPercent, &$lastStage, $progress): void {
+            if ($progress !== null) $progress($event);
             $stage = (string) ($event['stage'] ?? 'unknown');
             $percent = isset($event['percent']) && is_numeric($event['percent']) ? (int) floor((float) $event['percent']) : null;
             if ($stage === 'downloading' && $percent !== null) {
@@ -256,7 +266,8 @@ final class BrowserProcess
                 error_log('[browser-runtime] download progress percent=' . $percent);
                 return;
             }
-            error_log('[browser-runtime] stage=' . $stage);
+            if ($stage !== $lastStage) error_log('[browser-runtime] stage=' . $stage);
+            $lastStage = $stage;
         });
         error_log('[browser] selected provider=bundled kind=chrome version=' . ($runtime['version'] ?? 'unknown'));
         return $runtime;

@@ -1353,7 +1353,7 @@ final class ToolBroker
      * @param bool $nativeHostWait Once delivered, defer to the pinned outer turn deadline, without renewing it.
      * @param int|null $transportPollMs Return pending within this RPC slice without cancelling native work.
      * @return array Exact native output and role-preserving updates, or an owned pending call identity.
-     * @throws GatewayError On cancellation, an uncertain outcome, or the applicable deadline.
+     * @throws GatewayError On cancellation, an uncertain outcome, a confirmed lost scope, or the applicable deadline.
      */
     public static function waitResult(string $token, string $callId, int $timeoutMs, bool $nativeHostWait = false,
         ?int $transportPollMs = null): array
@@ -1366,6 +1366,35 @@ final class ToolBroker
         $transportDeadline = $transportPollMs === null ? null : microtime(true) + $transportPollMs / 1000;
         do {
             [$binding, $row, $retiredReceipt] = self::receiptForTokenUnlocked($token, $callId);
+            $turn = null;
+            $liveTurn = false;
+            if ($nativeHostWait && !$retiredReceipt && (string) $binding['status'] !== 'revoked'
+                && ((string) $row['status'] === 'delivered'
+                    || ($transportDeadline !== null && (string) $row['status'] === 'registered'))) {
+                $turn = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
+                $liveTurn = self::nativeWaitTurnIsLive($binding, $turn);
+                if ($transportDeadline !== null && !$liveTurn) {
+                    // A native receipt can atomically advance the binding/turn between these
+                    // independent reads. Confirm a lost scope against one locked snapshot;
+                    // never close its Web wait from an old pending row and a new turn.
+                    [$binding, $row, $retiredReceipt, $turn, $liveTurn] = Schema::transaction(
+                        static function () use ($token, $callId): array {
+                            [$binding, $row, $retiredReceipt] = self::receiptForTokenUnlocked($token, $callId);
+                            $turn = null;
+                            $liveTurn = false;
+                            if (!$retiredReceipt && (string) $binding['status'] !== 'revoked'
+                                && in_array((string) $row['status'], ['registered', 'delivered'], true)) {
+                                $turn = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
+                                $liveTurn = self::nativeWaitTurnIsLive($binding, $turn);
+                                if (!$liveTurn) {
+                                    throw new GatewayError('tool_wait_scope_changed', '工具等待所属回合已结束或发生变化，未重新发起调用。', 409);
+                                }
+                            }
+                            return [$binding, $row, $retiredReceipt, $turn, $liveTurn];
+                        }
+                    );
+                }
+            }
             if (!$retiredReceipt && (string) $binding['status'] === 'revoked') {
                 throw new GatewayError('mcp_capability_revoked', '工具能力已经撤销。', 409);
             }
@@ -1395,13 +1424,6 @@ final class ToolBroker
                 // Codex owns tool execution and approval. Delivery alone cannot tell whether
                 // it is running or waiting for the human. Observe the existing turn lifetime,
                 // rather than revoking its capability at the short MCP dispatch deadline.
-                $turn = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
-                $liveTurn = self::nativeWaitTurnIsLive($binding, $turn);
-                if ($transportDeadline !== null && !$liveTurn) {
-                    // A receipt already settled above remains readable. Pending work must
-                    // still belong to the exact active turn; polling never revives a closed one.
-                    throw new GatewayError('tool_wait_scope_changed', '工具等待所属回合已结束或发生变化，未重新发起调用。', 409);
-                }
                 if ($liveTurn) {
                     $deadline = (float) min((int) $turn['deadline_at'], (int) $binding['expires_at']);
                     if ((string) $row['status'] === 'registered') {
