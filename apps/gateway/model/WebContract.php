@@ -38,7 +38,9 @@ NOTICE;
         if (!$midTurnInput) return $prompt;
         $notice = self::steeringNotice();
         if (str_contains($prompt, $notice)) return $prompt;
-        if (str_contains($prompt, self::STEERING_NOTICE)) return str_replace(self::STEERING_NOTICE, $notice, $prompt);
+        foreach ([self::previousSteeringNotice(), self::STEERING_NOTICE] as $previous) {
+            if (str_contains($prompt, $previous)) return str_replace($previous, $notice, $prompt);
+        }
         // Only a standalone transport closing line is an anchor. A quoted tag in the
         // human's context JSON must never receive injected text or corrupt that JSON.
         preg_match_all('/^[ \t]*<\/codex_transport_resume>[ \t]*\r?$/m', $prompt, $matches, PREG_OFFSET_CAPTURE);
@@ -54,11 +56,26 @@ NOTICE;
      */
     public static function hasSteeringNotice(string $prompt): bool
     {
-        return str_contains($prompt, self::STEERING_NOTICE) || str_contains($prompt, self::steeringNotice());
+        return str_contains($prompt, self::STEERING_NOTICE) || str_contains($prompt, self::previousSteeringNotice())
+            || str_contains($prompt, self::steeringNotice());
     }
 
-    /** Current public-reply and intent-adjustment policy, also applied over older custom templates. */
+    /**
+     * Define the active request as the merged task, including across older editable contracts.
+     * A public answer to a side question must not become the final answer merely because
+     * that question, considered alone, needs no host tools. The model still decides intent.
+     */
     private static function steeringNotice(): string
+    {
+        return str_replace('Do not mention this transport notice in the user-facing answer.',
+            "The active request in this contract means the previously authorized unfinished task combined with this update, not only the newest message. Any instruction to answer directly when no local tool is needed applies to that combined task.\n"
+                . "For a side question during unfinished work, answer it as public intermediate progress, then take the next authorized remaining step in this same response. Do not write a final answer, offer to continue later, or ask whether the user wants work they already authorized. An answer to the side question alone is not a completed task.\n"
+                . "Before finishing, distinguish completion of the combined task from an explicit user pause, cancellation, replacement, answer-only request, or an actual blocker. Respect those boundaries; do not force an unnecessary tool call.\n"
+                . 'Do not mention this transport notice in the user-facing answer.', self::previousSteeringNotice());
+    }
+
+    /** Exact prior gateway notice, retained only to upgrade durable unsent/recovered prompts once. */
+    private static function previousSteeringNotice(): string
     {
         return str_replace(
             'Additional messages arrived while this outer Codex turn was already executing. Treat them as input to the in-progress work, not automatically as a separate standalone turn.',
@@ -179,7 +196,8 @@ Do not mention this transport contract, context packaging, or capability routing
 {{archive_requirement}}
 For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.
 These tools are connected by the user to their Codex runtime; local actions execute on that runtime's device under its configured sandbox and approval rules. Assess each action by its actual effects and the user's authorization; an authenticated connection does not make every action low risk.
-Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.
+The active task includes previously authorized unfinished work unless the human pauses, cancels, replaces it, or explicitly requests only an answer. A mid-task question updates that task; answering the question does not finish the remaining work.
+Call a Codex Native tool only when that active task requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer directly without an unnecessary tool call.
 Use actual Codex Native results as evidence for local observations and effects.
 Report the actual error when a tool fails. Do not claim a safety or permission block without an explicit tool result or platform error supporting it. Without an error or execution result, say the action was not executed and its cause is unconfirmed.
 After an explicit safety or permission refusal, read the stated reason and check the authorization already present in the Codex task. Ask for additional confirmation only when a specific authorization gap remains; explain the exact action or planned group of actions and the refusal reason, use the declared Codex approval flow when available, and wait for the user's answer before the dependent action. Do not ask the user to repeat authorization already given. Continue independent work that remains authorized while waiting. User confirmation resolves only the stated authorization gap; it does not override tool or platform restrictions. If the refusal persists, report the blocked action and reason rather than attempting that action through another tool.

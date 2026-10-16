@@ -2199,10 +2199,10 @@ final class TaskLedger
 
     /**
      * Choose recovery for a stopped ordinary task page after host/MCP work has drained.
-     * Completed host work requires the existing exact-receipt fresh-page recovery, never
-     * native regeneration with unproven history. This decision alone does not rotate a page
-     * or token: the recovery transaction must recheck receipts and ownership. With no completed
-     * work, the intent and page-local latch bound native Retry after lost acknowledgements.
+     * Completed host work can reserve a bounded same-page continuation when every receipt
+     * was delivered; otherwise it requires exact-receipt fresh-page recovery. Native Retry
+     * remains limited to tasks without completed host work. Terminal historical bindings
+     * with no active RPC cannot keep an unrelated current turn waiting indefinitely.
      * @param string $responseId Current logical ordinary Responses round.
      * @param string $incarnation Browser worker owning the exact surface.
      * @param int $fence Surface ownership version.
@@ -2210,16 +2210,18 @@ final class TaskLedger
      * @param string $failureKey SHA-256 of the observed native error-card identity.
      * @param bool $nativeControlAvailable Whether the observed native Retry can be clicked now.
      * A disabled button cannot reserve a click or prevent receipt-based page recovery.
-     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool}
+     * @param bool $preferSamePage Caller proved a stopped, owned page with a returned Send button.
+     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool,continue?:bool,marker?:string,deadline_at?:int}
      * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
      */
     public static function reserveTaskNetworkRetry(string $responseId, string $incarnation,
-        int $fence, string $documentNonce, string $failureKey, bool $nativeControlAvailable = true): array
+        int $fence, string $documentNonce, string $failureKey, bool $nativeControlAvailable = true,
+        bool $preferSamePage = false): array
     {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $failureKey) !== 1) {
             throw new GatewayError('task_network_retry_invalid', '网页网络重试标识无效。', 400);
         }
-        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey, $nativeControlAvailable): array {
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey, $nativeControlAvailable, $preferSamePage): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
@@ -2251,6 +2253,8 @@ final class TaskLedger
             }
             $waiting = false;
             $hasCompletedWork = false;
+            $currentCompletedCalls = 0;
+            $allReceiptsDelivered = true;
             $closedWaitFailure = null;
             foreach ($calls as $call) {
                 if ($call['status'] === 'unknown') {
@@ -2264,7 +2268,9 @@ final class TaskLedger
                 }
                 if (in_array($call['status'], ['registered','delivered'], true)) $waiting = true;
                 if ($call['status'] === 'completed') $hasCompletedWork = true;
+                if ($call['status'] === 'completed' && $call['binding_id'] === ($binding['id'] ?? null)) $currentCompletedCalls++;
                 if ($call['status'] === 'completed' && ($call['result_delivered_at'] === null || $call['result_json'] === null)) {
+                    $allReceiptsDelivered = false;
                     $closedWaitFailure ??= ToolBroker::settledWaitTransportFailureForResponse($responseId);
                     if ($call['binding_id'] === ($binding['id'] ?? null)
                         && $closedWaitFailure === 'tool_wait_scope_changed' && $call['result_json'] !== null) {
@@ -2278,10 +2284,25 @@ final class TaskLedger
             foreach ($bindings as $candidate) {
                 $active = $db->table('gateway_mcp_activities')->where('binding_id', $candidate['id'])->where('status', 'active')->count();
                 if (!is_numeric($active)) throw new GatewayError('storage_unavailable', '网页重试的 MCP 活动状态暂不可读取。', 503);
-                if ((int)$active > 0 || ($candidate['id'] !== ($binding['id'] ?? null)
-                    && in_array($candidate['status'], ['awaiting_start','running'], true))) $waiting = true;
+                if ((int)$active > 0) $waiting = true;
+                if ($candidate['id'] !== ($binding['id'] ?? null)
+                    && in_array($candidate['status'], ['awaiting_start','running'], true)) {
+                    $priorTurn = $db->table('gateway_task_turns')->where('id', $candidate['turn_id'])->find('status,task_id');
+                    $priorJob = $db->table('gateway_response_jobs')->where('id', $candidate['current_response_id'])->find('status,task_id,durable_turn_id');
+                    // Failed uploads in old databases can leave an unused binding awaiting_start.
+                    // Ignore only a conclusively terminal owner; active RPCs/calls above still block.
+                    if (!is_array($priorTurn) || !is_array($priorJob)
+                        || $priorTurn['task_id'] !== $job['task_id'] || $priorJob['task_id'] !== $job['task_id']
+                        || $priorJob['durable_turn_id'] !== $candidate['turn_id']
+                        || !in_array($priorTurn['status'], ['committed','failed','cancelled'], true)
+                        || !in_array($priorJob['status'], ['completed','failed','cancelled'], true)) $waiting = true;
+                }
             }
             if ($waiting) return array_replace($idle, ['waiting'=>true]);
+            if ($preferSamePage && $allReceiptsDelivered && $currentCompletedCalls > 0) {
+                return self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
+                    $failureKey, $currentCompletedCalls, $idle);
+            }
             if ($hasCompletedWork) return array_replace($idle, ['recover'=>true]);
             if (!$nativeControlAvailable) return $idle;
             $events = $db->table('gateway_task_events')->where('turn_id', $turn['id'])
@@ -2300,6 +2321,46 @@ final class TaskLedger
                     'document_nonce'=>$documentNonce,'operation_kind'=>'response']);
             return array_replace($idle, ['retry'=>true,'attempt'=>$attempts+1]);
         });
+    }
+
+    /**
+     * Reserve one control-only continuation after the caller's writer transaction proved a
+     * stopped stream and fully delivered native work. The existing durable marker prevents
+     * duplicate sends after lost acknowledgements/restarts; neither page nor token is rotated.
+     * @param array $job Current ordinary response, $turn/$surface its fenced active owner.
+     * @param array $binding Drained current tool capability, never a historical binding.
+     * @param string $failureKey Hash of the owned failed-stream identity.
+     * @param int $hostCalls Number of completed calls on this capability.
+     * @param array $idle Default retry projection returned for a duplicate or exhausted intent.
+     * @return array Retry projection with the reserved continuation marker or bounded wait.
+     */
+    private static function reserveStreamContinuationUnlocked(array $job, array $turn, array $surface,
+        array $binding, string $failureKey, int $hostCalls, array $idle): array
+    {
+        $previous = self::continuationStateUnlocked((string)$turn['id']);
+        if (!empty($previous['pending']) || ($previous['answer_hash'] ?? '') === $failureKey) {
+            return array_replace($idle, ['waiting'=>true]);
+        }
+        $attempt = (int)($previous['attempt'] ?? 0) + 1;
+        // Older releases used these markers for ordinary unfinished-work follow-ups.
+        // Preserve their marker sequence without counting them as failed-stream retries.
+        $streamAttempt = ($previous['reason'] ?? '') === 'stream_recovery'
+            ? (int)($previous['stream_recovery_attempt'] ?? 0) + 1 : 1;
+        if ($streamAttempt > 3) return array_replace($idle, ['exhausted'=>true,'attempt'=>3]);
+        $marker = 'RCMAKER-CONTINUE-' . substr(hash('sha256', (string)$turn['id'] . "\0" . $attempt), 0, 16);
+        $budget = json_decode((string)$job['budget_json'], true);
+        $deadline = max((int)$turn['deadline_at'], time() + (int)($budget['response_timeout_seconds'] ?? 600));
+        $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $turn['id'])
+            ->where('status', $turn['status'])->update(['deadline_at'=>$deadline,'updated_at'=>time()]);
+        if (!$updated || $updated->rowCount() !== 1) {
+            throw new GatewayError('storage_unavailable', '网页续做截止时间无法保存。', 503);
+        }
+        self::eventUnlocked($job['task_id'], $turn['id'], $job['id'], $surface['id'], 'task_continuation_intent', [
+            'attempt'=>$attempt,'stream_recovery_attempt'=>$streamAttempt,'reason'=>'stream_recovery','marker'=>$marker,'answer_hash'=>$failureKey,
+            'activity_revision'=>(int)$binding['activity_revision'],'host_calls'=>$hostCalls,
+            'no_progress_attempts'=>0,'intent_at'=>time(),'deadline_at'=>$deadline,
+        ]);
+        return array_replace($idle, ['continue'=>true,'marker'=>$marker,'attempt'=>$attempt,'deadline_at'=>$deadline]);
     }
 
     /**

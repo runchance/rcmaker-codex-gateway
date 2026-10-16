@@ -2950,7 +2950,7 @@ final class ToolBroker
             'archive_requirement' => $archiveRequired
                 ? 'Before acting or answering, discover rcmaker.context_read through codex_tool_inventory and call it with codex_tool_call and the current turn_token to verify relevant original records. The bounded working view is incomplete.' : '',
             'read_context_notice' => $readContext
-                ? 'Discover rcmaker.context_read through codex_tool_inventory and invoke it through codex_tool_call for any earlier fact omitted from the bounded working view.' : '',
+                ? 'Multipart ACKs confirm delivery, not continued model recall. Before continuing unfinished work from staged or restored history, discover rcmaker.context_read through codex_tool_inventory and invoke it through codex_tool_call with the current turn_token to verify the actual human goal, relevant completed tool receipts and remaining steps. Search relevant phrases or paginate exact original records when needed; do not guess missing facts or repeat completed effects. A self-contained answer-only question or explicit pause does not require an unrelated history lookup.' : '',
         ]);
         $browserNotice = self::browserToolNotice($hostToolNames, $contextJson);
         if ($browserNotice === '') return $prompt;
@@ -3193,8 +3193,17 @@ final class ToolBroker
         return null;
     }
 
-    /** Build a bounded same-turn follow-up for explicit unfinished work or a completion audit. */
-    public static function continuationPromptForResponse(string $responseId, string $marker, bool $audit = false): string
+    /**
+     * Build a control-only same-turn follow-up without resending history or authorizing new scope.
+     * @param string $responseId Current ordinary native response owning the live capability.
+     * @param string $marker Durable continuation marker reserved by TaskLedger.
+     * @param bool $audit Request an evidence audit of the existing task.
+     * @param bool $streamRecovery Reconcile an explicitly failed stream, respecting human pause/cancellation.
+     * @return string Bounded contract containing exactly the current tool token and continuation intent.
+     * @throws GatewayError If the live binding or its original verified token cannot be recovered.
+     */
+    public static function continuationPromptForResponse(string $responseId, string $marker, bool $audit = false,
+        bool $streamRecovery = false): string
     {
         $job = ResponseJob::execution($responseId);
         $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')
@@ -3215,12 +3224,15 @@ final class ToolBroker
         }
         $tokens = array_values($tokens);
         if (count($tokens) !== 1) throw new GatewayError('continuation_token_missing', '无法核对当前工具令牌，已停止网页续做。', 409);
-        $purpose = $audit
+        $purpose = $streamRecovery
+            ? 'The prior webpage stream timed out after native tools continued working. All accepted host calls and their exact results have now settled. Check the actual latest human goal, including steering instructions, and the confirmed receipts; continue only the remaining authorized work. If the work is already complete, give its verified final answer. If the human paused or cancelled it, acknowledge that and do not resume development. '
+            : ($audit
             ? 'Your preceding answer followed several host-tool calls. Before closing this same Codex turn, audit EVERY outcome requested by the latest human user against actual native tool receipts and verification. If any authorized item is missing, continue implementing and testing it now; if all are complete, give the final answer with concrete evidence. '
-            : 'Your preceding answer explicitly left authorized work unfinished. Continue that original task now in its original workspace and scope. ';
+            : 'Your preceding answer explicitly left authorized work unfinished. Continue that original task now in its original workspace and scope. ');
         return $marker . "\nThis message continues the SAME active Codex user turn. " . $purpose
             . 'Use the attached RCMAKER Connector and current verified native tools; '
             . 'use turn_token ' . $tokens[0] . ' for every Connector call. Inspect prior successful tool receipts before editing; do not repeat already completed or uncertain host effects. '
+            . ($streamRecovery ? 'Use codex_tool_inventory/codex_tool_call to read rcmaker.context_read when prior details or receipts are missing from this page; do not infer missing results from promises. ' : '')
             . 'Finish outstanding implementation and run relevant verification in this turn. Send intermediate visible progress as you work. '
             . 'Do not end with another promise of future work. If a real blocker remains, report its exact evidence and remaining work. '
             . 'Respect any original planning-only or deferred phase boundary. Do not quote this continuation marker to the Codex user.';

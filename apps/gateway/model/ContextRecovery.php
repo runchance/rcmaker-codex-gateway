@@ -246,8 +246,8 @@ final class ContextRecovery
         $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('task_id', $taskId)
             ->where('gateway_response_jobs.model', $spec['model'])->where('reasoning_effort', $spec['reasoning_effort'] ?? null)
-            ->where('status', 'failed')->where('transport_parts_total', 0)->order([['rowid','DESC']])->limit(8)
-            ->select('id,error_json,budget_json,prompt');
+            ->where('status', 'failed')->order([['rowid','DESC']])->limit(8)
+            ->select('id,error_json,budget_json,prompt,transport_parts_total,transport_stage_sent');
         foreach ($rows ?: [] as $row) {
             $error = json_decode((string) $row['error_json'], true);
             $prior = json_decode((string) $row['budget_json'], true);
@@ -258,7 +258,15 @@ final class ContextRecovery
             // an older byte-bound rejection. Actual older turns remain pinned.
             if (($budget['counter'] ?? null) === 'o200k_base_with_bounded_bpe_chunks'
                 && ($prior['counter'] ?? null) !== $budget['counter']) continue;
-            $limits = ['tokens'=>ContextBudget::tokens($row['prompt'], $prior), 'chars'=>mb_strlen($row['prompt'])];
+            $text = (string) $row['prompt'];
+            if ((int) $row['transport_parts_total'] > 1) {
+                $stage = SDB(null, 'medoo', 'sqlite')->table('gateway_web_messages')->where('response_id', $row['id'])
+                    ->where('direction', 'outbound')->where('kind', 'stage')
+                    ->where('stage_no', (int) $row['transport_stage_sent'])->find('text');
+                if (!is_array($stage) || !is_string($stage['text'] ?? null) || $stage['text'] === '') continue;
+                $text = $stage['text'];
+            }
+            $limits = ['tokens'=>ContextBudget::tokens($text, $prior), 'chars'=>mb_strlen($text)];
             foreach ($limits as $unit => $observed) {
                 $limit = max(1, (int) floor($observed * 0.75));
                 foreach (['message_', 'stage_message_', 'stage_fallback_message_'] as $prefix) {
@@ -267,9 +275,35 @@ final class ContextRecovery
                 }
             }
             $budget['message_limit_source_response_id'] = $row['id'];
+            $budget['recovery_import_input_tokens'] = self::rejectedImportInputTokens($row, $prior);
             return $budget;
         }
         return $budget;
+    }
+
+    /**
+     * Derive a smaller fresh-import working view from the actual rejected transaction.
+     * This is a task-local recovery target, not a claim about the account/model context window.
+     * @param array $job Rejected physical submission, already proven inert by the caller for automatic recovery.
+     * @param array $budget Its pinned token counter. @return int Source-text token target; original records remain archived.
+     */
+    private static function rejectedImportInputTokens(array $job, array $budget): int
+    {
+        $tokens = ContextBudget::tokens((string) $job['prompt'], $budget);
+        $messageTokens = $tokens;
+        if ((int) ($job['transport_parts_total'] ?? 0) > 1) {
+            $stages = SDB(null, 'medoo', 'sqlite')->table('gateway_web_messages')->where('response_id', $job['id'])
+                ->where('direction', 'outbound')->where('kind', 'stage')
+                ->where('stage_no', '<=', (int) $job['transport_stage_sent'])->order([['stage_no','ASC']])->select('text');
+            $tokens = 0;
+            foreach ($stages ?: [] as $stage) {
+                $messageTokens = ContextBudget::tokens((string) $stage['text'], $budget);
+                $tokens += $messageTokens;
+            }
+        }
+        // A physical rejection does not identify whether per-message or cumulative
+        // input caused it. Stay below both observed envelopes on the one safe retry.
+        return max(4096, (int) floor(min($tokens * 0.6, $messageTokens * 0.75)));
     }
 
     /** Whether an error belongs to inert context transport rather than the executable commit. */
@@ -335,15 +369,28 @@ final class ContextRecovery
             if ($staging && $code === 'CHATGPT_MESSAGE_TOO_LARGE') {
                 $budget['context_min_parts'] = min((int) $budget['context_max_parts'], (int) $job['transport_parts_total'] + 1);
                 // The observed staging envelope was rejected. Retry with smaller messages,
-                // not the same overlong payload or a larger model fallback.
+                // not the same overlong payload or a larger model fallback. Shrinking a
+                // configured 500k ceiling does not shrink a rejected 90k physical stage.
+                $rejected = $db->table('gateway_web_messages')->where('response_id', $responseId)
+                    ->where('direction', 'outbound')->where('kind', 'stage')
+                    ->where('stage_no', (int) $job['transport_stage_sent'])->find('text');
+                $text = is_array($rejected) ? (string) ($rejected['text'] ?? '') : '';
+                $observed = $text === '' ? []
+                    : ['tokens'=>ContextBudget::tokens($text, $budget), 'chars'=>mb_strlen($text)];
                 foreach (['tokens','chars'] as $unit) {
                     $key = 'stage_message_' . $unit;
-                    $budget[$key] = (int) floor($budget[$key] * 0.75);
+                    $budget[$key] = max(1, (int) floor(min((int) $budget[$key],
+                        (int) ($observed[$unit] ?? $budget[$key])) * 0.75));
                     $budget['stage_fallback_message_' . $unit] = $budget[$key];
                     // Shrinking only staging shifts its discarded load into the executable
                     // final message. A size retry must shrink that envelope too.
                     $budget['message_' . $unit] = min((int) $budget['message_' . $unit], $budget[$key]);
                 }
+                if ($text !== '') $budget['message_limit_rejected_stage'] = [
+                    'response_id'=>$responseId, 'stage'=>(int) $job['transport_stage_sent'],
+                    'chars'=>$observed['chars'], 'tokens'=>$observed['tokens']];
+                $budget['message_limit_source_response_id'] = $job['id'];
+                $budget['recovery_import_input_tokens'] = self::rejectedImportInputTokens($job, $budget);
             }
             // History is recompiled from the durable request; never from whatever text the page shows.
             $rebuildFull = !empty($job['continuation_source_response_id']);
@@ -351,7 +398,26 @@ final class ContextRecovery
                 : ($job['transport_context_json'] ?? $job['context_json'])), true, 128, JSON_THROW_ON_ERROR);
             $canonicalContext = ContextHistory::canonical($context);
             $importedRestore = null;
-            if ($job['operation_kind'] === 'response' && array_key_exists('imported_history_selection', $budget)) {
+            if ($staging && $code === 'CHATGPT_MESSAGE_TOO_LARGE' && $job['operation_kind'] === 'response'
+                && !empty($job['mcp_binding_id'])) {
+                $environment = json_decode((string) $job['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
+                $restore = [
+                    'budget'=>$budget, 'context_json'=>$job['context_json'], 'full_context_json'=>$job['context_json'],
+                    'transport_context_json'=>$job['context_json'], 'model'=>$job['model'],
+                    'reasoning_effort'=>$job['reasoning_effort'] ?? null, 'operation_kind'=>'response',
+                    'browser_lease_key'=>$job['browser_lease_key'], 'checkpoint_marker'=>$job['checkpoint_marker'],
+                    'tool_environment_json'=>$job['tool_environment_json'], 'tool_environment_hash'=>$job['tool_environment_hash'],
+                    'tools'=>$environment['tools'] ?? [], 'tool_choice'=>'auto', 'tool_outputs'=>[],
+                ];
+                $selected = ContextWindow::selectImportedHistory($restore, false, $job, true);
+                if (isset($selected['imported_budget_context_json'])) {
+                    $importedRestore = $selected;
+                    $budget = $selected['budget'];
+                    $canonicalContext = $selected['transport_context_json'];
+                    $context = json_decode($canonicalContext, true, 128, JSON_THROW_ON_ERROR);
+                }
+            }
+            if ($importedRestore === null && $job['operation_kind'] === 'response' && array_key_exists('imported_history_selection', $budget)) {
                 $environment = json_decode((string)$job['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
                 $importedRestore = self::restoreImportedWindow([
                     'budget'=>$budget, 'context_json'=>$job['context_json'], 'full_context_json'=>$job['context_json'],

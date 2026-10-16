@@ -6,6 +6,36 @@ namespace app\gateway\model;
 final class ContextWindow
 {
     /**
+     * Keep original records queryable when normal tool-capable history is staged.
+     * ACKs prove delivery, not model recall. This exposes the existing read-only
+     * capability without adding a host-tool requirement or completion fence.
+     * @param array $spec Normalized response with its immutable full source.
+     * @return array Same messages/tools, with optional task-scoped source access for long history.
+     */
+    public static function exposeMultipartSource(array $spec): array
+    {
+        $budget = (array) ($spec['budget'] ?? []);
+        if ((int) ($budget['version'] ?? 0) < 9 || !empty($spec['tool_outputs'])
+            || ($spec['operation_kind'] ?? 'response') !== 'response' || !self::importReaderAvailable($spec)) return $spec;
+        $original = (string) ($spec['full_context_json'] ?? $spec['context_json']);
+        $staged = mb_strlen($original) > (int) ($budget['soft_message_chars'] ?? 110000);
+        if (!$staged) {
+            try {
+                $physical = (string) ($spec['transport_context_json'] ?? $spec['context_json']);
+                $preview = ToolBroker::previewPromptForBudget($spec, $physical);
+                $staged = \support\browser\ChatGptTransport::plan($preview['prompt'], $budget, $budget,
+                    ['sol_available'=>!empty($budget['sol_available']), 'pro_supported'=>!empty($budget['observed_pro_capacity'])], null,
+                    AttachmentStore::tokenReserve(AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $physical), $budget)) !== null;
+            } catch (GatewayError $error) {
+                if (!in_array($error->errorCode, ['CHATGPT_CONTEXT_TOO_LARGE', 'CHATGPT_MULTIPART_UNAVAILABLE'], true)) throw $error;
+                $staged = true;
+            }
+        }
+        if ($staged) $spec['budget']['imported_original_context_available'] = true;
+        return $spec;
+    }
+
+    /**
      * Keep instructions and user messages verbatim; move old assistant/tool history to the existing
      * task-scoped reader before ChatGPT can silently evict it. No model summary replaces the source.
      * @param array $spec Normalized request, inside the existing reservation transaction.
@@ -150,10 +180,11 @@ final class ContextWindow
      * @param array $spec Prepared request with its pinned model budget and complete readable history.
      * @param bool $noGatewayHistory Caller proved this task has no local history or live epoch.
      * @param ?array $prior Owned local response carrying the persisted selection and original archive.
+     * @param bool $verifiedInertRecovery Only ContextRecovery may set this after proving no executable commit/tool effects.
      * @return array Request with selected transport and imported_budget_context_json for logical usage.
      * @throws GatewayError If the current request/instructions or their atomic tool block cannot fit.
      */
-    public static function selectImportedHistory(array $spec, bool $noGatewayHistory, ?array $prior = null): array
+    public static function selectImportedHistory(array $spec, bool $noGatewayHistory, ?array $prior = null, bool $verifiedInertRecovery = false): array
     {
         $budget = (array) ($spec['budget'] ?? []);
         if ((int) ($budget['version'] ?? 0) < 5 || ($spec['operation_kind'] ?? 'response') !== 'response'
@@ -167,6 +198,29 @@ final class ContextWindow
         $receiptOrSteering = (array) ($spec['tool_outputs'] ?? []) !== [] || !empty($spec['steering_restart'])
             || (array) ($spec['steering_messages'] ?? []) !== [] || !empty($spec['operational_context_source_response_id']);
         $reader = self::importReaderAvailable($spec);
+        $recoverySource = $prior;
+        if (is_array($prior) && !empty($budget['message_limit_source_response_id'])
+            && $budget['message_limit_source_response_id'] !== $prior['id']) {
+            // An older gateway could replace the size error with a stale ACK error.
+            // Resolve only its same-task/model original failure, never another task's limit.
+            $recoverySource = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+                ->where('id', $budget['message_limit_source_response_id'])->where('task_id', $prior['task_id'])
+                ->where('gateway_response_jobs.model', $spec['model'])->find('id,status,error_json');
+        }
+        $priorError = is_array($recoverySource) ? json_decode((string) ($recoverySource['error_json'] ?? ''), true) : null;
+        $recoveryInput = (int) ($budget['recovery_import_input_tokens'] ?? 0);
+        $sizeRecovery = $reader && !$receiptOrSteering && $recoveryInput > 0 && is_array($recoverySource)
+            && ($budget['message_limit_source_response_id'] ?? null) === $recoverySource['id']
+            && ($verifiedInertRecovery || (($recoverySource['status'] ?? null) === 'failed'
+                && ($priorError['error']['code'] ?? null) === 'CHATGPT_MESSAGE_TOO_LARGE'));
+        if ($sizeRecovery) {
+            // Re-import only after a proven size failure, preserving all current instructions,
+            // human requirements and whole native call/result blocks. The full source remains
+            // the archive; this is never applied to a live receipt or retained-page steering.
+            $selection = null;
+            unset($spec['budget']['imported_history_selection'], $spec['budget']['context_min_parts']);
+            $budget = $spec['budget'];
+        }
 
         if (is_array($selection)) {
             $alreadySelected = isset($spec['imported_budget_context_json']);
@@ -198,14 +252,33 @@ final class ContextWindow
             return $spec;
         }
 
-        if (!$noGatewayHistory || $receiptOrSteering || !empty($spec['input_is_delta'])
-            || !empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
-            || !empty($spec['verified_compaction_source']) || isset($context['continuation'])) return $spec;
+        if ((!$noGatewayHistory && !$sizeRecovery) || $receiptOrSteering || !empty($spec['input_is_delta'])
+            || (!$sizeRecovery && (!empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
+                || isset($context['continuation']))) || !empty($spec['verified_compaction_source'])) return $spec;
         $reserve = (int) $budget['contract_reserve_tokens'] + (int) $budget['output_reserve_tokens'];
         $capacity = min((int)$budget['context_tokens'], (int)($budget['browser_context_tokens'] ?? $budget['context_tokens'])) - $reserve;
+        $logicalCapacity = $capacity;
+        if ($sizeRecovery) $capacity = min($capacity, $recoveryInput);
         $originalAttachments = AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $original, false);
-        if (ContextBudget::tokens($original, $budget) + AttachmentStore::tokenReserve($originalAttachments, $budget) <= $capacity) return $spec;
+        if (ContextBudget::tokens($original, $budget) + AttachmentStore::tokenReserve($originalAttachments, $budget) <= $capacity) {
+            // Raw JSON fitting is insufficient: the real control contract, multipart
+            // envelopes and ACK reserves must also fit before skipping import selection.
+            try {
+                $preview = ToolBroker::previewPromptForBudget($spec, $original);
+                \support\browser\ChatGptTransport::plan($preview['prompt'], $budget, $budget,
+                    ['sol_available'=>!empty($budget['sol_available']), 'pro_supported'=>!empty($budget['observed_pro_capacity'])], null,
+                    AttachmentStore::tokenReserve(AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $original), $budget));
+                return $spec;
+            } catch (GatewayError $error) {
+                if (!in_array($error->errorCode, ['CHATGPT_CONTEXT_TOO_LARGE', 'CHATGPT_MULTIPART_UNAVAILABLE'], true)) throw $error;
+            }
+        }
         $protected = self::importProtectedIndices($messages);
+        if ($sizeRecovery) {
+            foreach ($messages as $index => $message) {
+                if (($message['role'] ?? null) === 'user') $protected[$index] = true;
+            }
+        }
         if ($protected === []) return $spec;
         [$blocks, $unsafe] = self::importAtomicBlocks($messages);
         $mandatory = [];
@@ -232,8 +305,21 @@ final class ContextWindow
             ksort($kept);
             return self::importProjection($context, array_keys($kept), hash('sha256', $original), $reader);
         };
+        if ($sizeRecovery) {
+            // The observed envelope is a recovery preference, not permission to
+            // reject or cut current instructions. Keep the mandatory atomic view
+            // even when it alone exceeds that preference, within the real window.
+            $minimum = ContextHistory::canonical($project(count($blocks)));
+            $minimumTokens = ContextBudget::tokens($minimum, $budget) + AttachmentStore::tokenReserve(
+                AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $minimum, false), $budget);
+            $capacity = min($logicalCapacity, max($capacity, $minimumTokens + 1024));
+        }
         $previewSpec = $spec;
         $previewSpec['budget']['imported_original_context_available'] = $reader;
+        if ($sizeRecovery) {
+            $previewSpec['budget']['original_context_required'] = true;
+            $previewSpec['budget']['original_context_sha256'] = hash('sha256', $original);
+        }
         // This temporary marker scopes the planner's internal ID; the final persisted
         // selection below records the actual complete source and selected indices.
         $previewSpec['budget']['imported_history_selection'] = ['version'=>1];
@@ -259,7 +345,8 @@ final class ContextWindow
             }
         };
         if (!$fits($project(count($blocks)))) {
-            throw new GatewayError('context_length_exceeded', '当前需求、附件和系统/开发者指令本身已超过预算；未截断正文或移除指令。', 400);
+            throw new GatewayError($sizeRecovery ? 'CHATGPT_CONTEXT_TOO_LARGE' : 'context_length_exceeded',
+                '当前需求、附件和系统/开发者指令本身已超过预算；未截断正文或移除指令。', 400);
         }
         // Find the earliest fitting atomic boundary, including the existing physical planner,
         // instead of recounting every historical prefix or changing the account's stage modes.
@@ -276,6 +363,10 @@ final class ContextWindow
             'selected_message_indices' => $projected['original_context']['working_message_indices']];
         $spec['budget']['imported_history_selection'] = $selection;
         $spec['budget']['imported_original_context_available'] = $reader;
+        if ($sizeRecovery) {
+            $spec['budget']['original_context_required'] = true;
+            $spec['budget']['original_context_sha256'] = hash('sha256', $original);
+        }
         $spec['budget']['imported_transport_transaction_id'] = $previewSpec['budget']['imported_transport_transaction_id'];
         if ($previewToken !== null) $spec['imported_prompt_turn_token'] = $previewToken;
         $spec['full_context_json'] = $original;

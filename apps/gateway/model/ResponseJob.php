@@ -182,6 +182,7 @@ final class ResponseJob
                     // will use; generating it after selection would enlarge the prompt.
                     $spec['checkpoint_marker'] = LunaCheckpoint::marker($spec);
                 }
+                $spec = ContextWindow::exposeMultipartSource($spec);
                 $spec = ContextWindow::selectImportedHistory($spec, $noGatewayHistory, is_array($historyJob) ? $historyJob : null);
                 if (!empty($spec['steering_restart']) && isset($spec['imported_budget_context_json'])) {
                     // Steering starts a fresh physical page. Carry the verified selected
@@ -561,6 +562,18 @@ final class ResponseJob
         $events = [];
         foreach ($rows as $row) {
             $event = json_decode((string) $row['event_json'], true, 64, JSON_THROW_ON_ERROR);
+            // Older versions persisted a physical Web upload failure under Codex's
+            // logical overflow code. Repair only that projection on replay, using the
+            // original failure ledger; neither the stored event nor history is edited.
+            if (($event['type'] ?? null) === 'response.failed'
+                && ($event['response']['error']['code'] ?? null) === 'context_length_exceeded') {
+                $failed = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+                    ->where('id', $responseId)->find('error_json');
+                $original = is_array($failed) ? json_decode((string) ($failed['error_json'] ?? ''), true) : null;
+                if (in_array($original['error']['code'] ?? null, ['CHATGPT_MESSAGE_TOO_LARGE', 'CHATGPT_CONTEXT_TOO_LARGE'], true)) {
+                    $event['response']['error'] = ResponsesProtocol::clientFailure($original)['body']['error'];
+                }
+            }
             if (is_array($event)) $events[] = $event;
         }
         return $events;

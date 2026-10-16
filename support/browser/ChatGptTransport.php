@@ -683,6 +683,12 @@ final class ChatGptTransport
         // This is only a transport choice: records remain exact, and the selected model
         // and effort still own the final execution message.
         $softSingleLimit = max(12000, intdiv((int) ($budget['base_compact_tokens'] ?? $budget['message_tokens']), 2));
+        // Connector-bearing Web messages can reject far below the model's token
+        // window. New snapshots prefer the verified conservative text envelope;
+        // pinned old transactions and complete indivisible records remain exact.
+        $softMessageChars = (int) ($budget['version'] ?? 0) >= 9 ? (int) ($budget['soft_message_chars'] ?? 0) : 0;
+        $editorStageChars = $softMessageChars > 0 ? min(self::MAX_EDITOR_STAGE_CHARS, $softMessageChars)
+            : self::MAX_EDITOR_STAGE_CHARS;
         $freeInitialInline = $freshFreeConversation && (int) ($budget['version'] ?? 0) >= 8
             && ($capabilities['account_plan'] ?? '') === 'free' && ($budget['account_plan'] ?? '') === 'free'
             && in_array($budget['model'] ?? '', ['chatgpt-web/luna', 'chatgpt-web/think'], true)
@@ -691,7 +697,8 @@ final class ChatGptTransport
         $preferStaging = (int) ($budget['version'] ?? 1) >= 5
             && ($settings['context_transport'] ?? 'auto') === 'auto'
             && $maximum >= 2 && (!empty($capabilities['sol_available']) || $lunaMultipart)
-            && $inlineTokens > $softSingleLimit && !$freeInitialInline;
+            && ($inlineTokens > $softSingleLimit
+                || ($softMessageChars > 0 && mb_strlen($prompt) > $softMessageChars)) && !$freeInitialInline;
         $initialParts = 1;
         if ((int) ($budget['version'] ?? 1) < 4 && !empty($budget['context_extended'])) {
             $usage = $inlineTokens + (int) $budget['contract_reserve_tokens'];
@@ -730,7 +737,7 @@ final class ChatGptTransport
             'message_tokens'=>(int)$budget['message_tokens'], 'message_chars'=>(int)$budget['message_chars'],
             'context_tokens'=>(int)$budget['context_tokens'], 'compact_tokens'=>(int)($budget['compact_tokens'] ?? 0),
             'context_multiplier'=>(int)($budget['context_multiplier'] ?? 1),
-            'editor_stage_chars'=>self::MAX_EDITOR_STAGE_CHARS];
+            'editor_stage_chars'=>$editorStageChars];
         $partCandidates = (int) ($budget['version'] ?? 1) === 5 ? [2, 6] : range(2, $maximum);
         foreach ($balanced ? [true] : [false, true] as $allowFallback) {
             foreach ($partCandidates as $parts) {
@@ -769,18 +776,21 @@ final class ChatGptTransport
                     if ($parts === 2) $twoPartStatus = $valid ? 'context_limit' : 'message_limit';
                     continue;
                 }
-                if ($parts === 2) $twoPartStatus = $plan['max_stage_chars'] <= self::MAX_EDITOR_STAGE_CHARS ? 'fits' : 'editor_preference';
+                $candidateChars = $softMessageChars > 0
+                    ? max($plan['max_stage_chars'], mb_strlen($plan['final_text'])) : $plan['max_stage_chars'];
+                if ($parts === 2) $twoPartStatus = $candidateChars <= $editorStageChars ? 'fits' : 'editor_preference';
                 $candidateEvidence = $decision + ['parts'=>$parts, 'two_part_status'=>$twoPartStatus,
                     'max_stage_chars'=>$plan['max_stage_chars'], 'max_stage_tokens'=>$plan['max_stage_tokens'],
                     'reason'=>!empty($budget['compaction_transport']) ? 'compaction_transport'
                         : ($parts > 2 && $twoPartStatus === 'editor_preference' ? 'editor_preference'
                         : ($parts > 2 ? 'partition_limits' : ($preferStaging ? 'soft_inline_threshold' : 'message_limit')))];
                 if ((int) ($budget['version'] ?? 1) < 5
-                    || $plan['max_stage_chars'] <= self::MAX_EDITOR_STAGE_CHARS) {
+                    || $candidateChars <= $editorStageChars) {
                     $decisionEvidence = $candidateEvidence;
                     return $plan;
                 }
-                if ($bestOversize === null || $plan['max_stage_chars'] < $bestOversize['max_stage_chars']) {
+                if ($bestOversize === null || $candidateChars < ($softMessageChars > 0
+                    ? max($bestOversize['max_stage_chars'], mb_strlen($bestOversize['final_text'])) : $bestOversize['max_stage_chars'])) {
                     $bestOversize = $plan;
                     $bestOversizeEvidence = $candidateEvidence;
                 }
@@ -944,9 +954,22 @@ final class ChatGptTransport
      * no record is truncated, split or silently omitted. Proven recovery may stage settled
      * receipts after the active user record, leaving that intent in the commit; original
      * message_index values still reconstruct the exact chronology. Pinned limits make recovery deterministic.
+     * New snapshots first try the conservative physical envelope, then the complete-record fallback.
      */
     private static function partitionBoundedRecords(array $records, int $parts, string $contract, array $budget): array
     {
+        $softChars = (int) ($budget['version'] ?? 0) >= 9 ? (int) ($budget['soft_message_chars'] ?? 0) : 0;
+        if ($softChars > 0) {
+            $preferred = $budget;
+            unset($preferred['soft_message_chars']);
+            foreach (['message_chars', 'stage_message_chars', 'stage_fallback_message_chars'] as $key) {
+                if (isset($preferred[$key])) $preferred[$key] = min((int) $preferred[$key], $softChars);
+            }
+            try { return self::partitionBoundedRecords($records, $parts, $contract, $preferred); }
+            catch (GatewayError $error) {
+                if ($error->errorCode !== 'CHATGPT_CONTEXT_TOO_LARGE') throw $error;
+            }
+        }
         $empty = [];
         for ($i = 0; $i < $parts; $i++) {
             $empty[] = json_encode(['version'=>1,'part_index'=>$i+1,'total_parts'=>$parts,'records'=>[]], JSON_THROW_ON_ERROR);

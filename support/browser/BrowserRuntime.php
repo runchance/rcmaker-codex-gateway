@@ -4273,8 +4273,8 @@ JS;
                 $detail = $reason . (is_array($cleared) ? '_TEXT_' . mb_strlen((string) ($cleared['text'] ?? ''))
                     . '_PILLS_' . (int) ($cleared['connector_count'] ?? 0) : '');
                 if ($attempt < 2) {
-                    Timer::add(0.25, fn() => $this->clearTaskMultipartComposer($responseId, $code, $message,
-                        $after, $attempt + 1, $detail), null, false);
+                    $this->scheduleMultipartOperation($responseId, fn() => $this->clearTaskMultipartComposer(
+                        $responseId, $code, $message, $after, $attempt + 1, $detail), 0.25);
                     return;
                 }
                 // ChatGPT's controlled editor can reject a DOM selection after a remount.
@@ -4297,8 +4297,8 @@ JS;
                                             $this->taskFailTurn($responseId, $code, $message . ' [backspace ' . $detail . ']');
                                             return;
                                         }
-                                        Timer::add(0.2, fn() => $this->verifyTaskMultipartComposerCleared(
-                                            $responseId, $code, $message, $after, $detail), null, false);
+                                        $this->scheduleMultipartOperation($responseId, fn() => $this->verifyTaskMultipartComposerCleared(
+                                            $responseId, $code, $message, $after, $detail), 0.2);
                                     });
                             });
                     }, 5.0);
@@ -4349,7 +4349,8 @@ JS;
                 return;
             }
             if (microtime(true) < $deadline) {
-                Timer::add(0.08, fn() => $this->waitMultipartStageSendReady($responseId, $stage, $deadline, $text), null, false);
+                $this->scheduleMultipartOperation($responseId,
+                    fn() => $this->waitMultipartStageSendReady($responseId, $stage, $deadline, $text), 0.08);
                 return;
             }
             $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_SEND_NOT_READY', 'Multipart 分段发送控件未进入可发送状态。');
@@ -4359,10 +4360,12 @@ JS;
     /**
      * Accept only the exact durable stage ACK; one single-field typo may request a correction.
      * Recovery observations never issue correction messages, and no correction repeats payload.
+     * A released observer or an already acknowledged stage is a stale poll, not a missing transaction.
      */
     private function waitMultipartStageAcknowledgement(string $responseId, int $stage, float $deadline, bool $recover): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || $stage <= (int) ($turn['transport_stage_acked'] ?? 0)) return;
         $plan = is_array($turn) ? ($turn['multipart'] ?? null) : null;
         $entry = is_array($plan) ? (($plan['stages'][$stage - 1] ?? null)) : null;
         if (!is_array($entry) || !is_string($entry['ack'] ?? null)) {
@@ -4404,7 +4407,8 @@ JS;
                     && $currentAssistantCount >= $baselineAssistantCount + $stage;
                 if ($candidate) {
                     if ($this->waitForTaskSubmissionError($responseId)) {
-                        Timer::add(0.2, fn() => $this->waitMultipartStageAcknowledgement($responseId, $stage, $deadline, $recover), null, false);
+                        $this->scheduleMultipartOperation($responseId,
+                            fn() => $this->waitMultipartStageAcknowledgement($responseId, $stage, $deadline, $recover), 0.2);
                         return;
                     }
                     if (($state['failure_code'] ?? null) === 'CHATGPT_MESSAGE_TOO_LARGE') {
@@ -4444,7 +4448,8 @@ JS;
                     $this->chatGptTurns[$responseId]['multipart_mismatch_since'] = 0.0;
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.20, fn() => $this->waitMultipartStageAcknowledgement($responseId, $stage, $deadline, $recover), null, false);
+                    $this->scheduleMultipartOperation($responseId,
+                        fn() => $this->waitMultipartStageAcknowledgement($responseId, $stage, $deadline, $recover), 0.2);
                     return;
                 }
                 $facts = is_array($state) ? $this->multipartAckFacts($state) : '';
@@ -4527,11 +4532,34 @@ JS;
                     return;
                 }
                 if (microtime(true) < $readyDeadline && microtime(true) < $deadline) {
-                    Timer::add(0.08, fn() => $this->waitMultipartAckRepairSendReady($responseId, $stage, $deadline, $readyDeadline, $text), null, false);
+                    $this->scheduleMultipartOperation($responseId,
+                        fn() => $this->waitMultipartAckRepairSendReady($responseId, $stage, $deadline, $readyDeadline, $text), 0.08);
                     return;
                 }
                 $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_NOT_READY', 'Multipart ACK 修正发送控件未进入可发送状态。');
             });
+    }
+
+    /**
+     * Schedule multipart work only for the page, transaction and stage that requested it.
+     * A size-error body can retire a page while its ACK poll is waiting; response IDs alone
+     * are reused by that recovery and cannot fence a delayed poll against the replacement.
+     * @param string $responseId Physical observer key. @param callable():void $operation Pending page work.
+     * @param float $delay Seconds before observation; no task or preparation deadline is renewed.
+     * @return void Released/replaced/completed stages silently discard their old timers.
+     */
+    private function scheduleMultipartOperation(string $responseId, callable $operation, float $delay): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $keys = array_flip(['session_id', 'document_nonce', 'owner_incarnation', 'fencing_version',
+            'transport_transaction_id', 'transport_stage_sent', 'transport_stage_acked']);
+        $owner = array_intersect_key($turn, $keys);
+        Timer::add($delay, function () use ($responseId, $operation, $keys, $owner): void {
+            $current = $this->chatGptTurns[$responseId] ?? null;
+            if (!is_array($current) || array_intersect_key($current, $keys) !== $owner) return;
+            $operation();
+        }, null, false);
     }
 
     /** Keep a running/recovered multipart turn on the timeout snapshot pinned when the job was created. */
@@ -5626,7 +5654,7 @@ JS;
                     ConnectorState::assertRuntimeReady();
                 }
                 if (($turn['compaction_phase'] ?? null) !== 'preparing') {
-                    TaskLedger::connectorPrepared($responseId, !empty($turn['retained_connector']) ? 'retained' : 'mention',
+                    TaskLedger::connectorPrepared((string)($turn['logical_response_id'] ?? $responseId), !empty($turn['retained_connector']) ? 'retained' : 'mention',
                         (string)$turn['owner_incarnation'], (int)$turn['fencing_version']);
                 }
             }
@@ -5657,7 +5685,7 @@ JS;
                     (string) $turn['prompt']
                 );
             } else {
-                WebMessageAudit::recordOutgoing($responseId, 'continuation', (string)$turn['prompt']);
+                WebMessageAudit::recordOutgoing((string)($turn['logical_response_id'] ?? $responseId), 'continuation', (string)$turn['prompt']);
             }
             if (($turn['compaction_phase'] ?? null) === 'preparing'
                 || in_array((string) ($turn['operation_kind'] ?? 'response'), ['compact_v1', 'compact_v2'], true)) {
@@ -6262,9 +6290,11 @@ JS;
                 // A stream alert can remain visible while the same page continues generation.
                 // Keep that page and its tools alive; the alert alone cannot authorize replay.
                 if (!empty($snapshot['generation_running'])) {
+                    $this->chatGptTurns[$responseId]['stopped_stream_observation'] = null;
                     $this->scheduleTaskPoll($responseId, 0.5);
                     return;
                 }
+                if (!$activeCompact && $this->continueStoppedTaskStream($responseId, $snapshot)) return;
                 if (($snapshot['error']['code'] ?? '') === 'CHATGPT_NETWORK_ERROR'
                     && $this->retryTaskNetworkError($responseId, $snapshot)) return;
                 // The fresh-page path rotates its token and includes exact confirmed receipts;
@@ -7562,6 +7592,102 @@ JS;
     }
 
     /**
+     * Prefer a control-only message on the original page after an explicit failed stream
+     * actually stopped and its accepted native work drained. A connection banner during
+     * generation never enters this path. The ledger's durable marker bounds retries across
+     * lost acknowledgements/restarts; unknown effects still prohibit all automatic recovery.
+     * @param string $responseId Physical observer, possibly following a newer native receipt round.
+     * @param array $snapshot Bound stopped response with its current native error and Send state.
+     * @return bool Whether this path owns waiting, preparation or failure; false retains legacy recovery.
+     */
+    private function continueStoppedTaskStream(string $responseId, array $snapshot): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || empty($turn['tool_capable'])
+            || ($snapshot['generation_running'] ?? null) !== false
+            || ($snapshot['send_button_visible'] ?? null) !== true
+            || empty($snapshot['new_user_id']) || empty($snapshot['response_id'])
+            || (string)$snapshot['response_id'] !== (string)($turn['bound_assistant_id'] ?? '')) return false;
+        $logicalId = (string)($turn['logical_response_id'] ?? $responseId);
+        $completion = ToolBroker::completionForResponse($logicalId);
+        if ((int)($completion['invocation_count'] ?? 0) < 1) return false;
+        $failureKey = hash('sha256', json_encode([$snapshot['new_user_id'], $snapshot['response_id'],
+            $snapshot['error']['code'] ?? '', $snapshot['network_retry']['failure_id'] ?? '',
+            $snapshot['network_retry']['fingerprint'] ?? ''], JSON_THROW_ON_ERROR));
+        $previous = $turn['stopped_stream_observation'] ?? null;
+        if (!is_array($previous) || ($previous['signature'] ?? null) !== $failureKey) {
+            $this->chatGptTurns[$responseId]['stopped_stream_observation'] = ['signature'=>$failureKey,'since'=>microtime(true)];
+            $this->scheduleTaskPoll($responseId, 0.5);
+            return true;
+        }
+        if (microtime(true) - (float)$previous['since'] < self::COMPLETION_SETTLE_SECONDS) {
+            $this->scheduleTaskPoll($responseId, 0.5);
+            return true;
+        }
+        $this->evaluateTask($responseId, WebModelPage::baselineExpression(),
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $failureKey): void {
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($turn) || (string)($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
+                if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
+                    || empty($baseline['temporary_chat'])
+                    || !WebModelPage::isTemporaryChatUrl((string)($baseline['url'] ?? ''), self::modelUrl())
+                    || !in_array($snapshot['new_user_id'], (array)($baseline['user_ids'] ?? []), true)
+                    || !in_array($snapshot['response_id'], (array)($baseline['assistant_ids'] ?? []), true)) {
+                    // A genuinely unusable composer retains the existing exact-receipt fallback.
+                    $this->recoverFailedMessageStream($responseId, true, (string)$snapshot['error']['code']);
+                    return;
+                }
+                if (!empty($baseline['generation_running'])) {
+                    $this->chatGptTurns[$responseId]['stopped_stream_observation'] = null;
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                try {
+                    $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId, (string)$turn['owner_incarnation'],
+                        (int)$turn['fencing_version'], (string)$turn['document_nonce'], $failureKey, false, true);
+                    if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 0.5); return; }
+                    if (!empty($reservation['exhausted'])) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
+                            'ChatGPT 网页连续出现网络错误，自动重试已达三次；原上下文和工具回执仍保留。', true);
+                        return;
+                    }
+                    if (empty($reservation['continue'])) {
+                        $this->recoverFailedMessageStream($responseId, true, (string)$snapshot['error']['code']);
+                        return;
+                    }
+                    $prompt = ToolBroker::continuationPromptForResponse($logicalId, $reservation['marker'], false, true);
+                    ResponseJob::finishDraftText($logicalId);
+                    $this->chatGptTurns[$responseId]['baseline_users'] = $baseline['user_ids'];
+                    $this->chatGptTurns[$responseId]['baseline_assistants'] = $baseline['assistant_ids'];
+                    $this->chatGptTurns[$responseId]['bound_assistant_id'] = '';
+                    $this->chatGptTurns[$responseId]['continuation_marker'] = $reservation['marker'];
+                    $this->chatGptTurns[$responseId]['continuation_pending'] = true;
+                    $this->chatGptTurns[$responseId]['continuation_intent_at'] = time();
+                    $this->chatGptTurns[$responseId]['continuation_sending'] = true;
+                    $this->chatGptTurns[$responseId]['deadline'] = (float)$reservation['deadline_at'];
+                    $this->chatGptTurns[$responseId]['prompt'] = $prompt;
+                    $this->chatGptTurns[$responseId]['attachments'] = [];
+                    $this->chatGptTurns[$responseId]['require_root_before_send'] = false;
+                    $this->chatGptTurns[$responseId]['sent_at'] = 0.0;
+                    foreach (['round_prefix','post_tool_answer_baseline','draft_emitted','emitted'] as $key) {
+                        $this->chatGptTurns[$responseId][$key] = '';
+                    }
+                    $this->chatGptTurns[$responseId]['observed_markdown'] = null;
+                    $this->chatGptTurns[$responseId]['observed_content'] = false;
+                    $this->chatGptTurns[$responseId]['artifact_observed_candidates'] = [];
+                    unset($this->chatGptTurns[$responseId]['markdown_buffer']);
+                    // A distinct user message must select its App again even on the same page.
+                    $this->chatGptTurns[$responseId]['retained_connector'] = false;
+                    $this->chatGptTurns[$responseId]['connector_preparing'] = true;
+                    $this->prepareTaskConnector($responseId, (string)$turn['connector_name'], 0);
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                }
+            });
+        return true;
+    }
+
+    /**
      * Recover a stopped ordinary network error after host tools and MCP replies drain.
      * Completed tool work uses the existing exact-receipt recovery and retires the old page;
      * only tasks without completed host work may activate native Retry. A recovery banner or
@@ -8229,6 +8355,8 @@ JS;
                 && WebModelPage::isConversationSubmission($params, (string) ($owner['main_frame_id'] ?? ''), self::modelUrl())) {
                 $this->taskSessions[$sessionId] = array_replace($owner, [
                     'submission_request_id'=>(string) ($params['requestId'] ?? ''), 'submission_finished'=>false,
+                    'submission_request_bytes'=>is_string($params['request']['postData'] ?? null)
+                        ? strlen($params['request']['postData']) : null,
                     'submission_request_started_at'=>microtime(true), 'submission_finished_at'=>0.0,
                     'submission_failed'=>false,
                     'submission_canceled'=>false, 'submission_error_code'=>null, 'submission_http_status'=>null,
@@ -8268,6 +8396,7 @@ JS;
                 $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
                 $this->taskSessions[$sessionId]['submission_http_status'] = (int) round((float) ($response['status'] ?? 0));
                 $this->recordTaskTransportObservation((string) ($owner['response_id'] ?? ''), 'response_http', [
+                    'request_bytes' => $owner['submission_request_bytes'] ?? null,
                     'protocol' => $response['protocol'] ?? null,
                     'http_status' => (int) round((float) ($response['status'] ?? 0)),
                     'request_fingerprint' => hash('sha256', (string) $params['requestId']),

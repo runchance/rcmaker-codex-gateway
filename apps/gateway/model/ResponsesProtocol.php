@@ -262,13 +262,16 @@ final class ResponsesProtocol
         return ['error' => ['message' => $message, 'type' => $type, 'param' => $param, 'code' => $code]];
     }
 
-    /** Translate proven input-size failures at the Codex boundary; keep ledger diagnostics unchanged. */
+    /**
+     * Keep physical Web message limits distinct from the logical context-window limit.
+     * Codex replaces context_length_exceeded with a start-a-new-thread instruction;
+     * one rejected upload, including an inert stage, does not establish that condition.
+     */
     public static function clientFailure(array $body, int $status = 502): array
     {
         if (in_array($body['error']['code'] ?? '', [
             'CHATGPT_MESSAGE_TOO_LARGE', 'CHATGPT_CONTEXT_TOO_LARGE', 'context_length_exceeded',
         ], true)) {
-            $body['error']['code'] = 'context_length_exceeded';
             $body['error']['type'] = 'invalid_request_error';
             $status = 400;
         }

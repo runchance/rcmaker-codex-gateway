@@ -80,9 +80,14 @@ final class ContextBudget
         // Sol stages use Medium; Luna stages use its ordinary Low envelope. Never stage on Pro.
         $stage = $small ? $message : self::messageLimits('medium', $capabilities ?? []);
         $stageFallback = $stage;
-        // Version 8 includes 6.1.8's Plus/Luna limits. Existing persisted snapshots keep
-        // their original limits throughout host-tool continuations and recovery.
-        return ['version' => 8, 'context_tokens' => $context, 'compact_tokens' => $compact,
+        // Live GPT-6 Web + Connector probes accepted 114k ASCII characters and
+        // rejected 116k, while the same account accepted larger messages without
+        // a Connector. This is a conservative transport target, not a model context
+        // limit or a universal Web maximum. Prefer smaller physical messages without
+        // clipping/splitting an indivisible record or shrinking the logical window.
+        // Receipts and already pinned transactions keep their original snapshots.
+        return ['version' => 9, 'context_tokens' => $context, 'compact_tokens' => $compact,
+            'soft_message_chars'=>$small ? 0 : 110000,
             'browser_context_tokens'=>$luna ? ($extended ? 84000 : 28000) : $context,
             'base_context_tokens'=>$base, 'base_compact_tokens'=>$baseCompact, 'context_multiplier'=>$multiplier,
             'context_effective_ratio'=>round($context / $base, 6),

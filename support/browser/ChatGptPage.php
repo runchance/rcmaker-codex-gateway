@@ -151,6 +151,8 @@ final class ChatGptPage
         $errorCode = static function (mixed $value): ?string {
             if (!is_array($value)) return null;
             if (($value['detail']['code'] ?? '') === 'message_length_exceeds_limit') return 'message_length_exceeds_limit';
+            if (($value['detail']['code'] ?? '') === 'input_too_large'
+                && ($value['detail']['type'] ?? '') === 'last_user_message') return 'input_too_large/last_user_message';
             if (($value['error_code'] ?? '') === 'input_too_large'
                 && ($value['error_reason'] ?? '') === 'last_user_message' && is_string($value['error'] ?? null)) return 'input_too_large/last_user_message';
             return null;
