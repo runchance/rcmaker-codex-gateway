@@ -500,6 +500,9 @@ final class ContextRecovery
                     : ToolBroker::rebuildUnsentPromptUnlocked($promptJob));
             }
             if ($prompt === null) return null;
+            if ($job['operation_kind'] === 'response') {
+                $prompt = WebContract::withCheckpointProgressNotice($prompt, $context);
+            }
             if (!$exactImportedReadonly && !$readOnlyFallback && empty($job['mcp_binding_id']) && !empty($job['checkpoint_marker'])) {
                 $prompt = LunaCheckpoint::instructions($job['checkpoint_marker']) . "\n\n" . $prompt;
             }

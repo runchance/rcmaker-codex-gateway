@@ -256,7 +256,7 @@ final class ContextCompaction
         $spec['postcompact_user_input'] = (bool) array_filter($suffix, static fn(array $message): bool =>
             ($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message));
         $delta = ['version' => 3, 'system' => [], 'messages' => array_merge($leading, [
-            ['role' => 'developer', 'content' => 'Codex has finished its context checkpoint. This existing Web conversation remains the working context. The temporary summary-only control has ended. Resume the outstanding authorized task from the confirmed progress and exact tool receipts already in this conversation. Do not repeat completed work or treat the checkpoint as task completion. Apply the current tool contract and any new instructions below; respect actual user stop, cancellation and approval requirements.'],
+            ['role' => 'developer', 'content' => 'Codex has finished its context checkpoint. This existing Web conversation remains the working context. The temporary summary-only control has ended. Resume the outstanding authorized task from the confirmed progress and exact tool receipts already in this conversation. Do not repeat completed work or treat the checkpoint as task completion. Apply the current tool contract and any new instructions below; respect actual user stop, cancellation and approval requirements. ' . WebContract::checkpointProgressInstruction()],
         ], $suffix), 'continuation' => [
             'mode' => 'exact_prefix', 'source_response_id' => $source['id'],
             'source_surface_id' => $surface['id'], 'source_epoch_id' => $surface['epoch_id'],

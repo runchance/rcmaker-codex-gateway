@@ -348,6 +348,8 @@ A new request after manual stop uses the same setting. It controls normal contin
 
 **Codex compaction does not mean the Web model has exhausted its context.** Compaction drains accepted tool receipts, stops the old generation, then sends a separate summary request. After the checkpoint completes, the gateway retains the same Web page when its document, task ownership and checkpoint can be verified exactly. It sends only a resume instruction and new content, without retransmitting retained history. Temporary summary controls end and the remaining task continues; this also applies across repeated compactions. Missing or unverifiable pages and actual capacity or request failures still follow the existing recovery flow. Ordinary task continuation cannot enter an active summary operation.
 
+On the first resumed execution after each checkpoint, the model should briefly state verified progress and the immediate remaining step in your language before starting new tools, then continue working. This is progress, not a final answer or a claim of unverified completion. Ordinary tool receipts and later follow-ups do not repeat this handoff reply; newer question-only, pause or changed-goal instructions still take priority. This requirement adds no retries, extra tool calls or completion gate.
+
 Repeating the same read-only compaction request with a different temporary conversation ID joins its existing summary or returns its stored result when the integration, model, effort, branch and complete history match. It does not open another page to resend the request. Failed responses retain their actual error; a controlled recovery requires proof of the complete source, an unpublished summary and no host operations. This also covers older records that failed because a private summary draft changed, without rewriting the original failure or completed tool receipts.
 
 A standalone “Connection interrupted / Waiting for the full response” notice does not invalidate the page or finish the task. The gateway continues observing tool receipts, generation state and the Send control. Once Send returns, tools must also be settled and the answer stable, or an actual request failure established, before the turn can finish or enter recovery.
@@ -384,6 +386,8 @@ Use **Clear all idle tasks** in Task center and review its confirmation. Running
 ## 8. Settings, context and usage
 
 Keep the defaults for initial use. **Preferences** controls normal operation; **Model contracts** edits the templates sent to Web models and does not need adjustment for ordinary use.
+
+Upgrades automatically update default contracts. Templates customized and saved in the console remain unchanged and do not automatically merge new default wording; edit them or restore defaults when needed. The gateway adds the first execution progress instruction after compaction outside the template, including for custom templates, but check custom wording for conflicting instructions. Updated code applies to subsequent requests after loading and does not change content already sent to the Web page.
 
 | Setting | Meaning and when to change it |
 | --- | --- |

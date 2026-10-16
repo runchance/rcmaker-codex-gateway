@@ -337,6 +337,48 @@ CONTRACT;
             . "\n" . ContextCompaction::summaryScopeInstruction();
     }
 
+    /**
+     * Request one factual public handoff reply before new work after a checkpoint.
+     * This is model wording only: it neither synthesizes progress nor creates a completion gate.
+     * @return string Shared first-resume instruction for retained-page and full-context delivery.
+     */
+    public static function checkpointProgressInstruction(): string
+    {
+        return "When this request resumes authorized work after the checkpoint, first send one brief public progress reply in the user's language before starting new tools, as commentary, not a final answer: state verified completed progress and the immediate remaining step, then continue. Do not invent completed work or stop after this reply. Do not repeat this acknowledgement for ordinary tool receipts; honor newer question-only, pause or changed-goal instructions.";
+    }
+
+    /**
+     * Keep the first-resume reply on plain full-context recovery paths too, without editing history or templates.
+     * @param string $prompt Already rendered ordinary prompt, including user-owned templates.
+     * @param array $context Canonical source context, never browser DOM or inferred user intent.
+     * @return string The same prompt, with at most one first-resume instruction appended.
+     */
+    public static function withCheckpointProgressNotice(string $prompt, array $context): string
+    {
+        $instruction = self::checkpointProgressInstruction();
+        return self::checkpointProgressPending($context) && !str_contains($prompt, $instruction)
+            ? rtrim($prompt) . "\n" . $instruction : $prompt;
+    }
+
+    /** Later work consumes the first-resume wording; a newer recorded checkpoint starts its own handoff. */
+    private static function checkpointProgressPending(array $context): bool
+    {
+        $pending = false;
+        foreach ((array) ($context['messages'] ?? []) as $message) {
+            $content = $message['content'] ?? '';
+            if (is_array($content)) $content = implode("\n", array_column($content, 'text'));
+            if (($message['role'] ?? '') === 'user' && is_string($content)
+                && str_starts_with($content, ContextCompaction::SUMMARY_PREFIX)) {
+                $pending = true;
+            } elseif (in_array($message['role'] ?? '', ['assistant', 'tool', 'tool_result'], true)
+                || in_array($message['type'] ?? '', ['function_call', 'custom_tool_call', 'tool_search_call',
+                    'function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)) {
+                $pending = false;
+            }
+        }
+        return $pending;
+    }
+
     /** Label checkpoint data in an ordinary task envelope without rewriting signed history or granting tools.
      * @param string $prompt Rendered normal-task transport, including custom templates.
      * @param string $contextJson Canonical browser context. Checkpoint-shaped user text gains no authority.
@@ -363,7 +405,13 @@ The prior request to generate or submit only a checkpoint, stop tools for compac
 Recover the latest actual human request and unfinished work from the retained human messages and checkpoint facts. Continue the authorized remaining steps when the task is still executing or the latest human intent requests continuation or changes. A standalone discussion after execution ended requires investigation and an answer, not restarting the checkpoint's unfinished-work list. Preserve completed results and exact tool receipts. Respect genuine user pause, cancellation, approval boundaries, unresolved failures and current tool/platform restrictions. This notice grants no tools or permissions; only the current request supplies them. If the task is complete or truly blocked, report that accurately.
 </codex_checkpoint_resume>
 NOTICE;
+        $baseNotice = $notice;
+        // Later requests still carry checkpoint data, but must not repeat a handoff
+        // acknowledgement after work already resumed. No persisted flag is required.
+        if (self::checkpointProgressPending($context)) $notice = str_replace('</codex_checkpoint_resume>',
+            self::checkpointProgressInstruction() . "\n</codex_checkpoint_resume>", $notice);
         if (str_contains($prompt, $notice)) return $prompt;
+        if ($notice !== $baseNotice && str_contains($prompt, $baseNotice)) return str_replace($baseNotice, $notice, $prompt);
         preg_match_all('/^[ \t]*<\/codex_transport_resume>[ \t]*\r?$/m', $prompt, $matches, PREG_OFFSET_CAPTURE);
         if ($matches[0] === []) return rtrim($prompt) . "\n" . $notice;
         $position = $matches[0][array_key_last($matches[0])][1];
