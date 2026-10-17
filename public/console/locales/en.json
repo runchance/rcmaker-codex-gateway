@@ -1081,5 +1081,6 @@
     "工具连接组件准备状态暂不可读取。": "The tool connection component preparation status is temporarily unavailable.",
     "工具连接组件准备状态无法保存。": "The tool connection component preparation status could not be saved.",
     "工具连接组件正在后台准备，刷新页面或重新打开后仍可继续查看进度。": "The tool connection component is being prepared in the background. You can check progress after refreshing or reopening.",
-    "组件仍在后台准备，请稍后查看进度；无需重复开始。": "Component preparation is still running in the background. Check progress later; there is no need to start it again."
+    "组件仍在后台准备，请稍后查看进度；无需重复开始。": "Component preparation is still running in the background. Check progress later; there is no need to start it again.",
+    "工作区状态刷新暂未完成，正在自动重试；已显示的画面会保留。": "Workspace status could not be refreshed yet. Retrying automatically; the current view will be kept."
 }

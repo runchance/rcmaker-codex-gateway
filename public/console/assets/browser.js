@@ -8,6 +8,8 @@
     const closeRejections = new Set(['surface_not_closable', 'INVALID_BROWSER_SURFACE', 'INVALID_FIELD', 'INVALID_JSON']);
     let reading = false;
     let readSequence = 0;
+    let refreshFailures = 0;
+    let nextRefreshAt = 0;
     let refreshTimer = null;
     let screenshotTimer = null;
     let screenshotReading = false;
@@ -274,28 +276,38 @@
             screenshotReading = false;
         }
     }
-    /** Manual refresh supersedes an older poll; automatic commits preserve the user's current interaction. */
+    /** Read live workspace state once per poll after admission; retain frames and back off failed reads. */
     async function refresh(manual = false) {
-        if (disposed || !Gateway.isPageActive() || (!manual && (reading || !Gateway.automaticRefreshAllowed()))) return;
+        if (disposed || !Gateway.isPageActive() || (!manual && (reading || Date.now() < nextRefreshAt
+            || !Gateway.automaticRefreshAllowed()))) return;
         const sequence = ++readSequence;
         reading = true;
         if (manual) byId('refresh').disabled = true;
         try {
-            const ready = await Gateway.ensureReady({quietAfterAdmission: true});
-            if (!ready || disposed || sequence !== readSequence || !Gateway.isPageActive()) return;
+            // Entry and explicit refresh check setup. Following an admitted workspace only needs its live state;
+            // API operations still enforce their own current readiness and page ownership.
+            if ((manual || !lastState) && !await Gateway.ensureReady({quietAfterAdmission: true})) return;
+            if (disposed || sequence !== readSequence || !Gateway.isPageActive()) return;
             const requested = new Map(Array.from(pendingClosures, ([surfaceId, pending]) =>
                 [surfaceId, {phase: pending.phase, version: pending.version}]));
             const ids = Array.from(requested.keys());
             const state = await Gateway.request('/api/browser' + (ids.length
-                ? '?closing_surfaces=' + encodeURIComponent(ids.join(',')) : ''));
+                ? '?closing_surfaces=' + encodeURIComponent(ids.join(',')) : ''), undefined, 30000);
             if (disposed || sequence !== readSequence || !Gateway.isPageActive()
                 || (!manual && !Gateway.automaticRefreshAllowed())) return;
+            refreshFailures = 0;
+            nextRefreshAt = 0;
             applyCloseStates(state, requested);
             render(state);
             setError(closeError);
             refreshScreenshot(state, manual);
         } catch (e) {
-            if (!disposed && sequence === readSequence && (manual || Gateway.automaticRefreshAllowed())) setError(e.message);
+            if (!disposed && sequence === readSequence && (manual || Gateway.automaticRefreshAllowed())) {
+                nextRefreshAt = Date.now() + Math.min(15000, 3000 * 2 ** Math.min(refreshFailures++, 3));
+                const unconfirmed = e.code === 'LOCAL_REQUEST_TIMEOUT' || e.code === 'LOCAL_REQUEST_UNCONFIRMED';
+                setError(closeError || (unconfirmed
+                    ? I18n.t('工作区状态刷新暂未完成，正在自动重试；已显示的画面会保留。') : e.message));
+            }
         } finally {
             if (sequence === readSequence) {
                 reading = false;
