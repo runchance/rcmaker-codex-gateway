@@ -977,7 +977,8 @@ final class ContextHistory
 
     /**
      * Prove a new human revision racing an already published tool batch. Rejoin its exact
-     * response until native receipts arrive; do not cancel, duplicate or infer host effects.
+     * response until native receipts arrive, including a new native UUID after a proven
+     * disconnect with complete source history; never cancel, duplicate or infer host effects.
      * @param array $spec Full native history with no fresh host receipt.
      * @param ?string $taskId Already routed task ID, or null during readiness checks.
      * @return ?array Verified source and role-preserving updates, or null for any mismatch.
@@ -988,7 +989,7 @@ final class ContextHistory
         return self::activeNativeContextUpdateUnlocked($spec, $taskId, true);
     }
 
-    /** Match only this source's ordered public output; human joins require a pending published tool batch. */
+    /** Match exact public output; a new native turn may recover an unreceived batch only after detachment. */
     private static function activeNativeContextUpdateUnlocked(array $spec, ?string $taskId, bool $humanSteering): ?array
     {
         if (($spec['operation_kind'] ?? 'response') !== 'response'
@@ -1028,16 +1029,23 @@ final class ContextHistory
                 ->where('client_turn_id', (string) $lineage['turn_id'])->where('status', 'committed')->find();
         }
         if (!is_array($turn)) return null;
+        $detachedNativeJoin = false;
         if ((string) $turn['client_turn_id'] !== (string) $spec['turn_id']
             && !($humanSteering && ($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS')) {
-            if (!str_starts_with((string) $turn['client_turn_id'], 'postcompact_')) return null;
-            // A derived active turn must belong to this original native turn's verified checkpoint.
-            $lineage = $spec;
-            $lineage['task_key'] = (string) ($link['current_task_key'] ?? $spec['task_key']);
-            $lineage['previous_response_id'] = null;
-            $lineage['context_json'] = self::canonical($incoming);
-            $lineage = ContextCompaction::resumeCommittedTurnUnlocked($lineage);
-            if ((string) $lineage['turn_id'] !== (string) $turn['client_turn_id']) return null;
+            $sameNativeTurn = false;
+            if (str_starts_with((string) $turn['client_turn_id'], 'postcompact_')) {
+                // The original native turn still requires its verified checkpoint derivation.
+                $lineage = $spec;
+                $lineage['task_key'] = (string) ($link['current_task_key'] ?? $spec['task_key']);
+                $lineage['previous_response_id'] = null;
+                $lineage['context_json'] = self::canonical($incoming);
+                $lineage = ContextCompaction::resumeCommittedTurnUnlocked($lineage);
+                $sameNativeTurn = (string) $lineage['turn_id'] === (string) $turn['client_turn_id'];
+            }
+            if (!$sameNativeTurn) {
+                if (!$humanSteering || !CodexCancellation::uuid((string) $spec['turn_id'])) return null;
+                $detachedNativeJoin = true;
+            }
         }
         $sourceId = (string) ($turn['response_id'] ?? '');
         $previous = (string) ($spec['previous_response_id'] ?? '');
@@ -1057,6 +1065,12 @@ final class ContextHistory
             && (string) $source['round_kind'] === 'text';
         $toolBoundary = (string) $source['status'] === 'completed' && (string) $source['round_kind'] === 'tool_call';
         if ($humanSteering && !$toolBoundary && !$running) return null;
+        if ($detachedNativeJoin && TaskLedger::cancellationNativeTurn(['job' => $source, 'turn' => $turn]) === $spec['turn_id']) {
+            $detachedNativeJoin = false;
+        }
+        // A failed/disconnected native turn can be followed by a new native UUID. Replay
+        // only its already issued, client-unreceived batch, never a running Web generation.
+        if ($detachedNativeJoin && (!$toolBoundary || !TaskLedger::clientTransportDetachedUnlocked($source))) return null;
         if ($humanSteering) {
             $binding = $db->table('gateway_mcp_bindings')->where('id', (string) ($source['mcp_binding_id'] ?? ''))->find();
             if (!is_array($binding) || $binding['status'] !== 'running' || $binding['task_id'] !== $taskId
@@ -1087,6 +1101,7 @@ final class ContextHistory
         }
         $prior = json_decode((string) $source['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $known = (array) ($prior['messages'] ?? []);
+        if ($detachedNativeJoin && (!empty($spec['input_is_delta']) || count($records) <= count($known))) return null;
         if ($humanSteering && count($records) === 1 && ($records[0]['role'] ?? '') === 'user'
             && ($previous === $sourceId || !empty($spec['input_is_delta']))) {
             $records = array_merge($known, $records);

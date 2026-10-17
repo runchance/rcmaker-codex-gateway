@@ -45,7 +45,7 @@ final class TaskLedger
     }
 
     /**
-     * Find the exact native turn through Response ancestry or verified checkpoint derivation.
+     * Find the exact native turn through a verified tool reconnect, Response ancestry or checkpoint derivation.
      * Shared by stop observation and detached-request routing; a checkpoint-derived turn
      * is still the same native turn when deciding whether new input is steering.
      * @param array $execution Current durable execution, not an arbitrary session's latest event.
@@ -55,6 +55,8 @@ final class TaskLedger
     {
         $job = $execution['job'];
         for ($depth = 0; $depth < 64; $depth++) {
+            $rejoined = self::rejoinedNativeTurn($job);
+            if ($rejoined !== null) return $rejoined;
             $id = (string) ($job['turn_id'] ?? '');
             if (CodexCancellation::uuid($id)) return $id;
             if (str_starts_with($id, 'postcompact_')) {
@@ -63,11 +65,23 @@ final class TaskLedger
             }
             if (!str_starts_with($id, 'postcompact_') || empty($job['previous_response_id'])) return null;
             $parent = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['previous_response_id'])
-                ->find('id,turn_id,previous_response_id,task_id,compaction_epoch');
+                ->find('id,turn_id,previous_response_id,task_id,compaction_epoch,durable_turn_id');
             if (!is_array($parent) || $parent['task_id'] !== $execution['job']['task_id']) return null;
             $job = $parent;
         }
         return null;
+    }
+
+    /** Read only the native UUID journaled by a proven tool-batch join for this exact durable turn. */
+    private static function rejoinedNativeTurn(array $job): ?string
+    {
+        if (empty($job['task_id']) || empty($job['durable_turn_id'])) return null;
+        $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('task_id', $job['task_id'])->where('turn_id', $job['durable_turn_id'])
+            ->where('event_type', 'native_tool_batch_rejoined')->order([['id', 'DESC']])->limit(1)->find();
+        $data = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
+        $native = (string) ($data['native_turn_id'] ?? '');
+        return CodexCancellation::uuid($native) ? $native : null;
     }
 
     /**
@@ -117,6 +131,8 @@ final class TaskLedger
                 }
             } while ($parent === null && count($checkpoints) === 128);
             if ($parent === null) return null;
+            $rejoined = self::rejoinedNativeTurn(['task_id' => $taskId, 'durable_turn_id' => $parent['id']]);
+            if ($rejoined !== null) return $rejoined;
             $clientTurn = (string) $parent['client_turn_id'];
             if (CodexCancellation::uuid($clientTurn)) return $clientTurn;
             $parentEpoch = SDB(null, 'medoo', 'sqlite')->table('gateway_task_epochs')->where('id', $parent['epoch_id'])
@@ -578,7 +594,30 @@ final class TaskLedger
         if (!is_array($source) || !is_array($source['messages'] ?? null)
             || count($messages) <= count($source['messages'])
             || !ContextHistory::matchesCompactionSource($source, $incoming, !empty($spec['native_responses_lite']))) return false;
-        $events = $db->table('gateway_task_events')->where('task_id', $taskId)->where('response_id', $job['id'])
+        if (!self::clientTransportDetachedUnlocked($job)) return false;
+        ToolBroker::revokeTaskUnlocked($taskId, 'client_detached_new_turn');
+        $cancelled = self::cancelTaskUnlocked($taskId);
+        if (!in_array($job['id'], $cancelled['response_ids'], true)) {
+            throw new GatewayError('recovery_conflict', '断开回合的退休所有权发生变化。', 409);
+        }
+        ResponseJob::failSupersededUnlocked((string)$job['id'], '客户端已断开；新的用户回合已替代原请求。');
+        self::eventUnlocked($taskId, (string)$turn['id'], (string)$job['id'], (string)$turn['surface_id'],
+            'detached_response_superseded', ['client_turn_id'=>$turn['client_turn_id'], 'new_client_turn_id'=>$spec['turn_id']]);
+        $spec['previous_response_id'] = null;
+        return true;
+    }
+
+    /**
+     * Prove all recorded subscribers of an already scoped response detached before its terminal.
+     * The caller owns the transaction and separately validates the task, generation and request.
+     * @param array $job Exact owned source with task_id and id, not an incoming client handle.
+     * @return bool False for live subscribers, missing/malformed evidence or a truncated event history.
+     */
+    public static function clientTransportDetachedUnlocked(array $job): bool
+    {
+        if (empty($job['task_id']) || empty($job['id'])) return false;
+        $events = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('task_id', $job['task_id'])->where('response_id', $job['id'])
             ->where('event_type', 'IN', ['response_client_attached', 'response_client_detached'])
             ->order([['id','DESC']])->limit(self::CLIENT_TRANSPORT_EVENT_LIMIT + 1)->select();
         // The extra row detects truncation. Never infer "all disconnected" from a tail
@@ -596,17 +635,7 @@ final class TaskLedger
             if ($event['event_type'] === 'response_client_attached') return false;
             $nonterminalDetached = $nonterminalDetached || !$data['terminal'];
         }
-        if (!$nonterminalDetached) return false;
-        ToolBroker::revokeTaskUnlocked($taskId, 'client_detached_new_turn');
-        $cancelled = self::cancelTaskUnlocked($taskId);
-        if (!in_array($job['id'], $cancelled['response_ids'], true)) {
-            throw new GatewayError('recovery_conflict', '断开回合的退休所有权发生变化。', 409);
-        }
-        ResponseJob::failSupersededUnlocked((string)$job['id'], '客户端已断开；新的用户回合已替代原请求。');
-        self::eventUnlocked($taskId, (string)$turn['id'], (string)$job['id'], (string)$turn['surface_id'],
-            'detached_response_superseded', ['client_turn_id'=>$turn['client_turn_id'], 'new_client_turn_id'=>$spec['turn_id']]);
-        $spec['previous_response_id'] = null;
-        return true;
+        return $nonterminalDetached;
     }
 
     /**
@@ -3127,11 +3156,13 @@ final class TaskLedger
      * @param bool $mailboxJoin Permit agent records only after the full active-source mailbox proof.
      * @param bool $steeringJoin Permit human records only after the exact pending-tool source proof.
      * @param bool $joinResponse False when a receipt request must reserve its own next batch.
+     * @param ?string $nativeTurnId Native UUID of a proven human tool join, retained for later stop/steering.
      * @return void
      * @throws GatewayError If source ownership changed or a record does not belong to this channel.
      */
     public static function queueOperationalContextUnlocked(array $source, array $updates, string $requestHash,
-        ?string $idempotencyKey, bool $mailboxJoin = false, bool $steeringJoin = false, bool $joinResponse = true): void
+        ?string $idempotencyKey, bool $mailboxJoin = false, bool $steeringJoin = false, bool $joinResponse = true,
+        ?string $nativeTurnId = null): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $turn = $db->table('gateway_task_turns')->where('id', (string) $source['durable_turn_id'])->find();
@@ -3176,6 +3207,11 @@ final class TaskLedger
             ['request_hash' => $requestHash, 'idempotency_key' => $idempotencyKey,
                 ...($mailboxJoin ? ['mailbox_join' => true] : []),
                 ...($steeringJoin ? ['steering_join' => true] : [])]);
+        if ($steeringJoin && CodexCancellation::uuid((string) $nativeTurnId)) {
+            self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
+                (string) $source['id'], (string) $source['surface_id'], 'native_tool_batch_rejoined',
+                ['native_turn_id' => $nativeTurnId]);
+        }
     }
 
     /**

@@ -123,7 +123,7 @@ final class ResponseJob
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
                 TaskLedger::queueOperationalContextUnlocked($source, $spec['operational_context_updates'],
                     (string) $spec['request_hash'], $idempotencyKey, !empty($spec['mailbox_context_join']),
-                    !empty($spec['steering_context_join']));
+                    !empty($spec['steering_context_join']), true, (string) ($spec['turn_id'] ?? ''));
                 return (string) $source['id'];
             }
             // Steering policy is selected once per request, never inherited from an older round.
