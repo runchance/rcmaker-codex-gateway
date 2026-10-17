@@ -81,6 +81,21 @@
     document.addEventListener('pointercancel', () => { pointerHeld = false; }, {passive: true});
     window.addEventListener('blur', () => { pointerHeld = false; });
 
+    /** Distinguish an unconfirmed local request from a typed service failure, including DOM code 20. */
+    function requestFailure(error, signal) {
+        if (signal.aborted || error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+            const pending = new Error(I18n.t('本地请求等待超时，后台操作可能仍在继续。请查看当前状态，勿重复提交。'));
+            pending.code = 'LOCAL_REQUEST_TIMEOUT';
+            pending.resultUnconfirmed = true;
+            return pending;
+        }
+        if (typeof error?.code === 'string' && error.code) return error;
+        const unavailable = new Error(I18n.t('暂时无法取得本地服务响应。保存结果可能尚未确认，请重新载入设置核对。'));
+        unavailable.code = 'LOCAL_REQUEST_UNCONFIRMED';
+        unavailable.resultUnconfirmed = true;
+        return unavailable;
+    }
+
     /** Fetch bounded JSON; failures never echo request bodies or upstream content. */
     async function jsonFetch(url, options, timeoutMs) {
         const controller = new AbortController();
@@ -92,13 +107,12 @@
                 const original = payload.message || (payload.error && payload.error.message) || I18n.t('本地服务未能完成操作。');
                 const error = new Error(I18n.error(original, payload.code));
                 error.originalMessage = original;
-                error.code = payload.code || 'HTTP_ERROR';
+                error.code = String(payload.code || 'HTTP_ERROR');
                 throw error;
             }
             return payload;
         } catch (error) {
-            if (error.code) throw error;
-            throw new Error(I18n.t('暂时无法取得本地服务响应。保存结果可能尚未确认，请重新载入设置核对。'));
+            throw requestFailure(error, controller.signal);
         } finally {
             clearTimeout(timeout);
         }
@@ -159,6 +173,8 @@
                 sequence: Number(response.headers.get('X-Browser-Sequence') || 0),
                 surfaceId: response.headers.get('X-Browser-Surface') || ''
             };
+        } catch (error) {
+            throw requestFailure(error, controller.signal);
         } finally {
             clearTimeout(timeout);
         }
@@ -182,7 +198,8 @@
         const savedRevision = saved ? Number(saved.id) : 0;
         const tunnel = settings && settings.tunnel ? settings.tunnel : {};
         const connector = settings && settings.connector ? settings.connector : {};
-        const runtimeReady = !!(browser && browser.setup && browser.setup.runtime && browser.setup.runtime.installed && tunnel.binary_installed);
+        const runtimeReady = !!(browser && browser.setup && browser.setup.runtime && browser.setup.runtime.installed && tunnel.binary_installed
+            && !['queued', 'running'].includes(tunnel.preparation?.status));
         const browserBound = !!(browser && browser.status === 'ready' && savedRevision > 0 && Number(browser.network_revision) === savedRevision);
         const accountStatus = browser && browser.setup ? (browser.setup.account || 'not_checked') : 'not_checked';
         const accountReady = !!(!profileResetRequired && browserBound && accountStatus === 'ready');

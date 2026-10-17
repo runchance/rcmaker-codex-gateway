@@ -18,10 +18,12 @@ final class TunnelRuntime
     private const PROFILE = 'rcmaker-ai-web';
     private const RELEASE_BASE = 'https://github.com/openai/tunnel-client/releases/download/v' . self::VERSION;
     private const MAX_DOWNLOAD_BYTES = 104857600;
+    private const DOWNLOAD_TIMEOUT_SECONDS = 1800;
     /** Handle lives only in the dedicated GatewayTunnel worker. API workers never launch a daemon. */
     private static ?array $owned = null;
     private static ?string $ownedConfiguration = null;
 
+    /** Return daemon readiness and public preparation progress without performing installation or network I/O. */
     public static function snapshot(): array
     {
         Schema::initialize();
@@ -40,6 +42,7 @@ final class TunnelRuntime
             'active_network_revision' => $network['applied_php_revision'] === null ? null : (int) $network['applied_php_revision'],
             'last_error' => is_string($state['last_error']) ? $state['last_error'] : null,
             'updated_at' => (int) $state['updated_at'],
+            'preparation' => self::preparationSnapshot($state),
         ];
     }
 
@@ -118,7 +121,100 @@ final class TunnelRuntime
         return self::snapshot();
     }
 
-    /** Download/install only; useful for an explicit UI preparation action. */
+    /**
+     * Register or reattach one installation intent; never download inside an HTTP request.
+     * @return array Public preparation identifier, state and bounded observation budget.
+     * @throws GatewayError When network configuration or durable state is unavailable.
+     */
+    public static function requestPrepare(): array
+    {
+        Schema::initialize();
+        $network = NetworkSettings::state();
+        $revision = (int) ($network['applied_php_revision'] ?? 0);
+        if ($revision < 1) throw new GatewayError('NETWORK_NOT_APPLIED', '请先应用网络配置。', 422);
+        NetworkSettings::usable(NetworkSettings::revision($revision));
+        return Schema::transaction(function () use ($revision): array {
+            $state = self::state();
+            $operation = self::preparationSnapshot($state);
+            if (in_array($operation['status'] ?? '', ['queued', 'running'], true)) return $operation;
+            $operation = ['id'=>'prepare_' . bin2hex(random_bytes(12)), 'status'=>'queued',
+                'revision'=>$revision, 'created_at'=>time(), 'started_at'=>null, 'finished_at'=>null,
+                'wait_timeout_seconds'=>self::DOWNLOAD_TIMEOUT_SECONDS + 120 + 60 + 600];
+            self::savePreparation($state, $operation);
+            return $operation;
+        });
+    }
+
+    /**
+     * Execute the pending preparation under the dedicated worker's exclusive ownership lock.
+     * A restarted owner rechecks authenticated installed files through the existing installer.
+     * Network, file hashing and process probes run outside all writer transactions.
+     * @param string $owner Incarnation of the worker holding the installation's tunnel ownership lock.
+     * @return bool Whether a queued/interrupted preparation was processed.
+     * @throws GatewayError When the durable operation cannot be read or saved.
+     */
+    public static function processPreparation(string $owner): bool
+    {
+        $state = self::state();
+        if (!in_array(self::preparationSnapshot($state)['status'] ?? '', ['queued', 'running'], true)) return false;
+        $operation = Schema::transaction(function () use ($owner): ?array {
+            $state = self::state();
+            $operation = self::preparationSnapshot($state);
+            if (!in_array($operation['status'] ?? '', ['queued', 'running'], true)) return null;
+            $operation['status'] = 'running';
+            $operation['started_at'] ??= time();
+            $operation['owner'] = $owner;
+            self::savePreparation($state, $operation);
+            return $operation;
+        });
+        if ($operation === null) return false;
+        $failure = null;
+        try {
+            $network = NetworkSettings::state();
+            if ((int) ($network['applied_php_revision'] ?? 0) !== (int) $operation['revision']) {
+                throw new GatewayError('TUNNEL_PREPARE_NETWORK_CHANGED', '网络配置已变化，请重新准备工具连接组件。', 409);
+            }
+            $revision = NetworkSettings::revision((int) $operation['revision']);
+            NetworkSettings::usable($revision);
+            self::install($revision);
+        } catch (GatewayError $error) {
+            $failure = ['code'=>$error->errorCode, 'message'=>$error->getMessage()];
+        } catch (\Throwable) {
+            $failure = ['code'=>'TUNNEL_PREPARE_FAILED', 'message'=>'工具连接组件准备失败，请查看运行诊断。'];
+        }
+        Schema::transaction(function () use ($operation, $owner, $failure): void {
+            $state = self::state();
+            $current = json_decode((string) $state['preparation_json'], true, 16, JSON_THROW_ON_ERROR);
+            if (($current['id'] ?? '') !== $operation['id'] || ($current['owner'] ?? '') !== $owner
+                || ($current['status'] ?? '') !== 'running') return;
+            $current['status'] = $failure === null ? 'succeeded' : 'failed';
+            $current['finished_at'] = time();
+            $current['result'] = $failure;
+            self::savePreparation($state, $current, $failure === null);
+        });
+        return true;
+    }
+
+    /** Return only public operation facts; the worker incarnation is never an API capability. */
+    private static function preparationSnapshot(array $state): array
+    {
+        $operation = json_decode((string) ($state['preparation_json'] ?? '{}'), true, 16, JSON_THROW_ON_ERROR);
+        if (!is_array($operation)) throw new GatewayError('STORAGE_UNAVAILABLE', '工具连接组件准备状态暂不可读取。', 503);
+        unset($operation['owner']);
+        return $operation;
+    }
+
+    /** Save one fenced intent/result inside the caller's short transaction, preserving daemon/user state. */
+    private static function savePreparation(array $state, array $operation, bool $installed = false): void
+    {
+        $values = ['preparation_json'=>json_encode($operation, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)];
+        if ($installed) $values['binary_version'] = self::VERSION;
+        $result = SDB(null, 'medoo', 'sqlite')->table('gateway_tunnel_state')->where('id', 1)
+            ->where('preparation_json', $state['preparation_json'])->update($values);
+        if (!$result || $result->rowCount() !== 1) throw new GatewayError('STORAGE_UNAVAILABLE', '工具连接组件准备状态无法保存。', 503);
+    }
+
+    /** Synchronous installer for non-HTTP compatibility callers; the console uses requestPrepare(). */
     public static function prepare(): array
     {
         try {
@@ -444,7 +540,9 @@ final class TunnelRuntime
         $client = curl();
         $ok = false;
         try {
-            NetworkTransport::configure($client, $revision, $url, 180, 15, true);
+            NetworkTransport::configure($client, $revision, $url, self::DOWNLOAD_TIMEOUT_SECONDS, 15, true);
+            $client->setOpt(CURLOPT_LOW_SPEED_LIMIT, 1);
+            $client->setOpt(CURLOPT_LOW_SPEED_TIME, 120);
             $client->setFile($file);
             $client->setOpt(CURLOPT_MAXFILESIZE, self::MAX_DOWNLOAD_BYTES);
             $client->progress(static function ($resource, $total, $downloaded) {

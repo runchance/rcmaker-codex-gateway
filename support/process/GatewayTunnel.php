@@ -11,11 +11,15 @@ final class GatewayTunnel
 {
     private float $nextAttempt = 0.0;
     private int $settingsVersion = -1;
+    private bool $ticking = false;
+    private string $incarnation;
     /** @var resource|null */
     private $ownershipLock = null;
 
+    /** Register the existing exclusive owner loop; one tick owns installation/reconnect work at a time. */
     public function __construct($type, $worker, $timer)
     {
+        $this->incarnation = bin2hex(random_bytes(16));
         $cleanup = function (): void {
             if ($this->ownershipLock === null) return;
             try { TunnelRuntime::shutdown(); }
@@ -30,6 +34,8 @@ final class GatewayTunnel
             };
         }
         $timer::add(1, function (): void {
+            if ($this->ticking) return;
+            $this->ticking = true;
             try {
                 Schema::initialize();
                 $settingsVersion = (int) \app\gateway\model\GatewaySettings::internal()['updated_at'];
@@ -37,8 +43,8 @@ final class GatewayTunnel
                     $this->settingsVersion = $settingsVersion;
                     $this->nextAttempt = 0.0;
                 }
-                if (microtime(true) < $this->nextAttempt) return;
                 if ($this->ownershipLock === null) {
+                    if (microtime(true) < $this->nextAttempt) return;
                     $lock = @fopen(\RC\Config::get('gateway', 'database_file') . '.tunnel.lock', 'c');
                     if ($lock === false) {
                         $this->nextAttempt = microtime(true) + 15;
@@ -51,6 +57,8 @@ final class GatewayTunnel
                     }
                     $this->ownershipLock = $lock;
                 }
+                if (TunnelRuntime::processPreparation($this->incarnation)) $this->nextAttempt = 0.0;
+                if (microtime(true) < $this->nextAttempt) return;
                 TunnelRuntime::ensureReady();
                 $this->nextAttempt = microtime(true) + 5;
             } catch (GatewayError $error) {
@@ -59,6 +67,8 @@ final class GatewayTunnel
             } catch (\Throwable) {
                 try { TunnelRuntime::noteFailure('TUNNEL_RUNTIME_ERROR'); } catch (\Throwable) {}
                 $this->nextAttempt = microtime(true) + 15;
+            } finally {
+                $this->ticking = false;
             }
         });
     }

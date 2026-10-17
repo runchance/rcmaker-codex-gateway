@@ -56,9 +56,10 @@ final class Settings
         });
     }
 
+    /** Queue/rejoin preparation; the dedicated tunnel worker owns all installation work. */
     public function tunnelPrepare(Request $request)
     {
-        return $this->respond($request, fn(): array => TunnelRuntime::prepare());
+        return $this->respond($request, fn(): array => TunnelRuntime::requestPrepare());
     }
 
     public function tunnelConnect(Request $request)

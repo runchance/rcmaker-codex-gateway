@@ -489,6 +489,9 @@ final class Schema
             56 => [
                 'ALTER TABLE gateway_settings ADD COLUMN steering_full_context INTEGER NOT NULL DEFAULT 0',
             ],
+            57 => [
+                "ALTER TABLE gateway_tunnel_state ADD COLUMN preparation_json TEXT NOT NULL DEFAULT '{}'",
+            ],
         ];
     }
 

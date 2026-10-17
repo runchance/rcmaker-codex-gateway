@@ -198,6 +198,8 @@ The screenshot port is illustrative. Use your own proxy's port.
 
 ### 4.2 Prepare runtime components
 
+The browser and tool connection components are prepared separately. The tool component installs in the background; the console registers and observes the same durable operation. Repeated clicks, refreshes and reopening rejoin pending work; after a restart the installer first verifies existing files. Tool downloads allow 30 minutes in total, 15 seconds to connect and a two-minute low-speed limit below one byte per second. Integrity checks and atomic publication remain in place. An observation timeout or interrupted request does not declare installation failed or automatically resubmit it; check the status later. Confirmed backend download, integrity or version errors remain visible in both console languages.
+
 Select **Prepare runtime components → Start preparation** and wait for private Chrome and the tool tunnel components. Configure networking before downloading components.
 
 The browser archive download allows up to two hours in total; connecting is limited to 15 seconds, and a transfer below one byte per second for two minutes fails early. The console follows the backend installation budget and observes the same command. Reaching 60% does not trigger a timeout. Slow transfers keep the worker heartbeat active, including when the server does not provide a total file size. Failed partial downloads are removed; check the error and network settings before retrying.

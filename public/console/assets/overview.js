@@ -273,7 +273,12 @@
         byId('network-detail').textContent = state.networkTested ? Gateway.describe(network.saved) : I18n.t('选择直连或 HTTP 代理。');
         byId('use-direct').hidden = state.networkTested; byId('open-network').textContent = state.networkTested ? I18n.t('修改网络') : I18n.t('设置网络');
         badge('runtime-status', state.runtimeReady ? I18n.t('已完成') : (state.networkTested ? I18n.t('待准备') : I18n.t('等待网络')), state.runtimeReady ? 'good' : (state.networkTested ? 'pending' : ''));
-        byId('runtime-detail').textContent = state.runtimeReady ? I18n.t('组件已安装。') : (state.networkTested ? I18n.t('准备浏览器与工具连接组件。') : I18n.t('请先连接网络。'));
+        const preparingComponent = ['queued', 'running'].includes(tunnel.preparation?.status);
+        byId('runtime-detail').textContent = preparingComponent ? I18n.t('工具连接组件正在后台准备，刷新页面或重新打开后仍可继续查看进度。')
+            : (state.runtimeReady ? I18n.t('组件已安装。') : (state.networkTested ? I18n.t('准备浏览器与工具连接组件。') : I18n.t('请先连接网络。')));
+        if (!busy && preparingComponent) progress('runtime-progress', I18n.t('工具连接组件正在后台准备，刷新页面或重新打开后仍可继续查看进度。'));
+        else if (!busy && tunnel.preparation?.status === 'failed') progress('runtime-progress', I18n.error(tunnel.preparation.result?.message || I18n.t('工具连接组件准备失败，请查看运行诊断。'), tunnel.preparation.result?.code), 'warning');
+        else if (!busy && state.runtimeReady && tunnel.preparation?.status === 'succeeded') progress('runtime-progress', I18n.t('运行组件已准备完成。'));
         byId('open-runtime').textContent = state.runtimeReady ? I18n.t('查看组件') : I18n.t('准备运行组件');
         if (!labelsOnly) byId('open-runtime').disabled = !state.networkTested;
         badge('account-status', profileResetRequired ? I18n.t('清理未完成') : (state.modelReady ? I18n.t('已完成') : (state.accountReady ? I18n.t('检查连接') : (accountChecking ? I18n.t('正在检查') : (state.runtimeReady ? I18n.t('需要登录') : I18n.t('等待'))))), !profileResetRequired && state.modelReady ? 'good' : (state.runtimeReady ? 'pending' : ''));
@@ -373,7 +378,13 @@
     async function waitBrowserCommand(id, timeoutMs, pollIntervalMs = 100) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
-            const row = await Gateway.request('/api/browser/commands/' + id);
+            let row;
+            try { row = await Gateway.request('/api/browser/commands/' + id); }
+            catch (error) {
+                if (!error.resultUnconfirmed) throw error;
+                await sleep(Math.max(pollIntervalMs, 1000));
+                continue;
+            }
             if (row.status === 'succeeded') return row.result || {};
             if (row.status === 'failed') throw new Error(row.result ? I18n.error(row.result.message || I18n.t('浏览器操作失败。'), row.result.code) : I18n.t('浏览器操作失败。'));
             await sleep(pollIntervalMs);
@@ -480,6 +491,47 @@
         } catch (e) { progress('network-progress', e.message, 'warning'); await refresh(); }
         finally { busy = false; loading(button, false); }
     }
+    /** Observe one durable component preparation; slow/uncertain reads never enqueue it again. */
+    async function prepareTunnelComponent(existing) {
+        let operation = existing;
+        if (!operation || !['queued', 'running'].includes(operation.status)) {
+            try {
+                operation = await Gateway.request('/api/settings/tunnel/prepare', {});
+            } catch (error) {
+                if (!error.resultUnconfirmed) throw error;
+                const current = await Gateway.request('/api/settings/tunnel');
+                if (!current.preparation?.id || (current.preparation.id === existing?.id
+                    && !['queued', 'running'].includes(current.preparation.status))) throw error;
+                operation = current.preparation;
+            }
+        }
+        // Compatibility with an older running backend: its synchronous reply is already settled.
+        if (!operation?.id) return operation;
+        const seconds = Number(operation.wait_timeout_seconds);
+        const deadline = Date.now() + (Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 86400 ? seconds * 1000 : 45 * 60 * 1000);
+        while (Date.now() < deadline) {
+            let current;
+            try { current = await Gateway.request('/api/settings/tunnel'); }
+            catch (error) {
+                if (!error.resultUnconfirmed) throw error;
+                await sleep(1000);
+                continue;
+            }
+            const latest = current.preparation;
+            if (latest?.id) operation = latest;
+            if (operation.status === 'succeeded') return current;
+            if (operation.status === 'failed') {
+                throw new Error(I18n.error(operation.result?.message || I18n.t('工具连接组件准备失败，请查看运行诊断。'), operation.result?.code));
+            }
+            progress('runtime-progress', I18n.t('工具连接组件正在后台准备，刷新页面或重新打开后仍可继续查看进度。'));
+            await sleep(1000);
+        }
+        const pending = new Error(I18n.t('组件仍在后台准备，请稍后查看进度；无需重复开始。'));
+        pending.code = 'TUNNEL_PREPARATION_PENDING';
+        throw pending;
+    }
+
+    /** Prepare missing components without holding an HTTP request through downloads. */
     async function prepareRuntime() {
         if (busy || !snapshot || !snapshot.networkTested) return;
         const button = byId('runtime-confirm'); busy = true; loading(button, true, I18n.t('正在准备…'));
@@ -490,9 +542,11 @@
                 await browserCommand('/api/browser/install', {revision: Number(state.network.saved.id)}, 600000);
             }
             state = await Gateway.prerequisites();
-            if (!(state.settings.tunnel && state.settings.tunnel.binary_installed)) {
+            const preparation = state.settings.tunnel?.preparation;
+            if (!(state.settings.tunnel && state.settings.tunnel.binary_installed)
+                || ['queued', 'running', 'failed'].includes(preparation?.status)) {
                 progress('runtime-progress', I18n.t('正在准备工具连接组件…'));
-                await Gateway.request('/api/settings/tunnel/prepare', {}, 180000);
+                await prepareTunnelComponent(preparation);
             }
             progress('runtime-progress', I18n.t('运行组件已准备完成。')); await refresh();
         } catch (e) { progress('runtime-progress', e.message, 'warning'); }
@@ -793,7 +847,12 @@
         byId(id).addEventListener('input', () => { networkEditRevision++; });
     });
     byId('network-confirm').addEventListener('click', saveAndTestNetwork);
-    byId('open-runtime').addEventListener('click', () => { progress('runtime-progress', snapshot && snapshot.runtimeReady ? I18n.t('运行组件已经准备完成。') : I18n.t('等待开始。')); openLayer('runtime', I18n.t('准备运行组件'), false); });
+    byId('open-runtime').addEventListener('click', () => {
+        progress('runtime-progress', ['queued', 'running'].includes(snapshot?.settings?.tunnel?.preparation?.status)
+            ? I18n.t('工具连接组件正在后台准备，刷新页面或重新打开后仍可继续查看进度。')
+            : (snapshot && snapshot.runtimeReady ? I18n.t('运行组件已经准备完成。') : I18n.t('等待开始。')));
+        openLayer('runtime', I18n.t('准备运行组件'), false);
+    });
     byId('runtime-confirm').addEventListener('click', prepareRuntime);
     byId('open-login').addEventListener('click', () => {
         progress('account-progress', snapshot && snapshot.modelReady ? I18n.t('当前 ChatGPT 登录和模型连接均正常。') : (snapshot && snapshot.accountReady ? (snapshot.modelError ? I18n.error(snapshot.modelError, snapshot.modelErrorCode) : I18n.t('已登录，正在检查模型连接…')) : I18n.t('点击“打开登录页面”开始。')));

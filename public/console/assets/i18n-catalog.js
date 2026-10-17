@@ -1075,5 +1075,12 @@ window.GatewayTranslations = {
     "停止前的工具结果尚未确认；未全量重发或重新执行。": "Tool results from before the stop remain unconfirmed; nothing was resent or executed again.",
     "插话原页已经丢失；未新建页面或全量重发。": "The original interruption page is missing; no new page was created and no full context was resent.",
     "插话原页或压缩代次已变化；未发送新消息。": "The original page or compaction generation has changed; no new message was sent.",
-    "未能确认插话原页已停止且历史仍在；未发送新消息或全量重发。": "Could not confirm that the original page stopped with its history intact; no new message or full context was sent."
+    "未能确认插话原页已停止且历史仍在；未发送新消息或全量重发。": "Could not confirm that the original page stopped with its history intact; no new message or full context was sent.",
+    "本地请求等待超时，后台操作可能仍在继续。请查看当前状态，勿重复提交。": "The local request timed out; the operation may still be running. Check its current status before submitting again.",
+    "网络配置已变化，请重新准备工具连接组件。": "The network configuration changed. Prepare the tool connection component again.",
+    "工具连接组件准备失败，请查看运行诊断。": "Tool connection component preparation failed. Check the runtime diagnostics.",
+    "工具连接组件准备状态暂不可读取。": "The tool connection component preparation status is temporarily unavailable.",
+    "工具连接组件准备状态无法保存。": "The tool connection component preparation status could not be saved.",
+    "工具连接组件正在后台准备，刷新页面或重新打开后仍可继续查看进度。": "The tool connection component is being prepared in the background. You can check progress after refreshing or reopening.",
+    "组件仍在后台准备，请稍后查看进度；无需重复开始。": "Component preparation is still running in the background. Check progress later; there is no need to start it again."
 };
