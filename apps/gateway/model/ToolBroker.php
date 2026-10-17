@@ -2048,8 +2048,12 @@ final class ToolBroker
         $transport = (string) ($spec['transport_context_json'] ?? '');
         $context = $transport !== '' ? json_decode($transport, true, 128, JSON_THROW_ON_ERROR) : null;
         $steering = (array) ($spec['steering_messages'] ?? []);
+        // Native runtime updates and exact tool receipts can follow or separate human
+        // revisions. Prove the ordered human suffix without moving those other records;
+        // the source-history and receipt checks independently validate their provenance.
         $instructionTail = array_values(array_filter((array) ($context['messages'] ?? []),
-            static fn(array $message): bool => !ContextHistory::isOperationalUserMessage($message)));
+            static fn(array $message): bool => ($message['role'] ?? '') === 'user'
+                && !ContextHistory::isOperationalUserMessage($message)));
         if (!is_array($context) || !is_array($context['messages'] ?? null)
             || ($mailbox && (array) ($spec['mailbox_context_messages'] ?? []) === [])
             || (isset($context['continuation']) && empty($spec['steering_delta'])) || count($instructionTail) < count($steering)

@@ -695,9 +695,19 @@ final class ContextHistory
                         || in_array($record['role'] ?? '', ['developer', 'agent_message'], true)
                         || self::isOperationalUserMessage($record)), true);
                 if ($receiptDelta || $steering !== [] || $pending['messages'] !== []) {
-                    $priorFull['messages'] = array_merge($priorFull['messages'], $round['messages']);
-                    $priorFull['system'] = array_merge((array) ($priorFull['system'] ?? []), (array) ($contextUpdates['system'] ?? []));
-                    $spec['full_context_json'] = self::canonical($priorFull);
+                    // A full native transcript already orders interleaved human/runtime
+                    // updates and the newly received calls. Regrouping them for the Web
+                    // projection would break the next native request's exact-prefix proof.
+                    $completeNativeHistory = !$receiptDelta
+                        && self::matchesCompactionSource($priorFull, $context, !empty($spec['native_responses_lite']))
+                        && self::matchesNativeToolRound($priorFull, $context, $round, !empty($spec['native_responses_lite']));
+                    if ($completeNativeHistory) {
+                        $spec['full_context_json'] = self::canonical($context);
+                    } else {
+                        $priorFull['messages'] = array_merge($priorFull['messages'], $round['messages']);
+                        $priorFull['system'] = array_merge((array) ($priorFull['system'] ?? []), (array) ($contextUpdates['system'] ?? []));
+                        $spec['full_context_json'] = self::canonical($priorFull);
+                    }
                 }
             }
             return $spec;
@@ -926,6 +936,36 @@ final class ContextHistory
     }
 
     /**
+     * Preserve a complete native receipt suffix only when it contains exactly the
+     * published source output, selected receipts and proven updates in the Web round.
+     * Their interleaving can differ; extra/altered assistant or call records cannot
+     * acquire provenance through this ordering repair. Call/output wire bookkeeping
+     * is normalized with the existing native history comparator.
+     */
+    private static function matchesNativeToolRound(array $prior, array $context, array $round, bool $lite): bool
+    {
+        $known = (array) ($prior['messages'] ?? []);
+        $records = (array) ($context['messages'] ?? []);
+        $base = $prior['system'][0] ?? null;
+        $first = $records[0] ?? null;
+        $offset = $lite && is_string($base) && $base !== ''
+            && ($first['role'] ?? '') === 'developer' && ($first['content'] ?? null) === $base
+            && self::canonical($known[0] ?? null) !== self::canonical($first) ? 1 : 0;
+        $normalize = static fn(array $record): string => self::nativeToolHistoryCanonical([$record]);
+        $expectedRecords = (array) ($round['messages'] ?? []);
+        $requestedRecords = array_slice($records, count($known) + $offset);
+        $modelRecord = static fn(array $record): bool =>
+            !in_array($record['role'] ?? '', ['user', 'developer', 'agent_message'], true);
+        if (array_values(array_map($normalize, array_filter($expectedRecords, $modelRecord)))
+            !== array_values(array_map($normalize, array_filter($requestedRecords, $modelRecord)))) return false;
+        $expected = array_map($normalize, $expectedRecords);
+        $requested = array_map($normalize, $requestedRecords);
+        sort($expected, SORT_STRING);
+        sort($requested, SORT_STRING);
+        return $expected === $requested;
+    }
+
+    /**
      * Carry hook/mailbox context accompanying the exact pending receipt batch.
      * Records retain their roles and must never become human user steering.
      * @param array $context Newly compiled native request.
@@ -1144,6 +1184,10 @@ final class ContextHistory
             if (($record['role'] ?? '') === 'assistant' || ($record['type'] ?? '') === 'reasoning_summary') {
                 if (!isset($published[$publishedIndex])
                     || self::canonical($record) !== self::canonical($published[$publishedIndex++])) return null;
+            } elseif ($humanSteering && ($record['role'] ?? '') === 'developer') {
+                // Codex appends privileged runtime updates between native turns. Keep
+                // their role after the exact source proof, alongside the new human input.
+                $updates[] = $record;
             } elseif (($record['role'] ?? '') === 'agent_message') {
                 $updates[] = $record;
                 $hasMailbox = true;

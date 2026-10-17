@@ -333,10 +333,13 @@ final class TaskMaintenance
         $lock = $alreadyLocked ? null : self::lock(LOCK_EX | LOCK_NB, false);
         if (!$alreadyLocked && $lock === null) return false;
         try {
-            if (DB('medoo', 'sqlite')->query('SELECT 1 FROM gateway_tasks t WHERE (' . self::WORKING . ') LIMIT 1')->fetchColumn() !== false) return false;
             $file = SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup_files')->where('available_at', '<=', time())
                 ->order([['cleanup_id','ASC']])->limit(1)->find();
             if (!is_array($file)) return false;
+            // The idle timer also reaches this path when there is no file to clean.
+            // Never scan historical work under the exclusive admission lock just to
+            // discover an empty queue: a waiting Web request would block its API loop.
+            if (DB('medoo', 'sqlite')->query('SELECT 1 FROM gateway_tasks t WHERE (' . self::WORKING . ') LIMIT 1')->fetchColumn() !== false) return false;
             $sql = DB('medoo', 'sqlite');
             $id = (string) $file['resource_id'];
             $protected = false;

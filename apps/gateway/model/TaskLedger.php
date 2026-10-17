@@ -3150,11 +3150,11 @@ final class TaskLedger
     /**
      * Journal proven native context without another browser submission or a renewed lease.
      * @param array $source Exact active response proven by ContextHistory.
-     * @param array $updates Role-preserving environment, mailbox or proven human revisions.
+     * @param array $updates Role-preserving environment, privileged updates, mailbox or proven human revisions.
      * @param string $requestHash Exact native request identity for reconnects.
      * @param ?string $idempotencyKey Optional global Responses idempotency identity.
      * @param bool $mailboxJoin Permit agent records only after the full active-source mailbox proof.
-     * @param bool $steeringJoin Permit human records only after the exact pending-tool source proof.
+     * @param bool $steeringJoin Permit human/runtime records only after the exact pending-tool source proof.
      * @param bool $joinResponse False when a receipt request must reserve its own next batch.
      * @param ?string $nativeTurnId Native UUID of a proven human tool join, retained for later stop/steering.
      * @return void
@@ -3186,6 +3186,7 @@ final class TaskLedger
         foreach ((array) ($updates['messages'] ?? []) as $message) {
             if (!ContextHistory::isOperationalUserMessage($message)
                 && !(($mailboxJoin || $steeringJoin) && ($message['role'] ?? '') === 'agent_message')
+                && !($steeringJoin && ($message['role'] ?? '') === 'developer')
                 && !($steeringJoin && ($message['role'] ?? '') === 'user')) {
                 throw new GatewayError('invalid_context_update', '此通道只接收 Codex 环境信息。', 400);
             }
