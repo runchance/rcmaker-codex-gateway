@@ -4412,6 +4412,7 @@ JS;
     /**
      * Accept only the exact durable stage ACK; one single-field typo may request a correction.
      * Recovery observations never issue correction messages, and no correction repeats payload.
+     * An empty current assistant row is still pending, even if earlier rows contain ACKs.
      * A released observer or an already acknowledged stage is a stale poll, not a missing transaction.
      */
     private function waitMultipartStageAcknowledgement(string $responseId, int $stage, float $deadline, bool $recover): void
@@ -4455,7 +4456,7 @@ JS;
                 }
                 $baselineAssistantCount = count((array) (($this->chatGptTurns[$responseId]['baseline_assistants'] ?? [])));
                 $currentAssistantCount = is_array($state) ? (int) ($state['assistant_count'] ?? 0) : 0;
-                $candidate = is_array($state) && empty($state['generation_running']) && (int) ($state['nonempty_count'] ?? 0) > 0
+                $candidate = is_array($state) && empty($state['generation_running']) && (int) ($state['last_chars'] ?? 0) > 0
                     && $currentAssistantCount >= $baselineAssistantCount + $stage;
                 if ($candidate) {
                     if ($this->waitForTaskSubmissionError($responseId)) {

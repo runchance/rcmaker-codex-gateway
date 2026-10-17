@@ -386,17 +386,17 @@ return {ok:popups.length===1&&rows.length===1,popup_count:popups.length,row_coun
 JS);
     }
 
-    /** Find an exact assistant transport acknowledgement anywhere in this isolated Temporary Chat. */
+    /** Find an exact stage ACK; mismatch diagnostics describe the latest row even while it is empty. */
     public static function acknowledgementExpression(string $ack): string
     {
         $expected = json_encode(trim($ack), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         return self::wrap(str_replace('__ACK__', $expected, <<<'JS'
 const expected=__ACK__;const rows=assistantTurns();
 const texts=rows.map(el=>{const root=el.querySelector('.markdown,[data-markdown-text-style]')||el.querySelector('[data-message-author-role="assistant"]')||el;return String(root.innerText||root.textContent||'').replace(/\u00a0/g,' ').trim()});
-const matches=texts.filter(text=>text===expected);const nonempty=texts.filter(text=>text!=='');const last=nonempty.at(-1)||'';const pieces=expected.split(' ');
+const matches=texts.filter(text=>text===expected);const nonempty=texts.filter(text=>text!=='');const last=texts.at(-1)||'';const pieces=expected.split(' ');
 const rawRows=rows.map(el=>{const root=el.querySelector('.markdown,[data-markdown-text-style]')||el.querySelector('[data-message-author-role="assistant"]')||el;return String(root.innerText||root.textContent||'')});
 const messageTooLarge=/^(?:你提交的消息过长，请编辑后重新发送[。.!]?|The message you submitted was too long[.,]? Please (?:edit|reload the conversation and submit) (?:it|something shorter)(?: and (?:try again|resubmit))?[.!]?)(?:\s*(?:重试|Retry|Try again))?$/i.test(last);
-return {ok:true,matched:matches.length===1,count:matches.length,assistant_count:rows.length,nonempty_count:nonempty.length,last_chars:last.length,last_raw:rawRows.filter(text=>text.trim()!=='').at(-1)||'',
+return {ok:true,matched:matches.length===1,count:matches.length,assistant_count:rows.length,nonempty_count:nonempty.length,last_chars:last.length,last_raw:rawRows.at(-1)||'',
 failure_code:messageTooLarge?'CHATGPT_MESSAGE_TOO_LARGE':null,
 last_has_prefix:last.includes(pieces[0]||'__missing__'),last_has_transaction:last.includes(pieces[1]||'__missing__'),last_has_part:last.includes(pieces[2]||'__missing__'),last_has_hash:last.includes(pieces[3]||'__missing__'),
 generation_running:!!generationStop()};
