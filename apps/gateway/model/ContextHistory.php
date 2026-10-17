@@ -961,7 +961,7 @@ final class ContextHistory
 
     /**
      * Prove a native mailbox delivery extends the exact source and select receipt joining or restart.
-     * Only unchanged durable history and that source's completed public commentary may precede
+     * Only unchanged durable history and that source's published commentary or public summaries may precede
      * new agent records. A completed tool-call response still owns its pending host batch, so a
      * mailbox arriving at that publication boundary rejoins the already issued calls.
      * @param array $spec Compiled complete native request; no fresh tool receipt is permitted.
@@ -988,7 +988,7 @@ final class ContextHistory
         return self::activeNativeContextUpdateUnlocked($spec, $taskId, true);
     }
 
-    /** Shared exact-source proof; human joins are restricted to a pending published tool batch. */
+    /** Match only this source's ordered public output; human joins require a pending published tool batch. */
     private static function activeNativeContextUpdateUnlocked(array $spec, ?string $taskId, bool $humanSteering): ?array
     {
         if (($spec['operation_kind'] ?? 'response') !== 'response'
@@ -1106,14 +1106,18 @@ final class ContextHistory
         if (self::canonical($priorTop) !== self::canonical($incomingTop)
             || !self::matchesCompactionSource($prior, $prefix, $lite, true)) return null;
         $response = json_decode((string) ($source['response_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
-        $commentary = [];
+        $published = [];
         foreach ((array) ($response['output'] ?? []) as $item) {
-            if (($item['type'] ?? '') === 'message' && ($item['role'] ?? '') === 'assistant'
-                && ($item['phase'] ?? '') === 'commentary' && ($item['status'] ?? '') === 'completed') {
-                $commentary[] = self::compile([$item], '')['messages'][0];
+            $commentary = ($item['type'] ?? '') === 'message' && ($item['role'] ?? '') === 'assistant'
+                && ($item['phase'] ?? '') === 'commentary' && ($item['status'] ?? '') === 'completed';
+            // These are the exact public status/summary items already emitted to Codex.
+            // compile() retains their public summary only, never private reasoning content.
+            $summary = ($item['type'] ?? '') === 'reasoning' && !empty($item['summary']);
+            if ($commentary || $summary) {
+                $published[] = self::compile([$item], '')['messages'][0];
             }
         }
-        $commentaryIndex = 0;
+        $publishedIndex = 0;
         $updates = [];
         $hasMailbox = false;
         $hasHuman = false;
@@ -1122,9 +1126,9 @@ final class ContextHistory
             if (($record['role'] ?? '') === 'user' && !empty($record['id'])) $knownUserIds[(string) $record['id']] = true;
         }
         foreach (array_slice($records, count($known) + $offset) as $record) {
-            if (($record['role'] ?? '') === 'assistant') {
-                if (!isset($commentary[$commentaryIndex])
-                    || self::canonical($record) !== self::canonical($commentary[$commentaryIndex++])) return null;
+            if (($record['role'] ?? '') === 'assistant' || ($record['type'] ?? '') === 'reasoning_summary') {
+                if (!isset($published[$publishedIndex])
+                    || self::canonical($record) !== self::canonical($published[$publishedIndex++])) return null;
             } elseif (($record['role'] ?? '') === 'agent_message') {
                 $updates[] = $record;
                 $hasMailbox = true;
@@ -1141,7 +1145,7 @@ final class ContextHistory
                 return null;
             }
         }
-        if ($humanSteering ? !$hasHuman : (!$hasMailbox || $commentaryIndex === 0)) return null;
+        if ($humanSteering ? !$hasHuman : (!$hasMailbox || $publishedIndex === 0)) return null;
         return ['source' => $source, 'restart' => (int) $pending === 0,
             'client_turn_id' => (string) $turn['client_turn_id'],
             'updates' => ['version' => 3, 'system' => [], 'messages' => $updates]];
