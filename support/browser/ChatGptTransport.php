@@ -8,6 +8,8 @@ use app\gateway\model\ContextBudget;
 /** Pure ChatGPT-Web transport/model rules, preserving literal history inside JSON envelopes. */
 final class ChatGptTransport
 {
+    /** Complete ACK grammar; only exact expected literals can acknowledge a stage. */
+    private const ACKNOWLEDGEMENT_PATTERN = '/\ACODEX_MULTIPART_ACK (ctx_[a-f0-9]{32}) ([1-9][0-9]*\/[1-9][0-9]*) ([a-f0-9]{64})\z/D';
     // Large Runtime.evaluate insertText calls can time out before the editor acknowledges them.
     // Keep new inert stages small enough for one reliable browser write.
     private const MAX_EDITOR_STAGE_CHARS = 130000;
@@ -1152,6 +1154,23 @@ final class ChatGptTransport
     }
 
     /**
+     * Recognize a partial ACK rendering that must retain the original stage wait.
+     * The Stop control may be absent before the complete reply renders. This never
+     * accepts an ACK or extends its deadline; complete wrong ACKs keep their existing
+     * correction/mismatch policy and unrelated prose keeps its existing handling.
+     * @param string $actual Current assistant row, without Markdown wrappers.
+     * @return bool Nonempty ACK prefix/text whose required fields are not all present.
+     */
+    public static function acknowledgementIncomplete(string $actual): bool
+    {
+        $actual = trim($actual);
+        if ($actual === '') return false;
+        $prefix = 'CODEX_MULTIPART_ACK';
+        return (str_starts_with($prefix, $actual) || str_contains($actual, $prefix))
+            && preg_match(self::ACKNOWLEDGEMENT_PATTERN, $actual) !== 1;
+    }
+
+    /**
      * Permit one exact-literal correction when only the transaction or checksum differs.
      * This never acknowledges a part: the browser must still receive the full exact ACK.
      * Part/total changes, prose, malformed IDs and two conflicting fields cannot be repaired.
@@ -1161,9 +1180,8 @@ final class ChatGptTransport
      */
     public static function acknowledgementRepairable(string $expected, string $actual): bool
     {
-        $pattern = '/\ACODEX_MULTIPART_ACK (ctx_[a-f0-9]{32}) ([1-9][0-9]*\/[1-9][0-9]*) ([a-f0-9]{64})\z/D';
-        if (preg_match($pattern, trim($expected), $required) !== 1
-            || preg_match($pattern, trim($actual), $observed) !== 1
+        if (preg_match(self::ACKNOWLEDGEMENT_PATTERN, trim($expected), $required) !== 1
+            || preg_match(self::ACKNOWLEDGEMENT_PATTERN, trim($actual), $observed) !== 1
             || $required[2] !== $observed[2]) return false;
         $sameTransaction = hash_equals($required[1], $observed[1]);
         $sameChecksum = hash_equals($required[3], $observed[3]);
