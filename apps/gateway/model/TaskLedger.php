@@ -2263,6 +2263,7 @@ final class TaskLedger
      * with no active RPC cannot keep an unrelated current turn waiting indefinitely.
      * A closed historical wait is drained only when the current context proves its exact
      * saved receipt; this never acknowledges delivery to the retired Web page.
+     * Completed receipts already canonically handed off from older bindings are also drained.
      * @param string $responseId Current logical ordinary Responses round.
      * @param string $incarnation Browser worker owning the exact surface.
      * @param int $fence Surface ownership version.
@@ -2330,6 +2331,11 @@ final class TaskLedger
                 if ($call['status'] === 'completed') $hasCompletedWork = true;
                 if ($call['status'] === 'completed' && $call['binding_id'] === ($binding['id'] ?? null)) $currentCompletedCalls++;
                 if ($call['status'] === 'completed' && ($call['result_delivered_at'] === null || $call['result_json'] === null)) {
+                    // Canonical handoff preserved this result in a later round. Its retired
+                    // Web wait remains unacknowledged, but is no longer pending delivery here.
+                    $result = is_string($call['result_json']) ? json_decode($call['result_json'], true) : null;
+                    if ($call['binding_id'] !== ($binding['id'] ?? null)
+                        && !empty($result['canonical_handoff_response_id'])) continue;
                     if ($call['binding_id'] !== ($binding['id'] ?? null)
                         && ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $job, (string)$job['task_id'])) {
                         // The old wait is conclusively closed, and this turn already carries
