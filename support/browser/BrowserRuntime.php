@@ -7032,6 +7032,7 @@ JS;
     /**
      * Drain accepted host receipts, stop the exact old generation, then request only a checkpoint.
      * This never reports the interrupted partial answer as completion of the human task.
+     * After an owned Stop, confirm idle on the fenced document even if historical DOM groups change.
      * @param string $responseId Physical source observer.
      * @param string $logicalResponseId Its currently reserved compact response.
      * @return void Polling retains the durable deadline and never cancels a host invocation.
@@ -7052,8 +7053,11 @@ JS;
             $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$source['prompt']];
             if (!empty($source['transport_transaction_id'])) $witnesses[] = (string)$source['transport_transaction_id'];
             $surface = TaskLedger::execution($logicalResponseId)['surface'];
+            // Stop already proved the current user. Rerendered history must not block its idle acknowledgement;
+            // a running generation still requires that witness inside userStopExpression, even without a click.
+            $stopUnconfirmed = empty($turn['compaction_stop_clicked']);
             $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
-                (array)$turn['baseline_users'], empty($turn['compaction_stop_clicked']), true,
+                (array)$turn['baseline_users'], $stopUnconfirmed, $stopUnconfirmed,
                 self::acceptedInitialUser($source, $surface));
         } catch (GatewayError $error) {
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
