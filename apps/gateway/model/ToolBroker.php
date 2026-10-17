@@ -3223,7 +3223,7 @@ final class ToolBroker
      * @param string $responseId Current ordinary native response owning the live capability.
      * @param string $marker Durable continuation marker reserved by TaskLedger.
      * @param bool $audit Request an evidence audit of the existing task.
-     * @param bool $streamRecovery Reconcile an explicitly failed stream, respecting human pause/cancellation.
+     * @param bool $streamRecovery Reconcile a failed stream or settled empty tool response, respecting human pause/cancellation.
      * @return string Bounded contract containing exactly the current tool token and continuation intent.
      * @throws GatewayError If the live binding or its original verified token cannot be recovered.
      */
@@ -3250,7 +3250,7 @@ final class ToolBroker
         $tokens = array_values($tokens);
         if (count($tokens) !== 1) throw new GatewayError('continuation_token_missing', '无法核对当前工具令牌，已停止网页续做。', 409);
         $purpose = $streamRecovery
-            ? 'The prior webpage stream timed out after native tools continued working. All accepted host calls and their exact results have now settled. Check the actual latest human goal, including steering instructions, and the confirmed receipts; continue only the remaining authorized work. If the work is already complete, give its verified final answer. If the human paused or cancelled it, acknowledge that and do not resume development. '
+            ? 'The prior webpage response stopped before this Codex task was settled. All accepted host calls and their exact results have now settled. Check the actual latest human goal, including steering instructions, and the confirmed receipts; continue only the remaining authorized work. If the work is already complete, give its verified final answer. If the human paused or cancelled it, acknowledge that and do not resume development. '
             : ($audit
             ? 'Your preceding answer followed several host-tool calls. Before closing this same Codex turn, audit EVERY outcome requested by the latest human user against actual native tool receipts and verification. If any authorized item is missing, continue implementing and testing it now; if all are complete, give the final answer with concrete evidence. '
             : 'Your preceding answer explicitly left authorized work unfinished. Continue that original task now in its original workspace and scope. ');

@@ -6524,7 +6524,7 @@ JS;
                 // A tool-only answer may return to Send without a final body or Copy action,
                 // while its private stream observer still lacks a post-receipt finish event.
                 // Exact delivered source receipts plus a drained MCP fence can settle this
-                // empty ordinary terminal as a failure. An active checkpoint instead begins
+                // empty ordinary terminal for bounded recovery. An active checkpoint begins
                 // its separate summary-only handoff; it does not complete the user's task.
                 $emptyUiReceiptsSettled = $toolCapable && $deliveredAt !== null
                     && $deliverySignature !== '' && ($snapshot['send_button_visible'] ?? null) === true
@@ -6538,7 +6538,7 @@ JS;
                     // document and delivered receipt signature still bind a new idle witness.
                     'request_id' => !empty($emptySession['submission_request_id'])
                         ? (string) $emptySession['submission_request_id']
-                        : (string) ($activeCompact ? $logicalJob['previous_response_id'] : ''),
+                        : (string) (($activeCompact || $emptyUiReceiptsSettled) ? $logicalJob['previous_response_id'] : ''),
                     'request_finished_at' => $emptySession['submission_finished_at'] ?? null,
                     'source_receipt_signature' => $this->chatGptTurns[$responseId]['source_receipt_signature'] ?? '',
                     'transport_settled' => $emptyTransportSettled,
@@ -6866,7 +6866,8 @@ JS;
      * Resolve only a continuously observed empty terminal after the owned stream and tools settled.
      * A fresh MCP fence is read on every candidate poll and again before resolving the source;
      * it never publishes an empty user final. Confirmed failed streams use bounded recovery;
-     * healthy ordinary empty terminals fail honestly. A reserved checkpoint
+     * a tool-only empty terminal first uses the existing same-page continuation. Ordinary
+     * empty answers without confirmed host work still fail honestly. A reserved checkpoint
      * with exact delivered source receipts starts its separate control-only summary message.
      * @param string $responseId Physical runtime observer key.
      * @param string $logicalResponseId Current native Responses round on the same owned page.
@@ -6923,6 +6924,11 @@ JS;
                 return false;
             }
             $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, '');
+            return true;
+        }
+        if ($health['error_code'] === 'CHATGPT_EMPTY_RESPONSE' && $toolCapable
+            && ($evidence['ui_receipts_settled'] ?? null) === true
+            && $this->continueStoppedTaskStream($responseId, $snapshot, 'CHATGPT_EMPTY_RESPONSE')) {
             return true;
         }
         if ($health['error_code'] === 'CHATGPT_MESSAGE_STREAM_ERROR') {
@@ -7705,14 +7711,16 @@ JS;
 
     /**
      * Prefer a control-only message on the original page after an explicit failed stream
-     * actually stopped and its accepted native work drained. A connection banner during
+     * or a continuously observed tool-only empty terminal. The page must have stopped
+     * and its accepted native work and exact receipts must have drained. A connection banner during
      * generation never enters this path. The ledger's durable marker bounds retries across
      * lost acknowledgements/restarts; unknown effects still prohibit all automatic recovery.
      * @param string $responseId Physical observer, possibly following a newer native receipt round.
-     * @param array $snapshot Bound stopped response with its current native error and Send state.
+     * @param array $snapshot Bound stopped response with Send state and an optional native error.
+     * @param string|null $recoveryCause Explicitly settled empty cause, or the snapshot's observed error.
      * @return bool Whether this path owns waiting, preparation or failure; false retains legacy recovery.
      */
-    private function continueStoppedTaskStream(string $responseId, array $snapshot): bool
+    private function continueStoppedTaskStream(string $responseId, array $snapshot, ?string $recoveryCause = null): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || empty($turn['tool_capable'])
@@ -7723,8 +7731,9 @@ JS;
         $logicalId = (string)($turn['logical_response_id'] ?? $responseId);
         $completion = ToolBroker::completionForResponse($logicalId);
         if ((int)($completion['invocation_count'] ?? 0) < 1) return false;
+        $errorCode = $recoveryCause ?? (string)($snapshot['error']['code'] ?? 'CHATGPT_MESSAGE_STREAM_ERROR');
         $failureKey = hash('sha256', json_encode([$snapshot['new_user_id'], $snapshot['response_id'],
-            $snapshot['error']['code'] ?? '', $snapshot['network_retry']['failure_id'] ?? '',
+            $errorCode, $snapshot['network_retry']['failure_id'] ?? '',
             $snapshot['network_retry']['fingerprint'] ?? ''], JSON_THROW_ON_ERROR));
         $previous = $turn['stopped_stream_observation'] ?? null;
         if (!is_array($previous) || ($previous['signature'] ?? null) !== $failureKey) {
@@ -7737,7 +7746,7 @@ JS;
             return true;
         }
         $this->evaluateTask($responseId, WebModelPage::baselineExpression(),
-            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $failureKey): void {
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $failureKey, $errorCode): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || (string)($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
@@ -7746,7 +7755,7 @@ JS;
                     || !in_array($snapshot['new_user_id'], (array)($baseline['user_ids'] ?? []), true)
                     || !in_array($snapshot['response_id'], (array)($baseline['assistant_ids'] ?? []), true)) {
                     // A genuinely unusable composer retains the existing exact-receipt fallback.
-                    $this->recoverFailedMessageStream($responseId, true, (string)$snapshot['error']['code']);
+                    $this->recoverFailedMessageStream($responseId, true, $errorCode);
                     return;
                 }
                 if (!empty($baseline['generation_running'])) {
@@ -7760,11 +7769,13 @@ JS;
                     if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 0.5); return; }
                     if (!empty($reservation['exhausted'])) {
                         $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
-                            'ChatGPT 网页连续出现网络错误，自动重试已达三次；原上下文和工具回执仍保留。', true);
+                            $errorCode === 'CHATGPT_EMPTY_RESPONSE'
+                                ? 'ChatGPT 网页连续停止且未返回最终答复，自动续做已达三次；原上下文和工具回执仍保留。'
+                                : 'ChatGPT 网页连续出现网络错误，自动重试已达三次；原上下文和工具回执仍保留。', true);
                         return;
                     }
                     if (empty($reservation['continue'])) {
-                        $this->recoverFailedMessageStream($responseId, true, (string)$snapshot['error']['code']);
+                        $this->recoverFailedMessageStream($responseId, true, $errorCode);
                         return;
                     }
                     $prompt = ToolBroker::continuationPromptForResponse($logicalId, $reservation['marker'], false, true);

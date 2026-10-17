@@ -1,5 +1,6 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "ChatGPT 网页连续停止且未返回最终答复，自动续做已达三次；原上下文和工具回执仍保留。": "ChatGPT stopped repeatedly without a final answer. Automatic continuation reached its three-attempt limit; the original context and tool receipts are preserved.",
     "摘要发布记录暂不可读取。": "Summary publication records are temporarily unavailable.",
     "插话时全量重发上下文": "Resend full context when steering",
     "默认关闭：已受理工具结清后，停止原页生成并发送新增需求和必要回执。开启后沿用全量重发。重启、原页丢失或异常时，仍可验证完整上下文与准确回执后恢复。": "Off by default: drain accepted tools, stop the current generation, then send new instructions and required receipts. Enable to retain full-context resending. Recovery after a restart, missing page or page failure still uses verified full context and exact receipts.",
