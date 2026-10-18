@@ -50,7 +50,9 @@ final class ContextCompaction
      * Client, branch, integration, model/effort and the complete context bytes must match,
      * allowing only the exact gateway-owned failed-checkpoint notice appended by recovery.
      * Pending requests retain one producer and failed requests expose their real terminal.
-     * Active-source checkpoints are excluded; completed envelopes still require full proof.
+     * Source-linked checkpoints also retain one producer across temporary IDs; a failed
+     * source can recover only through the existing ownership and exact-receipt fences.
+     * Completed envelopes still require full proof.
      * Called within the existing task-maintenance admission boundary, before browser checks.
      * @param array $spec Fresh compact request, before any conversation routing mutation.
      * @param bool $locked Caller already owns the schema write transaction; never nest BEGIN.
@@ -60,7 +62,7 @@ final class ContextCompaction
     public static function readonlyReplay(array $spec, bool $locked = false): ?array
     {
         if (($spec['operation_kind'] ?? '') !== 'compact_v2' || empty($spec['integration_id'])
-            || !empty($spec['previous_response_id']) || (array)($spec['tool_outputs'] ?? []) !== []
+            || !empty($spec['previous_response_id'])
             || (array)($spec['tools'] ?? []) !== [] || ($spec['tool_choice'] ?? null) !== 'none') return null;
         $lookup = static function () use ($spec): ?array {
             $db = SDB(null, 'medoo', 'sqlite');
@@ -83,12 +85,18 @@ final class ContextCompaction
             $rows = DB('medoo', 'sqlite')->query("SELECT j.id FROM gateway_response_jobs j
                 JOIN gateway_tasks t ON t.id=j.task_id
                 JOIN gateway_context_checkpoints c ON c.response_id=j.id AND c.id=j.compact_id
-                WHERE j.status IN ('queued','running','failed','completed') AND j.operation_kind='compact_v2' AND j.previous_response_id IS NULL
+                WHERE j.status IN ('queued','running','failed','completed') AND j.operation_kind='compact_v2'
                 AND j.integration_id=:integration AND j.model=:model AND j.reasoning_effort IS :effort
                 AND j.context_json IN (:context,:recovered_context) AND j.compaction_epoch=:compaction_epoch
-                AND t.client_id=:client AND t.branch_id=:branch AND c.state IN ('generating','committed')
-                AND c.source_response_id IS NULL AND c.protocol='compact_v2'
-                ORDER BY CASE WHEN j.status='completed' THEN 0 WHEN j.status IN ('queued','running') THEN 1 ELSE 2 END,
+                AND t.client_id=:client AND t.branch_id=:branch AND c.state IN ('generating','committed','abandoned')
+                AND c.protocol='compact_v2' AND c.request_hash=j.request_hash
+                AND ((j.previous_response_id IS NULL AND c.source_response_id IS NULL)
+                    OR (c.source_response_id IS NOT NULL AND (c.source_response_id=j.previous_response_id OR j.previous_response_id IS NULL)
+                        AND EXISTS
+                        (SELECT 1 FROM gateway_response_jobs s WHERE s.id=c.source_response_id
+                            AND s.task_id=j.task_id AND s.epoch_id=c.source_epoch_id)))
+                ORDER BY CASE WHEN c.source_response_id IS NOT NULL THEN 0 ELSE 1 END,
+                CASE WHEN j.status='completed' THEN 0 WHEN j.status IN ('queued','running') THEN 1 ELSE 2 END,
                 CASE WHEN j.status IN ('queued','running') THEN j.rowid END ASC, j.rowid DESC LIMIT 16", [':integration'=>$spec['integration_id'], ':model'=>$spec['model'],
                     ':effort'=>$spec['reasoning_effort'] ?? null, ':client'=>$spec['client_id'] ?? 'responses',
                     ':branch'=>$spec['branch_id'] ?? 'main', ':context'=>$context, ':recovered_context'=>$recoveredContext,
@@ -99,6 +107,19 @@ final class ContextCompaction
                     || $job['compaction_epoch'] !== ($spec['compaction_epoch'] ?? 'base')) continue;
                 $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $job['compact_id'])->find();
                 if (!is_array($checkpoint) || $checkpoint['task_id'] !== $job['task_id']) continue;
+                if (!self::readonlySourceOutputsMatch($spec, $job, $checkpoint)) continue;
+                if ($checkpoint['state'] === 'abandoned' && $job['status'] === 'failed' && !empty($job['previous_response_id'])) {
+                    $original = self::originalReadonlySourceRequest($spec, $job);
+                    if ($original === null) continue;
+                    $hash = hash('sha256', $job['request_hash'] . '|readonly_source_recovery|' . $job['id']);
+                    $identity = hash('sha256', $original['task_key'] . '|compact_' . substr($hash, 0, 32) . '|' . $hash);
+                    $recovery = $db->table('gateway_response_jobs')->where('request_identity', $identity)->find();
+                    // Return the immutable source; its normal retry wrapper observes the
+                    // existing recovery. An abandoned slot alone never authorizes a send.
+                    if (is_array($recovery) && $recovery['request_hash'] === $hash
+                        && $recovery['operation_kind'] === 'compact_v2') return $job;
+                    continue;
+                }
                 if ($checkpoint['state'] === 'generating') {
                     // Observing an existing response performs no browser send. In particular,
                     // changing a temporary thread must not retry a failed or still-staging POST.
@@ -129,6 +150,44 @@ final class ContextCompaction
             return null;
         };
         return $locked ? $lookup() : Schema::transaction($lookup);
+    }
+
+    /**
+     * Prove trailing outputs repeat the recorded request without accepting a native receipt.
+     * An unresolved source is observed as unresolved; it cannot become a new imported task.
+     * @param array $spec Read-only request; this method never settles or delivers a host result.
+     * @param array $job Exact-context checkpoint candidate owned by the original task.
+     * @param array $checkpoint Verified checkpoint, including any pinned source before a page move.
+     * @return bool Every supplied output repeats the source context or its verified completed result.
+     */
+    private static function readonlySourceOutputsMatch(array $spec, array $job, array $checkpoint): bool
+    {
+        if (empty($job['previous_response_id']) && !empty($checkpoint['source_response_id'])) {
+            $events = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('task_id', $job['task_id'])
+                ->where('response_id', $job['id'])->where('event_type', 'mcp_readonly_compaction_replay_prepared')
+                ->order([['id','DESC']])->limit(1)->find();
+            $proof = is_array($events) ? json_decode((string) $events['data_json'], true) : null;
+            if (!is_array($proof) || ($proof['source_response_id'] ?? null) !== $checkpoint['source_response_id']
+                || !hash_equals(hash('sha256', (string) $job['context_json']), (string) ($proof['context_sha256'] ?? ''))) return false;
+        }
+        $outputs = (array) ($spec['tool_outputs'] ?? []);
+        if ($outputs === []) return true;
+        if (empty($job['previous_response_id']) && empty($checkpoint['source_response_id'])) return false;
+        $receipts = self::receiptOutputs(json_decode((string) $job['context_json'], true, 128, JSON_THROW_ON_ERROR));
+        $db = SDB(null, 'medoo', 'sqlite');
+        foreach ($outputs as $output) {
+            $callId = (string) ($output['call_id'] ?? '');
+            if (array_key_exists($callId, $receipts) && array_key_exists('output', $output)
+                && ContextHistory::canonical($output['output']) === ContextHistory::canonical($receipts[$callId])) continue;
+            $call = $db->table('gateway_tool_invocations')->where('task_id', $job['task_id'])->where('call_id', $callId)->find();
+            $result = is_array($call) ? json_decode((string) $call['result_json'], true) : null;
+            if (!is_array($call) || $call['status'] !== 'completed' || !is_string($result['output'] ?? null)
+                || !is_string($call['result_hash']) || !hash_equals($call['result_hash'], hash('sha256', $result['output']))
+                || !array_key_exists($callId, $receipts)
+                || !self::matchesPersistedReceipt($receipts[$callId], $result['output'], $call['result_hash'], !empty($result['output_is_content_parts']))
+                || !self::matchesPersistedReceipt($output['output'] ?? null, $result['output'], $call['result_hash'], !empty($result['output_is_content_parts']))) return false;
+        }
+        return true;
     }
 
     /**
@@ -356,6 +415,9 @@ final class ContextCompaction
     private static function retryExactUnsentFailure(array $spec, ?string $idempotencyKey, array $job): array
     {
         if (($job['status'] ?? '') !== 'failed' || empty($job['compact_id'])) return $job;
+        // A temporary compact thread is an observer of this exact source, not a new
+        // task owner. Recover on the original conversation mapping with one stable key.
+        $spec = self::originalReadonlySourceRequest($spec, $job) ?? $spec;
         $db = SDB(null, 'medoo', 'sqlite');
         // Exact client replays reach this wrapper before conversation routing. A separate
         // deterministic identity allows only the proven terminal source to enter that route;
@@ -465,6 +527,62 @@ final class ContextCompaction
         if (!is_array($task) || $task['status'] !== 'active'
             || !self::safeUnsentRetryUnlocked($checkpoint, $job, $spec, $taskId)) return $job;
         return ResponseJob::createOrReuse($retrySpec, $retryKey);
+    }
+
+    /**
+     * Resolve an exact read-only source retry back to its durable native conversation.
+     * @param array $spec Current compact request; changed history or authorization never aliases.
+     * @param array $job Failed source checkpoint selected by the request/replay fences.
+     * @return array|null Stable original request scope, without reviving host-tool permission.
+     */
+    private static function originalReadonlySourceRequest(array $spec, array $job): ?array
+    {
+        if (($spec['operation_kind'] ?? '') !== 'compact_v2' || empty($job['previous_response_id'])
+            || (array) ($spec['tools'] ?? []) !== [] || ($spec['tool_choice'] ?? null) !== 'none'
+            || !empty($spec['input_is_delta']) || ($spec['model'] ?? null) !== $job['model']
+            || ($spec['reasoning_effort'] ?? null) !== $job['reasoning_effort']
+            || ($spec['compaction_epoch'] ?? 'base') !== $job['compaction_epoch']
+            || ($spec['integration_id'] ?? null) !== $job['integration_id']
+            || (string) ($spec['full_context_json'] ?? $spec['context_json']) !== (string) $job['context_json']) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $persisted = $db->table('gateway_response_jobs')->where('id', $job['id'])->find();
+        if (!is_array($persisted) || $persisted['status'] !== 'failed'
+            || $persisted['context_json'] !== $job['context_json']) return null;
+        $job = $persisted;
+        $task = $db->table('gateway_tasks')->where('id', $job['task_id'])->find();
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $job['compact_id'])->find();
+        if (!is_array($task) || !is_array($checkpoint) || $checkpoint['task_id'] !== $job['task_id']
+            || $checkpoint['response_id'] !== $job['id'] || $checkpoint['source_response_id'] !== $job['previous_response_id']
+            || $checkpoint['request_hash'] !== $job['request_hash']
+            || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
+            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')) return null;
+        $requestedTask = 'task_' . substr((string) $spec['task_key'], 0, 24);
+        if ($requestedTask !== $job['task_id'] && empty($spec['integration_id'])) return null;
+        $links = $db->table('gateway_task_conversations')->where('current_task_id', $task['id'])->limit(2)->select();
+        if (!is_array($links) || count($links) > 1) return null;
+        $baseId = $links[0]['base_task_id'] ?? $task['id'];
+        if ($links === []) {
+            $event = $db->table('gateway_task_events')->where('task_id', $task['id'])->where('response_id', $job['id'])
+                ->where('event_type', 'source_waiting_checkpoint_superseded')->order([['id','DESC']])->limit(1)->find();
+            $facts = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
+            if (is_string($facts['native_base_task_id'] ?? null)) $baseId = $facts['native_base_task_id'];
+        }
+        $base = $baseId === $task['id'] ? $task : $db->table('gateway_tasks')->where('id', $baseId)->find();
+        if (!is_array($base) || $base['client_id'] !== $task['client_id']
+            || $base['thread_id'] !== $task['thread_id'] || $base['branch_id'] !== $task['branch_id']) return null;
+        $taskKey = hash('sha256', json_encode(['client'=>$base['client_id'], 'owner'=>$base['owner_key'],
+            'branch'=>$base['branch_id']], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+        if ('task_' . substr($taskKey, 0, 24) !== $base['id']) return null;
+        $spec['task_key'] = $taskKey;
+        $spec['browser_owner_key'] = $base['owner_key'];
+        $spec['browser_lease_key'] = $job['browser_lease_key'];
+        $spec['thread_id'] = $base['thread_id'];
+        $spec['request_hash'] = $job['request_hash'];
+        $spec['turn_id'] = 'compact_' . substr($job['request_hash'], 0, 32);
+        $spec['previous_response_id'] = null;
+        $spec['tool_outputs'] = [];
+        $spec['readonly_source_base_task_id'] = $base['id'];
+        return $spec;
     }
 
     /**
@@ -1236,8 +1354,10 @@ final class ContextCompaction
      * complete history, or after a proven terminal read-only failure. Native pre-turn
      * compaction need not contain a new human item at that terminal boundary. The caller
      * owns the response reservation transaction.
-     * A sent/observed summary, unresolved host effect or active MCP call keeps the fence.
-     * Completed receipts are immutable; only the unused old capability is revoked.
+     * A sent/observed summary, unresolved host effect or live MCP capability keeps the fence.
+     * A revoked source on a proven missing page may retire its orphaned transport only
+     * when every host call completed and the complete exact result history is present.
+     * Completed receipts are immutable; the old capability is revoked without cancelling host work.
      * @param string $taskId Current routed task identity.
      * @param array $spec New read-only native compact request, with full readable history.
      * @return bool Whether the old source-waiting slot and task were atomically retired.
@@ -1266,7 +1386,9 @@ final class ContextCompaction
             'task_id'=>$taskId, 'turn_id'=>$turn['id'], 'response_id'=>$job['id'], 'surface_id'=>$surface['id'],
             'event_type'=>'source_waiting_checkpoint_superseded',
             'data_json'=>json_encode(['checkpoint_id'=>$checkpoint['id'], 'source_response_id'=>$source['id'],
-                'delivered_tool_calls'=>count($calls)], JSON_THROW_ON_ERROR), 'created_at'=>time(),
+                'delivered_tool_calls'=>count(array_filter($calls, static fn(array $call): bool => $call['result_delivered_at'] !== null)),
+                'completed_tool_calls'=>count($calls),
+                'native_base_task_id'=>$spec['readonly_source_base_task_id'] ?? null], JSON_THROW_ON_ERROR), 'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', '源摘要等待替换证据无法保存。', 503);
         return true;
     }
@@ -1281,10 +1403,12 @@ final class ContextCompaction
      * @param string $taskId Routed task whose owner is encoded in the request.
      * @param array $spec Complete normalized read-only checkpoint request.
      * @param bool $missingReplay Inspect only queued/running same-scope page recovery.
+     * @param bool $missingPageObserved Caller holds the surface fence after trusted discovery proved the target absent.
      * @return array|null Verified task/checkpoint/job/source/turn/epoch/surface/calls rows.
      * @throws GatewayError If persisted receipts are incomplete or storage cannot be read.
      */
-    private static function sourceWaitingStateUnlocked(string $taskId, array $spec, bool $missingReplay = false): ?array
+    private static function sourceWaitingStateUnlocked(string $taskId, array $spec, bool $missingReplay = false,
+        bool $missingPageObserved = false): ?array
     {
         if (!in_array($spec['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
             || !empty($spec['input_is_delta']) || (array) ($spec['tools'] ?? []) !== []
@@ -1329,6 +1453,7 @@ final class ContextCompaction
         if (!is_array($turn) || !is_array($epoch) || !is_array($surface)
             || (string) $turn['task_id'] !== $taskId || (string) $epoch['task_id'] !== $taskId
             || (string) $surface['task_id'] !== $taskId || (string) $turn['response_id'] !== (string) $job['id']
+            || (string) $turn['generation_id'] !== (string) $job['generation_id']
             || (string) $turn['epoch_id'] !== (string) $epoch['id']
             || (string) $turn['surface_id'] !== (string) $surface['id']
             || (string) $surface['epoch_id'] !== (string) $epoch['id']
@@ -1377,8 +1502,21 @@ final class ContextCompaction
         $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)->select();
         if (!is_numeric($otherJobs) || (int) $otherJobs !== 0 || !is_numeric($otherTurns) || (int) $otherTurns !== 0
             || !is_array($calls) || $calls === [] || !is_array($bindings)) return null;
+        $retiredSource = false;
+        // Only the fenced browser discovery path can supply this observation. The
+        // same writer transaction revokes/rotates the source capability before reuse.
+        $closedMissingSource = $missingReplay && $missingPageObserved && $running && $sameScope;
+        if (!$running && $sameScope && !$movedFailure) {
+            foreach ($bindings as $binding) {
+                if ((string) $binding['id'] === (string) $source['mcp_binding_id'] && $binding['status'] === 'revoked'
+                    && self::hasMissingTargetCleanupUnlocked($binding, $job, $surface, true)) $retiredSource = true;
+            }
+        }
         foreach ($calls as $call) {
-            if ($call['status'] !== 'completed' || $call['result_delivered_at'] === null) return null;
+            // Missing delivery is transport uncertainty, not host uncertainty. This
+            // exception requires a revoked capability, proven missing page, and the
+            // full byte-verified receipt proof below; stored delivery ACKs stay intact.
+            if ($call['status'] !== 'completed' || (!$retiredSource && !$closedMissingSource && $call['result_delivered_at'] === null)) return null;
         }
         $sourceBinding = null;
         $settledSource = false;
@@ -1404,9 +1542,9 @@ final class ContextCompaction
             } elseif (!in_array($binding['status'], ['completed', 'revoked'], true)) return null;
             $activities = $db->table('gateway_mcp_activities')->where('binding_id', (string) $binding['id'])
                 ->where('status', 'active')->count();
-            if (!is_numeric($activities) || (int) $activities !== 0) return null;
+            if (!is_numeric($activities) || ((int) $activities !== 0 && !(($retiredSource || $closedMissingSource) && $isSource))) return null;
         }
-        if (!is_array($sourceBinding) || ($settledSourceRequired && !$settledSource) || ($movedFailure
+        if (!is_array($sourceBinding) || ($settledSourceRequired && !$settledSource && !$retiredSource) || ($movedFailure
             && ($sourceBinding['sent_at'] !== null || $sourceBinding['started_at'] !== null))) return null;
         $before = json_decode((string) $job['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $after = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
@@ -1421,10 +1559,11 @@ final class ContextCompaction
      * Prove that a missing active source may be moved as the same read-only checkpoint.
      * The caller owns the retry transaction; this method does not change any durable row.
      * @param array $job Queued/running compact whose previous response is the completed source.
-     * @return bool Complete delivered receipts and an untouched summary fence permit replay.
+     * @param bool $missingPageObserved True only for the fenced missing-target browser recovery transaction.
+     * @return bool Complete verified receipts and an untouched summary fence permit read-only replay.
      * @throws GatewayError If exact receipt evidence is incomplete or storage fails.
      */
-    public static function canReplayMissingSourceUnlocked(array $job): bool
+    public static function canReplayMissingSourceUnlocked(array $job, bool $missingPageObserved = false): bool
     {
         if (!in_array($job['status'] ?? '', ['queued', 'running'], true) || empty($job['previous_response_id'])) return false;
         $task = SDB(null, 'medoo', 'sqlite')->table('gateway_tasks')->where('id', (string) $job['task_id'])->find();
@@ -1434,7 +1573,7 @@ final class ContextCompaction
             'client_id'=>$task['client_id'], 'thread_id'=>$task['thread_id'], 'branch_id'=>$task['branch_id'],
             'browser_owner_key'=>$task['owner_key'], 'context_json'=>$job['context_json'],
             'full_context_json'=>$job['context_json'], 'compaction_epoch'=>$job['compaction_epoch'],
-        ], true);
+        ], true, $missingPageObserved);
         return $state !== null && (string) $state['job']['id'] === (string) $job['id']
             && (string) $state['job']['epoch_id'] === (string) $job['epoch_id']
             && (string) $state['job']['surface_id'] === (string) $job['surface_id'];
@@ -1532,24 +1671,28 @@ final class ContextCompaction
     }
 
     /**
-     * Accept only the post-failure physical-target cleanup of an unused rotated capability.
+     * Accept only ordered post-failure revocation and physical-target retirement evidence.
      * Cleanup writes a revocation event before retiring the current surface; other revocations
      * do not establish a safe summary retry. All host/summary evidence is checked by the caller.
      * @param array $binding Revoked current source capability, never a historical binding.
      * @param array $job Failed compact producer already verified against its legacy migration.
      * @param array $surface Current physical scope retired by the missing-target cleanup.
-     * @return bool Exact ordered cleanup evidence proves no new capability start or host effect.
+     * @param bool $retiredSource Allow an issued source capability only when its caller also proves every host receipt.
+     * @return bool Exact cleanup evidence identifies the closed physical scope; caller verifies host effects.
      */
-    private static function hasMissingTargetCleanupUnlocked(array $binding, array $job, array $surface): bool
+    private static function hasMissingTargetCleanupUnlocked(array $binding, array $job, array $surface, bool $retiredSource = false): bool
     {
         if ($surface['status'] !== 'retired' || $surface['retired_at'] === null
-            || $binding['revoked_at'] === null || $binding['sent_at'] !== null || $binding['started_at'] !== null) return false;
+            || $binding['revoked_at'] === null
+            || (!$retiredSource && ($binding['sent_at'] !== null || $binding['started_at'] !== null))) return false;
         $db = SDB(null, 'medoo', 'sqlite');
         $failure = $db->table('gateway_task_events')->where('task_id', (string) $job['task_id'])
             ->where('turn_id', (string) $job['durable_turn_id'])->where('response_id', (string) $job['id'])
             ->where('surface_id', (string) $surface['id'])->where('event_type', 'outcome_unknown')
             ->order([['id', 'DESC']])->limit(1)->find();
-        if (!is_array($failure) || (json_decode((string) $failure['data_json'], true)['code'] ?? '') !== 'CHATGPT_PAGE_CHANGED') return false;
+        $code = is_array($failure) ? (json_decode((string) $failure['data_json'], true)['code'] ?? '') : '';
+        if (!in_array($code, $retiredSource ? ['CHATGPT_PAGE_CHANGED', 'RECOVERY_OUTCOME_UNKNOWN'] : ['CHATGPT_PAGE_CHANGED'], true)
+            || (json_decode((string) $job['error_json'], true)['error']['code'] ?? '') !== $code) return false;
         $revocations = $db->table('gateway_task_events')->where('task_id', (string) $job['task_id'])
             ->where('turn_id', (string) $job['durable_turn_id'])->where('response_id', (string) $job['id'])
             ->where('event_type', 'mcp_capability_revoked')->where('id', '>', (int) $failure['id'])->select();

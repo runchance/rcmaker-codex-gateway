@@ -1,5 +1,6 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "旧摘要工具连接无法退休。": "The previous checkpoint tool connection could not be retired.",
     "ChatGPT 网页连续停止且未返回最终答复，自动续做已达三次；原上下文和工具回执仍保留。": "ChatGPT stopped repeatedly without a final answer. Automatic continuation reached its three-attempt limit; the original context and tool receipts are preserved.",
     "摘要发布记录暂不可读取。": "Summary publication records are temporarily unavailable.",
     "插话时全量重发上下文": "Resend full context when steering",

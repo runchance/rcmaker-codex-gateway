@@ -1767,6 +1767,7 @@ final class TaskLedger
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
             if ($maxRetries < 1
+                || in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS', 'CODEX_USER_STOPPED'], true)
                 || !in_array((string)$job['status'], $missingSurface ? ['queued','running'] : ['running'], true)
                 || (int) ($job['output_started'] ?? 0) !== 0
                 || (string) ($job['output_text'] ?? '') !== ''
@@ -1792,7 +1793,7 @@ final class TaskLedger
             // A missing source page changes only the checkpoint transport: no historical
             // host permission may be replayed on the new page. Provenance remains pinned.
             $rotated = $retainedCompact
-                ? ToolBroker::prepareReadOnlyCompactionReplayUnlocked($job)
+                ? ToolBroker::prepareReadOnlyCompactionReplayUnlocked($job, true)
                 : ($missingSurface && empty($job['mcp_binding_id'])
                 ? ContextRecovery::prepareUnboundReplayUnlocked($job)
                 : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface));

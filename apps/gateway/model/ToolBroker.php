@@ -679,10 +679,11 @@ final class ToolBroker
      * the page/epoch. Source jobs, checkpoint provenance and all historical receipts stay intact.
      * Unlike work recovery, this capability can never resume the historical native tool registry.
      * @param array $job Current persisted compact producer, not browser-authored context.
+     * @param bool $missingPageObserved Fenced browser discovery proved the physical source target absent.
      * @return array{binding_id:?string,prompt:string,job_fields:array}|null Exact read-only replay, or no safe proof.
      * @throws GatewayError If the immutable history cannot fit or the capability CAS fails.
      */
-    public static function prepareReadOnlyCompactionReplayUnlocked(array $job): ?array
+    public static function prepareReadOnlyCompactionReplayUnlocked(array $job, bool $missingPageObserved = false): ?array
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $current = $db->table('gateway_response_jobs')->where('id', (string) ($job['id'] ?? ''))->find();
@@ -690,7 +691,7 @@ final class ToolBroker
         foreach (['task_id', 'durable_turn_id', 'surface_id', 'epoch_id', 'compact_id', 'status'] as $field) {
             if (($job[$field] ?? null) !== ($current[$field] ?? null)) return null;
         }
-        if (!ContextCompaction::canReplayMissingSourceUnlocked($current)) return null;
+        if (!ContextCompaction::canReplayMissingSourceUnlocked($current, $missingPageObserved)) return null;
         $job = $current;
         $binding = self::bindingByIdUnlocked((string) $job['mcp_binding_id']);
         $environment = json_decode((string) $job['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
@@ -735,6 +736,16 @@ final class ToolBroker
             ->update($fields);
         if (!$updated || $updated->rowCount() !== 1) {
             throw new GatewayError('compaction_replay_conflict', '只读摘要恢复时工具能力所有权发生变化。', 409);
+        }
+        if ($missingPageObserved) {
+            // Retire the old RPC transport after replacing its token; all native results
+            // were proven complete above. Never manufacture a tool delivery ACK.
+            $retired = $db->table('gateway_mcp_activities')->where('binding_id', (string) $binding['id'])
+                ->where('status', 'active')->update(['status'=>'completed','updated_at'=>$now]);
+            if ($retired === false) throw new GatewayError('storage_unavailable', '旧摘要工具连接无法退休。', 503);
+            if ($retired->rowCount() > 0) self::eventUnlocked((string) $job['task_id'], (string) $job['durable_turn_id'], (string) $job['id'],
+                'compaction_source_transport_retired', ['retired_activities'=>$retired->rowCount(),
+                    'revision'=>(int) $binding['activity_revision'] + 1, 'reason'=>'physical_target_missing']);
         }
         self::eventUnlocked((string) $job['task_id'], (string) $job['durable_turn_id'], (string) $job['id'],
             'mcp_readonly_compaction_replay_prepared', [
