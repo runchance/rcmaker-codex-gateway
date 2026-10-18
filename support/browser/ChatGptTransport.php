@@ -15,8 +15,8 @@ final class ChatGptTransport
     private const MAX_EDITOR_STAGE_CHARS = 130000;
     /** Allow ten seconds for a completed empty answer to receive its final content. */
     private const EMPTY_RESPONSE_GRACE_SECONDS = 10.0;
-    /** A UI-only tool pause is ambiguous; require five continuously quiet minutes before recovery. */
-    private const EMPTY_TOOL_IDLE_SECONDS = 300.0;
+    /** A UI-only tool pause is ambiguous; require ten continuously quiet minutes before recovery. */
+    private const EMPTY_TOOL_IDLE_SECONDS = 600.0;
     /** An unreadable or suspended observer cannot accumulate a continuous terminal verdict. */
     private const EMPTY_RESPONSE_MAX_OBSERVATION_GAP_SECONDS = 5.0;
 
@@ -143,7 +143,7 @@ final class ChatGptTransport
      * a missing fence, changing ownership, activity, content or observation gap resets the window.
      * A confirmed non-cancelled network failure is a stream-recovery cause, not an empty
      * model answer. A native recovery notice without that evidence cannot settle the turn.
-     * UI-only ordinary tool pauses require five quiet minutes after a verified Stop-to-Send
+     * UI-only ordinary tool pauses require ten quiet minutes after a verified Stop-to-Send
      * transition. Real request completion/failure and explicitly stopped checkpoint sources
      * retain their normal short final-content settlement. Active generation never settles.
      * @param array|null $previous Prior candidate from this exact runtime turn, or null.
