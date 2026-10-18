@@ -7,6 +7,29 @@ use app\gateway\database\Schema;
 /** SQLite-backed response round bound to the Step 05 durable task ledger. */
 final class ResponseJob
 {
+    /**
+     * Read the last inserted round without sorting historical context/result payloads.
+     * Task indexes cover rowid, so MAX selects metadata before one primary-key body lookup.
+     * One aggregate subquery preserves the original single-statement snapshot, including
+     * read-only readiness checks outside the reservation transaction. SDB cannot express
+     * that nested aggregate as a structured condition; reuse the framework DB connection.
+     * @param string $taskId Already authorized durable task identity.
+     * @return array|null Internal persisted job row, or null when the task has no rounds.
+     * @throws GatewayError If the framework cannot read the latest-round metadata.
+     */
+    public static function latestForTaskUnlocked(string $taskId): ?array
+    {
+        $statement = DB('medoo', 'sqlite')->query('SELECT * FROM gateway_response_jobs
+            WHERE task_id=:task AND rowid=(SELECT MAX(rowid) FROM gateway_response_jobs WHERE task_id=:task)', [':task'=>$taskId]);
+        if (!$statement) throw new GatewayError('storage_unavailable', '任务时间线读取失败。', 503);
+        try {
+            $row = $statement->fetch(\PDO::FETCH_ASSOC);
+            return is_array($row) ? $row : null;
+        } finally {
+            $statement->closeCursor();
+        }
+    }
+
     /** @return array Job row with decoded response/error values. */
     public static function createOrReuse(array $spec, ?string $idempotencyKey): array
     {
@@ -172,8 +195,7 @@ final class ResponseJob
                         ->where('task_id', $contextTaskId)->find();
                 }
                 if (!is_array($historyJob)) {
-                    $historyJob = $db->table('gateway_response_jobs')->where('task_id', $contextTaskId)
-                        ->order([['rowid', 'DESC']])->limit(1)->find();
+                    $historyJob = self::latestForTaskUnlocked($contextTaskId);
                 }
                 $noGatewayHistory = !is_array($historyJob)
                     && !is_array($db->table('gateway_task_epochs')->where('task_id', $contextTaskId)->limit(1)->find());

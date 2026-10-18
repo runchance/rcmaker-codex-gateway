@@ -718,8 +718,7 @@ final class ContextHistory
         if (is_array($task) && in_array($task['status'], ['cancelled', 'needs_attention'], true)) {
             // A failed/cancelled turn can contain the newest readable user context. Its
             // output is not trusted, but dropping that context would strand delta clients.
-            $terminalLast = $db->table('gateway_response_jobs')->where('task_id', $taskId)
-                ->order([['rowid', 'DESC']])->limit(1)->find();
+            $terminalLast = ResponseJob::latestForTaskUnlocked($taskId);
             if (is_array($terminalLast) && !empty($terminalLast['context_json'])) $last = $terminalLast;
         }
         if ($previous !== '') {
@@ -1129,8 +1128,7 @@ final class ContextHistory
         if (!is_numeric($pending) || !is_numeric($unknown) || !is_numeric($activities)
             || (int) $unknown !== 0 || (($toolBoundary || $humanSteering) && (int) $pending === 0)) return null;
         if ($completedText) {
-            $last = $db->table('gateway_response_jobs')->where('task_id', $taskId)
-                ->order([['rowid', 'DESC']])->limit(1)->find();
+            $last = ResponseJob::latestForTaskUnlocked($taskId);
             if (!is_array($last) || (string) $last['id'] !== $sourceId
                 || (int) $pending !== 0 || (int) $activities !== 0) return null;
             if (!empty($source['mcp_binding_id'])) {

@@ -674,8 +674,7 @@ final class TaskLedger
             || $checkpoint['summary'] !== null || $checkpoint['response_json'] !== null
             || $checkpoint['committed_at'] !== null || $checkpoint['consumed_at'] !== null) return false;
         $job = $db->table('gateway_response_jobs')->where('id', (string) $checkpoint['response_id'])->find();
-        $latest = $db->table('gateway_response_jobs')->where('task_id', $taskId)
-            ->order([['rowid', 'DESC']])->limit(1)->find();
+        $latest = ResponseJob::latestForTaskUnlocked($taskId);
         if (!is_array($job) || !is_array($latest) || $latest['id'] !== $job['id']
             || $job['task_id'] !== $taskId || $job['compact_id'] !== $checkpoint['id']
             || $job['operation_kind'] !== 'compact_v2' || $job['round_kind'] !== 'text'

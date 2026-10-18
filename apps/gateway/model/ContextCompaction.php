@@ -282,8 +282,7 @@ final class ContextCompaction
         $db = SDB(null, 'medoo', 'sqlite');
         $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
-        $source = $db->table('gateway_response_jobs')->where('task_id', $taskId)
-            ->order([['rowid', 'DESC']])->limit(1)->find();
+        $source = ResponseJob::latestForTaskUnlocked($taskId);
         if (!is_array($task) || $task['status'] !== 'active' || !is_array($source)
             || $source['status'] !== 'completed' || $source['operation_kind'] !== 'compact_v2'
             || $source['model'] !== $spec['model']
