@@ -11,6 +11,13 @@ final class GatewayMaintenance
     /** @param string $type Framework runtime. @param mixed $worker Owning worker. @param string $timer Framework timer class. */
     public function __construct($type, $worker, $timer)
     {
+        $timer::add(300, static function (): void {
+            try {
+                TaskMaintenance::scheduleInactive();
+            } catch (\Throwable) {
+                // Retry at the next scan; settings and durable cleanup ownership remain authoritative.
+            }
+        });
         $timer::add(0.25, static function (): void {
             try {
                 Schema::initialize();

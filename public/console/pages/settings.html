@@ -67,6 +67,15 @@
             <p class="help">更多分段需要更长传输时间；六段不等于六倍模型窗口。</p>
             </details>
         </section>
+        <section class="panel" aria-labelledby="task-retention-heading">
+            <div class="panel-title"><h2 id="task-retention-heading"><i class="layui-icon layui-icon-delete panel-heading-icon" aria-hidden="true"></i>任务清理</h2></div>
+            <div class="field settings-confirmation-option">
+                <input id="auto-cleanup-inactive-tasks" type="checkbox" checked title="清理不活跃任务">
+                <p class="muted">默认开启。连续 3 天没有对话的本地任务会自动清理；正在执行、等待工具结果或结果尚未确认的任务会保留。</p>
+                <p class="muted">不影响之后在 Codex 中继续任务：对话历史仍保留，续发时会据此恢复。清理会移除网关中的任务记录、闲置网页和私有产物，请及时保存需要的文件。</p>
+                <p class="muted">继续任务所需的输入附件与压缩校验凭证会保留；本机项目文件、登录资料和设置不会被清理。</p>
+            </div>
+        </section>
         <div class="actions settings-save"><button id="save" type="submit" class="layui-btn">保存日常设置</button></div></form></div><div id="settings-contracts" role="tabpanel" hidden><form id="contracts-form" class="layui-form" autocomplete="off"><section class="panel" aria-labelledby="web-contract-heading">
             <div class="panel-title"><div><h2 id="web-contract-heading"><i class="layui-icon layui-icon-code-circle panel-heading-icon" aria-hidden="true"></i>Web 模型契约</h2><p class="muted task-panel-help">修改只对新消息生效，正在运行的任务保持原设置。</p></div></div>
             <details class="settings-disclosure contract-reference"><summary>模板说明与可用变量</summary>

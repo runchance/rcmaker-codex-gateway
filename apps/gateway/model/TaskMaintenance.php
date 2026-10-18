@@ -8,6 +8,8 @@ use RC\Config;
 /** Task-only deletion and idle SQLite reclamation, consumed by the dedicated maintenance worker. */
 final class TaskMaintenance
 {
+    private const INACTIVE_SECONDS = 3 * 86400;
+
     /** SQL aliases are internal constants. In-flight work, not a task's display category, protects its records. */
     private const WORKING = "EXISTS(SELECT 1 FROM gateway_response_jobs j WHERE j.task_id=t.id AND j.status IN ('queued','running'))
         OR EXISTS(SELECT 1 FROM gateway_task_turns u WHERE u.task_id=t.id AND u.status IN ('queued','submit_intent','submitted','running'))
@@ -17,6 +19,18 @@ final class TaskMaintenance
             AND (other.previous_response_id IN (SELECT id FROM gateway_response_jobs WHERE task_id=t.id)
             OR other.rolling_source_response_id IN (SELECT id FROM gateway_response_jobs WHERE task_id=t.id)
             OR other.continuation_source_response_id IN (SELECT id FROM gateway_response_jobs WHERE task_id=t.id)))";
+
+    /** Metadata-only checks use the existing (task_id,created_at) response index, never historical payloads. */
+    private const INACTIVE = "t.created_at<=:inactive_before
+        AND NOT EXISTS(SELECT 1 FROM gateway_response_jobs recent WHERE recent.task_id=t.id AND recent.created_at>:inactive_before)
+        AND NOT EXISTS(SELECT 1 FROM gateway_tool_invocations uncertain WHERE uncertain.task_id=t.id AND uncertain.status='unknown')
+        AND NOT EXISTS(SELECT 1 FROM gateway_browser_surfaces busy WHERE busy.task_id=t.id AND busy.status='busy')";
+
+    /** A stalled page-close acknowledgement must not duplicate its candidate or starve later retention batches. */
+    private const NOT_QUEUED = "NOT EXISTS(SELECT 1 FROM gateway_task_cleanup_items pending
+        JOIN gateway_task_cleanup owner ON owner.id=pending.cleanup_id WHERE pending.task_id=t.id
+        AND pending.status IN ('pending','waiting_surface','deleting_rows')
+        AND owner.status IN ('queued','deleting','waiting_idle','compacting'))";
 
     /** @return bool True for any live response, tool delivery, approval wait or retained Web generation. */
     public static function isWorking(string $taskId): bool
@@ -45,14 +59,38 @@ final class TaskMaintenance
         return self::withAdmission(static fn(): array => self::queueRequest($taskId));
     }
 
-    /** Queue deletion candidates inside the shared admission lock, then release it before any browser operation. */
-    private static function queueRequest(?string $taskId): array
+    /**
+     * Schedule at most 32 tasks without dialogue for three days on the existing maintenance worker.
+     * Reads the saved switch each time. No admission lock, browser calls or VACUUM run while scheduling;
+     * the consumer rechecks activity under its normal admission/writer locks before deleting anything.
+     * @return array|null Durable cleanup progress, or null when disabled or nothing is eligible.
+     * @throws GatewayError If storage cannot queue the batch; a later timer tick can retry safely.
+     */
+    public static function scheduleInactive(): ?array
     {
-        return Schema::transaction(static function () use ($taskId): array {
+        Schema::initialize();
+        $settings = SDB(null, 'medoo', 'sqlite')->table('gateway_settings')->where('id', 1)->find('auto_cleanup_inactive_tasks');
+        if (empty($settings['auto_cleanup_inactive_tasks'])) return null;
+        $before = time() - self::INACTIVE_SECONDS;
+        $candidate = DB('medoo', 'sqlite')->query('SELECT 1 FROM gateway_tasks t WHERE ' . self::INACTIVE
+            . ' AND t.updated_at<=:inactive_before AND ' . self::NOT_QUEUED . ' AND NOT (' . self::WORKING . ') LIMIT 1',
+            [':inactive_before' => $before])->fetchColumn();
+        return $candidate === false ? null : self::queueRequest(null, $before);
+    }
+
+    /** Snapshot manual or bounded automatic candidates atomically; browser work belongs to the consumer. */
+    private static function queueRequest(?string $taskId, ?int $inactiveBefore = null): array
+    {
+        return Schema::transaction(static function () use ($taskId, $inactiveBefore): array {
             $db = DB('medoo', 'sqlite');
-            $scope = $taskId === null ? 'all_idle' : $taskId;
-            $existing = SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('scope', $scope)
-                ->where('status', 'IN', ['queued','deleting','compacting'])->order([['id','DESC']])->limit(1)->find();
+            $scope = $inactiveBefore !== null ? 'inactive' : ($taskId === null ? 'all_idle' : $taskId);
+            $existing = $inactiveBefore !== null
+                ? $db->query("SELECT c.id FROM gateway_task_cleanup c WHERE c.scope='inactive'
+                    AND c.status IN ('queued','deleting','waiting_idle','compacting')
+                    AND EXISTS(SELECT 1 FROM gateway_task_cleanup_items i WHERE i.cleanup_id=c.id AND i.status IN ('pending','deleting_rows'))
+                    ORDER BY c.id DESC LIMIT 1")->fetch(\PDO::FETCH_ASSOC)
+                : SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('scope', $scope)
+                    ->where('status', 'IN', ['queued','deleting','compacting'])->order([['id','DESC']])->limit(1)->find();
             if (is_array($existing)) return self::snapshot((int) $existing['id']);
             if ($taskId !== null) {
                 if (!is_array(SDB(null, 'medoo', 'sqlite')->table('gateway_tasks')->where('id', $taskId)->find())) {
@@ -62,17 +100,24 @@ final class TaskMaintenance
             }
             $where = $taskId === null ? '' : ' AND t.id=:task';
             $parameters = $taskId === null ? [] : [':task'=>$taskId];
-            $skipped = $taskId === null ? (int) $db->query('SELECT COUNT(*) FROM gateway_tasks t WHERE (' . self::WORKING . ')')->fetchColumn() : 0;
+            if ($inactiveBefore !== null) {
+                $where .= ' AND t.updated_at<=:inactive_before AND ' . self::INACTIVE . ' AND ' . self::NOT_QUEUED;
+                $parameters[':inactive_before'] = $inactiveBefore;
+            }
+            $skipped = $taskId === null && $inactiveBefore === null
+                ? (int) $db->query('SELECT COUNT(*) FROM gateway_tasks t WHERE (' . self::WORKING . ')')->fetchColumn() : 0;
             $now = time();
             $inserted = SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->add([
                 'scope'=>$scope, 'status'=>'queued', 'requested_at'=>$now,
                 'updated_at'=>$now, 'skipped_count'=>$skipped, 'bytes_before'=>self::databaseBytes(),
+                'inactive_before'=>$inactiveBefore,
             ]);
             if (!$inserted) throw new GatewayError('storage_unavailable', '无法登记任务清理。', 503);
             $id = (int) $db->id();
             $parameters[':cleanup'] = (int) $id;
-            $db->query("INSERT INTO gateway_task_cleanup_items(cleanup_id,task_id,status)
-                SELECT :cleanup,t.id,'pending' FROM gateway_tasks t WHERE NOT (" . self::WORKING . ')' . $where, $parameters);
+            self::mustWrite($db->query("INSERT INTO gateway_task_cleanup_items(cleanup_id,task_id,status)
+                SELECT :cleanup,t.id,'pending' FROM gateway_tasks t WHERE NOT (" . self::WORKING . ')' . $where
+                . ($inactiveBefore !== null ? ' ORDER BY t.updated_at,t.id LIMIT 32' : ''), $parameters));
             return self::snapshot((int) $id);
         });
     }
@@ -182,6 +227,20 @@ final class TaskMaintenance
         $db = SDB(null, 'medoo', 'sqlite');
         $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
         if (!is_array($task)) { self::finishItem($cleanupId, $taskId, 'deleted'); return true; }
+        $cleanup = $db->table('gateway_task_cleanup')->where('id', $cleanupId)->find('inactive_before');
+        $automatic = isset($cleanup['inactive_before']);
+        if ($automatic) {
+            $settings = $db->table('gateway_settings')->where('id', 1)->find('auto_cleanup_inactive_tasks');
+            // Closing an owned idle page updates task.updated_at itself. New dialogue is still
+            // detected through the response index while waiting for that close acknowledgement.
+            $eligibility = self::INACTIVE . ($item['status'] === 'pending' ? ' AND t.updated_at<=:inactive_before' : '');
+            $eligible = DB('medoo', 'sqlite')->query('SELECT 1 FROM gateway_tasks t WHERE t.id=:task AND ' . $eligibility,
+                [':task' => $taskId, ':inactive_before' => (int) $cleanup['inactive_before']])->fetchColumn() !== false;
+            if ((!($settings['auto_cleanup_inactive_tasks'] ?? 0) && $item['status'] !== 'deleting_rows') || !$eligible) {
+                self::finishItem($cleanupId, $taskId, 'skipped');
+                return true;
+            }
+        }
         if (self::isWorking($taskId)) {
             if ($item['status'] === 'deleting_rows') {
                 $db->table('gateway_task_cleanup')->where('id', $cleanupId)->update(['status'=>'waiting_idle','updated_at'=>time()]);
@@ -210,10 +269,11 @@ final class TaskMaintenance
         $sql = DB('medoo', 'sqlite');
         $parameters = [':task'=>$taskId];
         // While another task is working, release the writer after one response's heavy payload.
-        // Idle cleanup keeps the fast whole-task path. This is maintenance batching, not a user/tool limit.
-        $otherWork = $sql->query('SELECT 1 FROM gateway_tasks t WHERE t.id<>:task AND (' . self::WORKING . ') LIMIT 1', $parameters)->fetchColumn() !== false;
+        // Explicit idle cleanup keeps the whole-task path; retention always takes one response
+        // so a large old conversation cannot monopolize admission merely because the gateway is idle.
+        $otherWork = !$automatic && $sql->query('SELECT 1 FROM gateway_tasks t WHERE t.id<>:task AND (' . self::WORKING . ') LIMIT 1', $parameters)->fetchColumn() !== false;
         $responseId = null;
-        if ($otherWork) {
+        if ($otherWork || $automatic) {
             $responseId = $sql->query('SELECT id FROM gateway_response_jobs WHERE task_id=:task ORDER BY rowid DESC LIMIT 1', $parameters)->fetchColumn();
             $responseId = is_string($responseId) ? $responseId : null;
         }
@@ -226,7 +286,16 @@ final class TaskMaintenance
         foreach ($files ?: [] as $file) self::queueFile($cleanupId, 'artifact', $file);
         $files = $sql->query('SELECT DISTINCT a.id,a.relative_path FROM gateway_attachments a JOIN gateway_response_attachments r ON r.attachment_id=a.id
             WHERE r.response_id IN (' . $jobIds . ')', $parameters)->fetchAll(\PDO::FETCH_ASSOC);
-        foreach ($files as $file) self::queueFile($cleanupId, 'attachment', $file);
+        foreach ($files as $file) {
+            if ($automatic) {
+                // Native history may refer to an input attachment after its local task is gone.
+                // Retain that input by identity; do not scan full historical payloads under admission.
+                self::mustWrite($db->table('gateway_attachments')->where('id', (string) $file['id'])
+                    ->update(['retained_for_history' => 1]));
+            } else {
+                self::queueFile($cleanupId, 'attachment', $file);
+            }
+        }
         // Optional historical pointers may outlive an old task; active dependents were excluded above.
         foreach (['rolling_source_response_id','continuation_source_response_id'] as $column) {
             self::mustWrite($sql->query('UPDATE gateway_response_jobs SET ' . $column . '=NULL WHERE ' . $column . ' IN (' . $jobIds . ')', $parameters));
@@ -271,6 +340,13 @@ final class TaskMaintenance
     private static function reclaimIdle(int $cleanupId): void
     {
         $sql = DB('medoo', 'sqlite');
+        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)->find();
+        if (isset($job['inactive_before'])) {
+            // Reuse SQLite's freed pages. Automatic retention must never hold admission
+            // across a whole-database VACUUM or a busy WAL checkpoint.
+            self::completeCleanup($cleanupId);
+            return;
+        }
         $working = (int) $sql->query('SELECT COUNT(*) FROM gateway_tasks t WHERE (' . self::WORKING . ')')->fetchColumn();
         $setup = (int) $sql->query("SELECT COUNT(*) FROM gateway_browser_commands WHERE status IN ('queued','running')")->fetchColumn();
         if ($working > 0 || $setup > 0) {
@@ -293,6 +369,13 @@ final class TaskMaintenance
                 ->update(['status'=>'waiting_idle','error_code'=>'CHECKPOINT_WAIT','updated_at'=>time()]);
             return;
         }
+        self::completeCleanup($cleanupId);
+    }
+
+    /** Finish a durable batch and bound its non-content operational summaries. */
+    private static function completeCleanup(int $cleanupId): void
+    {
+        $sql = DB('medoo', 'sqlite');
         SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)
             ->update(['status'=>'completed','bytes_after'=>self::databaseBytes(),'updated_at'=>time(),'error_code'=>null]);
         // Keep small operational summaries bounded, without retaining deleted conversation contents.

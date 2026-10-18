@@ -7,6 +7,7 @@ use app\gateway\database\Schema;
 /** Strongly typed, user-editable Step 06 settings persisted in SQLite. */
 final class GatewaySettings
 {
+    /** @return array Public preferences, including the persisted inactive-task cleanup switch; never exposes secrets. */
     public static function snapshot(): array
     {
         Schema::initialize();
@@ -35,6 +36,7 @@ final class GatewaySettings
             'skill_transport' => (string) $row['skill_transport'],
             'official_handoff_summary' => (bool) $row['official_handoff_summary'],
             'steering_full_context' => (bool) $row['steering_full_context'],
+            'auto_cleanup_inactive_tasks' => (bool) $row['auto_cleanup_inactive_tasks'],
             'web_initial_contract_template' => self::effectiveContract($row, 'web_initial_contract_template'),
             'web_resume_contract_template' => self::effectiveContract($row, 'web_resume_contract_template'),
             'web_readonly_contract_template' => self::effectiveContract($row, 'web_readonly_contract_template'),
@@ -55,10 +57,15 @@ final class GatewaySettings
         return $row;
     }
 
+    /**
+     * Validate and atomically save preferences using the existing optimistic revision guard.
+     * @param array $input Supported settings; omitted newer preferences keep their saved values.
+     * @return array Updated public preferences. @throws GatewayError On validation or revision conflict.
+     */
     public static function save(#[\SensitiveParameter] array $input): array
     {
         $allowed = [
-            'ui_locale', 'pro_weekly_budget',
+            'ui_locale', 'pro_weekly_budget', 'auto_cleanup_inactive_tasks',
             'expected_updated_at', 'mcp_enabled', 'auto_approve_tool_calls', 'connector_name', 'mcp_invoke_timeout_ms',
             'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'tunnel_id', 'runtime_key', 'runtime_key_action',
@@ -74,6 +81,7 @@ final class GatewaySettings
         $current = self::row();
         $input['ui_locale'] ??= $current['ui_locale'] ?: \RC\Config::get('gateway', 'default_locale');
         $input['pro_weekly_budget'] ??= $current['pro_weekly_budget'] ?? 0;
+        $input['auto_cleanup_inactive_tasks'] ??= $current['auto_cleanup_inactive_tasks'];
         foreach (['context_transport', 'context_max_parts', 'context_extended', 'response_timeout_seconds',
             'context_stage_timeout_seconds', 'compaction_timeout_seconds', 'skill_transport',
             'official_handoff_summary', 'steering_full_context', 'web_initial_contract_template', 'web_resume_contract_template',
@@ -92,6 +100,7 @@ final class GatewaySettings
             $data = validator()->input($input, [
                 'ui_locale' => ['rule' => 'string', 'len' => [2, 5], 'name' => 'Language'],
                 'pro_weekly_budget' => ['rule' => 'nnint', 'range' => [0, 100000], 'name' => 'Weekly Pro tracking budget'],
+                'auto_cleanup_inactive_tasks' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'Inactive task cleanup'],
                 'expected_updated_at' => ['rule' => 'nnint', 'name' => '设置版本'],
                 'mcp_enabled' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'MCP 开关'],
                 'auto_approve_tool_calls' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '一次性工具确认'],
@@ -169,7 +178,8 @@ final class GatewaySettings
         $data['auto_approve_tool_calls'] = (int) $data['auto_approve_tool_calls'];
         foreach (['mcp_invoke_timeout_ms', 'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'context_max_parts', 'context_extended', 'response_timeout_seconds', 'context_stage_timeout_seconds',
-            'compaction_timeout_seconds', 'official_handoff_summary', 'steering_full_context', 'pro_weekly_budget'] as $field) {
+            'compaction_timeout_seconds', 'official_handoff_summary', 'steering_full_context', 'pro_weekly_budget',
+            'auto_cleanup_inactive_tasks'] as $field) {
             $data[$field] = (int) $data[$field];
         }
         $data['protected_runtime_key'] = $protected;

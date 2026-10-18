@@ -10,7 +10,7 @@
     const savedForms = {general: null, contracts: null};
     const generalFields = ['pro-weekly-budget', 'context-parts', 'skill-transport',
         'context-extended', 'official-handoff-summary', 'steering-full-context', 'response-timeout', 'stage-timeout',
-        'compact-timeout', 'invoke-timeout', 'wait-poll', 'max-tools', 'auto-approve-tools'];
+        'compact-timeout', 'invoke-timeout', 'wait-poll', 'max-tools', 'auto-approve-tools', 'auto-cleanup-inactive-tasks'];
     const contracts = [
         { field: 'web_initial_contract_template', input: 'web-initial-contract', reset: 'reset-web-initial', status: 'web-initial-status' },
         { field: 'web_resume_contract_template', input: 'web-resume-contract', reset: 'reset-web-resume', status: 'web-resume-status' },
@@ -53,6 +53,7 @@
         byId('context-extended').checked = !!data.context_extended;
         byId('official-handoff-summary').checked = !!data.official_handoff_summary;
         byId('steering-full-context').checked = !!data.steering_full_context;
+        byId('auto-cleanup-inactive-tasks').checked = data.auto_cleanup_inactive_tasks !== false && Number(data.auto_cleanup_inactive_tasks ?? 1) !== 0;
         byId('response-timeout').value = data.response_timeout_seconds || 14400;
         byId('stage-timeout').value = data.context_stage_timeout_seconds || 180;
         byId('compact-timeout').value = data.compaction_timeout_seconds || 14400;
@@ -155,6 +156,7 @@
                 context_extended: byId('context-extended').checked ? 1 : 0,
                 official_handoff_summary: byId('official-handoff-summary').checked ? 1 : 0,
                 steering_full_context: byId('steering-full-context').checked ? 1 : 0,
+                auto_cleanup_inactive_tasks: byId('auto-cleanup-inactive-tasks').checked ? 1 : 0,
                 response_timeout_seconds: Number(byId('response-timeout').value),
                 context_stage_timeout_seconds: Number(byId('stage-timeout').value),
                 compaction_timeout_seconds: Number(byId('compact-timeout').value),

@@ -1,5 +1,10 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "任务清理": "Task cleanup",
+    "清理不活跃任务": "Clean up inactive tasks",
+    "继续任务所需的输入附件与压缩校验凭证会保留；本机项目文件、登录资料和设置不会被清理。": "Input attachments and checkpoint verification records needed to continue are retained. Local project files, login profiles and settings are not removed.",
+    "默认开启。连续 3 天没有对话的本地任务会自动清理；正在执行、等待工具结果或结果尚未确认的任务会保留。": "Enabled by default. Local tasks with no conversation for 3 consecutive days are cleaned up automatically. Tasks that are running, waiting for tools or have unconfirmed results are kept.",
+    "不影响之后在 Codex 中继续任务：对话历史仍保留，续发时会据此恢复。清理会移除网关中的任务记录、闲置网页和私有产物，请及时保存需要的文件。": "You can still continue the task in Codex: conversation history is kept and used to restore it when you send another message. Cleanup removes gateway task records, idle pages and private artifacts. Save any files you need.",
     "旧摘要工具连接无法退休。": "The previous checkpoint tool connection could not be retired.",
     "ChatGPT 网页连续停止且未返回最终答复，自动续做已达三次；原上下文和工具回执仍保留。": "ChatGPT stopped repeatedly without a final answer. Automatic continuation reached its three-attempt limit; the original context and tool receipts are preserved.",
     "摘要发布记录暂不可读取。": "Summary publication records are temporarily unavailable.",

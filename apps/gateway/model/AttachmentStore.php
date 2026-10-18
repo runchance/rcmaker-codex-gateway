@@ -304,7 +304,7 @@ final class AttachmentStore
         return $tokens;
     }
 
-    /** Remove only old parse-stage files proven absent from every durable response/checkpoint reference. */
+    /** Remove old parse-stage files unless retained for native history or referenced by live/archived checkpoints. */
     public static function cleanupOrphans(int $olderThanSeconds = 86400): int
     {
         Schema::initialize();
@@ -312,7 +312,7 @@ final class AttachmentStore
         $db = DB('medoo', 'sqlite');
         $candidates = $db->query(
             "SELECT a.id,a.relative_path FROM gateway_attachments a "
-            . "WHERE a.status='ready' AND a.created_at<:cutoff "
+            . "WHERE a.status='ready' AND a.retained_for_history=0 AND a.created_at<:cutoff "
             . "AND NOT EXISTS(SELECT 1 FROM gateway_response_attachments ra WHERE ra.attachment_id=a.id)",
             [':cutoff' => $cutoff]
         )->fetchAll(\PDO::FETCH_ASSOC);
@@ -321,6 +321,12 @@ final class AttachmentStore
             $id = (string) ($candidate['id'] ?? '');
             if (!preg_match('/\Aatt_[a-f0-9]{32}\z/D', $id)) continue;
             $needle = '%' . $id . '%';
+            // A task's transcript can be removed while its native checkpoint remains usable.
+            // Its archived references carry the same ownership protection as a live checkpoint.
+            $archived = SDB(null, 'medoo', 'sqlite')->table('gateway_checkpoint_proofs')
+                ->where('retained_refs_json', 'LIKE', $needle)->limit(1)->find('id');
+            if ($archived === false) throw new GatewayError('storage_unavailable', '无法读取检查点校验凭证，请稍后重试。', 503);
+            if (is_array($archived)) continue;
             $inResponse = $db->query(
                 'SELECT 1 FROM gateway_response_jobs WHERE prompt LIKE :n1 OR context_json LIKE :n2 OR transport_context_json LIKE :n3 LIMIT 1',
                 [':n1'=>$needle, ':n2'=>$needle, ':n3'=>$needle]

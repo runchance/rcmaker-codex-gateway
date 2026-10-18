@@ -499,6 +499,13 @@ final class Schema
                 'CREATE INDEX gateway_response_jobs_task_status ON gateway_response_jobs(task_id,status)',
                 'CREATE INDEX gateway_response_jobs_compact_source ON gateway_response_jobs(operation_kind,previous_response_id)',
             ],
+            59 => [
+                'ALTER TABLE gateway_settings ADD COLUMN auto_cleanup_inactive_tasks INTEGER NOT NULL DEFAULT 1 CHECK(auto_cleanup_inactive_tasks IN (0,1))',
+                'ALTER TABLE gateway_task_cleanup ADD COLUMN inactive_before INTEGER',
+            ],
+            60 => [
+                'ALTER TABLE gateway_attachments ADD COLUMN retained_for_history INTEGER NOT NULL DEFAULT 0 CHECK(retained_for_history IN (0,1))',
+            ],
         ];
     }
 

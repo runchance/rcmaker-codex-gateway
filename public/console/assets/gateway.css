@@ -413,6 +413,57 @@ p { line-height: 1.65; }
 .settings-page .contract-editor textarea { font-size: 12px; min-height: 220px; }
 .settings-page .settings-save { position: sticky; bottom: 0; margin: 0; padding: 14px 0; background: rgba(243, 245, 248, .96); border-top: 1px solid var(--gateway-line); z-index: 2; }
 .settings-page .contract-reference { margin-top: 0; margin-bottom: 24px; }
+
+/* One disclosure treatment for setup, settings, diagnostics and dynamic task details. */
+.gateway-page details > summary {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 46px;
+    padding: 12px 16px 12px 38px;
+    margin: 0;
+    border-radius: 9px;
+    list-style: none;
+    color: var(--gateway-ink);
+    font-weight: 600;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+    transition: color .15s ease, background-color .15s ease;
+}
+.gateway-page details > summary::-webkit-details-marker { display: none; }
+.gateway-page details > summary::before {
+    content: "";
+    position: absolute;
+    left: 17px;
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    color: var(--gateway-muted);
+    transform: translateY(-50%) rotate(-45deg);
+    transition: transform .15s ease;
+}
+.gateway-page details[open] > summary::before { transform: translateY(-70%) rotate(45deg); color: var(--gateway-accent); }
+.gateway-page details > summary:hover { color: var(--gateway-accent); background: var(--gateway-accent-soft); }
+.gateway-page details[open] > summary { margin-bottom: 14px; background: #f0f6f7; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.gateway-page :is(.setup-help, .settings-disclosure, .task-context-decision) {
+    margin: 16px 0;
+    padding: 0;
+    border: 1px solid var(--gateway-line);
+    border-radius: 10px;
+    background: #fafcfd;
+}
+.gateway-page :is(.setup-help, .settings-disclosure, .task-context-decision, .contract-editor) > :not(summary) { margin-left: 16px; margin-right: 16px; }
+.gateway-page :is(.setup-help, .settings-disclosure, .task-context-decision, .contract-editor) > :last-child:not(summary) { margin-bottom: 16px; }
+.settings-page .contract-editor { padding: 0; }
+.gateway-page :is(.task-conversation-turn, .task-web-audit-message) > summary { flex-wrap: wrap; row-gap: 6px; }
+.gateway-page :is(.task-conversation-turn, .task-web-audit-message) > summary > strong { flex: 1 1 180px; min-width: 0; }
+@media (prefers-reduced-motion: reduce) {
+    .gateway-page details > summary, .gateway-page details > summary::before { transition: none; }
+}
 .diagnostics-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
 .diagnostic-inclusions { margin: 24px 0 0; }
 .diagnostic-inclusions > div { margin: 0 0 20px; }
