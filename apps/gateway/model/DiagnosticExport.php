@@ -394,6 +394,21 @@ final class DiagnosticExport
     /** Extract known error signatures from free-form runtime output instead of exporting raw lines. */
     private static function logSignals(string $line): array
     {
+        if (preg_match('/\[storage-transaction\] (\{.*\})\s*$/D', $line, $match)) {
+            $timing = json_decode($match[1], true);
+            if (is_array($timing) && ($timing['event'] ?? '') === 'storage_transaction_slow') {
+                $safe = ['event'=>'storage_transaction_slow'];
+                foreach (['at','pid','wait_ms','held_ms'] as $key) {
+                    if (isset($timing[$key]) && (is_int($timing[$key]) || is_float($timing[$key]))
+                        && $timing[$key] >= 0) $safe[$key] = $timing[$key];
+                }
+                foreach (['operation','error_code'] as $key) {
+                    if (is_string($timing[$key] ?? null)
+                        && preg_match('/\A[A-Za-z_\\\\:][A-Za-z0-9_\\\\:]{0,159}\z/D', $timing[$key])) $safe[$key] = $timing[$key];
+                }
+                return $safe;
+            }
+        }
         $signals = [];
         foreach ([
             'sqlite_busy' => '/database (?:is )?locked|SQLITE_BUSY|SQLITE_LOCKED/i',

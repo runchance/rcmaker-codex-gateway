@@ -48,6 +48,7 @@
         outcome_unknown: I18n.t('执行结果未知，已停止自动重发'), tool_registered: I18n.t('MCP 工具调用已登记'),
         tool_delivered: I18n.t('工具调用已交给 Codex'), tool_result_received: I18n.t('Codex 工具结果已回传'),
         mcp_capability_created: I18n.t('已创建本回合 MCP 能力'), mcp_completion_committed: I18n.t('MCP 完成栅栏已提交'),
+        compaction_source_transport_retired: I18n.t('已结束停止网页的旧工具连接'),
         mcp_capability_revoked: I18n.t('MCP 能力已撤销'),
         original_context_read: I18n.t('已查询本任务的原始历史'),
         task_conversation_restarted: I18n.t('已在新任务继续此 Codex 对话'),

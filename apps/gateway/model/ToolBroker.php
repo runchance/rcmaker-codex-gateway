@@ -1632,7 +1632,7 @@ final class ToolBroker
     }
 
     /**
-     * Prove an older failed wait inside the same still-running source turn.
+     * Prove an older failed wait or an atomically sealed current source wait in the same turn.
      * The active-source caller already verified the current capability, page and native batch.
      * Exact native output and a typed closed wait are required; nothing is acknowledged here.
      * @return bool Whether this earlier completed call is covered by the compact's real history.
@@ -1645,7 +1645,7 @@ final class ToolBroker
             || ($call['turn_id'] ?? '') !== ($source['durable_turn_id'] ?? null)
             || ($call['status'] ?? '') !== 'completed' || ($call['result_delivered_at'] ?? null) !== null
             || empty($call['delivered_at']) || empty($call['completed_at'])
-            || empty($call['response_id']) || $call['response_id'] === $source['id']) return false;
+            || empty($call['response_id'])) return false;
         $db = SDB(null, 'medoo', 'sqlite');
         $older = $db->table('gateway_response_jobs')->where('id', $call['response_id'])->find();
         if (!is_array($older) || $older['task_id'] !== $source['task_id']
@@ -1653,14 +1653,17 @@ final class ToolBroker
             || $older['mcp_binding_id'] !== $source['mcp_binding_id']
             || $older['epoch_id'] !== $source['epoch_id'] || $older['surface_id'] !== $source['surface_id']
             || $older['status'] !== 'completed' || $older['round_kind'] !== 'tool_call'
-            || $older['operation_kind'] !== 'response' || (int)$older['round_no'] >= (int)$source['round_no']) return false;
+            || $older['operation_kind'] !== 'response' || (int)$older['round_no'] > (int)$source['round_no']) return false;
         $events = $db->table('gateway_task_events')->where('task_id', $source['task_id'])
             ->where('turn_id', $source['durable_turn_id'])->where('response_id', $call['response_id'])
             ->where('event_type', 'tool_result_transport_failed')->select('data_json');
         if (!is_array($events)) throw new GatewayError('storage_unavailable', '工具等待失败记录暂不可读取。', 503);
         foreach ($events as $event) {
             $facts = json_decode((string)$event['data_json'], true);
-            if (($facts['invocation_id'] ?? '') !== $call['id'] || ($facts['code'] ?? '') !== 'tool_wait_scope_changed') continue;
+            $code = $facts['code'] ?? '';
+            if (($facts['invocation_id'] ?? '') !== $call['id']
+                || !in_array($code, ['tool_wait_scope_changed', 'compaction_source_stopped'], true)
+                || ($call['response_id'] === $source['id'] && $code !== 'compaction_source_stopped')) continue;
             ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($spec, $call, (string)$source['task_id']);
             return true;
         }
@@ -1845,6 +1848,111 @@ final class ToolBroker
             $binding = self::bindingByResponseUnlocked($responseId);
             return self::commitCompletionFenceUnlocked($binding, $revision, $finalAnswer, true);
         });
+    }
+
+    /**
+     * Prepare an idle-page checkpoint fence after the browser proves the source receiver closed.
+     * This only reads state: live host work, unknown results and missing exact receipts still wait.
+     * @param string $responseId Current compact reservation, never an ordinary response.
+     * @param string $incarnation Browser owner verified before and after its read-only DOM observations.
+     * @param int $fence Exact surface ownership generation.
+     * @return int|null Activity revision to recheck after two stable idle page observations.
+     * @throws GatewayError When persisted receipt evidence is inconsistent or unavailable.
+     */
+    public static function beginStoppedCompactionFenceForResponse(string $responseId, string $incarnation, int $fence): ?int
+    {
+        $state = self::stoppedCompactionStateUnlocked($responseId, $incarnation, $fence);
+        return $state === null ? null : (int)$state['binding']['activity_revision'];
+    }
+
+    /**
+     * Fence only the stopped source's RPCs after all accepted native work has actually completed.
+     * Activities are retired from the closed generation, not acknowledged as successful RPCs.
+     * Exact unreceived outputs enter the existing summary handoff; physical delivery stays null.
+     * @param string $responseId Exact active compact job.
+     * @param int $revision Revision observed before the stable idle DOM reads.
+     * @param string $answer Observed source text, possibly empty; never the human task's final answer.
+     * @param string $incarnation Current browser owner.
+     * @param int $fence Current surface ownership generation.
+     * @return bool Whether the unchanged source was sealed for the separate checkpoint message.
+     * @throws GatewayError On inconsistent evidence or failed atomic writes.
+     */
+    public static function commitStoppedCompactionFenceForResponse(string $responseId, int $revision,
+        string $answer, string $incarnation, int $fence): bool
+    {
+        return Schema::transaction(function () use ($responseId, $revision, $answer, $incarnation, $fence): bool {
+            $state = self::stoppedCompactionStateUnlocked($responseId, $incarnation, $fence);
+            if ($state === null || (int)$state['binding']['activity_revision'] !== $revision) return false;
+            $binding = $state['binding'];
+            if ($binding['status'] === 'completed') return hash_equals((string)$binding['completion_hash'], hash('sha256', $answer));
+            $db = SDB(null, 'medoo', 'sqlite');
+            foreach ($state['receipts'] as $call) {
+                self::eventUnlocked($binding['task_id'], $binding['turn_id'], $call['response_id'],
+                    'tool_result_transport_failed', ['invocation_id'=>$call['id'], 'code'=>'compaction_source_stopped']);
+            }
+            $activities = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                ->where('status', 'active')->update(['status'=>'completed', 'updated_at'=>time()]);
+            if (!$activities) throw new GatewayError('storage_unavailable', '旧摘要源连接状态无法保存。', 503);
+            self::eventUnlocked($binding['task_id'], $binding['turn_id'], $responseId,
+                'compaction_source_transport_retired', ['active_requests_retired'=>$activities->rowCount(),
+                    'unreceived_results'=>count($state['receipts']), 'revision'=>$revision]);
+            // No request can register another native invocation once this transaction commits.
+            if (!self::commitCompletionFenceUnlocked($binding, $revision, $answer, true)) {
+                throw new GatewayError('compaction_source_unavailable', '摘要源连接收尾证据发生变化，未确认交接。', 409);
+            }
+            return true;
+        });
+    }
+
+    /** Read the owned compact and native effects; commit rechecks this proof under its writer lock. */
+    private static function stoppedCompactionStateUnlocked(string $responseId, string $incarnation, int $fence): ?array
+    {
+        $ledger = TaskLedger::execution($responseId);
+        $job = $ledger['job'];
+        $surface = $ledger['surface'];
+        if (!in_array($job['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+            || $job['status'] !== 'running' || empty($job['previous_response_id'])
+            || $ledger['turn']['response_id'] !== $responseId
+            || !in_array($ledger['turn']['status'], ['submitted','running'], true)
+            || $surface['status'] !== 'busy' || $surface['owner_incarnation'] !== $incarnation
+            || (int)$surface['fencing_version'] !== $fence) return null;
+        $binding = self::bindingByResponseUnlocked($responseId);
+        if (!in_array($binding['status'], ['running','completed'], true)
+            || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $job['durable_turn_id']
+            || self::activeCompactionCheckpointUnlocked($binding, $responseId, $job['previous_response_id']) === null) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', $job['previous_response_id'])->find();
+        if (!is_array($source) || $source['status'] !== 'completed' || $source['round_kind'] !== 'tool_call'
+            || $source['operation_kind'] !== 'response' || $source['durable_turn_id'] !== $binding['turn_id']
+            || $source['epoch_id'] !== $job['epoch_id'] || $source['model'] !== $job['model']
+            || $source['task_id'] !== $job['task_id'] || $source['mcp_binding_id'] !== $binding['id']
+            || $source['surface_id'] !== $surface['id'] || $source['submitted_document_nonce'] !== $surface['document_nonce']) return null;
+        $pending = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status', 'NOT IN', ['completed','cancelled'])->count();
+        $missing = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status','completed')->where('result_json',null)->count();
+        if (!is_numeric($pending) || !is_numeric($missing)) throw new GatewayError('storage_unavailable', '摘要源工具状态暂不可读取。', 503);
+        if ((int)$pending !== 0 || (int)$missing !== 0) return null;
+        $cancelled = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status','cancelled')->select('response_id,result_json');
+        if (!is_array($cancelled)) throw new GatewayError('storage_unavailable', '摘要源工具状态暂不可读取。', 503);
+        foreach ($cancelled as $call) {
+            if ($call['response_id'] !== null || empty(json_decode((string)$call['result_json'],true)['compaction_interrupted'])) return null;
+        }
+        $calls = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status','completed')->where('result_delivered_at',null)
+            ->select('id,task_id,turn_id,binding_id,response_id,call_id,status,delivered_at,completed_at,result_delivered_at,result_json,result_hash');
+        if (!is_array($calls)) throw new GatewayError('storage_unavailable', '摘要源工具状态暂不可读取。', 503);
+        $receipts = [];
+        foreach ($calls as $call) {
+            if ($call['task_id'] !== $job['task_id'] || $call['turn_id'] !== $binding['turn_id']) return null;
+            $result = is_string($call['result_json']) ? json_decode($call['result_json'], true) : null;
+            if ($call['status'] !== 'completed' || empty($call['completed_at']) || !is_string($call['result_json'])) return null;
+            if ($call['result_delivered_at'] !== null || !empty($result['canonical_handoff_response_id'])) continue;
+            ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($job, $call, $job['task_id']);
+            $receipts[] = $call;
+        }
+        return compact('binding', 'receipts');
     }
 
     /**

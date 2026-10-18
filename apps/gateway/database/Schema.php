@@ -492,6 +492,13 @@ final class Schema
             57 => [
                 "ALTER TABLE gateway_tunnel_state ADD COLUMN preparation_json TEXT NOT NULL DEFAULT '{}'",
             ],
+            // Keep hot metadata lookups away from historical context/result overflow pages.
+            // The implicit rowid suffix also preserves exact latest-round ordering without sorting.
+            58 => [
+                'CREATE INDEX gateway_response_jobs_task_kind ON gateway_response_jobs(task_id,round_kind)',
+                'CREATE INDEX gateway_response_jobs_task_status ON gateway_response_jobs(task_id,status)',
+                'CREATE INDEX gateway_response_jobs_compact_source ON gateway_response_jobs(operation_kind,previous_response_id)',
+            ],
         ];
     }
 
@@ -638,19 +645,45 @@ final class Schema
     {
         $db = DB('medoo', 'sqlite');
         $begun = false;
+        $started = hrtime(true);
+        $acquired = null;
+        $failure = null;
         try {
             $beginStatement = self::beginWriter($db);
             $begun = true;
+            $acquired = hrtime(true);
             $beginStatement->closeCursor();
             unset($beginStatement);
             $result = $operation();
             $db->query('COMMIT');
             return $result;
         } catch (\Throwable $error) {
+            $failure = $error instanceof GatewayError ? $error->errorCode : get_class($error);
             if ($begun) {
                 $db->query('ROLLBACK');
             }
             throw $error;
+        } finally {
+            self::recordSlowTransaction($started, $acquired, $failure);
+        }
+    }
+
+    /** Record only slow lock/transaction timings after cleanup; no SQL, values or exception text. */
+    private static function recordSlowTransaction(int $started, ?int $acquired, ?string $failure): void
+    {
+        $finished = hrtime(true);
+        if ($finished - $started < 1000000000) return;
+        try {
+            $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3)[2] ?? [];
+            $operation = (string)($caller['class'] ?? '') . '::' . (string)($caller['function'] ?? 'unknown');
+            if (!preg_match('/\A[A-Za-z_\\\\][A-Za-z0-9_\\\\]*::[A-Za-z_][A-Za-z0-9_]*\z/D', $operation)) $operation = 'unknown';
+            @error_log('[storage-transaction] ' . json_encode(['event'=>'storage_transaction_slow',
+                'at'=>time(), 'pid'=>getmypid(), 'operation'=>$operation,
+                'wait_ms'=>round((($acquired ?? $finished) - $started) / 1000000, 2),
+                'held_ms'=>$acquired === null ? 0 : round(($finished - $acquired) / 1000000, 2),
+                'error_code'=>$failure], JSON_THROW_ON_ERROR));
+        } catch (\Throwable) {
+            // Diagnostics cannot alter a committed result or replace the original failure.
         }
     }
 

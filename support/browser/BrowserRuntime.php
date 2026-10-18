@@ -6063,6 +6063,31 @@ JS;
                 $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
                 return;
             }
+            $session = $this->taskSessions[(string)$turn['session_id']] ?? [];
+            if (($snapshot['generation_running'] ?? null) === false
+                && ($snapshot['send_button_visible'] ?? null) === true
+                && (empty($session['submission_request_id']) || (!empty($session['submission_finished'])
+                    && !empty($session['submission_failed']) && ($session['submission_canceled'] ?? null) === false))
+                && in_array($snapshot['error']['code'] ?? '', ['', 'CHATGPT_STOPPED_THINKING',
+                    'CHATGPT_NETWORK_ERROR', 'CHATGPT_MESSAGE_STREAM_ERROR'], true)) {
+                $currentId = (string)($turn['logical_response_id'] ?? $responseId);
+                try {
+                    $current = ResponseJob::pollState($currentId);
+                    if (in_array($current['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+                        && !empty($current['previous_response_id']) && !empty($turn['tool_capable'])
+                        && $this->compactionSourceTransportClosed($currentId, $session)) {
+                        // Closed transport plus a stopped page must not wait for delivery to the old receiver.
+                        $this->chatGptTurns[$responseId]['compaction_closed_source'] = true;
+                        $this->chatGptTurns[$responseId]['compaction_phase'] = 'stopping_source';
+                        $this->stopCompactionSource($responseId, $currentId);
+                        return;
+                    }
+                } catch (GatewayError $stateError) {
+                    if ($stateError->errorCode === 'STORAGE_BUSY') $this->scheduleTaskPoll($responseId, 1.0);
+                    else $this->taskFailTurn($responseId, $stateError->errorCode, $stateError->getMessage(), true);
+                    return;
+                }
+            }
             if (is_array($snapshot['error'] ?? null)) {
                 if (($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING') {
                     $this->recordStoppedThinkingObservation($responseId, $snapshot);
@@ -7033,6 +7058,7 @@ JS;
      * Drain accepted host receipts, stop the exact old generation, then request only a checkpoint.
      * This never reports the interrupted partial answer as completion of the human task.
      * After an owned Stop, confirm idle on the fenced document even if historical DOM groups change.
+     * A failed source transport uses read-only idle confirmation and exact native checkpoint receipts.
      * @param string $responseId Physical source observer.
      * @param string $logicalResponseId Its currently reserved compact response.
      * @return void Polling retains the durable deadline and never cancels a host invocation.
@@ -7042,10 +7068,22 @@ JS;
         if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
         $turn = $this->chatGptTurns[$responseId];
         try {
-            $revision = ToolBroker::beginCompletionFenceForResponse($logicalResponseId);
+            $closedSource = (!empty($turn['compaction_closed_source']) && !empty($turn['compaction_stop_clicked']))
+                || $this->compactionSourceTransportClosed($logicalResponseId,
+                    $this->taskSessions[(string)$turn['session_id']] ?? []);
+            $this->chatGptTurns[$responseId]['compaction_closed_source'] = $closedSource;
+            $revision = $closedSource
+                ? ToolBroker::beginStoppedCompactionFenceForResponse($logicalResponseId,
+                    (string)$turn['owner_incarnation'], (int)$turn['fencing_version'])
+                : ToolBroker::beginCompletionFenceForResponse($logicalResponseId);
             if ($revision === null) {
+                $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
                 $this->scheduleTaskPoll($responseId, 0.2);
                 return;
+            }
+            if (($turn['compaction_stop_revision'] ?? null) !== $revision) {
+                $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                $this->chatGptTurns[$responseId]['compaction_stop_revision'] = $revision;
             }
             $compact = ResponseJob::execution($logicalResponseId);
             $source = ResponseJob::execution((string)$compact['previous_response_id']);
@@ -7057,9 +7095,13 @@ JS;
             // a running generation still requires that witness inside userStopExpression, even without a click.
             $stopUnconfirmed = empty($turn['compaction_stop_clicked']);
             $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
-                (array)$turn['baseline_users'], $stopUnconfirmed, $stopUnconfirmed,
+                (array)$turn['baseline_users'], $stopUnconfirmed, !$closedSource && $stopUnconfirmed,
                 self::acceptedInitialUser($source, $surface));
         } catch (GatewayError $error) {
+            if ($error->errorCode === 'STORAGE_BUSY') {
+                $this->scheduleTaskPoll($responseId, 1.0);
+                return;
+            }
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
             return;
         }
@@ -7067,6 +7109,7 @@ JS;
             if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
             if ($error !== null || !is_array($state) || empty($state['owned'])) {
                 $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                $this->chatGptTurns[$responseId]['compaction_closed_source'] = false;
                 // No owned Stop action occurred. Keep observing the existing page so
                 // its ordinary completion/error recovery remains available; never let
                 // a missing witness turn into a permanently latched stopping phase.
@@ -7079,6 +7122,11 @@ JS;
             if (!empty($state['stopped'])) $this->chatGptTurns[$responseId]['compaction_stop_clicked'] = true;
             if (!empty($state['generation_running']) || empty($state['editor_ready'])) {
                 $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                if (!empty($state['generation_running']) && empty($state['stopped'])
+                    && !empty($this->chatGptTurns[$responseId]['compaction_closed_source'])) {
+                    $this->chatGptTurns[$responseId]['compaction_closed_source'] = false;
+                    $this->chatGptTurns[$responseId]['compaction_phase'] = null;
+                }
                 $this->scheduleTaskPoll($responseId, 0.25);
                 return;
             }
@@ -7093,25 +7141,65 @@ JS;
                 '', (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn));
             $this->evaluateTask($responseId, $read, function ($readError, $snapshot) use ($responseId, $logicalResponseId, $revision): void {
                 if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
-                if ($readError !== null || !is_array($snapshot) || !empty($snapshot['generation_running'])) {
+                $closedSource = !empty($this->chatGptTurns[$responseId]['compaction_closed_source']);
+                if ($readError !== null || !is_array($snapshot) || !empty($snapshot['generation_running'])
+                    || ($closedSource && ($snapshot['send_button_visible'] ?? null) !== true)) {
                     $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
+                    if ($closedSource && !empty($snapshot['generation_running'])) {
+                        $this->chatGptTurns[$responseId]['compaction_closed_source'] = false;
+                        $this->chatGptTurns[$responseId]['compaction_phase'] = null;
+                    }
                     $this->scheduleTaskPoll($responseId, 0.25);
                     return;
                 }
                 try {
+                    $turn = $this->chatGptTurns[$responseId];
                     $completion = ToolBroker::completionForResponse($logicalResponseId);
                     $answer = ($completion['status'] ?? '') === 'completed' ? (string)$completion['final_answer']
                         : (string)($snapshot['markdown'] ?? $snapshot['visible_text'] ?? '');
-                    if (!ToolBroker::commitCompletionFenceForResponse($logicalResponseId, $revision, $answer)) {
+                    $committed = $closedSource
+                        ? ToolBroker::commitStoppedCompactionFenceForResponse($logicalResponseId, $revision, $answer,
+                            (string)$turn['owner_incarnation'], (int)$turn['fencing_version'])
+                        : ToolBroker::commitCompletionFenceForResponse($logicalResponseId, $revision, $answer);
+                    if (!$committed) {
+                        $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
                         $this->scheduleTaskPoll($responseId, 0.2);
                         return;
                     }
                     $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, $answer);
                 } catch (GatewayError $error) {
+                    if ($error->errorCode === 'STORAGE_BUSY') {
+                        $this->scheduleTaskPoll($responseId, 1.0);
+                        return;
+                    }
                     $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
                 }
             });
         });
+    }
+
+    /**
+     * Preserve a source's observed transport failure across browser-worker reattachment.
+     * A live private HTTP observer takes precedence. A missing observer needs a persisted
+     * non-cancelled failure from this exact compact, never age, an old task error or a banner.
+     * @param string $responseId Exact compact currently owning the fenced source page.
+     * @param array $session Current private HTTP observations, absent after worker replacement.
+     * @return bool Whether the source receiver is known closed; DOM idle is verified separately.
+     */
+    private function compactionSourceTransportClosed(string $responseId, array $session): bool
+    {
+        if (!empty($session['submission_request_id'])) {
+            return !empty($session['submission_finished']) && !empty($session['submission_failed'])
+                && ($session['submission_canceled'] ?? null) === false;
+        }
+        $events = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('response_id', $responseId)
+            ->where('event_type', 'browser_response_transport')->where('data_json','LIKE','%stream_failed%')
+            ->order([['id','DESC']])->limit(1)->select('data_json');
+        foreach (is_array($events) ? $events : [] as $event) {
+            $facts = json_decode((string)$event['data_json'], true);
+            if (($facts['state'] ?? '') === 'stream_failed' && ($facts['canceled'] ?? null) === false) return true;
+        }
+        return false;
     }
 
     /** Fence asynchronous stop callbacks against newer work, page claims and compaction generations. */
