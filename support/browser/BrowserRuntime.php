@@ -6549,14 +6549,29 @@ JS;
                 $emptyTransportSettled = !empty($emptySession['submission_request_id'])
                     && !empty($emptySession['submission_finished']) && empty($emptySession['submission_failed'])
                     && (!is_string($postToolBaseline) || $sourceTransportSettled);
-                // A tool-only answer may return to Send without a final body or Copy action,
-                // while its private stream observer still lacks a post-receipt finish event.
-                // Exact delivered source receipts plus a drained MCP fence can settle this
-                // empty ordinary terminal for bounded recovery. An active checkpoint begins
-                // its separate summary-only handoff; it does not complete the user's task.
+                // A disabled Send control or canceled HTTP stream alone cannot prove a
+                // tool-only response ended. Observe Stop after the exact latest receipt,
+                // then its return to Send; ordinary UI-only pauses also need a long quiet
+                // MCP window below. Explicit checkpoint source stops keep their own handoff.
+                $emptyUiTransition = ChatGptTransport::postReceiptUiSettlement(
+                    $this->chatGptTurns[$responseId]['empty_response_ui_observation'] ?? null, $snapshot, [
+                        'response_id'=>$logicalResponseId, 'session_id'=>(string)$turn['session_id'],
+                        'document_nonce'=>(string)$turn['document_nonce'],
+                        'owner_incarnation'=>(string)$turn['owner_incarnation'],
+                        'fencing_version'=>(int)$turn['fencing_version'],
+                        'assistant_id'=>$boundAssistantId,
+                        'request_id'=>!empty($emptySession['submission_request_id'])
+                            ? (string)$emptySession['submission_request_id'] : (string)($logicalJob['previous_response_id'] ?? ''),
+                        'receipt_signature'=>$deliverySignature, 'receipt_at_us'=>$deliveredAtUs,
+                        'post_tool_baseline'=>$postToolBaseline,
+                        'source_transport_unsettled'=>$toolCapable && !$emptyTransportSettled,
+                        'allow_empty_terminal'=>true,
+                    ], $now);
+                $this->chatGptTurns[$responseId]['empty_response_ui_observation'] = $emptyUiTransition['observation'];
                 $emptyUiReceiptsSettled = $toolCapable && $deliveredAt !== null
                     && $deliverySignature !== '' && ($snapshot['send_button_visible'] ?? null) === true
-                    && ($snapshot['generation_running'] ?? null) === false;
+                    && ($snapshot['generation_running'] ?? null) === false
+                    && ($stoppedCompactSource || $emptyUiTransition['settled']);
                 if ($this->observeEmptyResponseSettlement($responseId, $logicalResponseId, $snapshot, [
                     'response_id' => $logicalResponseId,
                     'session_id' => (string) $turn['session_id'],
@@ -6573,6 +6588,7 @@ JS;
                     'transport_failed' => !empty($emptySession['submission_failed'])
                         && ($emptySession['submission_canceled'] ?? null) !== true,
                     'ui_receipts_settled' => $emptyUiReceiptsSettled,
+                    'checkpoint_source_stopped' => $stoppedCompactSource,
                     'round_markdown' => $roundMarkdown,
                     'has_artifacts' => $hasArtifacts,
                 ], $now, $stoppedCompactSource)) return;

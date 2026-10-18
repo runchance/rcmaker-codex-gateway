@@ -15,6 +15,8 @@ final class ChatGptTransport
     private const MAX_EDITOR_STAGE_CHARS = 130000;
     /** Allow ten seconds for a completed empty answer to receive its final content. */
     private const EMPTY_RESPONSE_GRACE_SECONDS = 10.0;
+    /** A UI-only tool pause is ambiguous; require five continuously quiet minutes before recovery. */
+    private const EMPTY_TOOL_IDLE_SECONDS = 300.0;
     /** An unreadable or suspended observer cannot accumulate a continuous terminal verdict. */
     private const EMPTY_RESPONSE_MAX_OBSERVATION_GAP_SECONDS = 5.0;
 
@@ -37,13 +39,16 @@ final class ChatGptTransport
 
     /**
      * Observe UI generation after an exact host receipt when the original HTTP stream ended early.
-     * This permits only the existing stable-answer/MCP completion fence, never a new prompt,
-     * receipt acknowledgement or completion by itself. A returned Send button alone is stale
+     * This supplies UI evidence only: stable-answer completion and empty-response recovery
+     * still require their separate MCP fences and settling rules. It acknowledges no receipt.
+     * A returned Send button alone is stale
      * evidence: the same owned assistant must have been generating after this receipt first.
      * @param array|null $previous Private witness from the preceding observation of this page.
      * @param array $snapshot Owned response DOM; ordinary public status text is not an error.
      * @param array $evidence Exact response/session/document/owner/fence/assistant/request identity,
      *     receipt_signature, receipt_at_us, source_transport_unsettled and post_tool_baseline.
+     *     allow_empty_terminal also permits observing a Stop-to-Send transition without answer text;
+     *     the separate empty health rule still requires a prolonged drained-tool window.
      * @param float $now Current observation time in seconds.
      * @return array{observation:?array,settled:bool} Updated witness and optional terminal UI evidence.
      * @throws \JsonException When the exact observation identity cannot be encoded.
@@ -78,8 +83,10 @@ final class ChatGptTransport
             || !is_numeric($previous['observed_at'] ?? null) || (float)$previous['observed_at'] > $now
             || $now - (float)$previous['observed_at'] > self::EMPTY_RESPONSE_MAX_OBSERVATION_GAP_SECONDS
             || ($snapshot['send_button_visible'] ?? null) !== true
-            || !is_string($snapshot['markdown'] ?? null) || trim($snapshot['markdown']) === ''
-            || $snapshot['markdown'] === $evidence['post_tool_baseline']) return $empty;
+            || !is_string($snapshot['markdown'] ?? null)) return $empty;
+        $emptyTerminal = ($evidence['allow_empty_terminal'] ?? null) === true && trim($snapshot['markdown']) === '';
+        if (!$emptyTerminal && (trim($snapshot['markdown']) === ''
+            || $snapshot['markdown'] === $evidence['post_tool_baseline'])) return $empty;
         return ['observation'=>$witness, 'settled'=>true];
     }
 
@@ -136,11 +143,14 @@ final class ChatGptTransport
      * a missing fence, changing ownership, activity, content or observation gap resets the window.
      * A confirmed non-cancelled network failure is a stream-recovery cause, not an empty
      * model answer. A native recovery notice without that evidence cannot settle the turn.
-     * Generation duration is deliberately absent from this rule.
+     * UI-only ordinary tool pauses require five quiet minutes after a verified Stop-to-Send
+     * transition. Real request completion/failure and explicitly stopped checkpoint sources
+     * retain their normal short final-content settlement. Active generation never settles.
      * @param array|null $previous Prior candidate from this exact runtime turn, or null.
      * @param array $snapshot Current responseExpression() observation.
      * @param array $evidence Owned response/session/document/assistant/request IDs, transport_settled,
-     *     ui_receipts_settled (optional, exact source receipts delivered and Send returned),
+     *     ui_receipts_settled (optional, exact source receipts plus a witnessed Stop-to-Send transition),
+     *     checkpoint_source_stopped (optional, an explicitly stopped native compaction source),
      *     transport_failed (optional, an observed non-cancelled request failure),
      *     mcp_revision (null while tools are pending), round_markdown and has_artifacts.
      * @param float $now Current observation time in seconds; tests may use a deterministic clock.
@@ -151,6 +161,8 @@ final class ChatGptTransport
     {
         $empty = ['candidate' => null, 'error_code' => null];
         $transportFailed = ($evidence['transport_failed'] ?? null) === true;
+        $uiOnlyToolPause = ($evidence['transport_settled'] ?? null) !== true && !$transportFailed
+            && ($evidence['checkpoint_source_stopped'] ?? null) !== true;
         $settled = ($evidence['transport_settled'] ?? null) === true
             || (($evidence['ui_receipts_settled'] ?? null) === true
                 && ($snapshot['send_button_visible'] ?? null) === true);
@@ -187,7 +199,7 @@ final class ChatGptTransport
         }
         return [
             'candidate' => ['signature' => $signature, 'since' => $since, 'observed_at' => $now],
-            'error_code' => $now - $since >= self::EMPTY_RESPONSE_GRACE_SECONDS
+            'error_code' => $now - $since >= ($uiOnlyToolPause ? self::EMPTY_TOOL_IDLE_SECONDS : self::EMPTY_RESPONSE_GRACE_SECONDS)
                 ? ($transportFailed ? 'CHATGPT_MESSAGE_STREAM_ERROR' : 'CHATGPT_EMPTY_RESPONSE') : null,
         ];
     }
