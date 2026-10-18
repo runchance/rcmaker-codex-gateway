@@ -47,8 +47,8 @@ final class ContextCompaction
     /**
      * Join a read-only checkpoint when Codex changes only its temporary thread ID.
      * Existing conversations and active native tool batches retain their normal admission.
-     * Client, branch, integration, model/effort and the complete context bytes must match,
-     * allowing only the exact gateway-owned failed-checkpoint notice appended by recovery.
+     * Client, branch, integration, model/effort and every complete context value must match,
+     * allowing JSON object member ordering and the exact gateway-owned recovery notice only.
      * Pending requests retain one producer and failed requests expose their real terminal.
      * Source-linked checkpoints also retain one producer across temporary IDs; a failed
      * source can recover only through the existing ownership and exact-receipt fences.
@@ -72,6 +72,9 @@ final class ContextCompaction
             $context = (string)$spec['context_json'];
             $recoveredContext = $context;
             $decoded = json_decode($context, true, 128, JSON_THROW_ON_ERROR);
+            // Conversation routing canonicalizes imported history. Preserve both wire
+            // and stored member ordering; array order and every value remain exact.
+            $canonicalContext = ContextHistory::canonical($decoded);
             // Recovery appends this exact internal notice; Codex never receives it as
             // an input item. Restore only that notice, never normalize caller history.
             if (is_array($decoded['system'] ?? null)
@@ -87,7 +90,7 @@ final class ContextCompaction
                 JOIN gateway_context_checkpoints c ON c.response_id=j.id AND c.id=j.compact_id
                 WHERE j.status IN ('queued','running','failed','completed') AND j.operation_kind='compact_v2'
                 AND j.integration_id=:integration AND j.model=:model AND j.reasoning_effort IS :effort
-                AND j.context_json IN (:context,:recovered_context) AND j.compaction_epoch=:compaction_epoch
+                AND j.context_json IN (:context,:canonical_context,:recovered_context) AND j.compaction_epoch=:compaction_epoch
                 AND t.client_id=:client AND t.branch_id=:branch AND c.state IN ('generating','committed','abandoned')
                 AND c.protocol='compact_v2' AND c.request_hash=j.request_hash
                 AND ((j.previous_response_id IS NULL AND c.source_response_id IS NULL)
@@ -99,11 +102,11 @@ final class ContextCompaction
                 CASE WHEN j.status='completed' THEN 0 WHEN j.status IN ('queued','running') THEN 1 ELSE 2 END,
                 CASE WHEN j.status IN ('queued','running') THEN j.rowid END ASC, j.rowid DESC LIMIT 16", [':integration'=>$spec['integration_id'], ':model'=>$spec['model'],
                     ':effort'=>$spec['reasoning_effort'] ?? null, ':client'=>$spec['client_id'] ?? 'responses',
-                    ':branch'=>$spec['branch_id'] ?? 'main', ':context'=>$context, ':recovered_context'=>$recoveredContext,
+                    ':branch'=>$spec['branch_id'] ?? 'main', ':context'=>$context, ':canonical_context'=>$canonicalContext, ':recovered_context'=>$recoveredContext,
                     ':compaction_epoch'=>$spec['compaction_epoch'] ?? 'base'])->fetchAll(\PDO::FETCH_ASSOC);
             foreach ($rows as $candidate) {
                 $job = $db->table('gateway_response_jobs')->where('id', $candidate['id'])->find();
-                if (!is_array($job) || !in_array($job['context_json'], [$context, $recoveredContext], true)
+                if (!is_array($job) || !in_array($job['context_json'], [$context, $canonicalContext, $recoveredContext], true)
                     || $job['compaction_epoch'] !== ($spec['compaction_epoch'] ?? 'base')) continue;
                 $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $job['compact_id'])->find();
                 if (!is_array($checkpoint) || $checkpoint['task_id'] !== $job['task_id']) continue;
@@ -1740,7 +1743,16 @@ final class ContextCompaction
         }
         return $source;
     }
-    /** A terminal read-only retry retains all original records and may append only native user context. */
+    /**
+     * Preserve the complete terminal source before accepting appended native instructions.
+     * Codex can append developer/environment updates together with a new human request on
+     * restart. They remain in the new read-only summary; assistant/tool records cannot be
+     * invented after a closed source, and repeated native user IDs are still rejected.
+     * @param array $before Complete persisted source context, including every tool receipt.
+     * @param array $after Compiled current native context; the original prefix stays exact.
+     * @param bool $responsesLite Allow only the established Lite preamble/image-hint changes.
+     * @return bool Exact ordered source plus supported appended instructions, with unique user IDs.
+     */
     private static function hasCompleteSourcePrefix(array $before, array $after, bool $responsesLite): bool
     {
         $known = $before['messages'] ?? null; $records = $after['messages'] ?? null;
@@ -1759,6 +1771,7 @@ final class ContextCompaction
         $ids = [];
         foreach ($known as $record) if (is_string($record['id'] ?? null)) $ids[$record['id']] = true;
         foreach (array_slice($records, count($known) + $offset) as $record) {
+            if (in_array($record['role'] ?? '', ['developer', 'agent_message'], true)) continue;
             if (($record['role'] ?? '') !== 'user' || !is_string($record['id'] ?? null) || $record['id'] === ''
                 || isset($ids[$record['id']])) return false;
             $ids[$record['id']] = true;
