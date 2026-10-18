@@ -334,11 +334,13 @@ final class DiagnosticExport
         $tunnel = rtrim((string) Config::get('gateway', 'tunnel_runtime_root'), '/\\') . '/logs';
         $browser = rtrim((string) Config::get('gateway', 'browser_log_dir'), '/\\');
         $runtime = runtime_path() . '/logs';
+        $storage = rtrim((string) Config::get('gateway', 'storage_log_dir'), '/\\');
         return [
             'mcp' => $tunnel . '/mcp-events.jsonl', 'mcp_previous' => $tunnel . '/mcp-events.jsonl.1',
             'native' => $tunnel . '/native-events.jsonl', 'native_previous' => $tunnel . '/native-events.jsonl.1',
             'api' => $runtime . '/RC_GATEWAY_API.log', 'api_legacy' => $runtime . '/RC_GETWAY_API.log',
             'native_api' => $runtime . '/RC_GATEWAY_NATIVE_API.log', 'web_api' => $runtime . '/RC_GATEWAY_WEB_API.log',
+            'storage' => $storage . '/gateway-storage.log', 'storage_previous' => $storage . '/gateway-storage.log.1',
             'browser_runtime' => $browser . '/runtime-errors.log', 'browser_stderr' => $browser . '/stderr.log',
             'chrome' => $browser . '/chrome.log',
         ];

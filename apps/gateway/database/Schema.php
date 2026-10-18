@@ -502,8 +502,12 @@ final class Schema
         ];
     }
 
-    /** Initialize idempotently under a bounded cross-process lock. @throws GatewayError on storage or migration failure. */
-    public static function initialize(): void
+    /**
+     * Initialize idempotently under a bounded cross-process lock.
+     * @param callable|null $progress Optional local startup observer, called only by the migration owner.
+     * @throws GatewayError on storage or migration failure; observer errors never affect storage.
+     */
+    public static function initialize(?callable $progress = null): void
     {
         if (self::$ready) {
             return;
@@ -518,6 +522,7 @@ final class Schema
             throw new GatewayError('STORAGE_UNAVAILABLE', '无法打开数据初始化锁，请检查写入权限。', 503);
         }
         $locked = false;
+        $upgradeStarted = null;
         $deadline = microtime(true) + 2;
         try {
             do {
@@ -547,21 +552,44 @@ final class Schema
             // checksum/state validation, not another writer transaction or CREATE TABLE.
             // The initialization file lock still serializes migration checks/upgrades.
             $hasSchema = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_schema'")->fetchColumn() !== false;
-            if ($hasSchema && self::validatedVersion($db, $migrations) === count($migrations)) {
+            $currentVersion = $hasSchema ? self::validatedVersion($db, $migrations) : 0;
+            if ($hasSchema && $currentVersion === count($migrations)) {
                 self::validateInitializedState($db);
                 self::$ready = true;
                 return;
             }
-            self::transaction(function () use ($db, $migrations): void {
+            $indexes = 0;
+            foreach ($migrations as $version => $statements) {
+                if ($version <= $currentVersion) continue;
+                foreach ($statements as $sql) {
+                    if (preg_match('/\ACREATE (?:UNIQUE )?INDEX\b/i', $sql)) $indexes++;
+                }
+            }
+            $upgradeStarted = hrtime(true);
+            $notify = static function (string $phase, int $index = 0) use ($progress, $currentVersion, $migrations, $indexes, $upgradeStarted): void {
+                if ($progress === null) return;
+                try {
+                    $progress(['phase' => $phase, 'from_version' => $currentVersion, 'to_version' => count($migrations),
+                        'index' => $index, 'indexes' => $indexes, 'elapsed_seconds' => (hrtime(true) - $upgradeStarted) / 1000000000]);
+                } catch (\Throwable) {
+                    // A closed terminal or presentation error cannot roll back an upgrade.
+                }
+            };
+            $notify('starting');
+            self::transaction(function () use ($db, $migrations, $notify): void {
                 $db->query('CREATE TABLE IF NOT EXISTS gateway_schema (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)');
                 $current = self::validatedVersion($db, $migrations);
                 $freshInstallation = $current === 0;
+                $index = 0;
                 foreach ($migrations as $version => $statements) {
                     if ($version <= $current) {
                         continue;
                     }
                     foreach ($statements as $sql) {
+                        $buildingIndex = preg_match('/\ACREATE (?:UNIQUE )?INDEX\b/i', $sql) === 1;
+                        if ($buildingIndex) $notify('index_starting', ++$index);
                         $db->query($sql);
+                        if ($buildingIndex) $notify('index_finished', $index);
                     }
                     $hash = hash('sha256', json_encode($statements, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
                     $db->query('INSERT INTO gateway_schema(version,checksum) VALUES (:version,:checksum)', [':version' => $version, ':checksum' => $hash]);
@@ -585,9 +613,12 @@ final class Schema
                 self::validateInitializedState($db);
             });
             self::$ready = true;
+            $notify('completed');
         } catch (GatewayError $error) {
+            if ($upgradeStarted !== null) $notify('failed');
             throw $error;
         } catch (\Throwable $error) {
+            if ($upgradeStarted !== null) $notify('failed');
             throw new GatewayError('STORAGE_UNAVAILABLE', '本地数据库不可用，请检查磁盘空间、写入权限或文件占用。', 503);
         } finally {
             if ($locked) {
@@ -677,11 +708,32 @@ final class Schema
             $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3)[2] ?? [];
             $operation = (string)($caller['class'] ?? '') . '::' . (string)($caller['function'] ?? 'unknown');
             if (!preg_match('/\A[A-Za-z_\\\\][A-Za-z0-9_\\\\]*::[A-Za-z_][A-Za-z0-9_]*\z/D', $operation)) $operation = 'unknown';
-            @error_log('[storage-transaction] ' . json_encode(['event'=>'storage_transaction_slow',
+            $line = '[storage-transaction] ' . json_encode(['event'=>'storage_transaction_slow',
                 'at'=>time(), 'pid'=>getmypid(), 'operation'=>$operation,
                 'wait_ms'=>round((($acquired ?? $finished) - $started) / 1000000, 2),
                 'held_ms'=>$acquired === null ? 0 : round(($finished - $acquired) / 1000000, 2),
-                'error_code'=>$failure], JSON_THROW_ON_ERROR));
+                'error_code'=>$failure], JSON_THROW_ON_ERROR) . PHP_EOL;
+            // Business diagnostics have no framework access-log sink. Keep a bounded,
+            // exportable file instead of PHP's stderr (the user's gateway console).
+            $directory = (string) Config::get('gateway', 'storage_log_dir');
+            if ($directory === '') return;
+            if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) return;
+            $path = $directory . '/gateway-storage.log';
+            $lock = @fopen($path . '.lock', 'c');
+            if ($lock === false) return;
+            try {
+                // Never delay a result or hold a database transaction for log contention.
+                if (!flock($lock, LOCK_EX | LOCK_NB)) return;
+                clearstatcache(true, $path);
+                if (is_file($path) && (int) @filesize($path) >= 1048576) {
+                    if (is_file($path . '.1') && !@unlink($path . '.1')) return;
+                    if (!@rename($path, $path . '.1')) return;
+                }
+                @file_put_contents($path, $line, FILE_APPEND);
+            } finally {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
         } catch (\Throwable) {
             // Diagnostics cannot alter a committed result or replace the original failure.
         }

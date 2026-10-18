@@ -70,6 +70,8 @@ return [
     'console_origin' => 'http://127.0.0.1:' . $consolePort,
     'api_origin' => 'http://127.0.0.1:' . $apiPort,
     'database_file' => $dataDirectory . '/database/' . $databaseName,
+    // Diagnostic timings are file-only; isolated tools/tests never append to the live log.
+    'storage_log_dir' => $gatewayTestMode ? $testRuntimeRoot . '/storage-logs' : runtime_path() . '/logs',
     // Tests must never share runtime credentials or tunnel-client state with the appliance.
     // A leaked test worker is therefore unable to stop, reconnect or mutate the real tunnel.
     'runtime_secret_key_file' => $gatewayTestMode

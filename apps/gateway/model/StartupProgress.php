@@ -117,6 +117,35 @@ final class StartupProgress
         return $lines;
     }
 
+    /**
+     * Describe actual migration/index milestones before browser startup can proceed.
+     * @param array $state Non-secret Schema observer facts; completion means the transaction committed.
+     * @return array Framework Banner lines in the saved startup language, without database access.
+     */
+    public static function schemaLines(array $state): array
+    {
+        $zh = GatewayPresentation::locale() === 'zh-CN';
+        $seconds = number_format(max(0, (float) ($state['elapsed_seconds'] ?? 0)), 1, '.', '');
+        $index = (int) ($state['index'] ?? 0);
+        $total = (int) ($state['indexes'] ?? 0);
+        $version = (int) ($state['from_version'] ?? 0) . ' → ' . (int) ($state['to_version'] ?? 0);
+        $text = match ($state['phase'] ?? '') {
+            'starting' => $zh
+                ? '正在升级本地数据库（' . $version . '）。历史数据较多时建立索引可能较慢，请保持窗口开启；完成后自动继续启动浏览器。'
+                : 'Upgrading the local database (' . $version . '). Indexing large histories may take time. Keep this window open; browser startup will continue automatically.',
+            'index_starting' => $zh ? '正在建立索引 ' . $index . '/' . $total . '…'
+                : 'Building index ' . $index . '/' . $total . '…',
+            'index_finished' => $zh ? '索引 ' . $index . '/' . $total . ' 已建立（累计 ' . $seconds . ' 秒，等待升级提交）。'
+                : 'Index ' . $index . '/' . $total . ' built (' . $seconds . ' seconds elapsed; upgrade not yet committed).',
+            'completed' => $zh ? '数据库升级已完成（' . $seconds . ' 秒），继续准备运行环境。'
+                : 'Database upgrade committed (' . $seconds . ' seconds). Continuing runtime preparation.',
+            'failed' => $zh ? '数据库升级未完成，本次更改已回滚。请检查磁盘空间、权限及诊断日志。'
+                : 'Database upgrade did not complete; its changes were rolled back. Check disk space, permissions and diagnostic logs.',
+            default => '',
+        };
+        return $text === '' ? [] : [['text' => $text, 'color' => ($state['phase'] ?? '') === 'failed' ? 'yellow' : 'cyan']];
+    }
+
     /** @return string Console output using the framework's color, newline and sanitization rules. */
     public static function render(array $lines): string
     {
