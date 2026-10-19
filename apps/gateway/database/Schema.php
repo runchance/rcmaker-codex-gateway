@@ -666,14 +666,18 @@ final class Schema
         return $current;
     }
 
-    /** Verify singleton seed records on both the current-schema read path and a newly applied migration. */
+    /**
+     * Verify singleton seeds and finish each read before a worker can become idle.
+     * Medoo retains its last statement: fetching only one row leaves a WAL snapshot
+     * pinned indefinitely in an idle API worker, including when validation fails.
+     */
     private static function validateInitializedState(object $db): void
     {
-        $state = $db->query('SELECT id,saved_revision FROM gateway_network_state WHERE id=1')->fetch(\PDO::FETCH_ASSOC);
+        $state = $db->query('SELECT id,saved_revision FROM gateway_network_state WHERE id=1')->fetchAll(\PDO::FETCH_ASSOC)[0] ?? null;
         if (!$state || (int) $state['saved_revision'] < 1) {
             throw new GatewayError('SCHEMA_MISMATCH', '数据库初始化记录不完整，已停止写入。', 503);
         }
-        $browser = $db->query('SELECT id,status FROM gateway_browser_state WHERE id=1')->fetch(\PDO::FETCH_ASSOC);
+        $browser = $db->query('SELECT id,status FROM gateway_browser_state WHERE id=1')->fetchAll(\PDO::FETCH_ASSOC)[0] ?? null;
         if (!$browser || (int) $browser['id'] !== 1) {
             throw new GatewayError('SCHEMA_MISMATCH', '浏览器工作区初始化记录不完整，已停止写入。', 503);
         }
