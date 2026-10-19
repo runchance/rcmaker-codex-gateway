@@ -411,7 +411,7 @@ A recorded send intent is different from confirmed Web receipt. Compare it with 
 
 ### Clear task records
 
-Use **Clear all idle tasks** in Task center and review its confirmation. Running tasks, executing tools and approval waits are skipped. Cleanup does not target project source files or Codex chats. Referenced checkpoints or attachments may remain, and database shrinking may be deferred; see the [cleanup FAQ](faq.en.md#cleanup).
+Use **Clear all idle tasks** in Task center and review its confirmation. Running tasks, executing tools and approval waits are skipped. Cleanup does not target project source files or Codex chats. Referenced checkpoints or attachments may remain. Freed database space is reused by later writes; the running gateway does not automatically compact the entire database. See the [cleanup FAQ](faq.en.md#cleanup).
 
 <a id="settings"></a>
 

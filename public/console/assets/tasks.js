@@ -63,8 +63,8 @@
             + ' · ' + I18n.t('可复用空间：') + format(result.reusable_bytes);
         const job = result.job;
         const labels = {queued: I18n.t('清理已登记'), deleting: I18n.t('正在删除任务及释放网页标签'),
-            waiting_idle: I18n.t('记录已清理，等待任务空闲后缩小数据库文件'),
-            compacting: I18n.t('正在回收数据库文件空间'), completed: I18n.t('清理完成')};
+            waiting_idle: I18n.t('清理正在等待资源释放。'),
+            compacting: I18n.t('正在完成清理，释放的数据库空间将供后续复用'), completed: I18n.t('清理完成')};
         byId('task-cleanup-progress').textContent = job ? (labels[job.status] || I18n.t('等待清理'))
             + ' · ' + I18n.t('已删除：') + job.deleted_count + ' · ' + I18n.t('跳过工作中任务：') + job.skipped_count : '';
         byId('clear-idle-tasks').disabled = state.mutationBusy || !!(job && ['queued','deleting','compacting'].includes(job.status));

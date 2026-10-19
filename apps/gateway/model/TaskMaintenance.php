@@ -5,7 +5,7 @@ namespace app\gateway\model;
 use app\gateway\database\Schema;
 use RC\Config;
 
-/** Task-only deletion and idle SQLite reclamation, consumed by the dedicated maintenance worker. */
+/** Task-only deletion with reusable SQLite space, consumed by the dedicated maintenance worker. */
 final class TaskMaintenance
 {
     private const INACTIVE_SECONDS = 3 * 86400;
@@ -136,7 +136,7 @@ final class TaskMaintenance
     }
 
     /**
-     * Protect response admission against the brief idle VACUUM window, without changing request identities or rejecting work.
+     * Protect response admission against task/file deletion, without changing request identities or rejecting work.
      * @param callable $operation Existing response reservation. @return mixed Its original return value.
      */
     public static function withAdmission(callable $operation): mixed
@@ -190,10 +190,10 @@ final class TaskMaintenance
                 return true;
             }
             $waitingJobs[] = $id;
-            // Excluding a still-open browser page does not make its cleanup eligible for VACUUM.
+            // Excluding a still-open browser page must not complete its pending cleanup.
             $remaining = $sql->query("SELECT 1 FROM gateway_task_cleanup_items WHERE cleanup_id=:id
                 AND status IN ('pending','waiting_surface','deleting_rows') LIMIT 1", [':id' => $id])->fetchColumn();
-            if ($remaining === false) self::reclaimIdle($id);
+            if ($remaining === false) self::completeCleanup($id);
             return true;
         } catch (\Throwable $error) {
             // Lock contention is retryable and must not consume the deletion candidate or fail an active task.
@@ -336,43 +336,12 @@ final class TaskMaintenance
             [':id1'=>$cleanupId, ':id2'=>$cleanupId, ':skipped'=>$status === 'skipped' ? 1 : 0, ':now'=>time()]);
     }
 
-    /** Reclaim the physical file only while there is no admitted work, using SQLite through the framework connection. */
-    private static function reclaimIdle(int $cleanupId): void
-    {
-        $sql = DB('medoo', 'sqlite');
-        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)->find();
-        if (isset($job['inactive_before'])) {
-            // Reuse SQLite's freed pages. Automatic retention must never hold admission
-            // across a whole-database VACUUM or a busy WAL checkpoint.
-            self::completeCleanup($cleanupId);
-            return;
-        }
-        $working = (int) $sql->query('SELECT COUNT(*) FROM gateway_tasks t WHERE (' . self::WORKING . ')')->fetchColumn();
-        $setup = (int) $sql->query("SELECT COUNT(*) FROM gateway_browser_commands WHERE status IN ('queued','running')")->fetchColumn();
-        if ($working > 0 || $setup > 0) {
-            SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)
-                ->update(['status'=>'waiting_idle','updated_at'=>time()]);
-            return;
-        }
-        SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)
-            ->update(['status'=>'compacting','updated_at'=>time()]);
-        // VACUUM cannot run in a transaction. The admission lock remains held until it settles.
-        // Deleted pages are reusable immediately; this final idle step actually shrinks the file.
-        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)->find();
-        if (empty($job['vacuum_done']) && (int)($job['deleted_count'] ?? 0) > 0) {
-            $sql->query('VACUUM');
-            SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)->update(['vacuum_done'=>1]);
-        }
-        $checkpoint = $sql->query('PRAGMA wal_checkpoint(TRUNCATE)')->fetch(\PDO::FETCH_NUM);
-        if (is_array($checkpoint) && (int)$checkpoint[0] !== 0) {
-            SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup')->where('id', $cleanupId)
-                ->update(['status'=>'waiting_idle','error_code'=>'CHECKPOINT_WAIT','updated_at'=>time()]);
-            return;
-        }
-        self::completeCleanup($cleanupId);
-    }
-
-    /** Finish a durable batch and bound its non-content operational summaries. */
+    /**
+     * Finish a batch after every item settles, including legacy compacting/waiting_idle records.
+     * Freed pages remain reusable. Live VACUUM or a blocking checkpoint can monopolize the
+     * shared database even in this dedicated worker, starving browser startup and the console.
+     * Preserve vacuum_done as historical evidence; do not claim a file rewrite happened.
+     */
     private static function completeCleanup(int $cleanupId): void
     {
         $sql = DB('medoo', 'sqlite');

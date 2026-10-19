@@ -186,7 +186,7 @@ Task-center cleanup targets the gateway's eligible task records, not the project
 
 ### Why does the SQLite file remain large after cleanup?
 
-Deleted space may be reusable inside SQLite before the file shrinks. Reclamation can wait until active tasks are idle. Use the console's size/reusable-space/cleanup progress, not file size alone. Do not remove `-wal` or `-shm` sidecars while the application is running.
+Deleted records free space inside SQLite for later writes; the database file need not shrink immediately. The running gateway does not automatically compact the entire database or perform blocking file reclamation, which could hold the write lock and stall startup and the console. Legacy cleanup records waiting for compaction finish normally once their items have settled. Use the console's size/reusable-space/cleanup progress, not file size alone. Do not remove `-wal` or `-shm` sidecars while the application is running.
 
 ### What should I preserve during an upgrade or machine change?
 
