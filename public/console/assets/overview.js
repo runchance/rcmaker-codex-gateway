@@ -58,7 +58,7 @@
         document.querySelectorAll('[data-tool-step]').forEach(panel => { panel.hidden = panel.dataset.toolStep !== step; });
         byId('tools-surface-panel').hidden = true;
         if (step === 'network') prepareNetworkFields();
-        if (step === 'tunnel' && snapshot) fillToolFields();
+        if (['tunnel', 'connector'].includes(step) && snapshot) fillToolFields();
         if (step === 'account' || step === 'connector') startScreenshotLoop();
         byId('wizard-title').textContent = I18n.t('开始使用');
     }
@@ -320,6 +320,9 @@
     function renderToolsGuide(state) {
         if (!state || !state.settings) return;
         const settings = state.settings, tunnel = settings.tunnel || {}, connector = settings.connector || {};
+        const modeNotice = byId('chat-mode-notice');
+        modeNotice.hidden = !(settings.web_chat_mode === 'regular' && Number(settings.web_chat_fallback_at || 0) > 0);
+        modeNotice.textContent = I18n.t('临时对话未能找到插件，普通对话已通过连接器验证，现已自动切换为普通模式。新任务和后续检测使用普通对话；已有临时任务下次续发时完整初始化一次，之后只发新增需求。网页记录保存在 ChatGPT 历史中。');
         const tunnelSaved = Boolean((settings.tunnel_id || '').trim());
         const tunnelReady = tunnel.status === 'ready';
         const keyReady = settings.runtime_key_configured === true || Number(settings.runtime_key_configured || 0) === 1;
@@ -341,6 +344,8 @@
         byId('setup-tunnel-id').value = snapshot.settings.tunnel_id || '';
         byId('setup-api-key').value = '';
         byId('setup-connector-suffix').value = (snapshot.settings.connector_name || 'RCMAKER Codex').replace(/^RCMAKER\s+/i, '');
+        byId('setup-web-chat-mode').value = snapshot.settings.web_chat_mode || 'temporary';
+        if (layui.form) layui.form.render('select', 'web-chat-preference');
     }
     async function refresh(options) {
         const passive = Boolean(options && options.passive);
@@ -807,10 +812,28 @@
             progress('tools-progress', I18n.t('连接器名称已复制：') + value);
         } catch (_) { progress('tools-progress', I18n.t('复制失败，请手动复制连接器名称：') + value, 'warning'); }
     }
+    /** Save only the visible mode preference, then run the existing connector check. */
+    async function saveChatMode() {
+        if (busy || !snapshot) return;
+        const button = byId('tools-save-chat-mode');
+        busy = true; loading(button, true, I18n.t('正在保存…'));
+        let saved = false;
+        try {
+            await Gateway.request('/api/settings/chat-mode', {web_chat_mode: byId('setup-web-chat-mode').value,
+                expected_updated_at: Number(snapshot.settings.updated_at)});
+            await refresh(); saved = true;
+            Gateway.notifyStateChange('settings');
+        } catch (error) { progress('tools-progress', error.message, 'warning'); }
+        finally { busy = false; loading(button, false); }
+        if (saved) await verifyConnector();
+    }
+
     /** Observe the shared connector check until its real result; a local wait limit is not failure. */
     async function verifyConnector() {
         if (busy) return;
         const button = byId('tools-verify'); busy = true; loading(button, true, I18n.t('正在检查…'));
+        byId('setup-web-chat-mode').disabled = true;
+        if (layui.form) layui.form.render('select', 'web-chat-preference');
         progress('tools-progress', I18n.t('正在检查当前 ChatGPT 连接器…'));
         try {
             await browserCommand('/api/browser/connector/verify', {}, CONNECTOR_PROBE_WAIT_MS, 500);
@@ -822,7 +845,12 @@
                 ? I18n.t('连接器检查尚未结束。可稍后查看结果，再次检查会复用仍在执行的检查。') : e.message, 'warning');
             await refresh();
         }
-        finally { busy = false; loading(button, false); }
+        finally {
+            busy = false; loading(button, false);
+            byId('setup-web-chat-mode').disabled = false;
+            if (snapshot) byId('setup-web-chat-mode').value = snapshot.settings.web_chat_mode || 'temporary';
+            if (layui.form) layui.form.render('select', 'web-chat-preference');
+        }
     }
 
     byId('refresh').addEventListener('click', refresh);
@@ -884,6 +912,7 @@
     byId('tools-surface-refresh').addEventListener('click', refreshScreenshot);
     byId('tools-copy-connector').addEventListener('click', copyConnectorName);
     byId('tools-verify').addEventListener('click', verifyConnector);
+    byId('tools-save-chat-mode').addEventListener('click', saveChatMode);
     byId('codex-probe').addEventListener('click', function () { codexAction(this, async () => {
         // The existing busy guard pauses passive updates for this operation only.
         // Its isolated probe must not extend the user's surface interaction pause after completion.

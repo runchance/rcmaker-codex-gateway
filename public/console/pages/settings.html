@@ -40,6 +40,7 @@
             <div class="field settings-confirmation-option">
                 <input id="steering-full-context" type="checkbox" title="插话时全量重发上下文">
                 <p class="muted">默认关闭：已受理工具结清后，停止原页生成并发送新增需求和必要回执。开启后沿用全量重发。重启、原页丢失或异常时，仍可验证完整上下文与准确回执后恢复。</p>
+                <p class="muted">此开关用于临时模式。普通模式始终重新打开绑定的网页对话，仅发送新增需求和必要回执，不重发已保存的历史。</p>
             </div>
             <div class="field settings-confirmation-option">
                 <input id="official-handoff-summary" type="checkbox" title="切换到 Web 时使用官方模型生成交接摘要">
@@ -73,6 +74,7 @@
                 <input id="auto-cleanup-inactive-tasks" type="checkbox" checked title="清理不活跃任务">
                 <p class="muted">默认开启。连续 3 天没有对话的本地任务会自动清理；正在执行、等待工具结果或结果尚未确认的任务会保留。</p>
                 <p class="muted">不影响之后在 Codex 中继续任务：对话历史仍保留，续发时会据此恢复。清理会移除网关中的任务记录、闲置网页和私有产物，请及时保存需要的文件。</p>
+                <p class="muted">清理普通模式任务也会移除其网页对话绑定；之后续发会创建新网页对话。ChatGPT 历史中的旧记录不会随本地清理删除。</p>
                 <p class="muted">继续任务所需的输入附件与压缩校验凭证会保留；本机项目文件、登录资料和设置不会被清理。</p>
             </div>
         </section>

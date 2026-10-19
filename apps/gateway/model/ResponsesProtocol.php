@@ -124,7 +124,7 @@ final class ResponsesProtocol
         $promptCacheKey = self::optionalIdentity($data['prompt_cache_key'] ?? null, 'prompt_cache_key');
         // Recent Codex sends the current tool inventory as an input control item.
         // It belongs to the executable environment, never to user-authored history.
-        $toolDefinitions = $data['tools'] ?? [];
+        $toolInventories = [$data['tools'] ?? []];
         $toolsProvided = array_key_exists('tools', $data);
         $nativeResponsesLite = false;
         if (is_array($data['input'])) foreach ($data['input'] as $item) {
@@ -132,28 +132,17 @@ final class ResponsesProtocol
                 $nativeResponsesLite = true;
                 $toolsProvided = true;
                 if (!is_array($item->tools ?? null)) throw new GatewayError('invalid_request_error', 'additional_tools.tools 必须是数组。', 400);
-                if (!is_array($toolDefinitions)) throw new GatewayError('invalid_request_error', 'tools 必须是数组。', 400);
-                $toolDefinitions = array_merge($toolDefinitions, $item->tools);
+                $toolInventories[] = $item->tools;
             }
             if ($item instanceof \stdClass && ($item->type ?? '') === 'tool_search_output'
                 && is_array($item->tools ?? null)) {
                 // Discovered client tools remain callable even when Codex omits them from
                 // the next request's top-level tools list.
                 $toolsProvided = true;
-                $toolDefinitions = array_merge($toolDefinitions, $item->tools);
+                $toolInventories[] = $item->tools;
             }
         }
-        $definitions = [];
-        $definitionNames = [];
-        foreach ($toolDefinitions as $definition) {
-            $entry = $definition instanceof \stdClass ? get_object_vars($definition) : $definition;
-            if (!is_array($entry)) { $definitions[] = $definition; continue; }
-            $key = (string)($entry['type'] ?? 'function') . ':' . (string)($entry['name'] ?? 'tool_search');
-            if (isset($definitionNames[$key])) continue;
-            $definitionNames[$key] = true;
-            $definitions[] = $definition;
-        }
-        $tools = self::tools($definitions);
+        $tools = self::mergeToolInventories($toolInventories);
         $toolOutputs = self::toolOutputs($data['input']);
         $attachments = [];
         $settings = GatewaySettings::internal();
@@ -658,6 +647,50 @@ final class ResponsesProtocol
             return hash('sha256', json_encode($item, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         }
         return 'base';
+    }
+
+    /**
+     * Apply request-owned native tool updates in order, including incremental Lite namespaces.
+     * A later control item updates each exact tool identity, not the entire namespace: unchanged
+     * members remain callable while new exec/wait definitions and refreshed schemas take effect.
+     * Keep existing duplicate handling within each inventory and reject ambiguous wire aliases
+     * across updates, so namespace encoding cannot silently change a tool's native identity.
+     * @param array<int,mixed> $inventories Top-level tools followed by native input control items.
+     * @return array<int,array<string,mixed>> Validated tools for this request only.
+     * @throws GatewayError If any inventory is malformed or two identities share a wire name.
+     */
+    private static function mergeToolInventories(array $inventories): array
+    {
+        $tools = [];
+        $positions = [];
+        foreach ($inventories as $inventory) {
+            if ($inventory === null) continue;
+            if (!is_array($inventory)) throw new GatewayError('invalid_request_error', 'tools 必须是数组。', 400);
+            $definitions = [];
+            $definitionNames = [];
+            foreach ($inventory as $definition) {
+                $entry = $definition instanceof \stdClass ? get_object_vars($definition) : $definition;
+                if (!is_array($entry)) { $definitions[] = $definition; continue; }
+                $key = (string)($entry['type'] ?? 'function') . ':' . (string)($entry['name'] ?? 'tool_search');
+                if (isset($definitionNames[$key])) continue;
+                $definitionNames[$key] = true;
+                $definitions[] = $definition;
+            }
+            foreach (self::tools($definitions) as $tool) {
+                $wireName = $tool['wire_name'];
+                if (isset($positions[$wireName])) {
+                    $prior = $tools[$positions[$wireName]];
+                    if ($prior['name'] !== $tool['name'] || $prior['namespace'] !== $tool['namespace']) {
+                        throw new GatewayError('invalid_request_error', 'tools 中存在重复工具名称。', 400);
+                    }
+                    $tools[$positions[$wireName]] = $tool;
+                } else {
+                    $positions[$wireName] = count($tools);
+                    $tools[] = $tool;
+                }
+            }
+        }
+        return $tools;
     }
 
     /**

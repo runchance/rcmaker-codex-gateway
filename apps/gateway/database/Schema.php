@@ -506,6 +506,11 @@ final class Schema
             60 => [
                 'ALTER TABLE gateway_attachments ADD COLUMN retained_for_history INTEGER NOT NULL DEFAULT 0 CHECK(retained_for_history IN (0,1))',
             ],
+            61 => [
+                "ALTER TABLE gateway_settings ADD COLUMN web_chat_mode TEXT NOT NULL DEFAULT 'temporary' CHECK(web_chat_mode IN ('temporary','regular'))",
+                'ALTER TABLE gateway_settings ADD COLUMN web_chat_fallback_at INTEGER NOT NULL DEFAULT 0',
+                "CREATE TABLE gateway_task_web_chats (task_id TEXT PRIMARY KEY REFERENCES gateway_tasks(id) ON DELETE CASCADE, mode TEXT NOT NULL CHECK(mode IN ('temporary','regular')), conversation_id TEXT UNIQUE, account_key TEXT, updated_at INTEGER NOT NULL)",
+            ],
         ];
     }
 

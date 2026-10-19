@@ -49,6 +49,7 @@ Route::get('/api/adapters', GatewayRoute::handler(Adapters::class, 'index'));
 Route::get('/api/settings', GatewayRoute::handler(Settings::class, 'read'));
 Route::post('/api/settings', GatewayRoute::handler(Settings::class, 'save'));
 Route::post('/api/settings/locale', GatewayRoute::handler(Settings::class, 'locale'));
+Route::post('/api/settings/chat-mode', GatewayRoute::handler(Settings::class, 'chatMode'));
 Route::get('/api/settings/tunnel', GatewayRoute::handler(Settings::class, 'tunnelStatus'));
 Route::post('/api/settings/tunnel/prepare', GatewayRoute::handler(Settings::class, 'tunnelPrepare'));
 Route::post('/api/settings/tunnel/connect', GatewayRoute::handler(Settings::class, 'tunnelConnect'));

@@ -15,7 +15,7 @@ final class ChatGptWebAdapter implements WebModelAdapterInterface
     public static function declaredCapabilities(): array
     {
         return [
-            'text', 'temporary_chat', 'model_effort', 'image_input', 'skill_inline', 'skill_file',
+            'text', 'temporary_chat', 'regular_chat', 'model_effort', 'image_input', 'skill_inline', 'skill_file',
             'tool_roundtrip', 'artifact_download',
         ];
     }

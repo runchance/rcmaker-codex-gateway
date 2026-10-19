@@ -995,13 +995,18 @@ AWK;
         ]);
     }
 
-    /** Keep raw exec available while bounding nested agent waits before they reach the host. */
+    /** Preserve exec resource/yield hints while bounding nested agent waits before the host. */
     private static function transportBoundRawExecProgram(string $input, string $blockedExecName): string
     {
+        $pragma = '';
+        if (preg_match('/\A([\t ]*\/\/ @exec:[^\r\n]*)(?:\r\n|\n|\r|\z)/', $input, $match) === 1) {
+            $pragma = $match[1] . "\n";
+            $input = substr($input, strlen($match[0]));
+        }
         $waitNames = json_encode(self::AGENT_WAIT_NAMES, JSON_THROW_ON_ERROR);
         $blockedName = json_encode($blockedExecName, JSON_THROW_ON_ERROR);
         $pollMs = self::AGENT_WAIT_POLL_MS;
-        return implode("\n", [
+        return $pragma . implode("\n", [
             'await (async (tools) => {',
             $input,
             '})((() => {',

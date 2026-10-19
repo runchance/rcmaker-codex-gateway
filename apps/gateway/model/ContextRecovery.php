@@ -363,7 +363,16 @@ final class ContextRecovery
             $surface = $db->table('gateway_browser_surfaces')->where('id', $job['surface_id'])->find();
             if (!is_array($turn) || $turn['status'] !== 'queued' || (int) $turn['deadline_at'] <= time()
                 || !is_array($surface) || !in_array($surface['status'], ['ready','attaching','reserved','busy'], true)) return null;
+            $chat = TaskWebChat::state((string) $job['task_id']);
+            if ($chat['mode'] === 'regular' && !empty($chat['conversation_id'])) {
+                // Ordinary chats keep their remote history. A disposable target is never permission to replay it.
+                $regularBudget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
+                if ($staging || ($job['operation_kind'] !== 'response'
+                    && ($job['operation_kind'] !== 'compact_v2' || empty($regularBudget['regular_chat'])))) return null;
+                return TaskWebChat::reopenUnsentUnlocked($job, $turn, $surface);
+            }
             $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
+            if ($chat['mode'] === 'regular' && empty($chat['conversation_id'])) unset($budget['regular_chat']);
             // Steering's normal delivery preference never disables proven unsent recovery.
             // A replacement document receives durable full history, not the old page's suffix.
             unset($budget['steering_delta'], $budget['postcompact_page']);
@@ -500,6 +509,7 @@ final class ContextRecovery
                     : ToolBroker::rebuildUnsentPromptUnlocked($promptJob));
             }
             if ($prompt === null) return null;
+            $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $job['task_id']);
             if ($job['operation_kind'] === 'response') {
                 $prompt = WebContract::withCheckpointProgressNotice($prompt, $context);
             }

@@ -18,6 +18,7 @@ use app\gateway\model\GatewaySettings;
 use app\gateway\model\NetworkSettings;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\TaskLedger;
+use app\gateway\model\TaskWebChat;
 use app\gateway\model\ToolBroker;
 use app\gateway\model\WebMessageAudit;
 use support\process\OwnedRuntime;
@@ -118,6 +119,10 @@ final class BrowserRuntime
     /** A connector check owns a background page; the setup browser remains on the user's tab. */
     private ?string $connectorProbeTargetId = null;
     private ?string $connectorProbeSessionId = null;
+    /** Probe-only mode overrides never change the mode of an existing task. */
+    private ?string $connectorChatMode = null;
+    private bool $connectorFallbackAttempt = false;
+    private ?int $connectorFallbackRevision = null;
     /** @var array<int,float> Setup/native/connector commands cannot wait forever for browser-level CDP. */
     private array $connectorProbeCdpWaitSince = [];
     /** @var resource|null */
@@ -432,10 +437,11 @@ final class BrowserRuntime
         }
         $users = json_decode((string) ($expected['job']['baseline_users_json'] ?? '[]'), true) ?: [];
         $url = (string) $expected['surface']['url'];
-        if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl();
+        $chat = TaskWebChat::state((string) $expected['turn']['task_id']);
+        if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl($chat['mode'], $chat['conversation_id'] ?? null);
         $expression = WebModelPage::userStopExpression($url, $witnesses, $users,
             !$stop['clicked'] && empty($stop['verify_only']), false,
-            self::acceptedInitialUser($expected['job'], $expected['surface']));
+            self::acceptedInitialUser($expected['job'], $expected['surface']), $chat['mode']);
         $sessionId = (string) $stop['session_id'];
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $result) use ($responseId, $expected, $sessionId): void {
@@ -1121,6 +1127,9 @@ final class BrowserRuntime
             return;
         }
         unset($this->connectorProbeCdpWaitSince[$commandId]);
+        $this->connectorChatMode = (string) ($settings['web_chat_mode'] ?? 'temporary');
+        $this->connectorFallbackAttempt = false;
+        $this->connectorFallbackRevision = null;
         $this->connectorProbeGenerations[$commandId] = ConnectorState::runtimeGeneration();
         ConnectorState::invalidate($connectorName, $this->connectorProbeGenerations[$commandId]);
         $this->connectorProbeAttempts[$commandId] = 0;
@@ -1162,7 +1171,7 @@ final class BrowserRuntime
 
     private function navigateConnectorProbe(int $commandId, string $connectorName): void
     {
-        $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl()], $this->connectorProbeSessionId,
+        $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl($this->connectorChatMode)], $this->connectorProbeSessionId,
             function ($error) use ($commandId, $connectorName): void {
                 // Navigation can commit before a slow/lost CDP ACK. The read-only page check
                 // below establishes readiness; never issue a second navigation on this timeout.
@@ -1252,6 +1261,8 @@ final class BrowserRuntime
                     $this->beginConnectorProbe($commandId, $connectorName, $attempt + 1);
                     return;
                 }
+                if ($error === null && is_array($menu) && isset($menu['exact_count']) && (int) $menu['exact_count'] === 0
+                    && $this->tryRegularConnectorProbe($commandId, $connectorName)) return;
                 $this->connectorVerifyFail(
                     $commandId,
                     $connectorName,
@@ -1455,10 +1466,10 @@ final class BrowserRuntime
             $this->failCommand($commandId, $error->errorCode, $error->getMessage());
             return;
         }
-        $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl()], $this->connectorProbeSessionId,
+        $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl($this->connectorChatMode)], $this->connectorProbeSessionId,
             function ($error) use ($commandId, $connectorName, $attempt): void {
                 if ($error !== null && ($error['code'] ?? null) !== -2) {
-                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_RETRY_PAGE_FAILED', '连接器探针安全重试时无法打开新的 Temporary Chat。');
+                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_RETRY_PAGE_FAILED', '连接器探针安全重试时无法打开检查对话。');
                     return;
                 }
                 if ((int) ($this->connectorProbeAttempts[$commandId] ?? 0) + 1 !== $attempt) {
@@ -1506,12 +1517,44 @@ final class BrowserRuntime
 
     private function finishConnectorRuntimeProbe(int $commandId, string $connectorName): void
     {
+        if ($this->connectorFallbackAttempt && $this->connectorFallbackRevision !== null) {
+            try {
+                GatewaySettings::acceptRegularChatFallback($connectorName,
+                    (string) ($this->connectorProbeGenerations[$commandId] ?? ''), $this->connectorFallbackRevision);
+            } catch (GatewayError $error) {
+                $this->connectorVerifyFail($commandId, $connectorName, $error->errorCode, $error->getMessage());
+                return;
+            }
+        }
         $this->closeConnectorProbeSurface();
         $this->finishCommand($commandId, [
             'verified' => true,
             'runtime_verified' => true,
             'connector_name' => $connectorName,
+            'web_chat_mode' => $this->connectorChatMode,
+            'chat_mode_auto_fallback' => $this->connectorFallbackAttempt,
         ]);
+    }
+
+    /** A proven empty temporary mention menu permits one ordinary-page test, never a timeout/login fallback. */
+    private function tryRegularConnectorProbe(int $commandId, string $connectorName): bool
+    {
+        if ($this->connectorChatMode !== 'temporary' || $this->connectorFallbackAttempt || $this->connectorProbeSessionId === null) return false;
+        $settings = GatewaySettings::snapshot();
+        if (($settings['web_chat_mode'] ?? 'temporary') !== 'temporary' || $settings['connector_name'] !== $connectorName
+            || ConnectorState::runtimeGeneration() !== ($this->connectorProbeGenerations[$commandId] ?? null)) return false;
+        $this->connectorFallbackAttempt = true;
+        $this->connectorFallbackRevision = (int) $settings['updated_at'];
+        $this->connectorChatMode = 'regular';
+        $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl('regular')], $this->connectorProbeSessionId,
+            function ($error) use ($commandId, $connectorName): void {
+                if ($error !== null) {
+                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_PAGE_FAILED', 'Could not open the ordinary-chat connector check.');
+                    return;
+                }
+                $this->waitConnectorProbePage($commandId, $connectorName, microtime(true) + 60.0);
+            }, 60.0);
+        return true;
     }
 
     /** Finish a connector probe with optional allow-listed diagnostics; only safe first automatic failures retry. */
@@ -2939,6 +2982,7 @@ JS;
                         'owner_incarnation' => (string) $ownership['owner_incarnation'],
                         'fencing_version' => (int) $ownership['fencing_version'],
                         'response_id' => $responseId,
+                        'web_chat' => TaskWebChat::state((string) $ledger['turn']['task_id']),
                         'main_frame_id' => null,
                         'security_challenge_active' => false,
                         'security_challenge_path' => null,
@@ -3160,15 +3204,16 @@ JS;
         return true;
     }
 
-    /** Ensure a fresh task owns an isolated Temporary Chat before any prompt state is observed. */
+    /** Prepare the task's pinned chat mode and exact saved conversation before observing or submitting prompts. */
     private function prepareTaskTemporarySurface(string $responseId, int $commandId, string $sessionId, bool $recover): void
     {
-        if (!$recover && \app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId))) {
+        if (!$recover && ($this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary') === 'temporary'
+            && \app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId))) {
             $this->prepareSteeringSurface($responseId, $commandId, $sessionId, microtime(true) + 30.0);
             return;
         }
         $surface = TaskLedger::execution($responseId)['surface'];
-        $retainedDocument = WebModelPage::isTemporaryChatUrl((string)($surface['url'] ?? ''), self::modelUrl());
+        $retainedDocument = $this->taskChatMatches($responseId, (string)($surface['url'] ?? ''));
         $this->evaluateTaskSession($sessionId, WebModelPage::capabilityExpression(),
             function ($error, $capability) use ($responseId, $commandId, $sessionId, $recover, $retainedDocument): void {
                 if ($error === null && is_array($capability)) {
@@ -3176,8 +3221,7 @@ JS;
                         $this->taskFailTurn($responseId, 'authentication_required', 'ChatGPT 网页需要重新登录。', $recover);
                         return;
                     }
-                    if (!empty($capability['temporary_chat'])
-                        && WebModelPage::isTemporaryChatUrl((string) ($capability['url'] ?? ''), self::modelUrl())) {
+                    if ($this->taskChatMatches($responseId, (string) ($capability['url'] ?? ''))) {
                         $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, $recover, microtime(true) + 20.0);
                         return;
                     }
@@ -3191,15 +3235,16 @@ JS;
                     $this->taskFailTurn(
                         $responseId,
                         'RECOVERY_OUTCOME_UNKNOWN',
-                        '恢复任务时原页面已经离开 Temporary Chat；不会导航或自动重发。',
+                        '恢复任务时页面与绑定的网页对话不匹配；不会导航或自动重发。',
                         true
                     );
                     return;
                 }
-                $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl()], $sessionId,
+                $chat = $this->taskSessions[$sessionId]['web_chat'];
+                $this->taskCdp->send('Page.navigate', ['url' => self::taskModelUrl($chat['mode'], $chat['conversation_id'] ?? null)], $sessionId,
                     function ($navigateError) use ($responseId, $commandId, $sessionId): void {
                         if ($navigateError !== null) {
-                            $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_NAVIGATION_FAILED', '无法进入 ChatGPT 临时对话。');
+                            $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_NAVIGATION_FAILED', '无法进入任务的 ChatGPT 对话。');
                             return;
                         }
                         $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, false, microtime(true) + 60.0);
@@ -3232,7 +3277,8 @@ JS;
         $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [(string) $source['prompt']];
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
-            (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface));
+            (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface),
+            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary');
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
@@ -3346,20 +3392,26 @@ JS;
                     $this->taskFailTurn($responseId, 'authentication_required', 'ChatGPT 网页需要重新登录。', $recover);
                     return;
                 }
-                $temporary = !empty($capability['temporary_chat'])
-                    && WebModelPage::isTemporaryChatUrl((string) ($capability['url'] ?? ''), self::modelUrl());
+                if (!empty($this->taskSessions[$sessionId]['saved_chat_missing']) && !empty($capability['on_chatgpt'])) {
+                    $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, $recover, max($deadline, microtime(true) + 60.0));
+                    return;
+                }
+                $temporary = $this->taskChatMatches($responseId, (string) ($capability['url'] ?? ''));
                 $readyForRecovery = $recover && !empty($capability['on_chatgpt']) && $temporary;
                 $readyForFresh = !$recover && !empty($capability['on_chatgpt']) && $temporary
                     && !empty($capability['editor_ready']) && empty($capability['generation_running']);
-                if ($readyForRecovery || $readyForFresh) {
-                    $this->startTaskTurn($responseId, $commandId, $sessionId, $recover);
+                $readyForOrdinarySteer = !$recover && $temporary && !empty($capability['editor_ready'])
+                    && ($this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary') === 'regular'
+                    && \app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId));
+                if ($readyForRecovery || $readyForFresh || $readyForOrdinarySteer) {
+                    $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, $recover, max($deadline, microtime(true) + 60.0));
                     return;
                 }
                 if (!empty($capability['on_chatgpt']) && !empty($capability['editor_ready']) && !$temporary) {
                     $this->taskFailTurn(
                         $responseId,
                         $recover ? 'RECOVERY_OUTCOME_UNKNOWN' : 'CHATGPT_TEMPORARY_CHAT_REQUIRED',
-                        $recover ? '恢复任务时原页面已经离开 Temporary Chat；不会自动重发。' : '任务页面没有保持在 ChatGPT Temporary Chat。',
+                        $recover ? '恢复任务时页面与绑定的网页对话不匹配；不会自动重发。' : '任务页面与绑定的 ChatGPT 对话不匹配。',
                         $recover
                     );
                     return;
@@ -3372,6 +3424,57 @@ JS;
             }
             Timer::add(0.25, fn() => $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, $recover, $deadline), null, false);
         }, 2.0);
+    }
+
+    /** Verify ordinary-chat account ownership before reading or sending; retries preserve one preparation deadline. */
+    private function verifyTaskChatAccount(string $responseId, int $commandId, string $sessionId, bool $recover, float $deadline): void
+    {
+        $owner = $this->taskSessions[$sessionId] ?? null;
+        if (!is_array($owner) || ($owner['response_id'] ?? '') !== $responseId) return;
+        if (($owner['web_chat']['mode'] ?? 'temporary') !== 'regular') {
+            $this->startTaskTurn($responseId, $commandId, $sessionId, $recover);
+            return;
+        }
+        $this->taskCdp->send('Runtime.evaluate', ['expression' => WebModelPage::accountFingerprintExpression(),
+            'returnByValue' => true, 'awaitPromise' => true], $sessionId,
+            function ($error, $result) use ($responseId, $commandId, $sessionId, $recover, $deadline, $owner): void {
+                $currentOwner = $this->taskSessions[$sessionId] ?? [];
+                foreach (['response_id', 'surface_id', 'owner_incarnation', 'fencing_version'] as $key) {
+                    if (($currentOwner[$key] ?? null) !== ($owner[$key] ?? null)) return;
+                }
+                $account = $result['result']['value'] ?? null;
+                if ($error !== null || !is_array($account) || empty($account['verified'])) {
+                    if (microtime(true) < $deadline) {
+                        Timer::add(1.0, fn() => $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, $recover, $deadline), [], false);
+                    } else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', $recover);
+                    return;
+                }
+                $saved = (string) ($owner['web_chat']['account_key'] ?? '');
+                if ($saved !== '' && !hash_equals($saved, (string) $account['account_key'])) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_CHANGED', 'The Web chat belongs to another account or workspace.', true);
+                    return;
+                }
+                $this->taskSessions[$sessionId]['account_key'] = (string) $account['account_key'];
+                if (!empty($this->taskSessions[$sessionId]['saved_chat_missing'])) {
+                    try {
+                        TaskWebChat::forgetDeleted($responseId, (string) $owner['owner_incarnation'], (int) $owner['fencing_version'],
+                            (string) $owner['web_chat']['conversation_id'], (string) $account['account_key']);
+                        $repair = \app\gateway\model\ContextRecovery::repairUnsent($responseId, 'CHATGPT_SURFACE_MISSING');
+                        if ($repair === null) {
+                            $this->taskFailTurn($responseId, 'CHATGPT_SAVED_CHAT_DELETED', 'The saved Web chat was deleted; its previous submission will not be replayed automatically.', true);
+                            return;
+                        }
+                        $this->releaseTaskSession($responseId);
+                        Timer::add(0.02, fn() => $this->prepareTaskSurface($responseId, (int) $repair['command_id'], false), [], false);
+                    } catch (GatewayError $failure) {
+                        $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    }
+                    return;
+                }
+                if (!$recover && \app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId))) {
+                    $this->prepareSteeringSurface($responseId, $commandId, $sessionId, microtime(true) + 30.0);
+                } else $this->startTaskTurn($responseId, $commandId, $sessionId, $recover);
+            }, 20.0);
     }
 
     private function startTaskTurn(string $responseId, int $commandId, string $sessionId, bool $recover): void
@@ -3419,8 +3522,9 @@ JS;
                 // A newly created/about:blank surface must still prove the Temporary Chat
                 // root before its first submit. A fenced retained /c/ page already has that
                 // history even if the client omitted previous_response_id on a new turn.
-                'require_root_before_send' => !WebModelPage::isTemporaryChatUrl((string) ($surface['url'] ?? ''), self::modelUrl())
-                    || WebModelPage::isTemporaryChatStartUrl((string) ($surface['url'] ?? ''), self::modelUrl()),
+                'web_chat' => $session['web_chat'] ?? ['mode' => 'temporary'],
+                'require_root_before_send' => !$this->taskChatMatches($responseId, (string) ($surface['url'] ?? ''))
+                    || $this->taskChatMatches($responseId, (string) ($surface['url'] ?? ''), true),
                 'session_id' => $sessionId,
                 'surface_id' => (string) $surface['id'],
                 'target_id' => (string) ($surface['target_id'] ?? ''),
@@ -3547,10 +3651,12 @@ JS;
         $this->evaluateTask($responseId, WebModelPage::baselineExpression(), function ($error, $baseline) use ($responseId, $attempt): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
-            $ready = $error === null && is_array($baseline) && !empty($baseline['temporary_chat'])
-                && WebModelPage::isTemporaryChatUrl((string) ($baseline['url'] ?? ''), self::modelUrl())
+            $ready = $error === null && is_array($baseline)
+                && $this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''))
                 && (empty($turn['require_root_before_send'])
-                    || WebModelPage::isTemporaryChatStartUrl((string) ($baseline['url'] ?? ''), self::modelUrl()))
+                    || $this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''), true))
+                && (($turn['web_chat']['mode'] ?? 'temporary') !== 'regular' || !empty($turn['web_chat']['conversation_id'])
+                    || (array) ($baseline['user_ids'] ?? []) === [])
                 && !empty($baseline['editor_ready']) && empty($baseline['generation_running']);
             if (!$ready) {
                 if ($attempt < 5 && empty($turn['sent_at']) && microtime(true) + 1.0 < (float) $turn['deadline']) {
@@ -4674,6 +4780,12 @@ JS;
     private function prepareTaskPersonalization(string $responseId, string $connectorName): void
     {
         if (!isset($this->chatGptTurns[$responseId])) return;
+        if (($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? 'temporary') === 'regular') {
+            // Ordinary chats expose their connector directly; never probe or toggle Temporary Chat controls here.
+            $this->chatGptTurns[$responseId]['personalization_state'] = 'regular';
+            $this->prepareTaskConnector($responseId, $connectorName, 1);
+            return;
+        }
         $this->evaluateTask($responseId, WebModelPage::personalizationStateExpression(),
             function ($error, $state) use ($responseId, $connectorName): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
@@ -4940,7 +5052,8 @@ JS;
             && (string) ($surface['owner_incarnation'] ?? '') === (string) ($turn['owner_incarnation'] ?? '')
             && (int) ($surface['fencing_version'] ?? -1) === (int) ($turn['fencing_version'] ?? -2)
             && (!$sameDocument || (string) ($surface['document_nonce'] ?? '') === (string) ($turn['document_nonce'] ?? ''))
-            && (!$requireRoot || WebModelPage::isTemporaryChatStartUrl((string) ($surface['url'] ?? ''), self::modelUrl()));
+            && (!$requireRoot || WebModelPage::isTaskChatStartUrl((string) ($surface['url'] ?? ''), self::modelUrl(),
+                $turn['web_chat']['mode'] ?? 'temporary', $turn['web_chat']['conversation_id'] ?? null));
     }
 
     /** Reload once before submission, then prove the new document and reselect the model and Connector. */
@@ -4993,9 +5106,9 @@ JS;
                         return;
                     }
                     if ($error === null && is_array($capability)
-                        && !empty($capability['temporary_chat']) && !empty($capability['editor_ready'])
+                        && !empty($capability['editor_ready'])
                         && empty($capability['generation_running'])
-                        && WebModelPage::isTemporaryChatStartUrl((string) ($capability['url'] ?? ''), self::modelUrl())) {
+                        && $this->taskChatMatches($responseId, (string) ($capability['url'] ?? ''), true)) {
                         try { $current = TaskLedger::execution($responseId); }
                         catch (\Throwable) { $current = []; }
                         if ($current === [] || !self::freshTaskConnectorRefreshAllowed($turn, $current, false)
@@ -5010,7 +5123,7 @@ JS;
                         Timer::add(0.25, fn() => $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline), null, false);
                         return;
                     }
-                    $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_FAILED', '刷新后 Temporary Chat 未恢复可发送状态，未发送任务。');
+                    $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_FAILED', '刷新后任务对话未恢复可发送状态，未发送任务。');
                 }, 3.0);
             return;
         }
@@ -5247,7 +5360,7 @@ JS;
         $observe();
     }
 
-    /** Attach project-private files only on the final commit message, with one bounded input-discovery deadline. */
+    /** Attach private files only on the final commit, using the task's pinned mode and one input-discovery deadline. */
     private function prepareTaskAttachments(string $responseId, ?float $deadline = null): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -5272,7 +5385,8 @@ JS;
             if (($attachment['kind'] ?? null) !== 'image') $imageOnly = false;
         }
         $deadline ??= min((float) $turn['deadline'], microtime(true) + 20.0);
-        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly, $mimeTypes),
+        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly, $mimeTypes,
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'),
             function ($stateError, $state) use ($responseId, $expected, $files, $imageOnly, $deadline): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if ($stateError === null && is_array($state) && !empty($state['ok'])) {
@@ -5370,11 +5484,12 @@ JS;
         $this->recordTaskTransportObservation($responseId, $phase, $facts);
     }
 
-    /** Wait for exact files and finished upload UI within the same bounded attachment deadline. */
+    /** Wait for exact files and finished upload UI within the same deadline, using this task's pinned chat mode. */
     private function waitTaskAttachmentsAccepted(string $responseId, array $expected, bool $imageOnly, float $deadline): void
     {
         if (!isset($this->chatGptTurns[$responseId])) return;
-        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly),
+        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly, [],
+            ($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? 'temporary') === 'regular'),
             function ($error, $state) use ($responseId, $expected, $imageOnly, $deadline): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if ($error === null && is_array($state) && !empty($state['ok'])) {
@@ -5649,7 +5764,7 @@ JS;
             }, '发送前稳定等待后未能确认工具连接器，未发送。');
     }
 
-    /** Final file-integrity fence immediately before irreversible submit. */
+    /** Final file-integrity fence in this task's pinned chat mode immediately before irreversible submit. */
     private function verifyTaskAttachmentsThenSend(string $responseId): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -5662,7 +5777,8 @@ JS;
         $expected = array_values(array_map(static fn(array $attachment): string => (string) $attachment['filename'], $attachments));
         $imageOnly = !in_array(false, array_map(static fn(array $attachment): bool =>
             ($attachment['kind'] ?? null) === 'image', $attachments), true);
-        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly),
+        $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly, [],
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'),
             function ($error, $state) use ($responseId): void {
                 if ($error !== null || !is_array($state) || empty($state['ok'])) {
                     $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INTEGRITY_LOST', '发送前附件状态发生变化，已停止发送。');
@@ -5685,10 +5801,9 @@ JS;
                     && empty($turn['accepted']) && empty($turn['continuation_sending'])
                     && (int) ($turn['transport_stage_acked'] ?? 0) === 0;
                 if ($surfaceError !== null || !is_array($surface)
-                    || empty($surface['temporary_chat'])
-                    || !WebModelPage::isTemporaryChatUrl((string) ($surface['url'] ?? ''), self::modelUrl())
-                    || ($rootRequired && !WebModelPage::isTemporaryChatStartUrl((string) ($surface['url'] ?? ''), self::modelUrl()))) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_LOST', '发送前任务页面已经离开 Temporary Chat，已停止发送。');
+                    || !$this->taskChatMatches($responseId, (string) ($surface['url'] ?? ''))
+                    || ($rootRequired && !$this->taskChatMatches($responseId, (string) ($surface['url'] ?? ''), true))) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_LOST', '发送前任务页面与绑定的网页对话不匹配，已停止发送。');
                     return;
                 }
                 $this->commitTaskSend($responseId);
@@ -5993,7 +6108,8 @@ JS;
         }
         $expression = WebModelPage::responseExpression((array) $turn['baseline_users'], (array) $turn['baseline_assistants'],
             (string)($turn['continuation_marker'] ?? ''), (string)($turn['bound_assistant_id'] ?? ''),
-            self::hasLegacyCitationPrefix($turn));
+            self::hasLegacyCitationPrefix($turn),
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' && empty($turn['web_chat']['conversation_id']) ? $responseId : '');
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
@@ -6044,7 +6160,7 @@ JS;
                 return;
             }
             $snapshotUrl = (string)($snapshot['url'] ?? '');
-            if (!WebModelPage::isTemporaryChatUrl($snapshotUrl, self::modelUrl())) {
+            if (!$this->taskChatMatches($responseId, $snapshotUrl)) {
                 // ChatGPT briefly uses /c/local-chatgpt%3A<id> before the final
                 // /c/<id> URL. Keep observing the same fenced page; this transition
                 // is neither proof of acceptance nor reason to resend.
@@ -6054,10 +6170,20 @@ JS;
                     $this->scheduleTaskPoll($responseId, 0.10);
                     return;
                 }
-                $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_LOST', '任务页面已经离开 Temporary Chat，结果未知且不会自动重发。', true);
+                $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_LOST', '任务页面与绑定的网页对话不匹配，结果未知且不会自动重发。', true);
                 return;
             }
             try {
+                if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular' && !empty($snapshot['new_user'])
+                    && empty($turn['web_chat']['conversation_id'])
+                    && WebModelPage::regularConversationId($snapshotUrl, self::modelUrl()) !== null) {
+                    $expected = TaskLedger::pollExecution((string) ($turn['logical_response_id'] ?? $responseId));
+                    $chat = TaskWebChat::observe($expected, $snapshotUrl,
+                        (string) ($this->taskSessions[(string) $turn['session_id']]['account_key'] ?? ''), self::modelUrl(),
+                        !empty($snapshot['initial_binding_witness']), $responseId);
+                    $this->chatGptTurns[$responseId]['web_chat'] = $chat;
+                    $this->taskSessions[(string) $turn['session_id']]['web_chat'] = $chat;
+                }
                 TaskLedger::observeSurface((string) $turn['surface_id'], (string) $turn['owner_incarnation'], (int) $turn['fencing_version'], (string) ($snapshot['url'] ?? ''));
             } catch (GatewayError $error) {
                 $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
@@ -6387,7 +6513,8 @@ JS;
                     // private observer state. A drained saved source and its exact stopped
                     // DOM answer are stronger evidence; they start only the ordinary
                     // one-shot summary handoff, never fabricate or complete a checkpoint.
-                    $completedSource = ChatGptTransport::completedSourceForHandoff($explicitCompletion, $snapshot);
+                    $completedSource = ChatGptTransport::completedSourceForHandoff($explicitCompletion, $snapshot,
+                        $this->taskChatMatches($responseId, (string) ($snapshot['url'] ?? '')));
                     if ($completedSource !== null) {
                         $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, $completedSource);
                         return;
@@ -7112,7 +7239,7 @@ JS;
             $stopUnconfirmed = empty($turn['compaction_stop_clicked']);
             $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
                 (array)$turn['baseline_users'], $stopUnconfirmed, !$closedSource && $stopUnconfirmed,
-                self::acceptedInitialUser($source, $surface));
+                self::acceptedInitialUser($source, $surface), $turn['web_chat']['mode'] ?? 'temporary');
         } catch (GatewayError $error) {
             if ($error->errorCode === 'STORAGE_BUSY') {
                 $this->scheduleTaskPoll($responseId, 1.0);
@@ -7254,17 +7381,16 @@ JS;
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || ($turn['compaction_phase'] ?? null) !== 'baseline') return;
                 if (is_array($baseline) && (!empty($baseline['url']))
-                    && (empty($baseline['temporary_chat'])
-                        || !WebModelPage::isTemporaryChatUrl((string)$baseline['url'], self::modelUrl()))) {
+                    && !$this->taskChatMatches($responseId, (string)$baseline['url'])) {
                     $this->taskFailTurn($responseId, 'compaction_handoff_page_unavailable',
-                        '源回答已结束，但原临时聊天页面已变化；原上下文仍保留。', true);
+                        '源回答已结束，但原任务对话页面已变化；原上下文仍保留。', true);
                     return;
                 }
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
                     || !empty($baseline['generation_running'])) {
                     if (microtime(true) - (float)($turn['compaction_baseline_since'] ?? 0.0) >= 30.0) {
                         $this->taskFailTurn($responseId, 'compaction_handoff_page_unavailable',
-                            '源回答已结束，但原临时聊天未进入可发送检查点的状态；原上下文仍保留。', true);
+                            '源回答已结束，但原任务对话未进入可发送检查点的状态；原上下文仍保留。', true);
                         return;
                     }
                     $this->scheduleTaskPoll($responseId, 0.35);
@@ -7382,7 +7508,7 @@ JS;
                 $this->chatGptTurns[$responseId]['handoff_poll_errors'] = 0;
                 $this->chatGptTurns[$responseId]['handoff_poll_error_since'] = 0.0;
                 if ($error !== null || !is_array($snapshot)
-                    || !WebModelPage::isTemporaryChatUrl((string)($snapshot['url'] ?? ''), self::modelUrl())) {
+                    || !$this->taskChatMatches($responseId, (string)($snapshot['url'] ?? ''))) {
                     if ($summary === null) {
                         $this->taskFailTurn($responseId, 'compaction_handoff_page_unavailable',
                             '检查点请求后的原页面不可确认；不会重复发送，原上下文仍保留。', true);
@@ -7655,7 +7781,8 @@ JS;
         $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$physical['prompt']];
         if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
         $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
-            (array)$physical['baseline_users'], true, true, self::acceptedInitialUser($physical, $ledger['surface'])),
+            (array)$physical['baseline_users'], true, true, self::acceptedInitialUser($physical, $ledger['surface']),
+            $turn['web_chat']['mode'] ?? 'temporary'),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
@@ -7861,8 +7988,7 @@ JS;
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || (string)($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
-                    || empty($baseline['temporary_chat'])
-                    || !WebModelPage::isTemporaryChatUrl((string)($baseline['url'] ?? ''), self::modelUrl())
+                    || !$this->taskChatMatches($responseId, (string)($baseline['url'] ?? ''))
                     || !in_array($snapshot['new_user_id'], (array)($baseline['user_ids'] ?? []), true)
                     || !in_array($snapshot['response_id'], (array)($baseline['assistant_ids'] ?? []), true)) {
                     // A genuinely unusable composer retains the existing exact-receipt fallback.
@@ -8382,7 +8508,8 @@ JS;
     {
         try {
             AdapterCapabilities::observe('text', 'verified', ['response_id' => $logicalResponseId]);
-            AdapterCapabilities::observe('temporary_chat', 'verified', ['response_id' => $logicalResponseId]);
+            AdapterCapabilities::observe(($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? 'regular_chat' : 'temporary_chat',
+                'verified', ['response_id' => $logicalResponseId]);
             if (is_array($turn['requested_mode'] ?? null)) {
                 AdapterCapabilities::observe('model_effort', 'verified', [
                     'response_id' => $logicalResponseId,
@@ -8626,6 +8753,12 @@ JS;
             $response = is_array($params['response'] ?? null) ? $params['response'] : [];
             $url = (string) ($response['url'] ?? '');
             if (!WebModelPage::isBackendUrl($url, self::modelUrl())) return;
+            $savedChat = $owner['web_chat'] ?? [];
+            if (($savedChat['mode'] ?? '') === 'regular' && !empty($savedChat['conversation_id'])
+                && in_array((int) ($response['status'] ?? 0), [404, 410], true)
+                && (string) parse_url($url, PHP_URL_PATH) === '/backend-api/conversation/' . $savedChat['conversation_id']) {
+                $this->taskSessions[$sessionId]['saved_chat_missing'] = true;
+            }
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
                 $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
                 $this->taskSessions[$sessionId]['submission_http_status'] = (int) round((float) ($response['status'] ?? 0));
@@ -8877,10 +9010,26 @@ JS;
         return $url;
     }
 
-    /** Task-owned browser tabs always use the isolated Temporary Chat surface. */
-    private static function taskModelUrl(): string
+    /** New checks use the saved mode; task callers pass their pinned mode and exact conversation identity. */
+    private static function taskModelUrl(?string $mode = null, ?string $conversationId = null): string
     {
-        return WebModelPage::temporaryChatUrl(self::modelUrl());
+        $mode ??= (string) (GatewaySettings::internal()['web_chat_mode'] ?? 'temporary');
+        return $mode === 'regular' ? WebModelPage::regularChatUrl(self::modelUrl(), $conversationId)
+            : WebModelPage::temporaryChatUrl(self::modelUrl());
+    }
+
+    /** Match only the current task's pinned mode and saved ordinary-chat UUID, including all send/stop/recovery guards. */
+    private function taskChatMatches(string $responseId, string $url, bool $start = false): bool
+    {
+        $chat = $this->chatGptTurns[$responseId]['web_chat'] ?? null;
+        if (!is_array($chat)) foreach ($this->taskSessions as $session) {
+            if (($session['response_id'] ?? '') === $responseId) { $chat = $session['web_chat'] ?? null; break; }
+        }
+        // Legacy observer snapshots predate chat modes; they may still match only an explicit Temporary Chat.
+        // Missing metadata must never authorize an ordinary conversation.
+        if (!is_array($chat)) $chat = ['mode' => 'temporary'];
+        return $start ? WebModelPage::isTaskChatStartUrl($url, self::modelUrl(), $chat['mode'], $chat['conversation_id'] ?? null)
+            : WebModelPage::isTaskChatUrl($url, self::modelUrl(), $chat['mode'], $chat['conversation_id'] ?? null);
     }
 
 }

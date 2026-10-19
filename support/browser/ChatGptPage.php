@@ -29,6 +29,101 @@ final class ChatGptPage
     }
 
     /**
+     * Read a fresh account/workspace fingerprint without exporting raw identity or credentials.
+     * @return string Async same-origin DOM expression yielding only verification and a private SHA-256 fingerprint.
+     */
+    public static function accountFingerprintExpression(): string
+    {
+        return <<<'JS'
+(async()=>{
+ try{
+  const response=await fetch('/api/auth/session',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(15000)});
+  if(!response.ok||new URL(response.url).origin!==location.origin)return {verified:false};
+  const session=await response.json(),id=session.user?.id,account=session.account?.id;
+  if(session.error||[id,account].some(v=>typeof v!=='string'||!v||v.length>256)||(session.expires&&Date.parse(session.expires)<=Date.now()))return {verified:false};
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id+'\0'+account));
+  return {verified:true,account_key:[...new Uint8Array(digest)].map(v=>v.toString(16).padStart(2,'0')).join('')};
+ }catch{return {verified:false};}
+})()
+JS;
+    }
+
+    /**
+     * Build a new ordinary chat or the exact saved UUID route on the configured origin.
+     * @param string $modelUrl Configured provider URL, used only for its validated origin.
+     * @param string|null $conversationId Saved canonical UUID, or null for a new ordinary chat.
+     * @return string Ordinary root or exact saved conversation URL.
+     * @throws \InvalidArgumentException If the supplied conversation identity is not a UUID.
+     */
+    public static function regularChatUrl(string $modelUrl, ?string $conversationId = null): string
+    {
+        $root = explode('?', self::temporaryChatUrl($modelUrl), 2)[0];
+        if ($conversationId === null || $conversationId === '') return $root;
+        if (preg_match('/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/iD', $conversationId) !== 1) {
+            throw new \InvalidArgumentException('Invalid saved Web conversation identity.');
+        }
+        return $root . 'c/' . strtolower($conversationId);
+    }
+
+    /**
+     * Extract only a persistent ordinary UUID, excluding temporary, local and foreign routes.
+     * @param string $url Observed page URL. @param string $modelUrl Configured provider origin.
+     * @return string|null Lowercase UUID, or null until a valid persistent route is observed.
+     */
+    public static function regularConversationId(string $url, string $modelUrl): ?string
+    {
+        if (!self::isRegularChatUrl($url, $modelUrl)) return null;
+        return preg_match('~^/c/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$~iD',
+            (string) parse_url($url, PHP_URL_PATH), $match) === 1 ? strtolower($match[1]) : null;
+    }
+
+    /**
+     * Check the configured origin, absence of a temporary flag, and an ordinary root/UUID route.
+     * @param string $url Observed page URL. @param string $modelUrl Configured provider origin.
+     * @return bool A local SPA UUID is allowed while waiting for its persistent route to settle.
+     */
+    public static function isRegularChatUrl(string $url, string $modelUrl): bool
+    {
+        $actual = parse_url($url); $expected = parse_url(self::regularChatUrl($modelUrl));
+        if (!$actual || !$expected || isset($actual['user']) || isset($actual['pass'])
+            || strtolower((string) ($actual['scheme'] ?? '')) !== strtolower((string) ($expected['scheme'] ?? ''))
+            || strtolower((string) ($actual['host'] ?? '')) !== strtolower((string) ($expected['host'] ?? ''))
+            || (int) ($actual['port'] ?? 0) !== (int) ($expected['port'] ?? 0)) return false;
+        foreach (explode('&', (string) ($actual['query'] ?? '')) as $part) {
+            if (urldecode(explode('=', $part, 2)[0]) === 'temporary-chat') return false;
+        }
+        return preg_match('~^(?:/|/c/(?:local-chatgpt%3a)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$~iD',
+            (string) ($actual['path'] ?? '/')) === 1;
+    }
+
+    /**
+     * Match the task's pinned mode without adopting a different saved ordinary conversation.
+     * @param string $url Observed page URL. @param string $modelUrl Configured provider origin.
+     * @param string $mode Pinned temporary or regular mode.
+     * @param string|null $conversationId Saved ordinary UUID, or null before first verified binding.
+     * @return bool Whether this route matches the task's current page policy.
+     */
+    public static function isTaskChatUrl(string $url, string $modelUrl, string $mode = 'temporary', ?string $conversationId = null): bool
+    {
+        if ($mode === 'temporary') return self::isTemporaryChatUrl($url, $modelUrl);
+        if ($mode !== 'regular' || !self::isRegularChatUrl($url, $modelUrl)) return false;
+        return !$conversationId || self::regularConversationId($url, $modelUrl) === $conversationId;
+    }
+
+    /**
+     * Match a blank new-chat root or an existing task's exact saved ordinary conversation.
+     * @param string $url Observed page URL. @param string $modelUrl Configured provider origin.
+     * @param string $mode Pinned temporary or regular mode.
+     * @param string|null $conversationId Saved ordinary UUID, or null before first verified binding.
+     * @return bool Whether this route is an allowed starting destination for the task.
+     */
+    public static function isTaskChatStartUrl(string $url, string $modelUrl, string $mode = 'temporary', ?string $conversationId = null): bool
+    {
+        return self::isTaskChatUrl($url, $modelUrl, $mode, $conversationId)
+            && ($mode === 'regular' && $conversationId ? true : (parse_url($url, PHP_URL_PATH) ?: '/') === '/');
+    }
+
+    /**
      * Recognize explicit Temporary Chat routes on the configured origin, including SPA local IDs.
      * A local conversation can remain in use while native tools run; elapsed time does not revoke
      * its explicit temporary-chat flag. Ordinary chats and missing/conflicting flags stay rejected.
@@ -433,11 +528,11 @@ JS);
      * @return string CDP expression returning ownership, composer readiness and generation state.
      */
     public static function userStopExpression(string $url, array $tokens, array $users, bool $click,
-        bool $requireWitness = false, bool $acceptedInitialUser = false): string
+        bool $requireWitness = false, bool $acceptedInitialUser = false, string $chatMode = 'temporary'): string
     {
         $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users),
             'click' => $click, 'requireWitness' => $requireWitness,
-            'acceptedInitialUser' => $acceptedInitialUser], JSON_THROW_ON_ERROR);
+            'acceptedInitialUser' => $acceptedInitialUser, 'chatMode' => $chatMode], JSON_THROW_ON_ERROR);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
@@ -459,7 +554,9 @@ const retainedIdentityWitness=String(location.href||'')===expected.url&&(baselin
     &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
 const witness=tokenWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
-const temporary=sameOrigin&&temporaryChatPage(location.pathname,location.search);
+const regular=sameOrigin&&expected.chatMode==='regular'&&!new URLSearchParams(location.search).has('temporary-chat')
+    &&String(location.href||'')===expected.url&&/^\/(?:c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?$/i.test(location.pathname);
+const temporary=sameOrigin&&(expected.chatMode==='temporary'?temporaryChatPage(location.pathname,location.search):regular);
 if(!temporary)return {owned:false,page_invalid:true,generation_running:false,editor_ready:!!composer,stopped:false};
 const owned=String(location.href||'')===expected.url||witness;
 const stops=[...document.querySelectorAll('[data-testid="stop-button"]')].filter(visible);
@@ -714,16 +811,20 @@ JS;
      * @param list<string> $filenames Exact attachment basenames expected in the composer.
      * @param bool $imageOnly Require decoded image previews instead of document cards.
      * @param list<string> $mimeTypes Optional validated MIME types, in filename order.
+     * @param bool $ordinaryChat Allow an owned unique input ID when ordinary navigation retains another composer.
      * @return string Read-only DOM expression; names alone never prove upload completion.
      */
-    public static function attachmentStateExpression(array $filenames, bool $imageOnly = true, array $mimeTypes = []): string
+    public static function attachmentStateExpression(array $filenames, bool $imageOnly = true, array $mimeTypes = [], bool $ordinaryChat = false): string
     {
         $expected = json_encode(array_values($filenames), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $mimes = json_encode(array_values($mimeTypes), JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        return self::wrap(str_replace(['__EXPECTED__', '__IMAGE_ONLY__', '__MIME_TYPES__'], [$expected, $imageOnly ? 'true' : 'false', $mimes], <<<'JS'
+        return self::wrap(str_replace(['__EXPECTED__', '__IMAGE_ONLY__', '__MIME_TYPES__', '__ORDINARY_CHAT__'],
+            [$expected, $imageOnly ? 'true' : 'false', $mimes, $ordinaryChat ? 'true' : 'false'], <<<'JS'
 const expected=__EXPECTED__;
 const imageOnly=__IMAGE_ONLY__;
 const mimeTypes=__MIME_TYPES__;
+const ordinaryChat=__ORDINARY_CHAT__;
+if(ordinaryChat&&[...document.querySelectorAll(COMPOSER)].filter(visible).length>1)return {ok:false,code:'CHATGPT_EDITOR_AMBIGUOUS',input_count:0,matched_count:0,names:[]};
 const composer=visibleOne(COMPOSER);if(!composer)return {ok:false,code:'CHATGPT_EDITOR_MISSING',input_count:0,matched_count:0,names:[]};
 const form=composer.closest('form');if(!form)return {ok:false,code:'CHATGPT_EDITOR_FORM_MISSING',input_count:0,matched_count:0,names:[]};
 const selectors=imageOnly
@@ -748,6 +849,14 @@ const formSelector=form.id&&document.querySelectorAll('form[id="'+CSS.escape(for
 const uniqueSelector=(input,selector)=>{
     const scoped=form.contains(input)&&formSelector?formSelector+' '+selector:selector;
     for(const query of [scoped,scoped+':not([disabled])']){
+        const all=[...document.querySelectorAll(query)];
+        if(all.length===1&&all[0]===input)return query;
+    }
+    // Ordinary root-to-conversation navigation can retain a hidden composer with
+    // the same structural selectors. Use only the already ranked, compatible
+    // current-form input's observed unique ID; never choose among owned peers.
+    if(ordinaryChat&&input.id&&input.form===form){
+        const query='input[type="file"][id="'+CSS.escape(input.id)+'"]';
         const all=[...document.querySelectorAll(query)];
         if(all.length===1&&all[0]===input)return query;
     }
@@ -918,7 +1027,7 @@ JS));
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
-        string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false): string
+        string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false, string $initialBindingMarker = ''): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -926,10 +1035,12 @@ JS));
         $assistantCount = count($baselineAssistantIds);
         $marker = json_encode($continuationMarker, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $bound = json_encode($boundResponseId, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $initialBinding = json_encode($initialBindingMarker, JSON_THROW_ON_ERROR);
         $body = <<<'JS'
 const beforeUsers=new Set(__USERS__);const beforeAssistants=new Set(__ASSISTANTS__);
 const beforeUserCount=__USER_COUNT__;const beforeAssistantCount=__ASSISTANT_COUNT__;
 const expectedContinuationMarker=__MARKER__,boundResponseId=__BOUND__;
+const expectedInitialBinding=__INITIAL_BINDING__;
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
 const assistants=assistantTurns().map((el,i)=>({el,id:turnId(el,i,'assistant')}));
 // Long Temporary Chats can virtualize the oldest turn while appending the newest one. In that
@@ -955,6 +1066,7 @@ const reorderedAgent=uniqueUser&&identityAssistants.length===1
 const identityUser=uniqueUser&&((baselineVisible&&(!baselineAssistant||after(baselineAssistant.el,uniqueUser.el)))||reorderedAgent)
     ?uniqueUser:null;
 const newUser=continuationUser||countGrowthUser||identityUser;
+const initialBindingWitness=!!expectedInitialBinding&&!!newUser&&[newUser.el?.innerText,newUser.el?.textContent].some(t=>String(t||'').includes('<rcmaker_chat_binding>'+expectedInitialBinding+'</rcmaker_chat_binding>'));
 const answerCandidates=newUser?assistants.filter(entry=>after(newUser.el,entry.el)&&!beforeAssistants.has(entry.id)):[];
 // The current ChatGPT renderer can virtualize the original user bubble after
 // Connector tool results while keeping the new assistant message visible.
@@ -1222,11 +1334,11 @@ else if(/your session has expired|你的工作階段已過期|您的工作階段
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
 JS;
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__'],
-            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound],
+            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__'],
+            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound, $initialBinding],
             $body
         ), $legacyCitations);
     }

@@ -39,6 +39,25 @@ final class Settings
         return $this->respond($request, fn(): array => TunnelRuntime::refresh());
     }
 
+    /**
+     * Save the connector-step chat preference with the existing validator and optimistic revision.
+     * @param Request $request Console request containing only the preference and expected revision.
+     * @return mixed Framework JSON response using the existing settings error envelope.
+     */
+    public function chatMode(Request $request)
+    {
+        return $this->respond($request, function () use ($request): array {
+            $input = $this->body($request);
+            if (array_diff(array_keys($input), ['web_chat_mode', 'expected_updated_at'])
+                || !array_key_exists('web_chat_mode', $input)) throw new GatewayError('INVALID_FIELD', 'Unsupported Web chat preference field.');
+            $current = GatewaySettings::snapshot();
+            $base = array_intersect_key($current, array_flip(['mcp_enabled', 'connector_name', 'mcp_invoke_timeout_ms',
+                'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes', 'tunnel_id']));
+            $base['mcp_enabled'] = (int) $base['mcp_enabled'];
+            return GatewaySettings::save($input + $base);
+        });
+    }
+
     /** Save only language; leave settings and model contracts open in other tabs untouched. */
     public function locale(Request $request)
     {

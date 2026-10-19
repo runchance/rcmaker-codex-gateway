@@ -97,9 +97,10 @@ final class ChatGptTransport
      * Copy plus byte-identical saved Markdown is required; returned Send alone is insufficient.
      * @param array|null $completion Current logical response's drained completion projection.
      * @param array $snapshot Fresh owned DOM evidence, after assistant identity filtering.
+     * @param bool $ownedChatVerified Caller verified the snapshot URL against this task's pinned conversation.
      * @return string|null Exact saved source answer, or null while evidence is insufficient.
      */
-    public static function completedSourceForHandoff(?array $completion, array $snapshot): ?string
+    public static function completedSourceForHandoff(?array $completion, array $snapshot, bool $ownedChatVerified = false): ?string
     {
         if (!is_array($completion) || ($completion['status'] ?? null) !== 'completed'
             || !is_int($completion['revision'] ?? null)
@@ -107,7 +108,7 @@ final class ChatGptTransport
             || !empty($completion['context_read_pending'])
             || !is_string($completion['final_answer'] ?? null)
             || trim($completion['final_answer']) === ''
-            || ($snapshot['temporary_chat'] ?? null) !== true
+            || (!$ownedChatVerified && ($snapshot['temporary_chat'] ?? null) !== true)
             || ($snapshot['new_user'] ?? null) !== true
             || (string) ($snapshot['response_id'] ?? '') === ''
             || ($snapshot['generation_running'] ?? null) !== false

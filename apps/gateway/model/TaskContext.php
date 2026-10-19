@@ -17,7 +17,7 @@ final class TaskContext
     public static function enabled(array $budget, array $environment): bool
     {
         if (empty($budget['message_limit_source_response_id']) && empty($budget['original_context_required'])
-            && empty($budget['imported_original_context_available'])) return false;
+            && empty($budget['imported_original_context_available']) && empty($budget['regular_chat'])) return false;
         foreach ($environment['tools'] ?? [] as $tool) if (($tool['wire_name'] ?? '') === self::WIRE_NAME) return false;
         return true;
     }

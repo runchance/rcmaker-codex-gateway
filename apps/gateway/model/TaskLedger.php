@@ -312,6 +312,7 @@ final class TaskLedger
     /**
      * Route a Codex conversation to its current task or open a fresh task after a verified retirement boundary.
      * The caller owns the response reservation transaction; browser sends and host effects never occur here.
+     * Recovery-created tasks pin the saved mode or retain their own proven ordinary conversation binding.
      * @param array $spec Normalized request carrying the client, owner, branch and readable context.
      * @return array{spec:array,prepared:bool} Routed request and whether its full context is already prepared.
      * @throws GatewayError If ownership conflicts or the durable routing/retirement evidence cannot be saved.
@@ -336,6 +337,9 @@ final class TaskLedger
         $newUserMessage = ($lastMessage['role'] ?? '') === 'user'
             && !ContextHistory::isOperationalUserMessage($lastMessage);
         $operation = (string) ($spec['operation_kind'] ?? 'response');
+        if (is_array($task) && $newUserMessage && !$hasToolOutputs && $operation === 'response') {
+            TaskWebChat::initializeMissingUnsentUnlocked($taskId);
+        }
         if (is_array($task) && ($task['status'] === 'active'
                 || ($task['status'] === 'needs_attention' && empty(GatewaySettings::internal()['steering_full_context'])))
             && $newUserMessage && !$hasToolOutputs && $operation === 'response') {
@@ -517,6 +521,17 @@ final class TaskLedger
             'thread_id' => $spec['thread_id'] ?? null, 'branch_id' => $spec['branch_id'] ?? 'main',
             'owner_key' => $ownerKey, 'status' => 'active', 'created_at' => $now, 'updated_at' => $now])) {
             throw new GatewayError('storage_unavailable', '续聊任务无法创建。', 503);
+        }
+        // Recovery creates the task before reserveTurnUnlocked sees it. Pin the saved
+        // chat preference here too; otherwise this new task looks like a legacy temporary task.
+        TaskWebChat::createUnlocked($newTaskId, $taskId);
+        $newChat = TaskWebChat::state($newTaskId);
+        if ($newChat['mode'] === 'regular' && !empty($newChat['conversation_id'])) {
+            $sourceJob = ResponseJob::latestForTaskUnlocked($taskId);
+            if (is_array($sourceJob)) {
+                $spec['regular_recovery_source_response_id'] = $sourceJob['id'];
+                $spec['regular_recovery_source_task_id'] = $taskId;
+            }
         }
         if ($precommitRetry || ($failedHandoffRecovered && $task['status'] === 'active') || $lateReceiptsRecovered) {
             $retired = $db->table('gateway_tasks')->where('id', $taskId)->where('status', $task['status'])->update([
@@ -945,6 +960,7 @@ final class TaskLedger
             ])) {
                 throw new GatewayError('storage_unavailable', '任务记录无法创建。', 503);
             }
+            TaskWebChat::createUnlocked($taskId);
             $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
         }
         if (!is_array($task)
@@ -1142,6 +1158,10 @@ final class TaskLedger
                 'updated_at' => $now,
             ])) throw new GatewayError('storage_unavailable', '任务页面租约无法创建。', 503);
             self::transferCheckpointPageUnlocked($spec, $taskId, $currentEpochId, $surfaceId, $now);
+            if (!empty($spec['budget']['regular_chat'])) {
+                $targets = (array) \RC\Config::get('gateway', 'probe_targets');
+                TaskWebChat::transferPageUnlocked($taskId, $currentEpochId, $surfaceId, (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'));
+            }
             $updated = $db->table('gateway_tasks')->where('id', $taskId)->update([
                 'current_epoch_id' => $epochId, 'status' => 'active', 'updated_at' => $now,
             ]);
@@ -1765,6 +1785,10 @@ final class TaskLedger
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
+            $chat = TaskWebChat::state((string) $turn['task_id']);
+            if ($chat['mode'] === 'regular') {
+                return ['retry' => false, 'exhausted' => false, 'attempt' => 0];
+            }
             if ($maxRetries < 1
                 || in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS', 'CODEX_USER_STOPPED'], true)
                 || !in_array((string)$job['status'], $missingSurface ? ['queued','running'] : ['running'], true)
@@ -3440,8 +3464,10 @@ final class TaskLedger
 
     private static function publicTask(array $task, ?array $epoch, ?array $surface, ?array $turn): array
     {
+        $chat = TaskWebChat::state((string) $task['id']);
         return [
             'id' => (string) $task['id'], 'client_id' => (string) $task['client_id'],
+            'web_chat_mode' => $chat['mode'], 'web_conversation_id' => $chat['conversation_id'] ?? null,
             'thread_id' => $task['thread_id'], 'branch_id' => (string) $task['branch_id'],
             'status' => (string) $task['status'], 'current_epoch_id' => $task['current_epoch_id'],
             'epoch_no' => is_array($epoch) ? (int) $epoch['epoch_no'] : null,

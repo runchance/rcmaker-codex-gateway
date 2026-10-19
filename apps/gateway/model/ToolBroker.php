@@ -3070,7 +3070,7 @@ final class ToolBroker
         return "<codex_context_window_notice>\n" . $original['notice'] . "\n</codex_context_window_notice>";
     }
 
-    /** Build the tool-capable Web contract while preserving its exact context JSON. */
+    /** Build the tool-capable Web contract, adding only notices for advertised host capabilities. */
     private static function conciseControlPrompt(string $token, string $contextJson, ?string $checkpointMarker,
         bool $readContext, bool $contextOnly, bool $archiveRequired, array $hostToolNames,
         bool $parallelToolCalls, ?string $hostShell, array $outputControl, ?bool $retainedPage = null): string
@@ -3100,6 +3100,13 @@ final class ToolBroker
                 ? 'Multipart ACKs confirm delivery, not continued model recall. Before continuing unfinished work from staged or restored history, discover rcmaker.context_read through codex_tool_inventory and invoke it through codex_tool_call with the current turn_token to verify the actual human goal, relevant completed tool receipts and remaining steps. Search relevant phrases or paginate exact original records when needed; do not guess missing facts or repeat completed effects. A self-contained answer-only question or explicit pause does not require an unrelated history lookup.' : '',
         ]);
         $browserNotice = self::browserToolNotice($hostToolNames, $contextJson);
+        if (!$contextOnly) {
+            $execName = in_array('functions__exec', $hostToolNames, true) ? 'functions__exec'
+                : (in_array('exec', $hostToolNames, true) ? 'exec' : '');
+            if ($execName !== '') {
+                $browserNotice = trim(self::codeModeToolNotice($execName) . "\n" . $browserNotice);
+            }
+        }
         if ($browserNotice === '') return $prompt;
         $anchor = '<codex_context_json>';
         $contextStart = strpos($prompt, $contextJson);
@@ -3111,6 +3118,29 @@ final class ToolBroker
             return substr($prompt, 0, $anchorOffset) . $browserNotice . "\n" . substr($prompt, $anchorOffset);
         }
         return $browserNotice . "\n" . $prompt;
+    }
+
+    /**
+     * Explain native internal concurrency without overriding the outer serial-call contract.
+     * Only the current task's advertised exec tool supplies execution, approvals and receipts.
+     * @param string $execName Exact current outer registry name, never inferred from task history.
+     * @return string Scoped instructions for direct and nested tool callers, including custom templates.
+     */
+    private static function codeModeToolNotice(string $execName): string
+    {
+        return "<codex_native_code_mode>\n"
+            . 'The current Codex runtime advertises ' . $execName . ', its native JavaScript tool orchestrator. '
+            . 'Discover its current description/schema through codex_tool_inventory, then invoke it through codex_tool_call with that exact wire_name and the JavaScript in input. '
+            . 'Use one outer exec call at a time; do not overlap it with another outer tool. The outer parallel_tool_calls setting remains authoritative. '
+            . 'Inside exec, use awaited Promise.allSettled for small groups of independent reads, searches or independent tests when their tool descriptions permit concurrency. '
+            . 'Keep dependencies, approvals, shared browser interactions and edits to the same files sequential. Respect every tool-specific ordering rule. '
+            . 'Use only tools actually advertised by that exec registry and only for this task and its authorized workspace; never borrow another task, token, session or page. '
+            . 'Label and emit each operation result using the native output helpers; inspect both rejected promises and nonzero command exit codes. '
+            . 'Preserve successful results when a sibling fails. Do not rerun the whole batch, or retry an accepted operation whose result is pending or unknown. '
+            . 'For a yielded exec, use its exact native continuation handle and advertised wait tool until it settles; do not create a replacement exec. '
+            . 'After user interjection or stop, start no superseded work; preserve accepted operations and their exact receipts. Give the required public acknowledgement before new tools. '
+            . 'Direct tools remain available for dependent work and runtimes without exec; never invent a missing tool or permissions.\n'
+            . '</codex_native_code_mode>';
     }
 
     /** Explain the actual host browser route only when this turn advertises it and the task needs it. */

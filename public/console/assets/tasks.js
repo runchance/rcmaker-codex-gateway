@@ -552,6 +552,8 @@
         summary.className = 'state-grid task-summary';
         [
             [I18n.t('客户端'), task.client_id], ['Thread', task.thread_id || I18n.t('未提供')],
+            [I18n.t('网页对话模式'), I18n.t(task.web_chat_mode === 'regular' ? '普通对话（保存到 ChatGPT 历史）' : '临时对话（默认）')],
+            [I18n.t('网页对话标识'), task.web_conversation_id || '—'],
             [I18n.t('当前阶段'), task.current_epoch_id ? (I18n.t('阶段 ') + (task.epoch_no || '—')) : I18n.t('尚未建立')],
             [I18n.t('创建时间'), formatTime(task.created_at)], [I18n.t('更新时间'), formatTime(task.updated_at)],
             [I18n.t('取消时间'), task.cancelled_at ? formatTime(task.cancelled_at) : '—']

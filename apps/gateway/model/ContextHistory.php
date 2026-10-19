@@ -1332,6 +1332,7 @@ final class ContextHistory
             throw new GatewayError('task_surface_missing', '上下文续接的任务页面记录不一致。', 503);
         }
         $spec['browser_lease_key'] = (string) $surface['lease_key'];
+        if (TaskWebChat::retained($spec + ['task_id' => $reservation['task_id']], $surface)) return $spec;
         if (ContextCompaction::retainedResumePage($spec, $surface)) return $spec;
         if (!empty($spec['tool_outputs'])) {
             $epoch = SDB(null, 'medoo', 'sqlite')->table('gateway_task_epochs')->where('id', $surface['epoch_id'])->find();
@@ -1400,6 +1401,7 @@ final class ContextHistory
      */
     public static function retainedContext(array $job, array $surface): bool
     {
+        if (TaskWebChat::retained($job, $surface)) return true;
         if (SteeringContext::isDelta($job)) return SteeringContext::retained($job, $surface);
         if (ContextCompaction::retainedResumePage($job, $surface)) return true;
         if (empty($job['continuation_source_response_id'])) return false;

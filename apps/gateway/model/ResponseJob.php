@@ -183,8 +183,10 @@ final class ResponseJob
                 $spec['budget'] = ContextRecovery::applyObservedMessageLimitUnlocked($spec, $spec['budget']);
             }
             $budget = $spec['budget'] ?? $budget;
-            $spec = LunaCheckpoint::applyUnlocked($spec);
-            if (($spec['operation_kind'] ?? 'response') === 'response') {
+            $spec = TaskWebChat::prepareModeChangeUnlocked($spec);
+            if (empty($spec['web_chat_mode_change'])) $spec = LunaCheckpoint::applyUnlocked($spec);
+            $spec = TaskWebChat::prepareContinuationUnlocked($spec);
+            if (($spec['operation_kind'] ?? 'response') === 'response' && empty($spec['budget']['regular_chat'])) {
                 // A foreign/forked conversation can be larger than this model's window before
                 // it has any local epoch. Select its recent history before the admission check;
                 // later rounds must inherit the same selection instead of importing it again.
@@ -221,7 +223,8 @@ final class ResponseJob
                 $budget = $spec['budget'];
             }
             if ((!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id']))
-                && !($spec['steering_full_context'] ?? GatewaySettings::internal()['steering_full_context'])) {
+                && (!empty($spec['budget']['regular_chat'])
+                    || !($spec['steering_full_context'] ?? GatewaySettings::internal()['steering_full_context']))) {
                 $spec = SteeringContext::prepareUnlocked($spec);
                 $budget = $spec['budget'];
             }
@@ -232,7 +235,7 @@ final class ResponseJob
                 ?? ($exactPrefix ? $spec['context_json'] : $logicalContext));
             $spec['transport_context_json'] = $transportContext;
             $budgetContext = (string) ($spec['imported_budget_context_json']
-                ?? (!empty($spec['rolling_source_response_id']) ? $transportContext : $logicalContext));
+                ?? (!empty($spec['rolling_source_response_id']) || !empty($spec['budget']['regular_chat']) ? $transportContext : $logicalContext));
             // context_json is the context carried by this physical browser message after exact-prefix
             // continuation / rolling compaction. full_context_json remains the durable recovery/budget source.
             // Full logical context still owns the model budget even when exact-prefix continuation
@@ -253,6 +256,10 @@ final class ResponseJob
             if (($spec['operation_kind'] ?? 'response') !== 'response') {
                 $reuse = ContextCompaction::reserveUnlocked($spec, $responseId);
                 if ($reuse !== null) return $reuse;
+                // Reservation may prove a saved ordinary source and reduce this physical
+                // checkpoint to a control message. Preserve its proof and attachment scope.
+                $budget = $spec['budget'];
+                $transportContext = (string) ($spec['transport_context_json'] ?? $transportContext);
                 // A complete native checkpoint can exceed the ordinary one-message
                 // window that triggered it. The enlarged budget belongs only to this
                 // checkpoint's browser transport and is pinned with the job below.
@@ -264,13 +271,15 @@ final class ResponseJob
                     $budget, (string) $spec['prompt'], $compactAttachmentTokens,
                     !empty($spec['verified_compaction_source']) ? null : $transportContext);
             }
-            if (empty($spec['steering_delta'])) $spec = ContextWindow::prepare($spec, $attachmentTokens);
-            $spec = ContextCompaction::preparePageResumeUnlocked($spec);
+            if (empty($spec['steering_delta']) && empty($spec['budget']['regular_chat'])) $spec = ContextWindow::prepare($spec, $attachmentTokens);
+            if (empty($spec['budget']['regular_chat']) && empty($spec['web_chat_mode_change'])) $spec = ContextCompaction::preparePageResumeUnlocked($spec);
             $budget = $spec['budget'];
             $transportContext = (string)($spec['transport_context_json'] ?? $transportContext);
             $reservation = TaskLedger::reserveTurnUnlocked($spec, $responseId);
             if ($reservation['reused']) return (string) $reservation['response_id'];
+            TaskWebChat::commitModeChangeUnlocked($spec, $reservation);
             $spec = ContextHistory::bindReservedSurfaceUnlocked($spec, $reservation);
+            if (!empty($spec['budget']['regular_chat'])) $transportContext = (string) $spec['transport_context_json'];
             // Rebuilding a delta on a new page also needs the original retained attachments.
             $attachmentContext = (string) ($spec['context_json'] ?? $transportContext);
             $attachments = AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $attachmentContext);
@@ -305,6 +314,11 @@ final class ResponseJob
                 $prompt = WebContract::withSteeringNotice($prompt, WebContract::hasSteeringNotice((string) $prior['prompt']),
                     WebContract::steeringScope((string) $prior['prompt']));
             }
+            if (!empty($budget['regular_chat']) && ($spec['operation_kind'] ?? 'response') === 'response') {
+                $prompt = WebContract::withCheckpointProgressNotice($prompt,
+                    json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR));
+            }
+            if (!$bridge['is_continuation']) $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $reservation['task_id']);
             $roundInfo = $bridge;
             if (!$db->table('gateway_response_jobs')->add([
                 'id' => $responseId,
@@ -576,7 +590,7 @@ final class ResponseJob
     {
         $row = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find(
             'id,status,operation_kind,round_kind,previous_response_id,checkpoint_marker,'
-            . 'durable_turn_id,surface_id,generation_id,task_id,epoch_id,mcp_binding_id,command_id');
+            . 'durable_turn_id,surface_id,generation_id,task_id,epoch_id,mcp_binding_id,command_id,submit_intent_at,submitted_document_nonce');
         if (!is_array($row)) throw new GatewayError('response_not_found', 'Responses 请求不存在。', 404);
         return $row;
     }

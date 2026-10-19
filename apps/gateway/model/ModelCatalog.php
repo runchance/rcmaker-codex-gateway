@@ -406,6 +406,8 @@ final class ModelCatalog
 
     /**
      * Publish window-compatible Web choices while preserving native rows and unknown fields.
+     * Native Code Mode templates opt into mixed tools so older/direct clients remain usable;
+     * the client owns runtime availability and keeps its direct fallback and approval policy.
      * @param array $catalog Genuine authenticated native catalog.
      * @return array Catalog with visible window groups and hidden historical wire identities.
      */
@@ -469,7 +471,9 @@ final class ModelCatalog
                     . (!empty($route['notice']) ? ' · ' . $route['notice'] : ''),
                 'visibility' => !empty($route['legacy']) ? 'hide' : 'list', 'supported_in_api' => true,
                 'input_modalities' => ['text', 'image'],
-                'tool_mode' => null, 'upgrade' => null, 'default_reasoning_level' => $codexEffort,
+                'tool_mode' => in_array($template['tool_mode'] ?? null, ['code_mode', 'code_mode_only'], true)
+                    ? 'code_mode' : null,
+                'upgrade' => null, 'default_reasoning_level' => $codexEffort,
                 'supported_reasoning_levels' => $supportedLevels,
                 'context_window' => $budget['context_tokens'], 'max_context_window' => $budget['context_tokens'],
                 'effective_context_window_percent' => (int) round($budget['compact_tokens'] / $budget['context_tokens'] * 100),

@@ -317,7 +317,7 @@ final class ContextCompaction
         $spec['postcompact_user_input'] = (bool) array_filter($suffix, static fn(array $message): bool =>
             ($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message));
         $delta = ['version' => 3, 'system' => [], 'messages' => array_merge($leading, [
-            ['role' => 'developer', 'content' => 'Codex has finished its context checkpoint. This existing Web conversation remains the working context. The temporary summary-only control has ended. Resume the outstanding authorized task from the confirmed progress and exact tool receipts already in this conversation. Do not repeat completed work or treat the checkpoint as task completion. Apply the current tool contract and any new instructions below; respect actual user stop, cancellation and approval requirements. ' . WebContract::checkpointProgressInstruction()],
+            ['role' => 'developer', 'content' => self::pageResumeInstruction()],
         ], $suffix), 'continuation' => [
             'mode' => 'exact_prefix', 'source_response_id' => $source['id'],
             'source_surface_id' => $surface['id'], 'source_epoch_id' => $surface['epoch_id'],
@@ -335,6 +335,48 @@ final class ContextCompaction
         $spec['prompt'] = ContextHistory::plainPrompt($delta);
         $spec['continuation_source_response_id'] = $source['id'];
         return $spec;
+    }
+
+    /**
+     * Return the shared resume contract after a completed checkpoint; it grants no host capability.
+     * @return string Existing retained-page wording, also used after reopening a saved ordinary chat.
+     */
+    public static function pageResumeInstruction(): string
+    {
+        return 'Codex has finished its context checkpoint. This existing Web conversation remains the working context. The temporary summary-only control has ended. Resume the outstanding authorized task from the confirmed progress and exact tool receipts already in this conversation. Do not repeat completed work or treat the checkpoint as task completion. Apply the current tool contract and any new instructions below; respect actual user stop, cancellation and approval requirements. ' . WebContract::checkpointProgressInstruction();
+    }
+
+    /**
+     * Omit only the exact committed checkpoint prefix when resuming a persistent ordinary conversation.
+     * Unlike a temporary document proof, the saved conversation survives a closed tab or process restart.
+     * @param array $spec Routed request with its full native checkpoint context.
+     * @param array $source Latest response from this same task.
+     * @return array|null Resume messages and whether a new human instruction follows, or null for a non-checkpoint source.
+     * @throws GatewayError If a claimed checkpoint is not this task's exact committed checkpoint.
+     */
+    public static function savedChatResumeUnlocked(array $spec, array $source): ?array
+    {
+        if ($source['operation_kind'] !== 'compact_v2') return null;
+        $checkpoint = SDB(null, 'medoo', 'sqlite')->table('gateway_context_checkpoints')->where('id', $source['compact_id'])->find();
+        if ($source['status'] !== 'completed' || !is_array($checkpoint) || $checkpoint['task_id'] !== $source['task_id']
+            || $checkpoint['response_id'] !== $source['id']
+            || !self::matchesCommittedEpoch($checkpoint, (string) ($spec['compaction_epoch'] ?? 'base'))) {
+            throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint source could not be confirmed.', 409);
+        }
+        $wire = json_decode((string) $checkpoint['response_json'], true, 128, JSON_THROW_ON_ERROR);
+        $expected = ResponsesProtocol::retireTransportHandles(ContextHistory::compile($wire['output'], ''));
+        $full = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $records = (array) ($full['messages'] ?? []);
+        $leading = [];
+        while (($records[0]['role'] ?? '') === 'developer') $leading[] = array_shift($records);
+        $count = count($expected['messages']);
+        if (ContextHistory::canonical(array_slice($records, 0, $count)) !== ContextHistory::canonical($expected['messages'])) {
+            throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint history does not match the current task.', 409);
+        }
+        $suffix = array_slice($records, $count);
+        return ['messages' => [...$leading, ['role' => 'developer', 'content' => self::pageResumeInstruction()], ...$suffix],
+            'user_input' => (bool) array_filter($suffix, static fn(array $record): bool =>
+                ($record['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($record))];
     }
 
     /**
@@ -1856,6 +1898,11 @@ final class ContextCompaction
      * Reserve one checkpoint for the source epoch inside the caller's transaction.
      * A retired source has no reusable page, but its complete readable history can be
      * summarized on a newly reserved page after all active turns have finished.
+     * Explicit ordinary-mode migration also uses a new page; temporary-mode page selection is unchanged.
+     * @param array $spec Prepared request, updated with the checkpoint's source and transport proof.
+     * @param string $responseId Proposed checkpoint producer response.
+     * @return string|null Existing producer ID to reuse, or null after reserving this producer.
+     * @throws GatewayError On unconfirmed source, tool outcomes or conflicting checkpoint ownership.
      */
     public static function reserveUnlocked(array &$spec, string $responseId): ?string
     {
@@ -1980,7 +2027,9 @@ final class ContextCompaction
         }
         if (is_array($epoch)) {
             if ($epoch['status'] === 'active') {
-                $spec['browser_lease_key'] = (string) $epoch['lease_key'];
+                // A first ordinary submission must initialize its isolated destination,
+                // even when native compaction happens before the next human message.
+                if (empty($spec['web_chat_mode_change'])) $spec['browser_lease_key'] = (string) $epoch['lease_key'];
                 $spec['compaction_epoch'] = (string) $epoch['compaction_epoch'];
                 $spec['reasoning_effort'] = $epoch['reasoning_effort'];
             } elseif ($epoch['status'] !== 'retired') {
@@ -1999,7 +2048,7 @@ final class ContextCompaction
             // will switch its logical response to the compact continuation after reservation.
             $spec['active_compaction_source'] = (string) $activeSource['id'];
             $spec['prompt'] = self::activeCompactionInstruction();
-        } elseif (is_array($last) && $last['operation_kind'] === 'response' && $last['round_kind'] === 'text'
+        } elseif (empty($spec['web_chat_mode_change']) && is_array($last) && $last['operation_kind'] === 'response' && $last['round_kind'] === 'text'
             && $last['epoch_id'] === $source && $last['model'] === $spec['model']
             && $last['reasoning_effort'] === ($spec['reasoning_effort'] ?? null)) {
             $surface = $db->table('gateway_browser_surfaces')->where('id', $last['surface_id'])->find();
@@ -2018,6 +2067,34 @@ final class ContextCompaction
                 // after this reservation but before the short summary-only prompt is submitted.
                 $spec['continuation_source_response_id'] = $last['id'];
             }
+        }
+        $regularChat = TaskWebChat::boundSpec($spec);
+        if ($regularChat !== null && !is_array($activeSource)) {
+            // A persistent conversation is the source even after Chrome closed its disposable tab.
+            // Require the same canonical source proof; a mismatch cannot authorize a history replay.
+            if (!is_array($last) || $last['operation_kind'] !== 'response' || $last['round_kind'] !== 'text') {
+                throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint source could not be confirmed.', 409);
+            }
+            $known = json_decode((string) $last['context_json'], true, 128, JSON_THROW_ON_ERROR);
+            $known['messages'][] = ['role' => 'assistant', 'content' => (string) $last['output_text']];
+            $requested = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+            // Native Responses may annotate the exact just-completed answer as final_answer.
+            // Its phase is transport metadata; preserve every earlier record and all tool receipts.
+            $answerIndex = count($known['messages']) - 1;
+            if (($requested['messages'][$answerIndex]['role'] ?? '') === 'assistant'
+                && ($requested['messages'][$answerIndex]['phase'] ?? '') === 'final_answer'
+                && ($requested['messages'][$answerIndex]['content'] ?? null) === $last['output_text']) {
+                unset($requested['messages'][$answerIndex]['phase']);
+            }
+            if (ContextHistory::canonical($known) !== ContextHistory::canonical($requested)) {
+                throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint history does not match the current task.', 409);
+            }
+            $spec['prompt'] = self::prompt(ContextHistory::canonical($requested), true);
+            $spec['verified_compaction_source'] = true;
+            $spec['continuation_source_response_id'] = $last['id'];
+            $spec['budget']['regular_chat'] = ['task_id' => $taskId, 'conversation_id' => $regularChat['conversation_id'],
+                'request_hash' => $spec['request_hash'], 'source_response_id' => $last['id']];
+            $spec['context_json'] = $spec['transport_context_json'] = ContextHistory::canonical(['version' => 3, 'system' => [], 'messages' => []]);
         }
         if (isset($spec['compact_id'])) return null;
         $id = 'ckpt_' . bin2hex(random_bytes(12));

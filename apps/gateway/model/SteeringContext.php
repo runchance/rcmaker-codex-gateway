@@ -56,6 +56,7 @@ final class SteeringContext
      */
     public static function prepareUnlocked(array $spec): array
     {
+        if (TaskWebChat::boundSpec($spec) !== null) return TaskWebChat::prepareContinuationUnlocked($spec);
         $db = SDB(null, 'medoo', 'sqlite');
         $source = $db->table('gateway_response_jobs')->where('id', (string) ($spec['stopped_source_response_id'] ?? $spec['previous_response_id']))->find();
         if (is_array($source) && self::isDelta($source) && empty($source['submit_intent_at'])) {
@@ -169,6 +170,11 @@ final class SteeringContext
         if (!self::isDelta($job)) return false;
         $budget = $job['budget'] ?? json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
         $proof = $budget['steering_delta'];
+        if (!empty($proof['regular_conversation_id']) && TaskWebChat::retained($job, $surface)) {
+            $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $proof['source_response_id'])->find('task_id,context_json');
+            return is_array($source) && $source['task_id'] === $job['task_id']
+                && hash_equals($proof['previous_context_sha256'], hash('sha256', (string) $source['context_json']));
+        }
         $db = SDB(null, 'medoo', 'sqlite');
         $source = $db->table('gateway_response_jobs')->where('id', $proof['source_response_id'])->find();
         $task = $db->table('gateway_tasks')->where('id', $job['task_id'])->find();

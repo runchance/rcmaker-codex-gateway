@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="../assets/gateway.css">
 </head>
 <body class="gateway-page">
+    <div id="chat-mode-notice" class="notice warning" role="status" hidden></div>
     <section id="setup-wizard" class="setup-wizard" hidden aria-labelledby="wizard-title">
         <header class="setup-wizard-header">
             <select id="wizard-language" class="console-language" data-language-choice aria-label="Language"><option value="en">English</option><option value="zh-CN">简体中文</option></select>
@@ -172,6 +173,13 @@
 
         <section class="tools-guide-card" data-tool-step="connector">
             <div class="tools-guide-heading"><span class="step-number">3</span><strong>创建 ChatGPT Connector</strong><span id="tools-connector-guide-status" class="badge">等待</span></div>
+            <div class="layui-form" lay-filter="web-chat-preference">
+                <div class="field tools-guide-field"><label for="setup-web-chat-mode">网页对话模式</label><select id="setup-web-chat-mode" lay-filter="web-chat-mode"><option value="temporary">临时对话（默认）</option><option value="regular">普通对话（保存到 ChatGPT 历史）</option></select></div>
+                <p class="help">默认使用临时对话。临时对话找不到插件时，会验证普通对话；验证通过后自动切换，并显示说明。</p>
+                <p class="help">普通模式每个任务绑定一条网页对话，重启或关闭标签后重新打开原对话，仅发送新增需求和必要回执。删除网页记录或清理本地任务后才新建。普通对话保存在 ChatGPT 历史中。</p>
+                <p class="help">切换到普通模式后，已有临时任务会在下次续发时，用完整上下文初始化独立的普通对话；已受理工具先结清。绑定后仅发送新增需求，已有普通绑定继续保留。</p>
+                <div class="setup-layer-actions compact-actions"><button id="tools-save-chat-mode" type="button" class="layui-btn layui-btn-primary">保存模式并检查连接器</button></div>
+            </div>
             <p class="muted">打开 ChatGPT 设置，创建连接器后点击“检查连接器”。</p>
             <ol class="connector-checklist">
                 <li>先在 ChatGPT 设置中启用 <strong>Developer Mode</strong>。</li>
