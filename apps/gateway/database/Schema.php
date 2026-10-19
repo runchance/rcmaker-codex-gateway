@@ -5,12 +5,13 @@ namespace app\gateway\database;
 use RC\Config;
 use app\gateway\model\GatewayError;
 
-/** Owns SQLite schema and short writer transactions through the framework connection, without a separate PDO. */
+/** Owns SQLite schema, writer transactions and maintenance checkpoints through the framework connection. */
 final class Schema
 {
     private static bool $ready = false;
     private const WRITER_WAIT_MILLISECONDS = 5000;
     private const WRITER_LOCK_ATTEMPTS = 3;
+    private const RECYCLED_WAL_BYTES = 16777216;
 
     /** @return array<int,string> Immutable migration SQL; hashes cover logical SQL, not package bytes. */
     public static function migrationOne(): array
@@ -563,6 +564,12 @@ final class Schema
                 throw new \RuntimeException('WAL unavailable');
             }
             $db->query('PRAGMA synchronous=FULL');
+            // COMMIT must sync its own WAL records, not copy a historic backlog into the
+            // main file on the browser/API event loop. GatewayMaintenance owns PASSIVE
+            // checkpoints; no foreground connection installs SQLite's automatic hook.
+            $db->query('PRAGMA wal_autocheckpoint=0')->fetchAll();
+            // This only trims already-recycled allocation, never uncheckpointed records.
+            $db->query('PRAGMA journal_size_limit=' . self::RECYCLED_WAL_BYTES)->fetchAll();
             $migrations = self::migrations();
             // Every MCP tool call has a fresh PHP child. An already-current schema needs
             // checksum/state validation, not another writer transaction or CREATE TABLE.
@@ -681,6 +688,24 @@ final class Schema
         if (!$browser || (int) $browser['id'] !== 1) {
             throw new GatewayError('SCHEMA_MISMATCH', '浏览器工作区初始化记录不完整，已停止写入。', 503);
         }
+    }
+
+    /**
+     * Copy available WAL pages from the independent maintenance worker only.
+     * PASSIVE never waits for active readers/writers or forces their snapshots to end.
+     * A busy or partial result is normal and is retried by the next maintenance tick.
+     * Disk I/O can still take time, so never call this from an API/browser transaction.
+     * @return array{busy:int,frames:int,checkpointed:int} SQLite checkpoint progress, without content.
+     * @throws \Throwable On initialization or storage failure; committed WAL remains authoritative.
+     */
+    public static function checkpointWal(): array
+    {
+        self::initialize();
+        $rows = DB('medoo', 'sqlite')->query('PRAGMA wal_checkpoint(PASSIVE)')->fetchAll(\PDO::FETCH_NUM);
+        if (!isset($rows[0]) || count($rows[0]) !== 3) {
+            throw new GatewayError('STORAGE_UNAVAILABLE', '本地数据库不可用，请检查磁盘空间、写入权限或文件占用。', 503);
+        }
+        return ['busy' => (int) $rows[0][0], 'frames' => (int) $rows[0][1], 'checkpointed' => (int) $rows[0][2]];
     }
 
     /**

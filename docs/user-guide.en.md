@@ -413,6 +413,8 @@ A recorded send intent is different from confirmed Web receipt. Compare it with 
 
 Use **Clear all idle tasks** in Task center and review its confirmation. Running tasks, executing tools and approval waits are skipped. Cleanup does not target project source files or Codex chats. Referenced checkpoints or attachments may remain. Freed database space is reused by later writes; the running gateway does not automatically compact the entire database. See the [cleanup FAQ](faq.en.md#cleanup).
 
+A separate maintenance process checkpoints database logs; browser and API commits no longer also process an accumulated log backlog. Maintenance uses `PASSIVE` checkpoints, leaving pages blocked by active readers or writers for a later pass without ending their snapshots or waiting for their locks. Commits retain full synchronization to disk. Safely recycled logs retain at most 16 MiB for reuse; this does not cap logs still awaiting a checkpoint. Maintenance and business processes still share the disk, so slow storage or long business write transactions can affect responsiveness.
+
 <a id="settings"></a>
 
 ## 8. Settings, context and usage
