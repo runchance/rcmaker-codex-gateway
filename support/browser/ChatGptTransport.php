@@ -1269,9 +1269,20 @@ final class ChatGptTransport
         ]);
     }
 
-    /** @param list<string> $parts @param list<string> $hashes */
+    /** Compile the final commit, keeping any trusted initial-chat witness above the collapsible payload.
+     * @param list<string> $parts @param list<string> $hashes
+     */
     private static function commitText(array $parts, array $hashes, string $transactionId, string $contract): string
     {
+        // ChatGPT truncates very long user bubbles in the DOM. Keep this trusted
+        // initial-chat witness in the short commit header, before the large final
+        // JSON part, rather than hiding it below that part in the execution contract.
+        // Other contracts, including Temporary Chat, keep their exact byte layout.
+        $bindingHeader = [];
+        if (preg_match('/\A(<rcmaker_chat_binding>resp_[a-f0-9]{24}<\/rcmaker_chat_binding>)\r?\n/', $contract, $match) === 1) {
+            $bindingHeader[] = $match[1];
+            $contract = substr($contract, strlen($match[0]));
+        }
         $total = count($parts);
         $final = $total - 1;
         $manifest = [];
@@ -1279,6 +1290,7 @@ final class ChatGptTransport
         $acknowledged = max(0, $total - 1);
         return implode("\n", [
             '<codex_multipart_commit>',
+            ...$bindingHeader,
             'transaction_id: ' . $transactionId,
             'parts: ' . $total,
             'manifest: ' . implode(' ', $manifest),

@@ -1339,27 +1339,65 @@ final class BrowserRuntime
             });
     }
 
-    /** Verify account and exact selected name again before reusing an initial MCP permission receipt. */
-    private function checkVisibleConnector(int $commandId, string $connectorName): void
+    /**
+     * Verify account/name before permission reuse; retry transient reads on the same isolated probe.
+     * Four attempts share one 90-second window. Retries never refresh pages or send model messages,
+     * and remain fenced to the original command, runtime generation, target and CDP session.
+     */
+    private function checkVisibleConnector(int $commandId, string $connectorName, ?float $accountDeadline = null,
+        int $accountAttempt = 0, array $accountChecks = []): void
     {
+        $accountDeadline ??= microtime(true) + 90.0;
         $sessionId = $this->connectorProbeSessionId;
         $targetId = $this->connectorProbeTargetId;
         $generation = $this->connectorProbeGenerations[$commandId] ?? '';
         $current = fn(): bool => $sessionId !== null && $targetId !== null
             && $this->connectorProbeSessionId === $sessionId && $this->connectorProbeTargetId === $targetId
             && ($this->connectorProbeGenerations[$commandId] ?? null) === $generation;
+        if (microtime(true) >= $accountDeadline) {
+            if ($current()) $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED',
+                'The Web chat account could not be verified.', ['account_reason'=>'readiness_deadline', 'account_checks'=>$accountChecks]);
+            return;
+        }
         $this->evaluateConnectorProbe(WebModelPage::accountFingerprintExpression(),
-            function ($error, $account) use ($commandId, $connectorName, $generation, $current): void {
+            function ($error, $account) use ($commandId, $connectorName, $generation, $current, $accountDeadline, $accountAttempt, $accountChecks): void {
                 if (!$current()) return;
                 $accountKey = $error === null && is_array($account) && !empty($account['verified'])
                     ? (string) ($account['account_key'] ?? '') : '';
                 if ($accountKey === '') {
-                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.');
+                    $reason = (string) ($account['reason'] ?? ($error !== null ? 'cdp_error' : 'identity_unavailable'));
+                    $allowed = ['http_error','invalid_json','invalid_session','expired_session','identity_unavailable',
+                        'wrong_origin','request_timeout','request_failed','cdp_error'];
+                    if (!in_array($reason, $allowed, true)) $reason = 'identity_unavailable';
+                    $status = max(0, min(599, (int) ($account['http_status'] ?? 0)));
+                    $retryable = in_array($reason, ['invalid_json','identity_unavailable','request_timeout','request_failed','cdp_error'], true)
+                        || ($reason === 'http_error' && in_array($status, [403,408,425,429,500,502,503,504], true));
+                    $delay = max(min(20.0, 5.0 * (2 ** $accountAttempt)), $status === 429 ? 30.0 : 0.0,
+                        max(0, min(900, (int) ($account['retry_after_seconds'] ?? 0))));
+                    $diagnostics = ['account_reason'=>$reason, 'http_status'=>$status, 'account_attempts'=>$accountAttempt + 1,
+                        'elapsed_ms'=>max(0, min(90000, (int) ($account['elapsed_ms'] ?? 0))),
+                        'retry_after_seconds'=>max(0, min(900, (int) ($account['retry_after_seconds'] ?? 0))),
+                        'cdp_code'=>is_array($error) ? (int) ($error['code'] ?? 0) : 0];
+                    $accountChecks[] = $diagnostics;
+                    if ($retryable && $accountAttempt < 3 && microtime(true) + $delay + 1.0 < $accountDeadline) {
+                        Timer::add($delay, function () use ($commandId, $connectorName, $generation, $current, $accountDeadline, $accountAttempt, $accountChecks): void {
+                            if (!$current()) return;
+                            $command = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('id', $commandId)->find('status');
+                            if (($command['status'] ?? '') !== 'running') return;
+                            if (ConnectorState::runtimeGeneration() !== $generation) {
+                                $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_RUNTIME_CHANGED', '工具连接已变化，旧检查已取消。'); return;
+                            }
+                            $this->checkVisibleConnector($commandId, $connectorName, $accountDeadline, $accountAttempt + 1, $accountChecks);
+                        }, null, false);
+                        return;
+                    }
+                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED',
+                        'The Web chat account could not be verified.', $diagnostics + ['account_checks'=>$accountChecks]);
                     return;
                 }
                 $this->connectorProbeAccounts[$commandId] = $accountKey;
                 $this->evaluateConnectorProbe(WebModelPage::connectorSelectedExpression($connectorName),
-                    function ($error, $selected) use ($commandId, $connectorName, $generation, $accountKey, $current): void {
+                    function ($error, $selected) use ($commandId, $connectorName, $generation, $accountKey, $current, $accountChecks): void {
                         if (!$current()) return;
                         if ($error !== null || empty($selected['selected']) || (int) ($selected['count'] ?? 0) !== 1) {
                             $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_SELECTION_LOST', 'The selected connector changed before the check completed.');
@@ -1370,10 +1408,10 @@ final class BrowserRuntime
                         catch (GatewayError $failure) {
                             $this->connectorVerifyFail($commandId, $connectorName, $failure->errorCode, $failure->getMessage()); return;
                         }
-                        if ($accepted) $this->finishConnectorRuntimeProbe($commandId, $connectorName, false);
+                        if ($accepted) $this->finishConnectorRuntimeProbe($commandId, $connectorName, false, $accountChecks);
                         else $this->beginConnectorRuntimeProbe($commandId, $connectorName);
                     });
-            }, 20.0, true);
+            }, max(1.0, min(20.0, $accountDeadline - microtime(true))), true);
     }
 
     /** Prove the selected ChatGPT Connector reaches this exact local MCP before declaring setup ready. */
@@ -1555,7 +1593,8 @@ final class BrowserRuntime
     }
 
     /** Finish an owned check and disclose whether a new MCP probe or only qualified visibility was verified. */
-    private function finishConnectorRuntimeProbe(int $commandId, string $connectorName, bool $runtimeVerified = true): void
+    private function finishConnectorRuntimeProbe(int $commandId, string $connectorName, bool $runtimeVerified = true,
+        array $accountChecks = []): void
     {
         if ($this->connectorFallbackAttempt && $this->connectorFallbackRevision !== null) {
             try {
@@ -1574,6 +1613,7 @@ final class BrowserRuntime
             'connector_name' => $connectorName,
             'web_chat_mode' => $this->connectorChatMode,
             'chat_mode_auto_fallback' => $this->connectorFallbackAttempt,
+            'account_checks' => $accountChecks,
         ]);
     }
 

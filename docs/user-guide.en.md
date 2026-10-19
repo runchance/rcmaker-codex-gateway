@@ -282,6 +282,8 @@ Review the page's notices, create the plugin and complete its installation/conne
 
 The first check verifies the real MCP permission round trip and saves an account-bound receipt. Later checks, including normal RCMAKER restarts, only confirm the uniquely matching connector in the private browser; they send no model message. A changed connector, account or connection configuration requires initial verification again. Clearing private sign-in data also removes the receipt. Older versions did not save its account binding, so the first check after upgrading establishes it once. A visibility check confirms availability in the page, not a new live MCP round trip.
 
+Transient account-read failures and rate limits use backoff on the same check page, with at most four reads within one 90-second account verification window. This neither refreshes task pages nor resends probe messages. Invalid sign-in, account changes and mismatched connector names still fail verification. Failure diagnostics retain only classifications, HTTP status and timing, never sign-in credentials.
+
 **Success:** both tunnel and connector checks pass. If the Tunnel is missing, check organization/workspace associations and permissions. If creation succeeds but the check fails, use the [connector FAQ](faq.en.md#connector).
 
 <details>
@@ -567,6 +569,8 @@ Attachment upload and processing wait for up to 10 minutes by default, within th
 Set `attachment_upload_timeout_seconds` (60–1800 seconds) under `[gateway]` in `.env` to adjust it;
 the setting takes effect after a normal restart. The task timeline records confirmed counts, elapsed time
 and upload status. The gateway does not send partial batches or automatically upload them again.
+
+When historical images are uploaded again in ordinary chats, ChatGPT may append `(1)`, `(2)` or another number to gateway-generated image filenames. The gateway recognizes these aliases by the original content-hash filename, while still requiring every unique decoded preview in the current task's composer and no upload errors. Initial multipart commits in new ordinary chats keep their ownership marker at the start so collapsed long messages do not prevent binding. Complete history, part checksums and exact tool receipts remain intact.
 
 If the recorded error is `net::ERR_HTTP2_PROTOCOL_ERROR`, you can test `browser_http_protocol = http1`
 under `[gateway]` in `.env` after tasks finish and the private Chrome is restarted normally. The default

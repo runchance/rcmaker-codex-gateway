@@ -30,20 +30,29 @@ final class ChatGptPage
 
     /**
      * Read a fresh account/workspace fingerprint without exporting raw identity or credentials.
-     * @return string Async same-origin DOM expression yielding only verification and a private SHA-256 fingerprint.
+     * @return string Async same-origin expression with a private fingerprint or safe failure classification, never credentials.
      */
     public static function accountFingerprintExpression(): string
     {
         return <<<'JS'
 (async()=>{
+ const started=performance.now();let status=0,retryAfter=0;
+ const failure=reason=>({verified:false,reason,http_status:status,retry_after_seconds:retryAfter,elapsed_ms:Math.round(performance.now()-started)});
  try{
   const response=await fetch('/api/auth/session',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(15000)});
-  if(!response.ok||new URL(response.url).origin!==location.origin)return {verified:false};
-  const session=await response.json(),id=session.user?.id,account=session.account?.id;
-  if(session.error||[id,account].some(v=>typeof v!=='string'||!v||v.length>256)||(session.expires&&Date.parse(session.expires)<=Date.now()))return {verified:false};
+  status=response.status;
+  const retryHeader=response.headers.get('Retry-After');
+  if(retryHeader&&/^\d+$/.test(retryHeader))retryAfter=Math.min(900,Number(retryHeader));
+  if(new URL(response.url).origin!==location.origin)return failure('wrong_origin');
+  if(!response.ok)return failure('http_error');
+  let session;try{session=await response.json()}catch{return failure('invalid_json')}
+  if(!session||typeof session!=='object'||session.error)return failure('invalid_session');
+  if(session.expires&&Date.parse(session.expires)<=Date.now())return failure('expired_session');
+  const id=session.user?.id,account=session.account?.id;
+  if([id,account].some(v=>typeof v!=='string'||!v||v.length>256))return failure('identity_unavailable');
   const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id+'\0'+account));
   return {verified:true,account_key:[...new Uint8Array(digest)].map(v=>v.toString(16).padStart(2,'0')).join('')};
- }catch{return {verified:false};}
+ }catch(error){return failure(['TimeoutError','AbortError'].includes(error?.name)?'request_timeout':'request_failed');}
 })()
 JS;
     }
@@ -843,7 +852,7 @@ JS;
      * @param list<string> $filenames Exact attachment basenames expected in the composer.
      * @param bool $imageOnly Require decoded image previews instead of document cards.
      * @param list<string> $mimeTypes Optional validated MIME types, in filename order.
-     * @param bool $ordinaryChat Allow an owned unique input ID when ordinary navigation retains another composer.
+     * @param bool $ordinaryChat Allow owned unique inputs and ChatGPT's numbered aliases of gateway-hashed image names.
      * @return string Read-only DOM expression; names alone never prove upload completion.
      */
     public static function attachmentStateExpression(array $filenames, bool $imageOnly = true, array $mimeTypes = [], bool $ordinaryChat = false): string
@@ -913,6 +922,16 @@ if(!inputSelector&&eligible.length===1){
 }
 if(!inputSelector)inputCount=Math.max(inputCount,eligible.length);
 const norm=value=>String(value||'').replace(/\s+/g,' ').trim();
+// Saved chats may rename a previously uploaded image with a numbered suffix.
+// Only accept that alias for our content-hashed image basenames, in this owned
+// composer; unrelated names, extensions and duplicate cards remain invalid.
+const expectedName=name=>{
+    if(expected.includes(name))return name;
+    if(!ordinaryChat)return null;
+    const renamed=/^(codex-input-image-[a-f0-9]{16}) ?\([1-9][0-9]{0,5}\)(\.(?:png|jpg|gif|webp))$/.exec(name);
+    const original=renamed?renamed[1]+renamed[2]:null;
+    return original&&expected.includes(original)?original:null;
+};
 const accessibleName=el=>{
     const aria=norm(el.getAttribute('aria-label'));if(aria)return aria;
     const labelled=norm(el.getAttribute('aria-labelledby'));
@@ -927,16 +946,17 @@ const groups=[...form.querySelectorAll('[role="group"]')].filter(visible);
 const attachmentTray=form.querySelector('[data-composer-attachments]');
 const attachmentCards=attachmentTray?[...attachmentTray.querySelectorAll('[role="button"][aria-label]')].filter(visible).filter(row=>{
     const name=norm(row.getAttribute('aria-label'));
-    if(!expected.includes(name))return false;
+    if(!expectedName(name))return false;
     if(!imageOnly)return true;
     return [...row.querySelectorAll('img[alt]')].some(img=>norm(img.getAttribute('alt'))===name&&img.complete&&img.naturalWidth>0);
 }):[];
 const proofs=[...groups,...attachmentCards];
 const names=proofs.map(accessibleName).filter(Boolean);
-const counts=expected.map(name=>names.filter(actual=>actual===name).length);
+const provedNames=names.map(expectedName);
+const counts=expected.map(name=>provedNames.filter(actual=>actual===name).length);
 const matched=counts.filter(count=>count===1).length;
 const duplicate=counts.some(count=>count>1);
-const pending=proofs.filter(row=>expected.includes(accessibleName(row))).some(row=>
+const pending=proofs.filter(row=>expectedName(accessibleName(row))).some(row=>
     [...row.querySelectorAll('[aria-busy="true"],[role="progressbar"],[class*="animate-spin"]')].some(visible))
     ||!!attachmentTray&&[...attachmentTray.querySelectorAll('[aria-busy="true"],[role="progressbar"],[class*="animate-spin"]')].some(visible);
 const uploadError=!!attachmentTray&&[...attachmentTray.querySelectorAll('[role="alert"],[aria-invalid="true"],[data-upload-error="true"]')].some(visible);
