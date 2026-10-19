@@ -2328,7 +2328,7 @@ final class TaskLedger
      * @param bool $nativeControlAvailable Whether the observed native Retry can be clicked now.
      * A disabled button cannot reserve a click or prevent receipt-based page recovery.
      * @param bool $preferSamePage Caller proved a stopped, owned page with a returned Send button.
-     * @param array|null $regularRecovery Ordinary-chat-only anchored document facts; null preserves legacy policy.
+     * @param array|null $regularRecovery Ordinary-chat-only anchored document facts; stopped_thinking also requires fresh baseline IDs.
      * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool,continue?:bool,marker?:string,deadline_at?:int,regular_action?:string,state?:array,published?:bool}
      * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
      */
@@ -2347,6 +2347,8 @@ final class TaskLedger
             $epoch = $db->table('gateway_task_epochs')->where('id', $job['epoch_id'])->find();
             $binding = empty($job['mcp_binding_id']) ? null
                 : $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
+            $stoppedBeforeStart = ($regularRecovery['action'] ?? '') === 'stopped_thinking'
+                && is_array($binding) && $binding['status'] === 'awaiting_start' && !empty($binding['sent_at']);
             if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
                 || $job['operation_kind'] !== 'response' || !in_array($turn['status'], ['submitted','running'], true)
                 || (int)$turn['deadline_at'] <= time() || $surface['status'] !== 'busy'
@@ -2356,7 +2358,7 @@ final class TaskLedger
                 || (int)$turn['fencing_version'] !== $fence
                 || !is_array($task) || $task['status'] !== 'active' || $task['current_epoch_id'] !== $job['epoch_id']
                 || !is_array($epoch) || $epoch['status'] !== 'active' || $epoch['task_id'] !== $job['task_id']
-                || (!empty($job['mcp_binding_id']) && (!is_array($binding) || $binding['status'] !== 'running'
+                || (!empty($job['mcp_binding_id']) && (!is_array($binding) || ($binding['status'] !== 'running' && !$stoppedBeforeStart)
                     || $binding['current_response_id'] !== $responseId || $binding['task_id'] !== $job['task_id']
                     || $binding['turn_id'] !== $turn['id']))) {
                 throw new GatewayError('task_network_retry_unavailable', '网页重试的当前回合或页面所有权已变化。', 409);
@@ -2509,6 +2511,8 @@ final class TaskLedger
     /**
      * Advance only a drained ordinary response: Retry, short resume when recovered, or
      * exact-chat refresh and short resume before permitting a fresh-chat fallback.
+     * Explicit stopped-thinking terminals use three same-page continuations without new host progress,
+     * then the same fenced ordinary-chat replacement. Other error families keep their existing sequence.
      * Caller owns the writer transaction and has validated task, capability, deadline and document.
      * @param array $facts Current bound user/assistant IDs and document time origin; resume adds fresh baseline proof.
      * @return array One durable action, bounded wait, or a request for the separately fenced fresh-chat fallback.
@@ -2532,8 +2536,31 @@ final class TaskLedger
         // A later incident starts with Retry again, rather than discarding a healthy chat.
         if (($state['stage'] ?? '') === 'resume' && $hostCalls > (int) $state['host_calls']
             && !self::regularStreamRecoveryPending($job['id'])) $state = [];
+        $stoppedThinking = ($facts['action'] ?? '') === 'stopped_thinking';
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
-        if (($facts['action'] ?? '') === 'resume' || $resumeAfterRetry) {
+        if ($stoppedThinking) {
+            if (empty($facts['terminal']) || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
+                || !in_array($facts['user_id'], $facts['user_ids'], true) || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            $continuation = self::continuationStateUnlocked($turn['id']);
+            if (($state['stage'] ?? '') === 'replace') return array_replace($idle, ['regular_action'=>'replace','state'=>$state]);
+            if (!empty($continuation['pending']) || ($state['failure_key'] ?? '') === $failureKey) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
+            $stoppedAttempts = (int) ($state['stopped_thinking_attempts'] ?? 0);
+            if ($stoppedAttempts >= 3) {
+                if (empty($state['marker']) || ($continuation['marker'] ?? '') !== $state['marker']) {
+                    throw new GatewayError('continuation_marker_mismatch', '网页继续消息与持久化意图不一致。', 409);
+                }
+                $stage = 'replace';
+            } else {
+                $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
+                    $failureKey, $hostCalls, $idle, 'stopped_thinking_recovery');
+                if (empty($continued['continue'])) return $continued;
+                $stoppedAttempts++; $stage = 'resume';
+            }
+        } elseif (($facts['action'] ?? '') === 'resume' || $resumeAfterRetry) {
             if (($state['stage'] ?? '') === 'resume'
                 && ($state['document_nonce'] ?? '') === $surface['document_nonce']
                 && ($state['document_id'] ?? '') === $facts['document_id']
@@ -2578,7 +2605,8 @@ final class TaskLedger
             'document_nonce'=>$surface['document_nonce'], 'document_id'=>$facts['document_id'],
             'conversation_id'=>$chat['conversation_id'], 'user_id'=>$facts['user_id'],
             'assistant_id'=>$facts['assistant_id'], 'failure_key'=>$failureKey, 'host_calls'=>$hostCalls,
-            'intent_at'=>time()] + ($stage === 'resume' ? ['marker'=>$continued['marker'], 'refreshed'=>!$resumeAfterRetry]
+            'intent_at'=>time()] + ($stoppedThinking ? ['stopped_thinking_attempts'=>$stoppedAttempts] : [])
+            + ($stage === 'resume' ? ['marker'=>$continued['marker'], 'refreshed'=>$stoppedThinking ? false : !$resumeAfterRetry]
                 : ($stage === 'replace' ? ['marker'=>$state['marker']] : []));
         if ($stage === 'resume') {
             $write = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['id'])
@@ -2602,10 +2630,11 @@ final class TaskLedger
      * @param string $failureKey Hash of the owned failed-stream identity.
      * @param int $hostCalls Number of completed calls on this capability.
      * @param array $idle Default retry projection returned for a duplicate or exhausted intent.
+     * @param string $reason Internal retry family; existing stream and stopped-thinking budgets stay distinct.
      * @return array Retry projection with the reserved continuation marker or bounded wait.
      */
     private static function reserveStreamContinuationUnlocked(array $job, array $turn, array $surface,
-        array $binding, string $failureKey, int $hostCalls, array $idle): array
+        array $binding, string $failureKey, int $hostCalls, array $idle, string $reason = 'stream_recovery'): array
     {
         $previous = self::continuationStateUnlocked((string)$turn['id']);
         if (!empty($previous['pending']) || ($previous['answer_hash'] ?? '') === $failureKey) {
@@ -2614,7 +2643,9 @@ final class TaskLedger
         $attempt = (int)($previous['attempt'] ?? 0) + 1;
         // Older releases used these markers for ordinary unfinished-work follow-ups.
         // Preserve their marker sequence without counting them as failed-stream retries.
-        $streamAttempt = ($previous['reason'] ?? '') === 'stream_recovery'
+        $sameFamily = ($previous['reason'] ?? '') === $reason
+            && ($reason !== 'stopped_thinking_recovery' || $hostCalls <= (int) ($previous['host_calls'] ?? 0));
+        $streamAttempt = $sameFamily
             ? (int)($previous['stream_recovery_attempt'] ?? 0) + 1 : 1;
         if ($streamAttempt > 3) return array_replace($idle, ['exhausted'=>true,'attempt'=>3]);
         $marker = 'RCMAKER-CONTINUE-' . substr(hash('sha256', (string)$turn['id'] . "\0" . $attempt), 0, 16);
@@ -2626,7 +2657,7 @@ final class TaskLedger
             throw new GatewayError('storage_unavailable', '网页续做截止时间无法保存。', 503);
         }
         self::eventUnlocked($job['task_id'], $turn['id'], $job['id'], $surface['id'], 'task_continuation_intent', [
-            'attempt'=>$attempt,'stream_recovery_attempt'=>$streamAttempt,'reason'=>'stream_recovery','marker'=>$marker,'answer_hash'=>$failureKey,
+            'attempt'=>$attempt,'stream_recovery_attempt'=>$streamAttempt,'reason'=>$reason,'marker'=>$marker,'answer_hash'=>$failureKey,
             'activity_revision'=>(int)$binding['activity_revision'],'host_calls'=>$hostCalls,
             'no_progress_attempts'=>0,'intent_at'=>time(),'deadline_at'=>$deadline,
         ]);

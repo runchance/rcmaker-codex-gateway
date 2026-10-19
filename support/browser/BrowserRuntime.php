@@ -3339,16 +3339,40 @@ JS;
             return;
         }
         $source = ResponseJob::execution((string) $job['budget']['steering_delta']['witness_response_id']);
+        $owner = $this->taskSessions[$sessionId];
+        $savedChat = TaskWebChat::retained($job, $surface);
+        if ($savedChat && !WebModelPage::isTaskChatUrl((string) $surface['url'], self::modelUrl(),
+            'regular', (string) ($owner['web_chat']['conversation_id'] ?? ''))) {
+            $this->taskFailTurn($responseId, 'CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', true);
+            $this->releaseSteeringPreparation($responseId, $sessionId);
+            return;
+        }
+        if ($savedChat && ($owner['account_document_nonce'] ?? '') !== $surface['document_nonce']) {
+            $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, false, $deadline);
+            return;
+        }
+        $verifiedSavedChat = $savedChat && !empty($owner['web_chat']['account_key']) && !empty($owner['account_key'])
+            && hash_equals($owner['web_chat']['account_key'], $owner['account_key']);
         preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $source['prompt'], $tokens);
         $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [(string) $source['prompt']];
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
             (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface),
-            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary');
+            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat);
         $this->evaluateTaskSession($sessionId, $expression,
-            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince): void {
+            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
                     $this->releaseSteeringPreparation($responseId, $sessionId);
+                    return;
+                }
+                try {
+                    $currentSurface = TaskLedger::pollExecution($responseId)['surface'];
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    return;
+                }
+                if ($currentSurface['document_nonce'] !== $surface['document_nonce']) {
+                    Timer::add(0.25, fn() => $this->prepareSteeringSurface($responseId, $commandId, $sessionId, $deadline), null, false);
                     return;
                 }
                 if ($error === null && is_array($state) && !empty($state['owned'])) {
@@ -3495,7 +3519,7 @@ JS;
         }, 2.0);
     }
 
-    /** Verify ordinary-chat account ownership before reading or sending; retries preserve one preparation deadline. */
+    /** Verify ordinary-chat account ownership in the same document before reading or sending; retain one preparation deadline. */
     private function verifyTaskChatAccount(string $responseId, int $commandId, string $sessionId, bool $recover, float $deadline): void
     {
         $owner = $this->taskSessions[$sessionId] ?? null;
@@ -3504,12 +3528,30 @@ JS;
             $this->startTaskTurn($responseId, $commandId, $sessionId, $recover);
             return;
         }
+        try {
+            $documentNonce = TaskLedger::pollExecution($responseId)['surface']['document_nonce'];
+        } catch (GatewayError $failure) {
+            $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), $recover);
+            return;
+        }
         $this->taskCdp->send('Runtime.evaluate', ['expression' => WebModelPage::accountFingerprintExpression(),
             'returnByValue' => true, 'awaitPromise' => true], $sessionId,
-            function ($error, $result) use ($responseId, $commandId, $sessionId, $recover, $deadline, $owner): void {
+            function ($error, $result) use ($responseId, $commandId, $sessionId, $recover, $deadline, $owner, $documentNonce): void {
                 $currentOwner = $this->taskSessions[$sessionId] ?? [];
                 foreach (['response_id', 'surface_id', 'owner_incarnation', 'fencing_version'] as $key) {
                     if (($currentOwner[$key] ?? null) !== ($owner[$key] ?? null)) return;
+                }
+                try {
+                    $currentSurface = TaskLedger::pollExecution($responseId)['surface'];
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), $recover);
+                    return;
+                }
+                if ($currentSurface['document_nonce'] !== $documentNonce) {
+                    if (microtime(true) < $deadline) {
+                        Timer::add(0.25, fn() => $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, $recover, $deadline), [], false);
+                    } else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', $recover);
+                    return;
                 }
                 $account = $result['result']['value'] ?? null;
                 if ($error !== null || !is_array($account) || empty($account['verified'])) {
@@ -3524,6 +3566,7 @@ JS;
                     return;
                 }
                 $this->taskSessions[$sessionId]['account_key'] = (string) $account['account_key'];
+                $this->taskSessions[$sessionId]['account_document_nonce'] = $documentNonce;
                 if (!empty($this->taskSessions[$sessionId]['saved_chat_missing'])) {
                     try {
                         TaskWebChat::forgetDeleted($responseId, (string) $owner['owner_incarnation'], (int) $owner['fencing_version'],
@@ -8344,14 +8387,15 @@ JS;
             || empty($turn['tool_capable']) || ($turn['operation_kind'] ?? 'response') !== 'response') return false;
         $logicalId = (string) ($turn['logical_response_id'] ?? $responseId);
         $state = TaskLedger::regularStreamRecoveryState($logicalId);
-        $failed = in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true);
+        $stoppedThinking = ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING';
+        $failed = $stoppedThinking || in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true);
         if (!$failed && ($state['stage'] ?? '') !== 'retry') return false;
         // Absence of a recognized Stop alone is not a stopped-page proof.
         $retry = $snapshot['network_retry'] ?? [];
         $nativeRetry = !empty($retry['available']) && !empty($retry['failure_id']) && !empty($retry['fingerprint']);
         if (($snapshot['generation_running'] ?? null) !== false
             || (empty($snapshot['send_button_visible']) && !$nativeRetry && empty($snapshot['completion_action_visible'])
-                && !(($state['stage'] ?? '') === 'retry' && !empty($snapshot['recovery_idle_button_visible'])))
+                && !(($stoppedThinking || ($state['stage'] ?? '') === 'retry') && !empty($snapshot['recovery_idle_button_visible'])))
             || empty($snapshot['new_user_id']) || empty($snapshot['response_id'])
             || $snapshot['response_id'] !== ($turn['bound_assistant_id'] ?? '')
             || !$this->taskChatMatches($responseId, (string) ($snapshot['url'] ?? ''))) {
@@ -8374,7 +8418,7 @@ JS;
             return true;
         }
         $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression(),
-            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed): void {
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed, $stoppedThinking): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || ($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
@@ -8391,7 +8435,8 @@ JS;
                         ['user_id'=>$snapshot['new_user_id'], 'assistant_id'=>$snapshot['response_id'],
                             'document_id'=>(string) $baseline['document_id'],
                             'terminal'=>$failed || !empty($snapshot['completion_action_visible']),
-                            'action'=>!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : '',
+                            'action'=>$stoppedThinking ? 'stopped_thinking'
+                                : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : ''),
                             'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']]);
                     if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 1.0); return; }
                     if (!empty($reservation['published'])) {

@@ -550,14 +550,17 @@ JS);
      * @param bool $click False reads acknowledgement; true may click the unique semantic Stop control.
      * @param bool $requireWitness Require the exact task message even when the composer is idle.
      * @param bool $acceptedInitialUser Durable proof that the current document accepted its first user submission.
+     * @param bool $verifiedSavedChat Caller verified the exact saved chat, account, document and current owner.
      * @return string CDP expression returning ownership, composer readiness and generation state.
      */
     public static function userStopExpression(string $url, array $tokens, array $users, bool $click,
-        bool $requireWitness = false, bool $acceptedInitialUser = false, string $chatMode = 'temporary'): string
+        bool $requireWitness = false, bool $acceptedInitialUser = false, string $chatMode = 'temporary',
+        bool $verifiedSavedChat = false): string
     {
         $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users),
             'click' => $click, 'requireWitness' => $requireWitness,
-            'acceptedInitialUser' => $acceptedInitialUser, 'chatMode' => $chatMode], JSON_THROW_ON_ERROR);
+            'acceptedInitialUser' => $acceptedInitialUser, 'chatMode' => $chatMode,
+            'verifiedSavedChat' => $verifiedSavedChat], JSON_THROW_ON_ERROR);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
@@ -577,12 +580,16 @@ const initialWitness=expected.acceptedInitialUser&&expected.users.length===0&&id
 const retainedIdentityWitness=String(location.href||'')===expected.url&&(baselineWitness||initialWitness)
     &&fresh.length===1&&fresh[0]===identity
     &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
-const witness=tokenWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
+let witness=tokenWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
 const regular=sameOrigin&&expected.chatMode==='regular'&&!new URLSearchParams(location.search).has('temporary-chat')
     &&String(location.href||'')===expected.url&&/^\/(?:c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?$/i.test(location.pathname);
 const temporary=sameOrigin&&(expected.chatMode==='temporary'?temporaryChatPage(location.pathname,location.search):regular);
 if(!temporary)return {owned:false,page_invalid:true,generation_running:false,editor_ready:!!composer,stopped:false};
+// A persisted ordinary conversation can contain several accepted incremental/continuation
+// messages after its first physical response. Its freshly verified account/UUID ownership
+// is authoritative; the original token need not be repeated in its latest user bubble.
+if(regular&&expected.verifiedSavedChat&&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||''))witness=true;
 const owned=String(location.href||'')===expected.url||witness;
 const stops=[...document.querySelectorAll('[data-testid="stop-button"]')].filter(visible);
 if(stops.length>1)return {owned:false,generation_running:true,editor_ready:!!composer,stopped:false};
