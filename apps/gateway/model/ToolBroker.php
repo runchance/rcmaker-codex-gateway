@@ -17,6 +17,22 @@ final class ToolBroker
         'codex_tool_inventory', 'codex_tool_call', 'codex_context_read', 'codex_work_update', 'codex_turn_complete',
     ];
 
+    /** @return list<string> Reserved bridge operations excluded from direct and nested host registries. */
+    public static function bridgeToolNames(): array
+    {
+        return self::BRIDGE_NAMES;
+    }
+
+    /** @param string $name Native or normalized registry name. @return bool Whether it recursively calls a Codex bridge. */
+    public static function isBridgeToolName(string $name): bool
+    {
+        $normalized = str_replace(['.', ':', '/', '-', ' '], '_', $name);
+        foreach (self::BRIDGE_NAMES as $bridge) {
+            if ($normalized === $bridge || str_ends_with($normalized, '_' . $bridge)) return true;
+        }
+        return str_starts_with($name, 'mcp__rcmaker_codex__');
+    }
+
     /**
      * Resolve the exact Connector selected when this durable response acquired its MCP binding.
      * Recovery and page retries must not substitute a later global settings name. The scope
@@ -576,9 +592,11 @@ final class ToolBroker
      * both paths. The caller must already own Schema::transaction().
      *
      * @param bool $missingSurface True only after an authoritative browser snapshot proves loss.
+     * @param bool $newOrdinaryChat Explicit staged recovery must rebuild the entire logical history.
      * @return array{binding_id:string,prompt:string,job_fields:array}|null
      */
-    public static function rotateNoStartRetryUnlocked(string $responseId, string $prompt, bool $missingSurface = false): ?array
+    public static function rotateNoStartRetryUnlocked(string $responseId, string $prompt, bool $missingSurface = false,
+        bool $newOrdinaryChat = false): ?array
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $binding = $db->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
@@ -596,7 +614,8 @@ final class ToolBroker
         if (!is_array($job)) throw new GatewayError('response_not_found', '任务恢复源记录不存在。', 404);
         $environment = json_decode($binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
         $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
-        $transport = (string)($job['transport_context_json'] ?? $job['context_json']);
+        if ($newOrdinaryChat) unset($budget['regular_chat'], $budget['steering_delta'], $budget['postcompact_page']);
+        $transport = (string)($newOrdinaryChat ? $job['context_json'] : ($job['transport_context_json'] ?? $job['context_json']));
         $context = json_decode($transport, true, 128, JSON_THROW_ON_ERROR);
         if (!empty($context['continuation'])) {
             // Legacy records may have persisted only an exact-prefix suffix. A fresh page
@@ -1020,6 +1039,13 @@ final class ToolBroker
                 ];
             }
             $currentResponseId = (string) $binding['current_response_id'];
+            if (TaskLedger::regularStreamRecoveryPending($currentResponseId)) {
+                // Regeneration may invent a new call_key for an already completed effect.
+                // Only exact existing IDs above may reuse receipts until the gateway's
+                // same-chat resume contract is visibly accepted.
+                return ['ok'=>true, 'paused'=>true,
+                    'instruction'=>'The gateway is reconciling this stopped Web response. This new action was not registered or executed. Existing call_id receipts remain available. Do not create replacement actions or claim completion; end this recovery response and wait for the gateway resume message.'];
+            }
             $turn = $db->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
             if (is_array($turn) && ($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
                 return ['ok' => true, 'paused' => true,
@@ -2573,11 +2599,13 @@ final class ToolBroker
         return $row;
     }
 
+    /** Acquire the existing completion fence only after any ordinary recovery resume is accepted. */
     private static function beginCompletionFenceUnlocked(array $binding, bool $allowOwnerWithoutMcpClaim): ?int
     {
         if ((string) $binding['status'] === 'completed') {
             return (int) ($binding['completion_revision'] ?? $binding['activity_revision']);
         }
+        if (TaskLedger::regularStreamRecoveryPending((string) $binding['current_response_id'])) return null;
         self::assertCompletionEligibleUnlocked($binding, $allowOwnerWithoutMcpClaim);
         $requiredToolCount = (int) ($binding['required_tool_count'] ?? (!empty($binding['requires_tool_call']) ? 1 : 0));
         if (self::invocationCountUnlocked((string) $binding['id']) < $requiredToolCount) {
@@ -2587,6 +2615,7 @@ final class ToolBroker
         return (int) $binding['activity_revision'];
     }
 
+    /** Commit immutable completion only for the same drained capability and accepted recovery phase. */
     private static function commitCompletionFenceUnlocked(array $binding, int $revision, string $finalAnswer, bool $allowOwnerWithoutMcpClaim): bool
     {
         $hash = hash('sha256', $finalAnswer);
@@ -2594,6 +2623,7 @@ final class ToolBroker
             if (hash_equals((string) ($binding['completion_hash'] ?? ''), $hash)) return true;
             throw new GatewayError('completion_conflict', '同一回合已提交不同的最终答案。', 409);
         }
+        if (TaskLedger::regularStreamRecoveryPending((string) $binding['current_response_id'])) return false;
         self::assertCompletionEligibleUnlocked($binding, $allowOwnerWithoutMcpClaim);
         $requiredToolCount = (int) ($binding['required_tool_count'] ?? (!empty($binding['requires_tool_call']) ? 1 : 0));
         if (self::invocationCountUnlocked((string) $binding['id']) < $requiredToolCount) {
@@ -2847,11 +2877,7 @@ final class ToolBroker
     {
         $wire = (string) ($tool['wire_name'] ?? '');
         $name = ltrim((string) ($tool['name'] ?? ''), '_');
-        if (in_array($name, self::BRIDGE_NAMES, true) || str_starts_with($wire, 'mcp__rcmaker_codex__')) return true;
-        foreach (self::BRIDGE_NAMES as $bridge) {
-            if ($wire === $bridge || str_ends_with($wire, '__' . $bridge) || str_ends_with($wire, '___' . $bridge)) return true;
-        }
-        return false;
+        return self::isBridgeToolName($name) || self::isBridgeToolName($wire);
     }
 
     /** Show real host tools and unrelated connectors; never expose a bridge namespace back to itself. */
@@ -3135,6 +3161,7 @@ final class ToolBroker
             . 'Inside exec, use awaited Promise.allSettled for small groups of independent reads, searches or independent tests when their tool descriptions permit concurrency. '
             . 'Keep dependencies, approvals, shared browser interactions and edits to the same files sequential. Respect every tool-specific ordering rule. '
             . 'Use only tools actually advertised by that exec registry and only for this task and its authorized workspace; never borrow another task, token, session or page. '
+            . 'Never discover or call another Codex bridge or RCMAKER connector from exec, including codex_exec/codex_tool_call under another integration name. For local commands use the native exec_command tool. These bridge operations are excluded from both ALL_TOOLS and tools. '
             . 'Label and emit each operation result using the native output helpers; inspect both rejected promises and nonzero command exit codes. '
             . 'Preserve successful results when a sibling fails. Do not rerun the whole batch, or retry an accepted operation whose result is pending or unknown. '
             . 'For a yielded exec, use its exact native continuation handle and advertised wait tool until it settles; do not create a replacement exec. '

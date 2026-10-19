@@ -29,6 +29,7 @@
     };
     const eventLabels = {
         browser_response_transport: I18n.t('网页回答流状态'),
+        regular_stream_recovery_intent: I18n.t('普通对话异常恢复已排队'),
         browser_observation_delayed: I18n.t('页面暂时繁忙，等待原请求结果'),
         surface_reserved: I18n.t('已为任务预留页面'), response_round_queued: I18n.t('Response Round 已登记'),
         tool_result_round_queued: I18n.t('工具结果 Round 已登记'), submit_intent: I18n.t('发送意图已持久化'),

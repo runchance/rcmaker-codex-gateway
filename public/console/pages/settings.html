@@ -40,7 +40,7 @@
             <div class="field settings-confirmation-option">
                 <input id="steering-full-context" type="checkbox" title="插话时全量重发上下文">
                 <p class="muted">默认关闭：已受理工具结清后，停止原页生成并发送新增需求和必要回执。开启后沿用全量重发。重启、原页丢失或异常时，仍可验证完整上下文与准确回执后恢复。</p>
-                <p class="muted">此开关用于临时模式。普通模式始终重新打开绑定的网页对话，仅发送新增需求和必要回执，不重发已保存的历史。</p>
+                <p class="muted">此开关用于临时模式。普通模式优先复用绑定对话；仅在网页重试和原对话刷新续做均失败后，才隔离旧页并用完整上下文及准确工具回执建立新对话。</p>
             </div>
             <div class="field settings-confirmation-option">
                 <input id="official-handoff-summary" type="checkbox" title="切换到 Web 时使用官方模型生成交接摘要">

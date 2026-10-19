@@ -1769,6 +1769,8 @@ final class TaskLedger
      * Temporary Chat is retained as a retired surface so the normal cleanup path can close it.
      * ToolBroker rotates the capability token in the same SQLite transaction, invalidating any
      * late request from the completed browser page before a fresh prompt can be submitted.
+     * Ordinary chats permit this replacement only after their persisted retry/refresh/resume
+     * sequence failed; healthy saved chats and unknown/pending host effects remain protected.
      *
      * @return array{retry:bool,exhausted:bool,attempt:int,old_surface_id?:string,new_surface_id?:string,generation_id?:string,binding_id?:?string}
      */
@@ -1786,8 +1788,23 @@ final class TaskLedger
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
             $chat = TaskWebChat::state((string) $turn['task_id']);
-            if ($chat['mode'] === 'regular') {
+            $regularRecovery = $chat['mode'] === 'regular' && $missingSurface
+                && $retryCause === 'regular_stream_recovery_exhausted';
+            if ($chat['mode'] === 'regular' && !$regularRecovery) {
                 return ['retry' => false, 'exhausted' => false, 'attempt' => 0];
+            }
+            if ($regularRecovery) {
+                $recovery = self::regularStreamRecoveryState($responseId);
+                $continuation = self::continuationStateUnlocked((string) $turn['id']);
+                if (($recovery['stage'] ?? '') !== 'replace' || empty($recovery['marker'])
+                    || ($continuation['marker'] ?? '') !== $recovery['marker'] || !empty($continuation['pending'])
+                    || ($recovery['conversation_id'] ?? '') !== ($chat['conversation_id'] ?? '')
+                    || ($recovery['document_nonce'] ?? '') !== $surface['document_nonce']) {
+                    return ['retry' => false, 'exhausted' => false, 'attempt' => 0];
+                }
+                if (self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                    return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0, 'waiting'=>true];
+                }
             }
             if ($maxRetries < 1
                 || in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS', 'CODEX_USER_STOPPED'], true)
@@ -1819,9 +1836,20 @@ final class TaskLedger
                 ? ToolBroker::prepareReadOnlyCompactionReplayUnlocked($job, true)
                 : ($missingSurface && empty($job['mcp_binding_id'])
                 ? ContextRecovery::prepareUnboundReplayUnlocked($job)
-                : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface));
+                : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface, $regularRecovery));
             if (!is_array($rotated)) {
                 return ['retry' => false, 'exhausted' => false, 'attempt' => (int) $attempts];
+            }
+            if ($regularRecovery) {
+                // A network recovery is the explicit exception to saved-chat reuse. Keep the
+                // account pin, retire the old surface below, and bind only a witnessed new chat.
+                $released = $db->table('gateway_task_web_chats')->where('task_id', $turn['task_id'])
+                    ->where('conversation_id', $chat['conversation_id'])->where('account_key', $chat['account_key'])
+                    ->update(['conversation_id'=>null, 'updated_at'=>time()]);
+                if (!$released || $released->rowCount() !== 1) {
+                    throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+                }
+                $rotated['prompt'] = TaskWebChat::withInitialBindingMarker($rotated['prompt'], $responseId, $turn['task_id']);
             }
 
             $epoch = $db->table('gateway_task_epochs')->where('id', (string) $turn['epoch_id'])->find();
@@ -2296,17 +2324,18 @@ final class TaskLedger
      * @param bool $nativeControlAvailable Whether the observed native Retry can be clicked now.
      * A disabled button cannot reserve a click or prevent receipt-based page recovery.
      * @param bool $preferSamePage Caller proved a stopped, owned page with a returned Send button.
-     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool,continue?:bool,marker?:string,deadline_at?:int}
+     * @param array|null $regularRecovery Ordinary-chat-only anchored document facts; null preserves legacy policy.
+     * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool,continue?:bool,marker?:string,deadline_at?:int,regular_action?:string,state?:array,published?:bool}
      * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
      */
     public static function reserveTaskNetworkRetry(string $responseId, string $incarnation,
         int $fence, string $documentNonce, string $failureKey, bool $nativeControlAvailable = true,
-        bool $preferSamePage = false): array
+        bool $preferSamePage = false, ?array $regularRecovery = null): array
     {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $failureKey) !== 1) {
             throw new GatewayError('task_network_retry_invalid', '网页网络重试标识无效。', 400);
         }
-        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey, $nativeControlAvailable, $preferSamePage): array {
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey, $nativeControlAvailable, $preferSamePage, $regularRecovery): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
@@ -2329,8 +2358,13 @@ final class TaskLedger
                 throw new GatewayError('task_network_retry_unavailable', '网页重试的当前回合或页面所有权已变化。', 409);
             }
             $idle = ['retry'=>false,'waiting'=>false,'exhausted'=>false,'attempt'=>0];
+            if ($regularRecovery !== null && self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
             // Native regeneration must never rewrite final text already committed to Codex.
-            if (!empty($job['output_started']) || (string)$job['output_text'] !== '') return $idle;
+            if (!empty($job['output_started']) || (string)$job['output_text'] !== '') {
+                return $regularRecovery === null ? $idle : array_replace($idle, ['published'=>true]);
+            }
             $calls = $db->table('gateway_tool_invocations')->where('task_id', $job['task_id'])->select();
             $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $job['task_id'])->select();
             if (!is_array($calls) || !is_array($bindings)) {
@@ -2395,6 +2429,11 @@ final class TaskLedger
                 }
             }
             if ($waiting) return array_replace($idle, ['waiting'=>true]);
+            if ($regularRecovery !== null) {
+                if (!$allReceiptsDelivered) return array_replace($idle, ['waiting'=>true]);
+                return self::reserveRegularStreamRecoveryUnlocked($job, $turn, $surface, $binding,
+                    $failureKey, $nativeControlAvailable, $currentCompletedCalls, $regularRecovery, $idle);
+            }
             if ($preferSamePage && $allReceiptsDelivered && $currentCompletedCalls > 0) {
                 return self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
                     $failureKey, $currentCompletedCalls, $idle);
@@ -2417,6 +2456,137 @@ final class TaskLedger
                     'document_nonce'=>$documentNonce,'operation_kind'=>'response']);
             return array_replace($idle, ['retry'=>true,'attempt'=>$attempts+1]);
         });
+    }
+
+    /**
+     * Read the current generation's ordinary-chat recovery intent, including after restart.
+     * @param string $responseId Current logical response; historical generations never authorize actions.
+     * @return array Persisted phase/ownership facts, or an empty state for legacy and temporary turns.
+     * @throws GatewayError If recovery storage cannot be read.
+     */
+    public static function regularStreamRecoveryState(string $responseId): array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('durable_turn_id,generation_id');
+        if ($job === false) throw new GatewayError('storage_unavailable', 'Web recovery state is temporarily unavailable.', 503);
+        if (!is_array($job) || empty($job['durable_turn_id'])) return [];
+        $row = $db->table('gateway_task_events')->where('turn_id', $job['durable_turn_id'])
+            ->where('event_type', 'regular_stream_recovery_intent')->order([['id','DESC']])->limit(1)->find('data_json');
+        if ($row === false) throw new GatewayError('storage_unavailable', 'Web recovery state is temporarily unavailable.', 503);
+        $state = is_array($row) ? json_decode((string) $row['data_json'], true, 32, JSON_THROW_ON_ERROR) : [];
+        return ($state['generation_id'] ?? null) === $job['generation_id'] ? $state : [];
+    }
+
+    /**
+     * Fence new host actions during native regeneration and refresh; old call IDs still return receipts.
+     * @param string $responseId Capability's current response. @return bool True until the exact resume message is accepted.
+     * @throws GatewayError On unavailable recovery or continuation storage.
+     */
+    public static function regularStreamRecoveryPending(string $responseId): bool
+    {
+        $state = self::regularStreamRecoveryState($responseId);
+        if ($state === []) return false;
+        if (($state['stage'] ?? '') !== 'resume') return true;
+        $continuation = self::continuationState($responseId);
+        return ($continuation['marker'] ?? '') !== ($state['marker'] ?? '') || !empty($continuation['pending']);
+    }
+
+    /** A queued human update or explicit stop always takes priority over automated ordinary recovery. */
+    private static function regularRecoveryHumanUpdatePendingUnlocked(array $job, array $turn): bool
+    {
+        if (in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)) return true;
+        $updates = self::pendingOperationalContextUnlocked($job);
+        foreach ($updates['messages'] as $message) {
+            if (($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Advance only a drained ordinary response: Retry, short resume when recovered, or
+     * exact-chat refresh and short resume before permitting a fresh-chat fallback.
+     * Caller owns the writer transaction and has validated task, capability, deadline and document.
+     * @param array $facts Current bound user/assistant IDs and document time origin; resume adds fresh baseline proof.
+     * @return array One durable action, bounded wait, or a request for the separately fenced fresh-chat fallback.
+     * @throws GatewayError On changed chat/account/ownership or unavailable storage.
+     */
+    private static function reserveRegularStreamRecoveryUnlocked(array $job, array $turn, array $surface,
+        ?array $binding, string $failureKey, bool $nativeControl, int $hostCalls, array $facts, array $idle): array
+    {
+        $chat = TaskWebChat::state((string) $job['task_id']);
+        if ($chat['mode'] !== 'regular' || empty($chat['conversation_id']) || empty($chat['account_key'])
+            || !is_array($binding) || empty($facts['user_id']) || empty($facts['assistant_id'])
+            || !is_string($facts['document_id'] ?? null) || $facts['document_id'] === '') {
+            throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+        }
+        $state = self::regularStreamRecoveryState($job['id']);
+        if ($state !== [] && (($state['surface_id'] ?? '') !== $surface['id']
+            || ($state['conversation_id'] ?? '') !== $chat['conversation_id'])) {
+            throw new GatewayError('surface_fence_lost', 'Web recovery ownership changed.', 409);
+        }
+        // New, completed host work proves the preceding recovery resumed real execution.
+        // A later incident starts with Retry again, rather than discarding a healthy chat.
+        if (($state['stage'] ?? '') === 'resume' && $hostCalls > (int) $state['host_calls']
+            && !self::regularStreamRecoveryPending($job['id'])) $state = [];
+        $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
+        if (($facts['action'] ?? '') === 'resume' || $resumeAfterRetry) {
+            if (($state['stage'] ?? '') === 'resume'
+                && ($state['document_nonce'] ?? '') === $surface['document_nonce']
+                && ($state['document_id'] ?? '') === $facts['document_id']
+                && ($resumeAfterRetry ? empty($state['refreshed'])
+                    : hash_equals($chat['account_key'], (string) ($facts['account_key'] ?? '')))) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
+            $validResume = $resumeAfterRetry
+                ? ($state['stage'] ?? '') === 'retry' && $state['document_id'] === $facts['document_id']
+                    && $state['user_id'] === $facts['user_id'] && !empty($facts['terminal'])
+                : ($state['stage'] ?? '') === 'refresh' && $state['document_id'] !== $facts['document_id']
+                    && hash_equals($chat['account_key'], (string) ($facts['account_key'] ?? ''))
+                    && $state['user_id'] === $facts['user_id'] && $state['assistant_id'] === $facts['assistant_id'];
+            if (!$validResume) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding, $failureKey, $hostCalls, $idle);
+            if (empty($continued['continue'])) return $continued;
+            $stage = 'resume';
+        } elseif (($state['stage'] ?? '') === 'resume') {
+            $continuation = self::continuationStateUnlocked($turn['id']);
+            if (!empty($continuation['pending'])) return array_replace($idle, ['waiting'=>true]);
+            $stage = !empty($state['refreshed']) ? 'replace' : 'refresh';
+        } elseif (($state['stage'] ?? '') === 'replace') {
+            return array_replace($idle, ['regular_action'=>'replace', 'state'=>$state]);
+        } elseif (($state['stage'] ?? '') === 'refresh') {
+            return array_replace($idle, ['regular_action'=>'refresh', 'state'=>$state]);
+        } elseif (($state['stage'] ?? '') === 'retry') {
+            if ($state['user_id'] !== $facts['user_id'] || $state['document_id'] !== $facts['document_id']) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            // A lost click acknowledgement must never click twice. Give an unchanged stopped
+            // card two minutes; a new owned failure/terminal response can advance immediately.
+            if (($state['failure_key'] === $failureKey || empty($facts['terminal'])) && time() - (int) $state['intent_at'] < 120) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
+            $stage = 'refresh';
+        } else {
+            $stage = $nativeControl ? 'retry' : 'refresh';
+        }
+        $state = ['stage'=>$stage, 'generation_id'=>$job['generation_id'], 'surface_id'=>$surface['id'],
+            'document_nonce'=>$surface['document_nonce'], 'document_id'=>$facts['document_id'],
+            'conversation_id'=>$chat['conversation_id'], 'user_id'=>$facts['user_id'],
+            'assistant_id'=>$facts['assistant_id'], 'failure_key'=>$failureKey, 'host_calls'=>$hostCalls,
+            'intent_at'=>time()] + ($stage === 'resume' ? ['marker'=>$continued['marker'], 'refreshed'=>!$resumeAfterRetry]
+                : ($stage === 'replace' ? ['marker'=>$state['marker']] : []));
+        if ($stage === 'resume') {
+            $write = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['id'])
+                ->where('generation_id', $job['generation_id'])->update([
+                    'submitted_document_nonce'=>$surface['document_nonce'],
+                    'baseline_users_json'=>json_encode($facts['user_ids'], JSON_THROW_ON_ERROR),
+                    'baseline_assistants_json'=>json_encode($facts['assistant_ids'], JSON_THROW_ON_ERROR),
+                ]);
+            if (!$write || $write->rowCount() !== 1) throw new GatewayError('surface_fence_lost', 'Web recovery ownership changed.', 409);
+        }
+        self::eventUnlocked($job['task_id'], $turn['id'], $job['id'], $surface['id'], 'regular_stream_recovery_intent', $state);
+        return array_replace($idle, $stage === 'resume' ? $continued : [], ['regular_action'=>$stage, 'state'=>$state]);
     }
 
     /**

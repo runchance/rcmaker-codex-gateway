@@ -1024,10 +1024,12 @@ JS));
      * @param string $continuationMarker Exact current continuation marker, or empty for initial work.
      * @param string $boundResponseId Previously observed assistant identity; empty before first binding.
      * @param bool $legacyCitations Preserve bytes when resuming a generation with already published old citation markup.
+     * @param bool $regularRecovery Accept an owned native stream-error Retry card in ordinary mode only.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
-        string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false, string $initialBindingMarker = ''): string
+        string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false,
+        string $initialBindingMarker = '', bool $regularRecovery = false): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1093,6 +1095,9 @@ const endComposer=visibleOne(COMPOSER);
 const endSend=endComposer?composerSendButtons(endComposer):[];
 const sendButtonVisible=endSend.length===1&&endSend[0].getAttribute('data-testid')!=='stop-button'
     &&!/^(?:Stop|Stop generating|停止|停止生成)$/i.test(String(endSend[0].getAttribute('aria-label')||'').trim());
+const recoveryIdleButtonVisible=__REGULAR_RECOVERY__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length===1
+    &&!!endComposer?.closest('form')&&[...endComposer.closest('form').querySelectorAll('button[aria-label]')].filter(visible)
+        .some(button=>/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(String(button.getAttribute('aria-label')||'').trim()));
 let markdown='';let markdownSegments=[];let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;let transportRecoveryVisible=false;
 if(answer){
     responsePresent=true;
@@ -1326,7 +1331,7 @@ const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(can
     if(currentTurn)return currentTurn.contains(candidate);
     return newUser?after(newUser.el,candidate):false;
 });
-const networkCard=networkErrorCard(newUser,answer);
+const networkCard=networkErrorCard(newUser,answer,__REGULAR_RECOVERY__);
 const networkRetry=networkCard?.descriptor||null;
 if(networkCard)error={code:'CHATGPT_NETWORK_ERROR',message:'ChatGPT 当前回答出现网络错误，页面提供重试。'};
 else if(stoppedThinkingVisible)error={code:'CHATGPT_STOPPED_THINKING',message:'ChatGPT 已停止思考，当前回答不能确认为完成。'};
@@ -1334,11 +1339,11 @@ else if(/your session has expired|你的工作階段已過期|您的工作階段
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
 JS;
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__'],
-            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound, $initialBinding],
+            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__'],
+            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound, $initialBinding, $regularRecovery ? 'true' : 'false'],
             $body
         ), $legacyCitations);
     }
@@ -1364,7 +1369,7 @@ const user=expected.user_id?users.find(entry=>entry.id===expected.user_id):null;
 const answer=expected.response_id?assistants.find(entry=>entry.id===expected.response_id):null;
 if((expected.user_id&&!user)||(expected.response_id&&!answer))return {clicked:false,code:'response_changed'};
 if((user&&users.at(-1)?.id!==user.id)||(answer&&assistants.at(-1)?.id!==answer.id))return {clicked:false,code:'response_changed'};
-const card=networkErrorCard(user,answer);
+const card=networkErrorCard(user,answer,expected.allow_message_stream===true);
 if(!card||card.descriptor.fingerprint!==expected.fingerprint
     ||card.descriptor.failure_id!==expected.failure_id)return {clicked:false,code:'error_changed'};
 if(!card.descriptor.available)return {clicked:false,code:'retry_unavailable'};
@@ -1674,7 +1679,7 @@ const promotedAssistant=(assistants,beforeAssistants,boundId,sameGroupId)=>{
 // and sole non-navigation retry action, independently of its localized timeout/error text.
 // Keep the old renderer's complete labels as a compatibility fallback, never as prose tests.
 // Keep the observed latest response identity, including grouped agent turns, as the UI boundary.
-const networkErrorCard=(user,answer)=>{
+const networkErrorCard=(user,answer,allowMessageStream=false)=>{
     const stateKey=Symbol.for('rcmaker.network.error.observation');
     const state=window[stateKey]||(window[stateKey]={card:null,sequence:0,failureId:''});
     if(generationStop()||(!user&&!answer)){state.card=null;return null;}
@@ -1716,12 +1721,14 @@ const networkErrorCard=(user,answer)=>{
             &&buttons[0].getAttribute('type')==='button'
             &&!card.querySelector('a[href],input,select,textarea,[contenteditable="true"]');
         const legacyLabel=/^(?:A network error occurred[.!]?\s*Please check your connection and try again[.!]?|Network error[.!]?|发生网络错误[。！]?\s*请检查(?:你的|您的)?(?:网络)?连接(?:，|,)?(?:然后)?(?:重试|再试一次)[。！]?|网络错误[。！]?(?:\s*请检查(?:你的|您的)?(?:网络)?连接(?:，|,)?(?:然后)?(?:重试|再试一次)[。！]?)?)$/i.test(label);
-        if(!nativeRetryShell&&!legacyLabel)return null;
+        const streamLabel=allowMessageStream&&/^(?:消息流中的错误|訊息串流發生錯誤|Error in message stream|Error in the message stream)(?:\s|$)/i.test(label);
+        if(!nativeRetryShell&&!legacyLabel&&!streamLabel)return null;
         const button=buttons.length===1&&(nativeRetryShell||/^(?:Retry|Try again|重试|重試|再试一次|再試一次)$/i.test(
             norm(buttons[0].getAttribute('aria-label')||buttons[0].textContent)))?buttons[0]:null;
         const buttonLabel=button?norm(button.getAttribute('aria-label')||button.textContent):'';
         const descriptor={user_id:user?.id||'',response_id:answer?.id||'',label,button_label:buttonLabel,
             available:!!button&&!button.disabled&&button.getAttribute('aria-disabled')!=='true'};
+        if(allowMessageStream)descriptor.allow_message_stream=true;
         descriptor.fingerprint=JSON.stringify([descriptor.user_id,descriptor.response_id,label,buttonLabel]);
         return {card,button,descriptor};
     }).filter(Boolean);

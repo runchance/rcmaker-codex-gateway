@@ -453,6 +453,9 @@ final class McpProtocol
         if (!is_string($wireName) || !preg_match('/\A[A-Za-z0-9_$\.:-]{1,1000}\z/', $wireName)) {
             throw new GatewayError('tool_name_invalid', 'wire_name 格式无效。');
         }
+        if (ToolBroker::isBridgeToolName($wireName)) {
+            throw new GatewayError('recursive_tool_denied', '工具桥不能递归调用自身。', 400);
+        }
         if ($wireName === 'codex.control.wait_result') {
             // Receipt-only continuation must not claim a turn, discover tools or
             // register another invocation. Retired receipt checks remain in ToolBroker.
@@ -995,7 +998,7 @@ AWK;
         ]);
     }
 
-    /** Preserve exec resource/yield hints while bounding nested agent waits before the host. */
+    /** Preserve exec hints, bound agent waits and exclude recursive bridges from both nested discovery and invocation. */
     private static function transportBoundRawExecProgram(string $input, string $blockedExecName): string
     {
         $pragma = '';
@@ -1007,19 +1010,22 @@ AWK;
         $blockedName = json_encode($blockedExecName, JSON_THROW_ON_ERROR);
         $pollMs = self::AGENT_WAIT_POLL_MS;
         return $pragma . implode("\n", [
-            'await (async (tools) => {',
+            'await (async (tools, ALL_TOOLS) => {',
             $input,
-            '})((() => {',
+            '})(...(() => {',
             '  const source = tools;',
+            self::bridgeRegistryGuardProgram(),
             '  const waitNames = new Set(' . $waitNames . ');',
             '  const blockedExecName = ' . $blockedName . ';',
             '  const pollMs = ' . $pollMs . ';',
-            '  const registryNames = new Set(Reflect.ownKeys(source));',
+            '  const registryNames = new Set(Reflect.ownKeys(source).filter(name => !isBridge(name)));',
+            '  const registry = typeof ALL_TOOLS !== "undefined" && Array.isArray(ALL_TOOLS) ? ALL_TOOLS.filter(tool => !isBridge(tool?.name)) : [];',
             '  if (typeof ALL_TOOLS !== "undefined" && Array.isArray(ALL_TOOLS)) {',
-            '    for (const tool of ALL_TOOLS) if (typeof tool?.name === "string") registryNames.add(tool.name);',
+            '    for (const tool of registry) if (typeof tool?.name === "string") registryNames.add(tool.name);',
             '  }',
             '  const wrappers = new Map();',
             '  const expose = name => {',
+            '    if (isBridge(name)) return async () => { throw new Error("Recursive Codex bridge calls are unavailable inside ChatGPT Web exec; use the native host tools for this task"); };',
             '    if (wrappers.has(name)) return wrappers.get(name);',
             '    const value = Reflect.get(source, name, source);',
             '    let exposed = value;',
@@ -1038,12 +1044,12 @@ AWK;
             '    wrappers.set(name, exposed);',
             '    return exposed;',
             '  };',
-            '  return new Proxy(Object.create(null), {',
+            '  const scopedTools = new Proxy(Object.create(null), {',
             '    get: (_target, name) => expose(name),',
-            '    has: (_target, name) => registryNames.has(name) || Reflect.has(source, name),',
+            '    has: (_target, name) => !isBridge(name) && (registryNames.has(name) || Reflect.has(source, name)),',
             '    ownKeys: () => [...registryNames],',
             '    getOwnPropertyDescriptor: (_target, name) =>',
-            '      registryNames.has(name) || Reflect.has(source, name)',
+            '      !isBridge(name) && (registryNames.has(name) || Reflect.has(source, name))',
             '        ? { configurable: true, enumerable: true, writable: false, value: expose(name) }',
             '        : undefined,',
             '    set: () => false,',
@@ -1053,8 +1059,18 @@ AWK;
             '    getPrototypeOf: () => null,',
             '    preventExtensions: () => false,',
             '  });',
+            '  return [scopedTools, Object.freeze(registry)];',
             '})());',
         ]);
+    }
+
+    /** One bridge-name predicate for raw exec and deferred registry discovery; no connector-specific names. */
+    private static function bridgeRegistryGuardProgram(): string
+    {
+        return 'const bridgeNames = ' . json_encode(ToolBroker::bridgeToolNames(), JSON_THROW_ON_ERROR) . ';'
+            . 'const isBridge = name => typeof name === "string" && (name.startsWith("mcp__rcmaker_codex__")'
+            . ' || bridgeNames.some(bridge => { const normalized = name.replace(/[.:\/ -]/g, "_");'
+            . ' return normalized === bridge || normalized.endsWith("_" + bridge); }));';
     }
 
     /** Emit one identified registry page, without executing any discovered tool. */
@@ -1066,6 +1082,7 @@ AWK;
             '// @exec: {"max_output_tokens": ' . self::NESTED_CATALOG_MAX_OUTPUT_TOKENS . '}',
             'if (!Array.isArray(ALL_TOOLS)) throw new Error("Native nested tool registry is unavailable");',
             'const excluded = new Set(' . $excludedJson . ');',
+            self::bridgeRegistryGuardProgram(),
             'const search = ' . $search . ';',
             'const matchScore = tool => {',
             '  const name = tool.name.toLowerCase();',
@@ -1083,7 +1100,7 @@ AWK;
             '  return score;',
             '};',
             'const matches = ALL_TOOLS.filter(tool => typeof tool?.name === "string"',
-            '  && /^[A-Za-z0-9_$]+$/.test(tool.name) && !excluded.has(tool.name))',
+            '  && /^[A-Za-z0-9_$]+$/.test(tool.name) && !excluded.has(tool.name) && !isBridge(tool.name))',
             '  .map((tool, index) => ({name:tool.name,',
             '    description:typeof tool.description === "string" ? tool.description : "", index}))',
             '  .map(tool => ({...tool, score:matchScore(tool)}))',

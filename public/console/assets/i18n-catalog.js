@@ -1136,7 +1136,13 @@ window.GatewayTranslations = {
     "任务页面与绑定的网页对话不匹配，结果未知且不会自动重发。": "The task page does not match its bound Web conversation; its outcome is unknown and it will not resend automatically.",
     "源回答已结束，但原任务对话页面已变化；原上下文仍保留。": "The source answer ended but its task conversation changed; the original context is retained.",
     "源回答已结束，但原任务对话未进入可发送检查点的状态；原上下文仍保留。": "The source answer ended but its task conversation is not ready for a checkpoint message; the original context is retained.",
-    "此开关用于临时模式。普通模式始终重新打开绑定的网页对话，仅发送新增需求和必要回执，不重发已保存的历史。": "This preference applies to Temporary Chat. Ordinary mode always reopens its bound Web conversation and sends only new instructions and required receipts, without replaying saved history.",
+    "此开关用于临时模式。普通模式优先复用绑定对话；仅在网页重试和原对话刷新续做均失败后，才隔离旧页并用完整上下文及准确工具回执建立新对话。": "This preference applies to Temporary Chat. Ordinary mode reuses its bound chat first. Only after native retry and refreshing/resuming that chat fail does it isolate the old page and restore complete context and exact tool receipts in a new chat.",
     "切换到普通模式后，已有临时任务会在下次续发时，用完整上下文初始化独立的普通对话；已受理工具先结清。绑定后仅发送新增需求，已有普通绑定继续保留。": "After switching to ordinary mode, an existing temporary task initializes its own ordinary chat with the complete context on its next continuation, after accepted tools settle. Once bound, it sends only new instructions. Existing ordinary bindings are retained.",
-    "临时对话未能找到插件，普通对话已通过连接器验证，现已自动切换为普通模式。新任务和后续检测使用普通对话；已有临时任务下次续发时完整初始化一次，之后只发新增需求。网页记录保存在 ChatGPT 历史中。": "The plugin was not found in Temporary Chat. An ordinary chat passed connector verification, so ordinary mode was saved automatically. New tasks and checks use ordinary chats. Existing temporary tasks initialize their own ordinary chat once with the complete context on their next continuation, then send only new instructions. Web conversations are saved in ChatGPT history."
+    "临时对话未能找到插件，普通对话已通过连接器验证，现已自动切换为普通模式。新任务和后续检测使用普通对话；已有临时任务下次续发时完整初始化一次，之后只发新增需求。网页记录保存在 ChatGPT 历史中。": "The plugin was not found in Temporary Chat. An ordinary chat passed connector verification, so ordinary mode was saved automatically. New tasks and checks use ordinary chats. Existing temporary tasks initialize their own ordinary chat once with the complete context on their next continuation, then send only new instructions. Web conversations are saved in ChatGPT history.",
+    "网页恢复状态暂不可读取。": "Web recovery state is temporarily unavailable.",
+    "网页恢复的任务或页面所有权已变化。": "Web recovery ownership changed.",
+    "网页对话刷新后仍未就绪，未重复发送消息。": "The Web chat refresh did not become ready; no duplicate message was sent.",
+    "网页对话无法安全恢复；原始上下文和准确工具结果均已保留。": "The Web chat could not recover safely; the original context and exact tool results are preserved.",
+    "消息流失败前已有部分回复送达；当前文字和工具结果均已保留，不会重新生成。": "The reply was partially delivered before the stream failed; its text and tool results are preserved without regeneration.",
+    "普通对话异常恢复已排队": "Ordinary chat recovery queued"
 };
