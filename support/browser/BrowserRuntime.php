@@ -4925,10 +4925,13 @@ JS;
     {
         if (!isset($this->chatGptTurns[$responseId])) return;
         if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
+        $documentNonce = (string) ($this->chatGptTurns[$responseId]['document_nonce'] ?? '');
         $this->chatGptTurns[$responseId]['connector_attempt'] = (int)($this->chatGptTurns[$responseId]['connector_attempt'] ?? 0) + 1;
         $this->evaluateTask($responseId, WebModelPage::connectorSelectedExpression($connectorName),
-            function ($error, $selected) use ($responseId, $connectorName, $attempt): void {
+            function ($error, $selected) use ($responseId, $connectorName, $attempt, $documentNonce): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
+                if (($this->chatGptTurns[$responseId]['document_nonce'] ?? '') !== $documentNonce
+                    || !empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
                 if ($error !== null || !is_array($selected)) {
                     $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_STATE_UNAVAILABLE', '无法确认 ChatGPT 工具连接器状态。');
                     return;
@@ -4942,31 +4945,37 @@ JS;
                     return;
                 }
                 $this->evaluateTask($responseId, WebModelPage::focusAndClearExpression(),
-                    function ($clearError, $cleared) use ($responseId, $connectorName, $attempt): void {
+                    function ($clearError, $cleared) use ($responseId, $connectorName, $attempt, $documentNonce): void {
                         $turn = $this->chatGptTurns[$responseId] ?? null;
-                        if (!is_array($turn)) return;
+                        if (!is_array($turn) || ($turn['document_nonce'] ?? '') !== $documentNonce
+                            || !empty($turn['connector_catalog_refresh_pending'])) return;
                         if ($clearError !== null || !is_array($cleared) || empty($cleared['ok'])) {
                             $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', '选择工具连接器前无法清空 ChatGPT 编辑器。');
                             return;
                         }
                         $this->typeConnectorMention($this->taskCdp, (string) $turn['session_id'],
-                            function ($insertError) use ($responseId, $connectorName, $attempt): void {
+                            function ($insertError) use ($responseId, $connectorName, $attempt, $documentNonce): void {
                                 // A lost CDP acknowledgement may still have opened the menu.
                                 // Read the current menu before deciding to clear/retry the draft.
-                                $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, microtime(true) + 2.5);
+                                $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, microtime(true) + 2.5, $documentNonce);
                             }, 5.0, $connectorName);
                     });
             });
     }
 
-    private function waitTaskConnectorMenu(string $responseId, string $connectorName, int $attempt, float $deadline): void
+    /** Observe one preparation document; delayed menu callbacks cannot touch its refreshed replacement. */
+    private function waitTaskConnectorMenu(string $responseId, string $connectorName, int $attempt, float $deadline,
+        ?string $expectedNonce = null): void
     {
         if (!isset($this->chatGptTurns[$responseId])) return;
         if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
+        $expectedNonce ??= (string) ($this->chatGptTurns[$responseId]['document_nonce'] ?? '');
+        if (($this->chatGptTurns[$responseId]['document_nonce'] ?? '') !== $expectedNonce) return;
         $this->evaluateTask($responseId, WebModelPage::connectorMenuExpression($connectorName),
-            function ($error, $menu) use ($responseId, $connectorName, $attempt, $deadline): void {
+            function ($error, $menu) use ($responseId, $connectorName, $attempt, $deadline, $expectedNonce): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
-                if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
+                if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])
+                    || ($this->chatGptTurns[$responseId]['document_nonce'] ?? '') !== $expectedNonce) return;
                 if ($error === null && is_array($menu)) {
                     $count = (int) ($menu['exact_count'] ?? 0);
                     if ($count > 1) {
@@ -4979,7 +4988,7 @@ JS;
                     }
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.1, fn() => $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, $deadline), null, false);
+                    Timer::add(0.1, fn() => $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, $deadline, $expectedNonce), null, false);
                     return;
                 }
                 if ($attempt < 3) {
@@ -4987,6 +4996,35 @@ JS;
                     return;
                 }
                 $turn = $this->chatGptTurns[$responseId] ?? null;
+                // A saved ordinary chat can lose its loaded App catalog between messages.
+                // Refresh this exact unsent page before any retained-page rebuild/error path.
+                if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular') {
+                    // An old menu observer must not fail a message that already moved on.
+                    if (empty($turn['continuation_sending']) && (!empty($turn['sent_at']) || !empty($turn['accepted'])
+                        || empty($turn['connector_preparing']))) return;
+                    try { $current = TaskLedger::pollExecution((string) ($turn['logical_response_id'] ?? $responseId)); }
+                    catch (\Throwable) { $current = []; }
+                    if ($current !== [] && (in_array($current['turn']['error_code'] ?? '',
+                            ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+                        || !in_array($current['job']['status'], ['queued','running'], true)
+                        || $current['surface']['owner_incarnation'] !== $turn['owner_incarnation']
+                        || (int) $current['surface']['fencing_version'] !== (int) $turn['fencing_version'])) return;
+                    if ($current !== [] && empty($turn['continuation_sending'])
+                        && (!empty($current['job']['submit_intent_at']) || !empty($current['job']['accepted_at']))) return;
+                    if ($this->refreshFreshTaskConnectorCatalog($responseId)) return;
+                    // A missing App is not proof of a damaged conversation. Never enter
+                    // Temporary Chat's receipt-rebuild path from a saved ordinary chat.
+                    $unsent = $current !== [] && $current['turn']['status'] === 'queued'
+                        && empty($current['job']['submit_intent_at']) && empty($current['job']['accepted_at'])
+                        && empty($turn['continuation_sending']);
+                    $refreshed = !empty($turn['connector_catalog_refresh_used']) && $unsent;
+                    $this->taskFailTurn($responseId,
+                        $refreshed ? 'CHATGPT_CONNECTOR_UNAVAILABLE' : 'CHATGPT_CONNECTOR_STATE_UNAVAILABLE',
+                        $refreshed
+                            ? 'The exact connector is still unavailable after refreshing the saved Web chat; the message was not sent and the original task is preserved.'
+                            : '连接器菜单回调到达时任务提交状态无法安全确认；不会重发。', !$unsent);
+                    return;
+                }
                 if (is_array($turn) && ($turn['compaction_phase'] ?? null) === 'preparing') {
                     $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_UNAVAILABLE',
                         '检查点消息无法选中原工具连接器，未发送；原上下文仍保留。', true);
@@ -5025,7 +5063,7 @@ JS;
             }, 3.0);
     }
 
-    /** A catalog refresh is safe only on this task's untouched, unsent Temporary Chat root. */
+    /** Refresh an unsent task root or its exact saved ordinary chat; never replay a submitted message. */
     private static function freshTaskConnectorRefreshAllowed(array $turn, array $ledger,
         bool $sameDocument = true, bool $requireRoot = true): bool
     {
@@ -5033,18 +5071,29 @@ JS;
         $durableTurn = $ledger['turn'] ?? null;
         $surface = $ledger['surface'] ?? null;
         if (!is_array($job) || !is_array($durableTurn) || !is_array($surface)) return false;
+        $savedOrdinary = ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+            && !empty($turn['web_chat']['conversation_id']) && !empty($turn['web_chat']['account_key']);
+        if ($savedOrdinary && (empty($job['id']) || empty($job['generation_id']) || empty($turn['surface_id'])
+            || $job['id'] !== ($durableTurn['response_id'] ?? null)
+            || $job['generation_id'] !== ($durableTurn['generation_id'] ?? null)
+            || ($job['task_id'] ?? null) !== ($durableTurn['task_id'] ?? '')
+            || ($job['task_id'] ?? null) !== ($surface['task_id'] ?? '')
+            || $turn['surface_id'] !== ($surface['id'] ?? null))) return false;
         return !empty($turn['tool_capable']) && !empty($turn['connector_preparing'])
             && !empty($turn['require_root_before_send'])
             && empty($turn['sent_at']) && empty($turn['accepted'])
-            && empty($turn['continuation_sending']) && empty($turn['retained_page_origin'])
+            && empty($turn['continuation_sending']) && ($savedOrdinary || empty($turn['retained_page_origin']))
+            && ($turn['compaction_phase'] ?? null) !== 'preparing'
             && (int) ($turn['transport_stage_sent'] ?? 0) === 0
             && (int) ($turn['transport_stage_acked'] ?? 0) === 0
             && (int) ($job['transport_stage_sent'] ?? 0) === 0
             && (int) ($job['transport_stage_acked'] ?? 0) === 0
             && empty($job['submit_intent_at']) && empty($job['accepted_at'])
-            && empty($job['previous_response_id'])
-            && empty($job['continuation_source_response_id'])
+            && ($savedOrdinary || empty($job['previous_response_id']))
+            && ($savedOrdinary || empty($job['continuation_source_response_id']))
+            && in_array((string) ($job['status'] ?? 'running'), ['queued','running'], true)
             && (string) ($durableTurn['status'] ?? '') === 'queued'
+            && empty($durableTurn['error_code'])
             && empty($durableTurn['submit_intent_at'])
             && (string) ($surface['status'] ?? '') === 'ready'
             && (string) ($surface['target_id'] ?? '') === (string) ($turn['target_id'] ?? '')
@@ -5070,19 +5119,66 @@ JS;
         $this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'] = true;
         $sessionId = (string) $turn['session_id'];
         $oldNonce = (string) $turn['document_nonce'];
-        $deadline = min((float) $turn['deadline'], microtime(true) + 60.0);
-        $this->taskCdp->send('Page.reload', ['ignoreCache' => false], $sessionId,
-            function ($error) use ($responseId, $sessionId, $oldNonce, $deadline): void {
-                if (($this->chatGptTurns[$responseId]['session_id'] ?? null) !== $sessionId) return;
-                // A lost acknowledgement can still mean the reload happened. Observe the
-                // document nonce and DOM instead of issuing a second navigation.
-                if ($error !== null && ($error['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
-                    $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_FAILED', 'ChatGPT 工具目录页面刷新失败，未发送任务。');
-                    return;
-                }
-                $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline);
-            }, 15.0);
+        $deadline = min((float) $turn['deadline'], microtime(true)
+            + (($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? 120.0 : 60.0));
+        $this->reloadTaskConnectorCatalog($responseId, $sessionId, $oldNonce, $deadline);
         return true;
+    }
+
+    /**
+     * Recheck the owned unsent page and Stop state before its single catalog reload.
+     * @param string $responseId Unsent response. @param string $sessionId Exact CDP owner.
+     * @param string $oldNonce Preparation document. @param float $deadline Shared preparation deadline.
+     * @return void No task or tool submission occurs here.
+     */
+    private function reloadTaskConnectorCatalog(string $responseId, string $sessionId, string $oldNonce, float $deadline): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || $turn['session_id'] !== $sessionId
+            || empty($turn['connector_catalog_refresh_pending'])) return;
+        $reload = function () use ($responseId, $sessionId, $oldNonce, $deadline): void {
+            $turn = $this->chatGptTurns[$responseId] ?? null;
+            if (!is_array($turn) || $turn['session_id'] !== $sessionId
+                || empty($turn['connector_catalog_refresh_pending'])) return;
+            try { $ledger = TaskLedger::execution($responseId); }
+            catch (\Throwable) { $ledger = []; }
+            if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                && in_array($ledger['turn']['error_code'] ?? '',
+                    ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)) return;
+            if (!self::freshTaskConnectorRefreshAllowed($turn, $ledger)
+                || ($ledger['surface']['document_nonce'] ?? '') !== $oldNonce) {
+                $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_UNSAFE',
+                    '刷新期间任务页面或提交状态发生变化，已停止发送。', true);
+                return;
+            }
+            $this->taskCdp->send('Page.reload', ['ignoreCache' => false], $sessionId,
+                function ($error) use ($responseId, $sessionId, $oldNonce, $deadline): void {
+                    if (($this->chatGptTurns[$responseId]['session_id'] ?? null) !== $sessionId) return;
+                    // A lost acknowledgement can still mean the reload happened. Observe the
+                    // document nonce and DOM instead of issuing a second navigation.
+                    if ($error !== null && ($error['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
+                        $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_FAILED', 'ChatGPT 工具目录页面刷新失败，未发送任务。');
+                        return;
+                    }
+                    $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline);
+                }, 15.0);
+        };
+        if (($turn['web_chat']['mode'] ?? 'temporary') !== 'regular') { $reload(); return; }
+        $this->evaluateTask($responseId, WebModelPage::baselineExpression(),
+            function ($error, $baseline) use ($responseId, $sessionId, $oldNonce, $deadline, $reload): void {
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($turn) || $turn['session_id'] !== $sessionId
+                    || empty($turn['connector_catalog_refresh_pending'])) return;
+                if ($error === null && is_array($baseline) && !empty($baseline['editor_ready'])
+                    && ($baseline['generation_running'] ?? null) === false
+                    && $this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''), true)) {
+                    $reload(); return;
+                }
+                if (microtime(true) < $deadline) {
+                    Timer::add(1.0, fn() => $this->reloadTaskConnectorCatalog($responseId, $sessionId, $oldNonce, $deadline), null, false);
+                } else $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_FAILED',
+                    '刷新后任务对话未恢复可发送状态，未发送任务。');
+            }, 15.0);
     }
 
     private function waitTaskConnectorCatalogRefresh(string $responseId, string $oldNonce, float $deadline): void
@@ -5091,6 +5187,9 @@ JS;
         if (!is_array($turn) || empty($turn['connector_catalog_refresh_pending'])) return;
         try { $ledger = TaskLedger::execution($responseId); }
         catch (\Throwable) { $ledger = []; }
+        if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+            && in_array($ledger['turn']['error_code'] ?? '',
+                ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)) return;
         if ($ledger !== [] && !self::freshTaskConnectorRefreshAllowed($turn, $ledger, false, false)) {
             $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_UNSAFE', '刷新期间任务页面或提交状态发生变化，已停止发送。', true);
             return;
@@ -5116,7 +5215,43 @@ JS;
                             $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_CATALOG_REFRESH_UNSAFE', '刷新后任务页面所有权或提交状态发生变化，已停止发送。', true);
                             return;
                         }
-                        $this->finishTaskConnectorCatalogRefresh($responseId, $nonce);
+                        if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular') {
+                            $this->evaluateTask($responseId, WebModelPage::accountFingerprintExpression(),
+                                function ($accountError, $account) use ($responseId, $nonce, $oldNonce, $deadline): void {
+                                    $turn = $this->chatGptTurns[$responseId] ?? null;
+                                    if (!is_array($turn) || empty($turn['connector_catalog_refresh_pending'])) return;
+                                    try { $current = TaskLedger::execution($responseId); }
+                                    catch (\Throwable) {
+                                        Timer::add(1.0, fn() => $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline), null, false);
+                                        return;
+                                    }
+                                    if (!self::freshTaskConnectorRefreshAllowed($turn, $current, false)) return;
+                                    if ($current['surface']['document_nonce'] !== $nonce) {
+                                        Timer::add(0.25, fn() => $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline), null, false);
+                                        return;
+                                    }
+                                    if ($accountError !== null || !is_array($account) || empty($account['verified'])) {
+                                        if (microtime(true) < $deadline) {
+                                            Timer::add(1.0, fn() => $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline), null, false);
+                                        } else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED',
+                                            'The Web chat account could not be verified.', true);
+                                        return;
+                                    }
+                                    try {
+                                        $expectedAccount = (string) (($turn['web_chat']['account_key'] ?? '')
+                                            ?: ($this->taskSessions[$turn['session_id']]['account_key'] ?? ''));
+                                        if ($expectedAccount !== '' && !hash_equals($expectedAccount, (string) $account['account_key'])) {
+                                            throw new GatewayError('CHATGPT_CHAT_ACCOUNT_CHANGED',
+                                                'The Web chat belongs to another account or workspace.', 409);
+                                        }
+                                        TaskWebChat::observe($current, $current['surface']['url'],
+                                            (string) $account['account_key'], self::modelUrl());
+                                        $this->finishTaskConnectorCatalogRefresh($responseId, $nonce);
+                                    } catch (GatewayError $failure) {
+                                        $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                                    }
+                                }, 20.0, true);
+                        } else $this->finishTaskConnectorCatalogRefresh($responseId, $nonce);
                         return;
                     }
                     if (microtime(true) < $deadline) {
@@ -7867,11 +8002,16 @@ JS;
         $this->preparePlainTaskComposer($responseId);
     }
 
-    /** The old chat no longer offers its Connector; rebuild only from confirmed native receipts. */
+    /** Temporary Chat fallback only; saved ordinary chats must refresh and retain their own binding. */
     private function rebuildUnavailableRetainedConnector(string $responseId): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular') {
+            $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_STATE_UNAVAILABLE',
+                '连接器菜单回调到达时任务提交状态无法安全确认；不会重发。', true);
+            return;
+        }
         $logicalResponseId = (string)($turn['logical_response_id'] ?? $responseId);
         try {
             $job = ResponseJob::execution($logicalResponseId);
@@ -8184,7 +8324,7 @@ JS;
                         } catch (GatewayError $failure) {
                             $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
                         }
-                    }, 20.0);
+                    }, 20.0, true);
             });
     }
 
@@ -8855,8 +8995,9 @@ JS;
         $this->taskCdp->send('Target.detachFromTarget', ['sessionId' => $sessionId], null, static function (): void {}, 2.0);
     }
 
-    /** @param callable(?array,mixed):void $callback */
-    private function evaluateTask(string $responseId, string $expression, callable $callback, float $timeout = 3.0): void
+    /** @param callable(?array,mixed):void $callback @param bool $awaitPromise Await asynchronous DOM expressions. */
+    private function evaluateTask(string $responseId, string $expression, callable $callback, float $timeout = 3.0,
+        bool $awaitPromise = false): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) {
@@ -8868,17 +9009,19 @@ JS;
             // Late responses from a discarded staging page cannot advance or fail its replacement.
             if (($this->chatGptTurns[$responseId]['session_id'] ?? null) !== $sessionId) return;
             $callback($error, $result);
-        }, $timeout);
+        }, $timeout, $awaitPromise);
     }
 
-    /** @param callable(?array,mixed):void $callback */
-    private function evaluateTaskSession(string $sessionId, string $expression, callable $callback, float $timeout = 3.0): void
+    /** @param callable(?array,mixed):void $callback @param bool $awaitPromise Preserve CDP Promise results when requested. */
+    private function evaluateTaskSession(string $sessionId, string $expression, callable $callback, float $timeout = 3.0,
+        bool $awaitPromise = false): void
     {
         if (!$this->taskCdp->ready() || $sessionId === '') {
             $callback(['code' => -1, 'message' => 'BROWSER_CDP_DISCONNECTED'], null);
             return;
         }
-        $this->taskCdp->send('Runtime.evaluate', ['expression' => $expression, 'returnByValue' => true], $sessionId,
+        $this->taskCdp->send('Runtime.evaluate', ['expression' => $expression, 'returnByValue' => true,
+            ...($awaitPromise ? ['awaitPromise'=>true] : [])], $sessionId,
             function ($error, $result) use ($callback): void {
                 $callback(is_array($error) ? $error : null, $result['result']['value'] ?? null);
             }, $timeout);

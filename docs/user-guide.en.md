@@ -262,6 +262,8 @@ In ordinary mode, each new task is bound to its own saved Web conversation and a
 
 Ordinary chats and ordinary-mode connector probes are saved in ChatGPT history. After switching to ordinary mode, an existing temporary task also initializes its own ordinary chat with the complete readable context on its next continuation. Accepted tools settle first, exact receipts are retained, and the old temporary page is isolated before sending. Once bound, only new instructions are sent. Existing ordinary bindings are retained even when the preference changes again. Tasks that remain in temporary mode keep their existing steering, compaction, recovery and full-context resend behavior.
 
+If a new, unsent message cannot find its exact connector in a saved ordinary chat, the gateway refreshes that same chat once and verifies its account before searching again. It keeps the saved conversation ID, current instructions and tool receipts. A missing connector after refresh does not by itself authorize another chat or Temporary Chat recovery; the task reports the connector problem and retains its original conversation.
+
 Select **ChatGPT Connector settings**, or **Open native browser** in that area, to create the plugin using the private Chrome account.
 
 The current official flow is **Plugins → + → Add custom MCP server**. If your account still uses Apps / Developer Mode, follow that interface and any developer-mode or workspace permission requirements. See the [official creation steps](https://developers.openai.com/api/docs/guides/custom-mcp-server).
