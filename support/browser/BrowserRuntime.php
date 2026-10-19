@@ -6750,6 +6750,7 @@ JS;
                 $snapshot['artifact_candidates'] = [];
                 $snapshot['commentary_blocks'] = [];
             }
+            $snapshot = self::selectMetricCardMarkdown($this->chatGptTurns[$responseId], $snapshot, $now);
             $rawMarkdown = (string) ($snapshot['markdown'] ?? '');
             if ($boundAssistantId !== '' && $observedAssistantId === $boundAssistantId) {
                 $recovering = ($snapshot['transport_recovery_visible'] ?? null) === true;
@@ -7404,6 +7405,51 @@ JS;
     }
 
     /**
+     * Retain legacy metric formatting only when it proves an already published prefix.
+     *
+     * Both candidates come from the same scoped DOM read. Fresh replies use semantic
+     * tables; an upgrade must not rewrite old headings in an append-only response.
+     * No text is synthesized, no ownership check is weakened and no message is sent.
+     *
+     * @param array $turn Current physical response's output and semantic ledger.
+     * @param array $snapshot Bound adapter observation, including an optional legacy candidate.
+     * @param float $now Observation time used for the read-only ledger comparison.
+     * @return array Observation with only Markdown and its segments selected together.
+     */
+    private static function selectMetricCardMarkdown(array $turn, array $snapshot, float $now): array
+    {
+        $legacy = $snapshot['metric_card_legacy'] ?? null;
+        $assistant = (string) ($turn['bound_assistant_id'] ?? '');
+        if ($assistant === '' || ($snapshot['response_id'] ?? '') !== $assistant
+            || ($snapshot['response_present'] ?? true) !== true
+            || !is_array($legacy) || !is_string($legacy['markdown'] ?? null)
+            || !is_array($legacy['markdown_segments'] ?? null)) return $snapshot;
+        $prefix = (string) ($turn['round_prefix'] ?? '') . (string) (!empty($turn['tool_capable'])
+            ? ($turn['draft_emitted'] ?? '') : ($turn['emitted'] ?? ''));
+        $useLegacy = $prefix !== '' && !str_starts_with((string) ($snapshot['markdown'] ?? ''), $prefix)
+            && str_starts_with($legacy['markdown'], $prefix);
+        $saved = $turn['markdown_buffer'] ?? null;
+        $scope = [(string) ($turn['document_nonce'] ?? ''), $assistant, (string) ($turn['logical_response_id'] ?? '')];
+        if (!$useLegacy && is_array($saved) && ($saved['scope'] ?? null) === $scope
+            && !empty($saved['state']['committed'])) {
+            // Virtualized prefixes can be absent from both raw candidates. Only an exact
+            // successful reconciliation with this turn's ledger can choose the old form.
+            $modern = ChatGptMarkdownBuffer::align($saved['state'], (array) ($snapshot['markdown_segments'] ?? []),
+                (string) ($snapshot['markdown'] ?? ''), !empty($snapshot['generation_running']), $now);
+            if (!$modern['consistent']) {
+                $previous = ChatGptMarkdownBuffer::align($saved['state'], $legacy['markdown_segments'],
+                    $legacy['markdown'], !empty($snapshot['generation_running']), $now);
+                $useLegacy = $previous['consistent'];
+            }
+        }
+        if ($useLegacy) {
+            $snapshot['markdown'] = $legacy['markdown'];
+            $snapshot['markdown_segments'] = $legacy['markdown_segments'];
+        }
+        return $snapshot;
+    }
+
+    /**
      * Align only the bound ordinary answer; keep audit text and native control paths unchanged.
      *
      * State belongs to one document, assistant and logical Responses round. A tool boundary
@@ -7757,6 +7803,7 @@ JS;
                 }
                 try {
                     $turn = $this->chatGptTurns[$responseId];
+                    $snapshot = self::selectMetricCardMarkdown($turn, $snapshot, microtime(true));
                     $completion = ToolBroker::completionForResponse($logicalResponseId);
                     $answer = ($completion['status'] ?? '') === 'completed' ? (string)$completion['final_answer']
                         : (string)($snapshot['markdown'] ?? $snapshot['visible_text'] ?? '');

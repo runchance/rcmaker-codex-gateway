@@ -1150,7 +1150,7 @@ const sendButtonVisible=endSend.length===1&&endSend[0].getAttribute('data-testid
 const recoveryIdleButtonVisible=__REGULAR_RECOVERY__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length===1
     &&!!endComposer?.closest('form')&&[...endComposer.closest('form').querySelectorAll('button[aria-label]')].filter(visible)
         .some(button=>/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(String(button.getAttribute('aria-label')||'').trim()));
-let markdown='';let markdownSegments=[];let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;let transportRecoveryVisible=false;
+let markdown='';let markdownSegments=[];let metricCardLegacy=null;let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;let transportRecoveryVisible=false;
 if(answer){
     responsePresent=true;
     // This localized native recovery panel is transport chrome, not model-authored progress.
@@ -1275,8 +1275,17 @@ if(answer){
     });
     commentaryBlocks.push(...statusBlocks);
     visibleText=roots.map(root=>transcriptVisibleText(root).replace(/\u00a0/g,' ').trim()).filter(Boolean).join('\n\n');
+    metricCardsObserved=false;
     markdown=roots.map(root=>toMarkdown(root,running)).filter(Boolean).join('\n\n');
     markdownSegments=semanticMarkdownSegments(roots,running,answer.id);
+    if(metricCardsObserved){
+        // Upgrade compatibility is decided by the runtime's exact published prefix,
+        // not by a guessed version or by replaying a message. No extra browser read.
+        legacyMetricCards=true;
+        metricCardLegacy={markdown:roots.map(root=>toMarkdown(root,running)).filter(Boolean).join('\n\n'),
+            markdown_segments:semanticMarkdownSegments(roots,running,answer.id)};
+        legacyMetricCards=false;
+    }
     responseHtml=roots.map(root=>String(withoutNativeRecovery(root).innerHTML||'')).join('');
     const pushArtifact=(href,filename,kind)=>{const existing=artifactCandidates.find(item=>item.filename===filename&&(item.href===href||item.href===''||href===''));if(existing){if(existing.href===''&&href!=='')existing.href=href;if(kind==='file_card')existing.kind='file_card';return;}artifactCandidates.push({href,filename,kind});};
     for(const anchor of roots.flatMap(root=>[...root.querySelectorAll('a')]).filter(visible)){
@@ -1391,7 +1400,7 @@ else if(/your session has expired|你的工作階段已過期|您的工作階段
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__'],
@@ -1836,6 +1845,9 @@ const transcriptVisibleText=root=>{
     return read(root).replace(/\n{3,}/g,'\n\n').trim();
 };
 let markdownRunning=false;
+let legacyMetricCards=false;
+let metricCardsObserved=false;
+let syntheticTableCell=false;
 const children=el=>[...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE?String(n.nodeValue||'').length>0:(n.nodeType===Node.ELEMENT_NODE&&!ignored(n)));
 const inline=(el,tail)=>{const cs=children(el);let out='';for(let i=0;i<cs.length;i++)out+=md(cs[i],tail&&i===cs.length-1);return out};
 // Escape rendered prose, not authored code or math: literal Markdown punctuation is visible text.
@@ -1844,7 +1856,7 @@ const markdownLiteral=(value,inTable=false)=>{
         .replace(/[\\`*_~\[\]$]/g,'\\$&')
         .replace(/(^|\n)([ \t]*)(#{1,6}(?=\s|$)|[+-](?=\s)|-{3,}(?=[ \t]*(?:\n|$))|=+(?=[ \t]*(?:\n|$)))/g,'$1$2\\$3')
         .replace(/(^|\n)([ \t]*)(\d+)([.)])(?=\s)/g,'$1$2$3\\$4');
-    return inTable?text:text.replace(/\|/g,'\\|');
+    return inTable||syntheticTableCell?text:text.replace(/\|/g,'\\|');
 };
 const markdownTarget=value=>String(value).replace(/[\s<>\\()]/g,char=>char==='('?'%28':char===')'?'%29':encodeURIComponent(char));
 const markdownTitle=el=>{const title=el.getAttribute('title');return title?' "'+String(title).replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/[\r\n]/g,' ')+'"':'';};
@@ -1966,6 +1978,49 @@ const markdownTable=el=>{
     const caption=[...el.children].find(child=>child.tagName.toLowerCase()==='caption'&&!ignored(child));
     return '\n\n'+(caption?inline(caption,false).trim()+'\n\n':'')+values.join('\n')+'\n\n';
 };
+// DIL uses headings for metric values inside a Grid, not document sections. Keep the
+// component's label/value relationships without depending on its generated CSS hash
+// or viewport width. Other grids retain their content as one atomic layout block.
+const metricCardGrid=el=>{
+    if(legacyMetricCards||el.tagName?.toLowerCase()!=='div'
+        ||![...el.classList].some(name=>name.startsWith('Grid-')))return null;
+    let owner=el.parentElement;
+    while(owner&&![...owner.classList].some(name=>name.startsWith('DilResponseRoot-')||name.startsWith('_DilResponseRoot')))owner=owner.parentElement;
+    if(!owner)return null;
+    metricCardsObserved=true;
+    const meaningful=node=>children(node).filter(child=>child.nodeType!==Node.TEXT_NODE||String(child.nodeValue||'').trim()!=='');
+    const items=meaningful(el),cards=[];
+    let pending=items.length===0;
+    for(const item of items){
+        if(item.nodeType!==Node.ELEMENT_NODE||item.tagName.toLowerCase()!=='div')return {cards:null,pending:false};
+        let parts=meaningful(item);
+        while(parts.length===1&&parts[0].nodeType===Node.ELEMENT_NODE&&parts[0].tagName.toLowerCase()==='div')parts=meaningful(parts[0]);
+        if(parts.length===0){pending=true;continue;}
+        if(parts.length>2||parts[0].nodeType!==Node.ELEMENT_NODE||parts[0].tagName.toLowerCase()!=='p'
+            ||parts.length===2&&(parts[1].nodeType!==Node.ELEMENT_NODE||!/^h[1-6]$/i.test(parts[1].tagName)))return {cards:null,pending:false};
+        if(parts.some(part=>part.querySelector('p,div,table,ul,ol,pre,blockquote,h1,h2,h3,h4,h5,h6')))return {cards:null,pending:false};
+        if(parts.length<2||parts.some(part=>!inline(part,false).trim())){pending=true;continue;}
+        cards.push(parts);
+    }
+    return {cards:pending?null:cards,pending};
+};
+// Use the same table-cell escaping for rendered prose and literal code. Synthetic
+// cells are <p>/<h1>, so their text nodes need the <td>/<th> pipe handling explicitly.
+const metricCardTable=cards=>{
+    // GFM cannot faithfully represent an odd literal backslash before a pipe in a
+    // table code span. Preserve the exact code in labelled list items instead.
+    if(cards.some(card=>card.some(part=>[...part.querySelectorAll('code')].some(code=>/\\\|/.test(code.textContent||''))))){
+        return '\n\n'+cards.map(card=>'- '+(inline(card[0],false).trim()+': '+inline(card[1],false).trim()).replace(/\n/g,'\n  ')).join('\n')+'\n\n';
+    }
+    const cell=el=>inline(el,false).trim().replace(/\r\n?/g,'\n')
+        .replace(/[ \t]*\n(?:[ \t]*\n)*[ \t]*/g,'<br>')
+        .replace(/(\\*)\|/g,(_,slashes)=>slashes+(slashes.length%2===0?'\\':'\\\\')+'|');
+    const line=values=>'| '+values.join(' | ')+' |';
+    const previous=syntheticTableCell;
+    syntheticTableCell=true;
+    try{return '\n\n'+[line(cards.map(card=>cell(card[0]))),line(cards.map(()=>'---')),line(cards.map(card=>cell(card[1])))].join('\n')+'\n\n';}
+    finally{syntheticTableCell=previous;}
+};
 const md=(node,tail=false)=>{
     if(node.nodeType===Node.TEXT_NODE){
         const text=String(node.nodeValue||'').replace(/\u00a0/g,' ');
@@ -1980,6 +2035,11 @@ const md=(node,tail=false)=>{
     const el=node;
     if(ignored(el))return '';
     const tag=el.tagName.toLowerCase();
+    const grid=metricCardGrid(el);
+    if(grid){
+        if(markdownRunning&&(tail||grid.pending))return '';
+        if(grid.cards?.length)return metricCardTable(grid.cards);
+    }
     const citation=citationWidget(el);
     if(citation){
         if(markdownRunning&&tail)return '';
@@ -2101,6 +2161,12 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
     };
     const flatten=root=>{
         if(nativeRecoveryPanel(root))return;
+        const grid=metricCardGrid(root);
+        if(grid){
+            push(root,'rich-layout',toMarkdown(root,false));
+            segments[segments.length-1].pending_layout=grid.pending;
+            return;
+        }
         // Only layout containers may be flattened. A root list/quote/math block owns its
         // delimiters too; flattening its children would drop them from the streamed answer.
         if(!['div','section','article'].includes(root.tagName.toLowerCase())||root.hasAttribute('data-footnotes')||mathSource(root)||citationWidget(root)){
@@ -2131,7 +2197,7 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
             flush();const tag=node.tagName.toLowerCase();
             const wrapper=['div','section','article'].includes(tag)&&!node.hasAttribute('data-footnotes')&&!mathSource(node)&&!('source_start' in range(node))
                 &&children(node).some(child=>child.nodeType===Node.ELEMENT_NODE&&blockTags.has(child.tagName.toLowerCase()));
-            if(wrapper){flatten(node);continue;}
+            if(wrapper||metricCardGrid(node)){flatten(node);continue;}
             const items=tag==='ul'||tag==='ol'?[...node.children].filter(child=>child.tagName.toLowerCase()==='li'):[];
             if(items.length){
                 const group=key(node)+':list';
@@ -2148,7 +2214,7 @@ const semanticMarkdownSegments=(roots,running,responseId)=>{
         flush();
     };
     roots.forEach(flatten);
-    return segments.map((segment,index)=>({...segment,streamable:index<segments.length-1&&!segment.pending_links}));
+    return segments.map((segment,index)=>({...segment,streamable:index<segments.length-1&&!segment.pending_links&&!segment.pending_layout}));
 };
 JS
             . $body . '})()';
