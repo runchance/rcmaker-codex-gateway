@@ -258,6 +258,11 @@ final class McpProtocol
                 $marker = 'rcmaker-tool-catalog:' . substr(hash_hmac('sha256', $callKey, $token), 0, 32) . ':';
                 $program = self::nestedCatalogProgram($query, $nestedOffset, $nestedLimit, $excluded, $marker);
                 $native = self::invokeResolvedTool($token, $gateway, $callKey, null, $program);
+                if (!empty($native['paused'])) {
+                    // Recovery, a queued user update or checkpoint deliberately prevents new discovery.
+                    // Its control notice is not a malformed native catalog or a lost link.
+                    return $native + ['available_tools'=>$page];
+                }
                 if (!empty($native['pending'])) {
                     // This is a live discovery invocation, not an invalid catalog. Its
                     // eventual native page contains the actual deferred names/descriptions.
@@ -456,15 +461,22 @@ final class McpProtocol
         if (ToolBroker::isBridgeToolName($wireName)) {
             throw new GatewayError('recursive_tool_denied', '工具桥不能递归调用自身。', 400);
         }
-        if ($wireName === 'codex.control.wait_result') {
-            // Receipt-only continuation must not claim a turn, discover tools or
-            // register another invocation. Retired receipt checks remain in ToolBroker.
+        if (in_array($wireName, ['codex.control.wait_result', 'codex.control.wait_code_mode'], true)) {
+            // wait_result remains receipt-only; wait_code_mode may reserve only an
+            // exact source-owned native wait. Retired checks remain in ToolBroker.
             $control = $arguments['arguments'] ?? null;
             if ($control instanceof \stdClass) $control = get_object_vars($control);
             if (array_key_exists('input', $arguments) || !is_array($control)
                 || array_keys($control) !== ['call_id'] || !is_string($control['call_id'])
                 || preg_match('/\Acall_[A-Za-z0-9_-]{20,128}\z/', $control['call_id']) !== 1) {
                 throw new GatewayError('tool_wait_arguments_invalid', '结果等待需要本回合已发起调用的准确 call_id。', 400);
+            }
+            if ($wireName === 'codex.control.wait_code_mode') {
+                // This separate control follows only the native receipt's owned cell.
+                // It never accepts a caller-selected cell or reissues the original exec.
+                $wait = ToolBroker::resumeCodeModeWait($token, $control['call_id']);
+                if (is_array($wait)) return !empty($wait['paused']) ? $wait
+                    : self::waitHostToolResult($token, (string) $wait['call_id']);
             }
             return self::waitHostToolResult($token, $control['call_id']);
         }
@@ -859,7 +871,21 @@ AWK;
                 'instruction' => 'The existing native call is still pending execution or user approval. This is not a tool failure, approval denial, or task completion. Keep the same turn_token and call codex_tool_call with wire_name="codex.control.wait_result" and arguments={"call_id":"' . $callId . '"} until its real result settles. This only waits for the issued call; do not resend the original action. Continue the task after reading its actual result; do not begin a final answer while it is pending.'];
         }
         self::$hostReceipt = ['token' => $token, 'call_id' => $callId, 'settled' => true];
-        return self::hostToolResultForToken($token, $result);
+        $native = self::hostToolResultForToken($token, $result);
+        $first = $native['__mcp_result']['content'][0] ?? [];
+        if (($first['type'] ?? '') === 'text' && str_starts_with((string) ($first['text'] ?? ''), 'Script running with cell ID ')
+            && ToolBroker::codeModeContinuation($token, $callId) !== null) {
+            // Keep all native output blocks exact and acknowledge only this flushed receipt.
+            // Outer exec completion means its yield arrived, not that the script finished.
+            $pending = ['ok'=>true, 'pending'=>true, 'kind'=>'code_mode_cell', 'call_id'=>$callId,
+                'resume'=>['tool'=>'codex_tool_call', 'wire_name'=>'codex.control.wait_code_mode',
+                    'arguments'=>['call_id'=>$callId]],
+                'instruction'=>'The native receipt above yielded a still-running script; its task results are not final. With the same turn_token, call codex_tool_call using the exact resume wire_name and arguments above to collect this script. Repeat the returned continuation until it settles. Do not rerun exec or its batch, infer success, or give a final answer while required results are pending. This control uses the exact native cell already owned by this task. Honor newer user instructions before starting any new work.'];
+            $native['__mcp_result']['content'][] = ['type'=>'text', 'text'=>json_encode($pending,
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)];
+            $native['__mcp_result']['structuredContent'] = $pending;
+        }
+        return $native;
     }
 
     /** Preserve the native host result and separately forward role-preserving Codex updates. */

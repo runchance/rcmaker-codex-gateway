@@ -305,7 +305,7 @@ final class ToolBroker
             TaskContext::enabled((array)($spec['budget'] ?? []), $environment), 'response', $contextOnly, $archive,
             array_column((array)($environment['tools'] ?? []), 'wire_name'), !empty($spec['parallel_tool_calls']),
             self::hostShellFromContext((string)($spec['full_context_json'] ?? $contextJson)),
-            (array)($spec['budget']['output_control'] ?? [])), 'turn_token'=>$turnToken];
+            (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)), 'turn_token'=>$turnToken];
     }
 
     /**
@@ -456,7 +456,7 @@ final class ToolBroker
                          array_column(json_decode((string) $spec['tool_environment_json'], true)['tools'] ?? [], 'wire_name'),
                          !empty($spec['parallel_tool_calls']),
                          self::hostShellFromContext((string)($spec['full_context_json'] ?? $spec['context_json'] ?? '')),
-                         (array)($spec['budget']['output_control'] ?? [])),
+                         (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
                     'is_continuation' => false,
                 ];
             }
@@ -516,7 +516,7 @@ final class ToolBroker
                  array_column(json_decode((string)$spec['tool_environment_json'], true)['tools'] ?? [], 'wire_name'),
                  !empty($spec['parallel_tool_calls']),
                  self::hostShellFromContext((string)($spec['full_context_json'] ?? $spec['context_json'] ?? '')),
-                 (array)($spec['budget']['output_control'] ?? [])),
+                 (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
             'is_continuation' => false,
         ];
     }
@@ -965,12 +965,14 @@ final class ToolBroker
      * @param string $token Current turn capability. @param string $wireName Registered host tool name.
      * @param string $callKey Stable caller operation identity. @param mixed $arguments Function arguments.
      * @param string|null $input Freeform tool input, when applicable.
+     * @param string|null $nativeSourceCallId Internal yielded-receipt identity; only its verified native wait can be registered/reused.
      * @return array Accepted call identity, or a successful paused control with no call_id or host effect.
      * @throws GatewayError On invalid arguments, ownership, conflicting identity or unavailable storage.
      */
-    public static function registerInvocation(string $token, string $wireName, string $callKey, mixed $arguments = null, ?string $input = null): array
+    public static function registerInvocation(string $token, string $wireName, string $callKey, mixed $arguments = null,
+        ?string $input = null, ?string $nativeSourceCallId = null): array
     {
-        return Schema::transaction(function () use ($token, $wireName, $callKey, $arguments, $input): array {
+        return Schema::transaction(function () use ($token, $wireName, $callKey, $arguments, $input, $nativeSourceCallId): array {
             $binding = self::bindingByTokenUnlocked($token);
             self::assertLiveUnlocked($binding, true);
             if (!preg_match('/\A[A-Za-z0-9._:-]{1,128}\z/', $callKey)) {
@@ -1017,8 +1019,31 @@ final class ToolBroker
                 ->order([['created_at', 'DESC'], ['id', 'DESC']])
                 ->limit(1)
                 ->find();
+            $reusedNativeWait = false;
+            if (!is_array($existing) && $nativeSourceCallId !== null) {
+                $source = self::codeModeContinuation($token, $nativeSourceCallId);
+                if ($source === null || !$source['receipt_delivered'] || $source['wire_name'] !== $wireName
+                    || $argumentsJson !== self::canonicalJson(['cell_id'=>$source['cell_id']])) {
+                    throw new GatewayError('tool_wait_arguments_invalid', 'The native script continuation changed; no replacement action was issued.', 409);
+                }
+                $nativeOrder = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+                    ->where('call_id', $nativeSourceCallId)->find('rowid');
+                // The model may already have used the advertised native wait directly.
+                // Reuse that accepted wait too, rather than consuming the same cell twice.
+                $waits = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+                    ->where('wire_name', $wireName)->where('rowid', '>', $nativeOrder['rowid'])
+                    ->order([['rowid','ASC']])->select('id,arguments_json');
+                if (!is_array($waits)) throw new GatewayError('storage_unavailable', 'Native wait receipts could not be read.', 503);
+                foreach ($waits as $wait) {
+                    $prior = json_decode((string) $wait['arguments_json'], true);
+                    if (($prior['cell_id'] ?? null) !== $source['cell_id']) continue;
+                    $existing = $db->table('gateway_tool_invocations')->where('id', $wait['id'])->find();
+                    $reusedNativeWait = true;
+                    break;
+                }
+            }
             if (is_array($existing)) {
-                if (!hash_equals((string) $existing['request_hash'], $requestHash)) {
+                if (!$reusedNativeWait && !hash_equals((string) $existing['request_hash'], $requestHash)) {
                     throw new GatewayError('tool_call_key_conflict', '同一 call_key 被用于不同的工具操作，已拒绝执行。', 409);
                 }
                 $status = (string) $existing['status'];
@@ -1830,6 +1855,68 @@ final class ToolBroker
         });
     }
 
+    /**
+     * Identify an unfinished native Code Mode cell from its exact durable receipt, for saved chats only.
+     * No model-supplied cell ID, command output, retired capability or other task can authorize a wait.
+     * @param string $token Current task capability. @param string $callId Exact source native call.
+     * @return array|null Current advertised wait name and source-owned cell, or no eligible continuation.
+     * @throws GatewayError On a missing or foreign source receipt or unavailable storage.
+     */
+    public static function codeModeContinuation(string $token, string $callId): ?array
+    {
+        [$binding, $row, $retired] = self::receiptForTokenUnlocked($token, $callId);
+        if ($retired || $binding['status'] !== 'running' || $row['status'] !== 'completed') return null;
+        $source = self::catalogEntry($binding, (string) $row['wire_name']);
+        if (!is_array($source) || !in_array($source['namespace'] ?? null, [null, 'functions'], true)
+            || (!(($source['name'] ?? '') === 'exec' && !empty($source['freeform']))
+                && !(($source['name'] ?? '') === 'wait' && empty($source['freeform'])))) return null;
+        $result = json_decode((string) $row['result_json'], true);
+        $header = (string) ($result['output'] ?? '');
+        if (!empty($result['output_is_content_parts'])) {
+            $parts = json_decode($header, true);
+            $first = is_array($parts) && array_is_list($parts) ? ($parts[0] ?? null) : null;
+            if (!is_array($first) || !in_array($first['type'] ?? '', ['input_text','output_text','text'], true)) return null;
+            $header = (string) ($first['text'] ?? '');
+        }
+        if (preg_match('/\AScript running with cell ID ([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*)\r?\nWall time [^\r\n]+\r?\nOutput:\r?\n/', $header, $match) !== 1
+            || strlen($match[1]) > 128) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $job = $db->table('gateway_response_jobs')->where('id', $binding['current_response_id'])->find();
+        $chat = TaskWebChat::state((string) $binding['task_id']);
+        if (($job['operation_kind'] ?? '') !== 'response' || ($chat['mode'] ?? '') !== 'regular'
+            || empty($chat['conversation_id'])) return null;
+        if (($source['name'] ?? '') === 'wait') {
+            $arguments = json_decode((string) $row['arguments_json'], true);
+            if (($arguments['cell_id'] ?? null) !== $match[1]) return null;
+        }
+        $environment = json_decode((string) $binding['tool_environment_json'], true);
+        $waits = array_values(array_filter((array) ($environment['tools'] ?? []), static fn($tool): bool =>
+            is_array($tool) && ($tool['name'] ?? '') === 'wait' && empty($tool['freeform'])
+            && in_array($tool['namespace'] ?? null, [null, 'functions'], true)
+            && isset($tool['parameters']['properties']['cell_id'])
+            && array_diff((array) ($tool['parameters']['required'] ?? []), ['cell_id']) === []));
+        if (count($waits) !== 1) return null;
+        return ['call_id'=>$callId, 'cell_id'=>$match[1], 'wire_name'=>(string) $waits[0]['wire_name'],
+            'receipt_delivered'=>$row['result_delivered_at'] !== null];
+    }
+
+    /**
+     * Reserve one native wait for a verified yielded receipt; replaying that source reuses the same call.
+     * Existing broker ownership, serial dispatch, user updates, cancellation and compaction checks apply.
+     * @param string $token Current capability. @param string $callId Source exec/wait receipt identity.
+     * @return array|null Existing/new wait invocation, pause notice, or no unfinished eligible script.
+     * @throws GatewayError On failed scope, native schema or durable registration checks.
+     */
+    public static function resumeCodeModeWait(string $token, string $callId): ?array
+    {
+        $continuation = self::codeModeContinuation($token, $callId);
+        // A lost flush acknowledgement first redelivers the source's exact native output.
+        // Queuing a wait behind that unacknowledged receipt would strand both calls.
+        if ($continuation === null || !$continuation['receipt_delivered']) return null;
+        return self::registerInvocation($token, $continuation['wire_name'],
+            'cell-wait-' . hash('sha256', $callId), ['cell_id'=>$continuation['cell_id']], null, $callId);
+    }
+
     /** Retired tokens may only finish an already recorded receipt; they cannot start new work. */
     private static function receiptForTokenUnlocked(string $token, string $callId): array
     {
@@ -2355,7 +2442,7 @@ final class ToolBroker
                 !empty($spec['budget']['original_context_required']),
                 array_column((array) ($environment['tools'] ?? []), 'wire_name'), $parallel,
                 self::hostShellFromContext((string) ($spec['full_context_json'] ?? $transport)),
-                (array) ($spec['budget']['output_control'] ?? [])),
+                (array) ($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
             'is_continuation' => false, 'steering_restart' => !$mailbox, 'mailbox_context_restart' => $mailbox,
         ];
     }
@@ -3056,7 +3143,7 @@ final class ToolBroker
      */
     private static function controlPrompt(string $token, string $contextJson, ?string $checkpointMarker = null, bool $readContext = false,
         string $operation = 'response', bool $contextOnly = false, bool $archiveRequired = false, array $hostToolNames = [],
-        bool $parallelToolCalls = false, ?string $hostShell = null, array $outputControl = []): string
+        bool $parallelToolCalls = false, ?string $hostShell = null, array $outputControl = [], bool $ordinaryFollowup = false): string
     {
         if ($contextJson === '') {
             $contextJson = '{"version":3,"system":[],"messages":[]}';
@@ -3082,7 +3169,7 @@ final class ToolBroker
         $contextJson = WebContract::contextJson($contextJson);
         $prompt = self::conciseControlPrompt($token, $contextJson, $checkpointMarker, $readContext,
             $contextOnly, $archiveRequired, $hostToolNames, $parallelToolCalls, $hostShell, $outputControl,
-            $retainedPage);
+            $retainedPage, $ordinaryFollowup);
         return $importNotice === '' ? $prompt : $prompt . "\n" . $importNotice;
     }
 
@@ -3096,10 +3183,34 @@ final class ToolBroker
         return "<codex_context_window_notice>\n" . $original['notice'] . "\n</codex_context_window_notice>";
     }
 
+    /** Select a retained saved-chat human request without changing active interjections or checkpoint control. */
+    private static function ordinaryFollowup(array $spec): bool
+    {
+        $budget = $spec['budget'] ?? json_decode((string) ($spec['budget_json'] ?? '{}'), true);
+        if (($spec['operation_kind'] ?? 'response') !== 'response' || empty($budget['regular_chat'])
+            || !empty($spec['steering_restart']) || array_key_exists('postcompact_user_input', $spec)
+            || !empty($budget['original_context_required'])
+            || !empty($spec['tool_outputs'])) return false;
+        $context = json_decode((string) ($spec['transport_context_json'] ?? $spec['context_json'] ?? '{}'), true);
+        foreach ((array) ($context['messages'] ?? []) as $message) {
+            // The same proof survives an unsent job's reload without a new persisted flag.
+            if (($message['role'] ?? '') === 'developer'
+                && ($message['content'] ?? null) === ContextCompaction::pageResumeInstruction()) return false;
+        }
+        // Persisted unsent upgrades must also retain the established active-interjection contract.
+        if (!empty($context['continuation']['steering']) && empty($spec['stopped_source_response_id'])
+            && (!WebContract::hasSteeringNotice((string) ($spec['prompt'] ?? ''))
+                || WebContract::steeringScope((string) $spec['prompt']) !== 'stopped_followup')) return false;
+        return ($context['continuation']['mode'] ?? '') === 'exact_prefix'
+            && !empty($context['continuation']['regular_conversation_id'])
+            && $context['continuation']['regular_conversation_id'] === ($budget['regular_chat']['conversation_id'] ?? null);
+    }
+
     /** Build the tool-capable Web contract, adding only notices for advertised host capabilities. */
     private static function conciseControlPrompt(string $token, string $contextJson, ?string $checkpointMarker,
         bool $readContext, bool $contextOnly, bool $archiveRequired, array $hostToolNames,
-        bool $parallelToolCalls, ?string $hostShell, array $outputControl, ?bool $retainedPage = null): string
+        bool $parallelToolCalls, ?string $hostShell, array $outputControl, ?bool $retainedPage = null,
+        bool $ordinaryFollowup = false): string
     {
         $settings = GatewaySettings::internal();
         $connectorName = trim((string) ($settings['connector_name'] ?? ''));
@@ -3122,9 +3233,9 @@ final class ToolBroker
                 ? 'No Codex host tools are authorized. The attached connector may read the original task history through rcmaker.context_read via codex_tool_call. Do not execute commands or modify files.' : '',
             'archive_requirement' => $archiveRequired
                 ? 'Before acting or answering, discover rcmaker.context_read through codex_tool_inventory and call it with codex_tool_call and the current turn_token to verify relevant original records. The bounded working view is incomplete.' : '',
-            'read_context_notice' => $readContext
+            'read_context_notice' => $readContext && !$ordinaryFollowup
                 ? 'Multipart ACKs confirm delivery, not continued model recall. Before continuing unfinished work from staged or restored history, discover rcmaker.context_read through codex_tool_inventory and invoke it through codex_tool_call with the current turn_token to verify the actual human goal, relevant completed tool receipts and remaining steps. Search relevant phrases or paginate exact original records when needed; do not guess missing facts or repeat completed effects. A self-contained answer-only question or explicit pause does not require an unrelated history lookup.' : '',
-        ]);
+        ], $ordinaryFollowup);
         $browserNotice = self::browserToolNotice($hostToolNames, $contextJson);
         if (!$contextOnly) {
             $execName = in_array('functions__exec', $hostToolNames, true) ? 'functions__exec'
@@ -3274,15 +3385,19 @@ final class ToolBroker
         preg_match_all('/(?<![A-Za-z0-9_-])(?:turn_[A-Za-z0-9_-]{32}|request_[A-Za-z0-9_-]{24,128})(?![A-Za-z0-9_-])/', (string) $job['prompt'], $matches);
         $tokens = array_values(array_unique(array_filter($matches[0], static fn($token)=>hash_equals((string)$binding['token_hash'],hash('sha256',$token)))));
         if (count($tokens) !== 1) return null;
-        $context = !empty($job['continuation_source_response_id']) ? $job['context_json']
-            : ($job['transport_context_json'] ?? $job['context_json']);
+        $ordinaryFollowup = self::ordinaryFollowup($job);
+        // A saved-chat human suffix already has its verified retained-page metadata.
+        // Rebuilding an unsent capability must not replace it with the full audit history.
+        $context = $ordinaryFollowup ? ($job['transport_context_json'] ?? $job['context_json'])
+            : (!empty($job['continuation_source_response_id']) ? $job['context_json']
+                : ($job['transport_context_json'] ?? $job['context_json']));
         $prompt = self::controlPrompt($tokens[0], (string)$context, $job['checkpoint_marker'] ?? null,
             TaskContext::enabled(json_decode($job['budget_json'],true)?:[],json_decode($binding['tool_environment_json'],true)?:[]),
             (string)($job['operation_kind'] ?? 'response'), empty(json_decode($binding['tool_environment_json'],true)['tools']),
             !empty(json_decode($job['budget_json'],true)['original_context_required']),
             array_column(json_decode($binding['tool_environment_json'],true)['tools'] ?? [], 'wire_name'),
             !empty($binding['parallel_tool_calls']), self::hostShellFromContext((string)$job['context_json']),
-            (array)((json_decode($job['budget_json'], true) ?: [])['output_control'] ?? []));
+            (array)((json_decode($job['budget_json'], true) ?: [])['output_control'] ?? []), $ordinaryFollowup);
         return WebContract::withSteeringNotice($prompt,
             ($job['operation_kind'] ?? 'response') === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']),
             WebContract::steeringScope((string)$job['prompt']));

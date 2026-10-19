@@ -6632,7 +6632,12 @@ JS;
                 $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = null;
                 $networkError = ($snapshot['error']['code'] ?? '') === 'CHATGPT_NETWORK_ERROR';
                 $failedMessageStream = $networkError
-                    || ($snapshot['error']['code'] ?? '') === 'CHATGPT_MESSAGE_STREAM_ERROR';
+                    || ($snapshot['error']['code'] ?? '') === 'CHATGPT_MESSAGE_STREAM_ERROR'
+                    // Keep this ordinary terminal observation for the fenced, button-based
+                    // recovery below. Temporary chats and checkpoint errors retain their path.
+                    || (($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING'
+                        && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                        && !empty($turn['tool_capable']) && ($turn['operation_kind'] ?? 'response') === 'response');
                 if ($networkError && $this->retryCompactNetworkError($responseId, $snapshot)) return;
                 if (!$networkError && in_array($snapshot['error']['code'] ?? '', ['CHATGPT_UPSTREAM_ERROR','CHATGPT_MESSAGE_TOO_LARGE'], true)
                     && $this->waitForTaskSubmissionError($responseId)) {
