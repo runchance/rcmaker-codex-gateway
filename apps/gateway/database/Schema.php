@@ -511,6 +511,10 @@ final class Schema
                 'ALTER TABLE gateway_settings ADD COLUMN web_chat_fallback_at INTEGER NOT NULL DEFAULT 0',
                 "CREATE TABLE gateway_task_web_chats (task_id TEXT PRIMARY KEY REFERENCES gateway_tasks(id) ON DELETE CASCADE, mode TEXT NOT NULL CHECK(mode IN ('temporary','regular')), conversation_id TEXT UNIQUE, account_key TEXT, updated_at INTEGER NOT NULL)",
             ],
+            62 => [
+                'ALTER TABLE gateway_connector_state ADD COLUMN permission_verified_at INTEGER',
+                'ALTER TABLE gateway_connector_state ADD COLUMN permission_account_key TEXT',
+            ],
         ];
     }
 

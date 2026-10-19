@@ -112,6 +112,8 @@ final class BrowserRuntime
     private array $connectorProbeAttempts = [];
     /** Runtime fences live only for the current asynchronous connector commands. */
     private array $connectorProbeGenerations = [];
+    /** @var array<int,string> Fresh pre-probe account hashes, scoped to a single isolated check. */
+    private array $connectorProbeAccounts = [];
     /** @var array<string,array> Isolated probe picker owners; never added to the task execution registry. */
     private array $connectorModelSelections = [];
     /** @var array<int,array> Verified non-Pro mode for each current readiness command. */
@@ -1088,7 +1090,7 @@ final class BrowserRuntime
         }
     }
 
-    /** Verify the exact connector with a no-host-effect round trip in the signed-in setup browser. */
+    /** Check the exact connector; only initial/account/configuration changes need a model probe. */
     private function verifyConnector(int $commandId, array $payload): void
     {
         $connectorName = trim((string) ($payload['connector_name'] ?? ''));
@@ -1326,7 +1328,7 @@ final class BrowserRuntime
                     return;
                 }
                 if ($error === null && is_array($selected) && !empty($selected['selected'])) {
-                    $this->beginConnectorRuntimeProbe($commandId, $connectorName);
+                    $this->checkVisibleConnector($commandId, $connectorName);
                     return;
                 }
                 if (microtime(true) < $deadline) {
@@ -1335,6 +1337,43 @@ final class BrowserRuntime
                 }
                 $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_SELECTION_FAILED', 'ChatGPT 没有确认连接器已经选中。');
             });
+    }
+
+    /** Verify account and exact selected name again before reusing an initial MCP permission receipt. */
+    private function checkVisibleConnector(int $commandId, string $connectorName): void
+    {
+        $sessionId = $this->connectorProbeSessionId;
+        $targetId = $this->connectorProbeTargetId;
+        $generation = $this->connectorProbeGenerations[$commandId] ?? '';
+        $current = fn(): bool => $sessionId !== null && $targetId !== null
+            && $this->connectorProbeSessionId === $sessionId && $this->connectorProbeTargetId === $targetId
+            && ($this->connectorProbeGenerations[$commandId] ?? null) === $generation;
+        $this->evaluateConnectorProbe(WebModelPage::accountFingerprintExpression(),
+            function ($error, $account) use ($commandId, $connectorName, $generation, $current): void {
+                if (!$current()) return;
+                $accountKey = $error === null && is_array($account) && !empty($account['verified'])
+                    ? (string) ($account['account_key'] ?? '') : '';
+                if ($accountKey === '') {
+                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.');
+                    return;
+                }
+                $this->connectorProbeAccounts[$commandId] = $accountKey;
+                $this->evaluateConnectorProbe(WebModelPage::connectorSelectedExpression($connectorName),
+                    function ($error, $selected) use ($commandId, $connectorName, $generation, $accountKey, $current): void {
+                        if (!$current()) return;
+                        if ($error !== null || empty($selected['selected']) || (int) ($selected['count'] ?? 0) !== 1) {
+                            $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_SELECTION_LOST', 'The selected connector changed before the check completed.');
+                            return;
+                        }
+                        try { $accepted = !$this->connectorFallbackAttempt
+                            && ConnectorState::acceptVisibleConnector($connectorName, $generation, $accountKey); }
+                        catch (GatewayError $failure) {
+                            $this->connectorVerifyFail($commandId, $connectorName, $failure->errorCode, $failure->getMessage()); return;
+                        }
+                        if ($accepted) $this->finishConnectorRuntimeProbe($commandId, $connectorName, false);
+                        else $this->beginConnectorRuntimeProbe($commandId, $connectorName);
+                    });
+            }, 20.0, true);
     }
 
     /** Prove the selected ChatGPT Connector reaches this exact local MCP before declaring setup ready. */
@@ -1429,7 +1468,7 @@ final class BrowserRuntime
             return;
         }
         if (!empty($probe['accepted'])) {
-            $this->finishConnectorRuntimeProbe($commandId, $connectorName);
+            $this->rememberConnectorPermission($commandId, $connectorName);
             return;
         }
         if (empty($probe['expired']) && microtime(true) < $deadline) {
@@ -1515,7 +1554,8 @@ final class BrowserRuntime
             });
     }
 
-    private function finishConnectorRuntimeProbe(int $commandId, string $connectorName): void
+    /** Finish an owned check and disclose whether a new MCP probe or only qualified visibility was verified. */
+    private function finishConnectorRuntimeProbe(int $commandId, string $connectorName, bool $runtimeVerified = true): void
     {
         if ($this->connectorFallbackAttempt && $this->connectorFallbackRevision !== null) {
             try {
@@ -1529,11 +1569,35 @@ final class BrowserRuntime
         $this->closeConnectorProbeSurface();
         $this->finishCommand($commandId, [
             'verified' => true,
-            'runtime_verified' => true,
+            'runtime_verified' => $runtimeVerified,
+            'visibility_verified' => !$runtimeVerified,
             'connector_name' => $connectorName,
             'web_chat_mode' => $this->connectorChatMode,
             'chat_mode_auto_fallback' => $this->connectorFallbackAttempt,
         ]);
+    }
+
+    /** Cache only a real permission receipt observed under the same browser account before and after the probe. */
+    private function rememberConnectorPermission(int $commandId, string $connectorName): void
+    {
+        $sessionId = $this->connectorProbeSessionId;
+        $targetId = $this->connectorProbeTargetId;
+        $generation = $this->connectorProbeGenerations[$commandId] ?? '';
+        $this->evaluateConnectorProbe(WebModelPage::accountFingerprintExpression(),
+            function ($error, $account) use ($commandId, $connectorName, $sessionId, $targetId, $generation): void {
+                if ($sessionId === null || $targetId === null || $this->connectorProbeSessionId !== $sessionId
+                    || $this->connectorProbeTargetId !== $targetId || ($this->connectorProbeGenerations[$commandId] ?? null) !== $generation) return;
+                $before = $this->connectorProbeAccounts[$commandId] ?? '';
+                $after = $error === null && is_array($account) && !empty($account['verified']) ? (string) ($account['account_key'] ?? '') : '';
+                if ($before !== '' && $after !== '') {
+                    if (!hash_equals($before, $after)) {
+                        $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.'); return;
+                    }
+                    try { ConnectorState::rememberPermissionProof($connectorName, $generation, $after); }
+                    catch (GatewayError $failure) { $this->connectorVerifyFail($commandId,$connectorName,$failure->errorCode,$failure->getMessage()); return; }
+                }
+                $this->finishConnectorRuntimeProbe($commandId, $connectorName);
+            }, 20.0, true);
     }
 
     /** A proven empty temporary mention menu permits one ordinary-page test, never a timeout/login fallback. */
@@ -1590,15 +1654,15 @@ final class BrowserRuntime
         $this->refreshTabs();
     }
 
-    /** Evaluate only within the isolated probe session. */
-    private function evaluateConnectorProbe(string $expression, callable $callback, float $timeout = 3.0): void
+    /** Evaluate only within the isolated probe session; awaitPromise is reserved for asynchronous account reads. */
+    private function evaluateConnectorProbe(string $expression, callable $callback, float $timeout = 3.0, bool $awaitPromise = false): void
     {
         $sessionId = $this->connectorProbeSessionId;
         if ($sessionId === null || !$this->taskCdp->ready()) {
             $callback(['code' => -1, 'message' => 'CONNECTOR_PROBE_SURFACE_MISSING'], null);
             return;
         }
-        $this->taskCdp->send('Runtime.evaluate', ['expression' => $expression, 'returnByValue' => true], $sessionId,
+        $this->taskCdp->send('Runtime.evaluate', ['expression' => $expression, 'returnByValue' => true, 'awaitPromise'=>$awaitPromise], $sessionId,
             static function ($error, $result) use ($callback): void {
                 $callback(is_array($error) ? $error : null, $result['result']['value'] ?? null);
             }, $timeout);
@@ -1787,6 +1851,7 @@ JS;
         $this->connectorProbeSessionId = null;
         $this->connectorProbeAttempts = [];
         $this->connectorProbeGenerations = [];
+        $this->connectorProbeAccounts = [];
         $this->connectorProbeCdpWaitSince = [];
         $this->startBrowser($commandId, $payload);
     }
@@ -1838,6 +1903,7 @@ JS;
         $this->connectorProbeSessionId = null;
         $this->connectorProbeAttempts = [];
         $this->connectorProbeGenerations = [];
+        $this->connectorProbeAccounts = [];
         $this->connectorProbeCdpWaitSince = [];
         @unlink(self::screenshotPath());
         $this->clearMonitorScreenshots();
@@ -3417,6 +3483,9 @@ JS;
                     return;
                 }
             }
+            if (is_array($capability) && empty($capability['editor_ready'])
+                && $this->deferSavedChatLoad($responseId, $sessionId,
+                    fn() => $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, $recover, $deadline))) return;
             if (microtime(true) >= $deadline) {
                 $this->taskFailTurn($responseId, $recover ? 'RECOVERY_OUTCOME_UNKNOWN' : 'CHATGPT_SURFACE_NOT_READY',
                     $recover ? '恢复任务时无法确认原页面状态；不会自动重发。' : '任务 ChatGPT 页面在限定时间内未进入可发送状态。', $recover);
@@ -3659,6 +3728,8 @@ JS;
                     || (array) ($baseline['user_ids'] ?? []) === [])
                 && !empty($baseline['editor_ready']) && empty($baseline['generation_running']);
             if (!$ready) {
+                if ($this->deferSavedChatLoad($responseId, (string) $turn['session_id'],
+                    fn() => $this->confirmTaskEditor($responseId, $attempt + 1))) return;
                 if ($attempt < 5 && empty($turn['sent_at']) && microtime(true) + 1.0 < (float) $turn['deadline']) {
                     Timer::add(1.0, fn() => $this->confirmTaskEditor($responseId, $attempt + 1), null, false);
                     return;
@@ -3671,6 +3742,161 @@ JS;
             $this->chatGptTurns[$responseId]['bound_assistant_id'] = null;
             $this->prepareTaskModel($responseId, false);
         });
+    }
+
+    /**
+     * Validate an unsent response's exact saved chat before any load recovery; no host effects are authorized.
+     * @param string $responseId Current response. @param string $sessionId Exact attached owner.
+     * @param array $phase Optional captured generation. @return array|null Fresh metadata, or no authority.
+     */
+    private function savedChatLoadLedger(string $responseId, string $sessionId, array $phase = []): ?array
+    {
+        $owner = $this->taskSessions[$sessionId] ?? [];
+        $chat = $owner['web_chat'] ?? [];
+        if (($owner['response_id'] ?? '') !== $responseId || ($chat['mode'] ?? '') !== 'regular'
+            || empty($chat['conversation_id']) || empty($chat['account_key'])) return null;
+        $ledger = TaskLedger::pollExecution($responseId);
+        $job = $ledger['job']; $turn = $ledger['turn']; $surface = $ledger['surface'];
+        $observer = $this->chatGptTurns[$responseId] ?? [];
+        if ($job['operation_kind'] !== 'response' || !in_array($job['status'], ['queued','running'], true)
+            || $turn['response_id'] !== $responseId || $job['generation_id'] !== $turn['generation_id']
+            || $turn['status'] !== 'queued' || !empty($turn['error_code'])
+            || !empty($job['submit_intent_at']) || !empty($job['accepted_at'])
+            || (int) $job['transport_stage_sent'] > 0 || (int) $job['transport_stage_acked'] > 0
+            || !empty($observer['sent_at']) || !empty($observer['accepted']) || !empty($observer['continuation_sending'])
+            || ($observer['compaction_phase'] ?? null) === 'preparing'
+            || $surface['id'] !== ($owner['surface_id'] ?? '') || $surface['session_id'] !== $sessionId
+            || $surface['owner_incarnation'] !== ($owner['owner_incarnation'] ?? '')
+            || (int) $surface['fencing_version'] !== (int) ($owner['fencing_version'] ?? -1)
+            || ($phase !== [] && $phase['generation_id'] !== $job['generation_id'])
+            || !WebModelPage::isTaskChatUrl($surface['url'], self::modelUrl(), 'regular', $chat['conversation_id'])) return null;
+        return $ledger;
+    }
+
+    /**
+     * Detect saved-chat load throttling before generic editor timeouts. Temporary/submitted pages are untouched.
+     * @param string $responseId Unsent response. @param string $sessionId Owned ordinary chat session.
+     * @param callable():void $resume Existing readiness path, resumed only after observation/recovery.
+     * @return bool Whether this observer owns the asynchronous readiness check.
+     */
+    private function deferSavedChatLoad(string $responseId, string $sessionId, callable $resume): bool
+    {
+        try { $ledger = $this->savedChatLoadLedger($responseId, $sessionId); }
+        catch (GatewayError) { return false; }
+        if ($ledger === null) return false;
+        if (!empty($this->taskSessions[$sessionId]['saved_load_bypass'])) {
+            unset($this->taskSessions[$sessionId]['saved_load_bypass']);
+            return false;
+        }
+        if (!empty($this->taskSessions[$sessionId]['saved_load_wait'])) return true;
+        $now = microtime(true);
+        $deadline = min((float) $ledger['turn']['deadline_at'], (float) ($this->chatGptTurns[$responseId]['deadline'] ?? PHP_FLOAT_MAX));
+        $phase = ['id'=>bin2hex(random_bytes(8)), 'generation_id'=>$ledger['job']['generation_id'],
+            'deadline'=>min($deadline, $now + max(120, (int) Config::get('gateway','browser_start_timeout_seconds'))),
+            'ceiling'=>min($deadline, $now + 600), 'turn_deadline'=>$deadline,
+            'attempt'=>0, 'not_before'=>0.0, 'failure_key'=>'', 'seen_429'=>false, 'reload_document'=>null];
+        $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
+        $this->pollSavedChatLoad($responseId, $sessionId, $phase['id'], $resume);
+        return true;
+    }
+
+    /** Poll a bounded read-only load observation; only an elapsed 429 cooldown may reload the exact unsent page. */
+    private function pollSavedChatLoad(string $responseId, string $sessionId, string $phaseId, callable $resume): void
+    {
+        $phase = $this->taskSessions[$sessionId]['saved_load_wait'] ?? [];
+        if (($phase['id'] ?? '') !== $phaseId) return;
+        $again = fn() => Timer::add(1.0,
+            fn() => $this->pollSavedChatLoad($responseId, $sessionId, $phaseId, $resume), null, false);
+        try { $ledger = $this->savedChatLoadLedger($responseId, $sessionId, $phase); }
+        catch (GatewayError $failure) {
+            if (microtime(true) < $phase['deadline']) $again();
+            else $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+            return;
+        }
+        if ($ledger === null) return;
+        $chat = $this->taskSessions[$sessionId]['web_chat'];
+        $this->evaluateTaskSession($sessionId, WebModelPage::savedChatLoadExpression($chat['conversation_id']),
+            function ($error, $snapshot) use ($responseId, $sessionId, $phaseId, $resume, $again, $chat): void {
+                $phase = $this->taskSessions[$sessionId]['saved_load_wait'] ?? [];
+                if (($phase['id'] ?? '') !== $phaseId) return;
+                try { $ledger = $this->savedChatLoadLedger($responseId, $sessionId, $phase); }
+                catch (GatewayError $failure) {
+                    if (microtime(true) < $phase['deadline']) $again();
+                    else $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    return;
+                }
+                if ($ledger === null) return;
+                $now = microtime(true);
+                $owned = $error === null && is_array($snapshot)
+                    && WebModelPage::isTaskChatUrl((string) ($snapshot['url'] ?? ''), self::modelUrl(), 'regular', $chat['conversation_id']);
+                if ($owned && !empty($snapshot['editor_ready']) && ($snapshot['generation_running'] ?? null) === false) {
+                    $this->evaluateTaskSession($sessionId, WebModelPage::accountFingerprintExpression(),
+                        function ($accountError, $account) use ($responseId, $sessionId, $phaseId, $resume, $again, $chat): void {
+                            $phase = $this->taskSessions[$sessionId]['saved_load_wait'] ?? [];
+                            if (($phase['id'] ?? '') !== $phaseId) return;
+                            try { $ledger = $this->savedChatLoadLedger($responseId, $sessionId, $phase); }
+                            catch (GatewayError $failure) {
+                                if (microtime(true) < $phase['deadline']) $again();
+                                else $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                                return;
+                            }
+                            if ($ledger === null) return;
+                            if ($accountError !== null || !is_array($account) || empty($account['verified'])) {
+                                if (microtime(true) < $phase['deadline']) $again();
+                                else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', true);
+                                return;
+                            }
+                            try { TaskWebChat::observe($ledger, $ledger['surface']['url'], (string) $account['account_key'], self::modelUrl()); }
+                            catch (GatewayError $failure) { $this->taskFailTurn($responseId,$failure->errorCode,$failure->getMessage(),true); return; }
+                            if (isset($this->chatGptTurns[$responseId])) $this->chatGptTurns[$responseId]['document_nonce'] = $ledger['surface']['document_nonce'];
+                            unset($this->taskSessions[$sessionId]['saved_load_wait']);
+                            $resume();
+                        }, 20.0, true);
+                    return;
+                }
+                // A running Stop always prevents reload, even when a stale 429 remains visible.
+                if ($owned && !empty($snapshot['generation_running']) && $now < $phase['turn_deadline']) { $again(); return; }
+                $load = $this->taskSessions[$sessionId]['saved_chat_load'] ?? [];
+                $status = (int) ($load['status'] ?? ($snapshot['http_status'] ?? 0));
+                if ($status === 429 && ($owned || !empty($load['request_id']))) {
+                    $key = (string) ($load['request_id'] ?? ($snapshot['document_id'] . ':' . ($snapshot['load_end_ms'] ?? 0)));
+                    if ($phase['failure_key'] !== $key) {
+                        $delay = $load['retry_after_seconds'] ?? min(120, 30 * (2 ** $phase['attempt']));
+                        $phase['not_before'] = $now + max(1, (int) $delay);
+                        $phase['deadline'] = min($phase['ceiling'], max($phase['deadline'], $phase['not_before'] + 30));
+                        $phase['failure_key'] = $key; $phase['seen_429'] = true;
+                        $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
+                        try { TaskLedger::observationDelayed($responseId, 'saved_chat_load',
+                            ['http_status'=>429,'retry_after_seconds'=>(int)$delay,'attempt'=>$phase['attempt']]); }
+                        catch (\Throwable) { /* Diagnostics cannot cancel load recovery. */ }
+                    }
+                }
+                // A new explicit non-rate error belongs to the existing login/deletion/error
+                // path. An earlier 429 must not hide it or keep refreshing a missing chat.
+                if (!$phase['seen_429'] || ($status >= 400 && $status !== 429)) {
+                    unset($this->taskSessions[$sessionId]['saved_load_wait']);
+                    $this->taskSessions[$sessionId]['saved_load_bypass'] = true;
+                    $resume(); return;
+                }
+                if ($phase['reload_document'] !== null && $owned
+                    && $phase['reload_document'] !== ($snapshot['document_id'] ?? null)) {
+                    $phase['reload_document'] = null;
+                    $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
+                }
+                if ($now >= $phase['deadline'] || ($phase['attempt'] >= 3 && $phase['reload_document'] === null && $status === 429)) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_CHAT_LOAD_RATE_LIMITED',
+                        'ChatGPT is still limiting conversation loading; the original chat and task are preserved. Please continue later.');
+                    return;
+                }
+                if ($owned && $status === 429 && $now >= $phase['not_before'] && $phase['reload_document'] === null
+                    && ($snapshot['generation_running'] ?? null) === false) {
+                    $phase['attempt']++; $phase['reload_document'] = (string) $snapshot['document_id'];
+                    $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
+                    $this->taskCdp->send('Page.reload', ['ignoreCache'=>false], $sessionId, fn() => $again(), 15.0);
+                    return;
+                }
+                $again();
+            }, 15.0);
     }
 
     /** Reconstruct the saved transaction and reconcile the exact in-flight ACK before doing anything else. */
@@ -9104,6 +9330,14 @@ JS;
         }
         $owner = $this->taskSessions[$sessionId];
         if ($method === 'Network.requestWillBeSent') {
+            $chat = $owner['web_chat'] ?? [];
+            if (($chat['mode'] ?? '') === 'regular' && !empty($chat['conversation_id'])
+                && ($params['request']['method'] ?? '') === 'GET' && !empty($params['requestId'])
+                && WebModelPage::isSavedChatLoadUrl((string) ($params['request']['url'] ?? ''), $chat['conversation_id'], self::modelUrl())) {
+                $reads = $owner['saved_chat_load_requests'] ?? [];
+                $reads[(string) $params['requestId']] = true;
+                $this->taskSessions[$sessionId]['saved_chat_load_requests'] = array_slice($reads, -8, null, true);
+            }
             $turn = $this->chatGptTurns[(string) ($owner['response_id'] ?? '')] ?? [];
             if (((float) ($turn['sent_at'] ?? 0) > 0 || (int) ($turn['transport_stage_sent'] ?? 0) > 0)
                 && WebModelPage::isConversationSubmission($params, (string) ($owner['main_frame_id'] ?? ''), self::modelUrl())) {
@@ -9148,9 +9382,16 @@ JS;
             if (!WebModelPage::isBackendUrl($url, self::modelUrl())) return;
             $savedChat = $owner['web_chat'] ?? [];
             if (($savedChat['mode'] ?? '') === 'regular' && !empty($savedChat['conversation_id'])
-                && in_array((int) ($response['status'] ?? 0), [404, 410], true)
-                && (string) parse_url($url, PHP_URL_PATH) === '/backend-api/conversation/' . $savedChat['conversation_id']) {
-                $this->taskSessions[$sessionId]['saved_chat_missing'] = true;
+                && isset($owner['saved_chat_load_requests'][(string) ($params['requestId'] ?? '')])
+                && WebModelPage::isSavedChatLoadUrl($url, $savedChat['conversation_id'], self::modelUrl())) {
+                $load = ['request_id'=>(string)$params['requestId'], 'status'=>(int)$response['status']];
+                foreach ((array) ($response['headers'] ?? []) as $name=>$value) {
+                    if (strtolower((string)$name) !== 'retry-after' || !is_string($value) || strlen($value)>64) continue;
+                    $seconds = ctype_digit(trim($value)) ? (int)trim($value) : max(0, (int)strtotime($value)-time());
+                    if ($seconds>0) $load['retry_after_seconds']=min(86400,$seconds);
+                }
+                $this->taskSessions[$sessionId]['saved_chat_load'] = $load;
+                if (in_array($load['status'], [404,410], true)) $this->taskSessions[$sessionId]['saved_chat_missing'] = true;
             }
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
                 $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
@@ -9213,6 +9454,7 @@ JS;
         $frame = $params['frame'] ?? null;
         if (!is_array($frame) || !empty($frame['parentId'])) return;
         unset($this->taskSessions[$sessionId]['network_trace']);
+        unset($this->taskSessions[$sessionId]['saved_chat_load'], $this->taskSessions[$sessionId]['saved_chat_load_requests']);
         $this->taskSessions[$sessionId]['main_frame_id'] = (string) ($frame['id'] ?? '');
         try {
             TaskLedger::documentChanged(
@@ -9331,7 +9573,7 @@ JS;
 
     private function finishCommand(int $id, array $result): void
     {
-        unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id]);
+        unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id], $this->connectorProbeAccounts[$id]);
         BrowserState::finish($id, true, $result);
         $this->commandBusy = false;
     }
@@ -9339,7 +9581,7 @@ JS;
     /** Persist a command failure and optional sanitized details, then release its worker slot. */
     private function failCommand(int $id, string $code, string $message, array $details = []): void
     {
-        unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id]);
+        unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id], $this->connectorProbeAccounts[$id]);
         BrowserState::finish($id, false, ['code' => $code, 'message' => $message] + $details);
         $this->commandBusy = false;
     }

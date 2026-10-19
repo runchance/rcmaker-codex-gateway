@@ -216,6 +216,8 @@ final class GatewaySettings
                     'probe_started_at' => null,
                     'recheck_required' => 0,
                     'recheck_command_id' => null,
+                    'permission_verified_at' => null,
+                    'permission_account_key' => null,
                     'last_error' => null,
                     'updated_at' => time(),
                 ]);

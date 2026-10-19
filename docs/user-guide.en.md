@@ -276,6 +276,8 @@ The current official flow is **Plugins → + → Add custom MCP server**. If you
 
 Review the page's notices, create the plugin and complete its installation/connection steps. Return to RCMAKER and select **Check connector**.
 
+The first check verifies the real MCP permission round trip and saves an account-bound receipt. Later checks, including normal RCMAKER restarts, only confirm the uniquely matching connector in the private browser; they send no model message. A changed connector, account or connection configuration requires initial verification again. Clearing private sign-in data also removes the receipt. Older versions did not save its account binding, so the first check after upgrading establishes it once. A visibility check confirms availability in the page, not a new live MCP round trip.
+
 **Success:** both tunnel and connector checks pass. If the Tunnel is missing, check organization/workspace associations and permissions. If creation succeeds but the check fails, use the [connector FAQ](faq.en.md#connector).
 
 <details>
@@ -540,6 +542,8 @@ Confirm the outcome of potentially executed writes before retrying. Clearing sig
 When a Temporary Chat task encounters an explicit page network error after making tool progress, the gateway waits for in-flight tools and receipts to settle, then restores the complete context and exact receipts on a new page and revokes the old page's tool token. Recovery may continue only the remaining authorized work; incomplete receipts or unknown outcomes prevent automatic replay. Tasks without tool progress may still use native page Retry. Context compaction keeps its separate recovery rules. Ordinary mode retains its saved conversation binding instead of replaying full history after a network error; an unconfirmed submission reports its actual state.
 
 ### Include this in a problem report
+
+If opening a saved ordinary chat returns HTTP 429 before the new message is submitted, the gateway keeps its exact conversation ID and waits before refreshing that page. It honors `Retry-After`; otherwise the waits are 30, 60 and 120 seconds, with at most three refreshes and a total wait bounded by the current task deadline and 10 minutes. A visible Stop button prevents refresh. No full-context resend or new conversation is used for this load failure. If loading remains limited, the original task and receipts are kept; existing account cooldown rules limit new submissions while accepted tool results can still be received. Workspace status/screenshot updates do not reload ChatGPT pages.
 
 For recurring **connection interrupted** notices, the task timeline records the browser protocol,
 request duration and received byte counts. Matching background recovery requests and MCP reply sizes,

@@ -1688,7 +1688,7 @@ final class TaskLedger
     /**
      * Record a delayed renderer observation without ending or extending the owned turn.
      * @param string $responseId Existing logical round. @param string $phase Observation stage.
-     * @param array $observation Allow-listed stop readiness flags, never page text or tokens.
+     * @param array $observation Allow-listed stop readiness or load cooldown facts, never page text or tokens.
      * @return void
      * @throws GatewayError When the durable job/ledger is unavailable.
      */
@@ -1698,9 +1698,13 @@ final class TaskLedger
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             if (!self::ownsCurrentGeneration($job, $turn)) return;
             $steering = $phase === 'steering_stop' && SteeringContext::isDelta($job) && $turn['status'] === 'queued';
-            if (!$steering && ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true))) return;
+            $loading = $phase === 'saved_chat_load' && $job['status'] === 'running'
+                && $job['operation_kind'] === 'response' && $turn['status'] === 'queued' && empty($job['submit_intent_at']);
+            if (!$steering && !$loading && ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true))) return;
             $data = ['deadline_at' => (int) $turn['deadline_at'],
-                'phase' => $steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response')];
+                'phase' => $loading ? 'saved_chat_load' : ($steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response'))];
+            if ($loading) $data += ['http_status'=>429,'attempt'=>max(0,min(3,(int)($observation['attempt']??0))),
+                'retry_after_seconds'=>max(1,min(86400,(int)($observation['retry_after_seconds']??30)))];
             if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed'] as $key) {
                 $data[$key] = isset($observation[$key]) ? (bool) $observation[$key] : null;
             }

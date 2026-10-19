@@ -185,7 +185,32 @@ JS;
         return str_starts_with((string) ($actual['path'] ?? ''), '/backend-api/');
     }
 
-    /** Match ChatGPT's explicit Cloudflare backend challenge without guessing from page text. */
+    /** Match only a pinned chat's natural load endpoint; never another chat or a submission endpoint. */
+    public static function isSavedChatLoadUrl(string $url, string $conversationId, string $modelUrl): bool
+    {
+        if (!self::isBackendUrl($url, $modelUrl)) return false;
+        $path = (string) (parse_url($url, PHP_URL_PATH) ?: '');
+        return in_array($path, ['/backend-api/conversation/' . $conversationId,
+            '/backend-api/conversations/' . $conversationId], true);
+    }
+
+    /**
+     * Read saved-chat readiness and the latest natural load status, never message text or credentials.
+     * @param string $conversationId Task's pinned UUID. @return string Read-only DOM expression.
+     */
+    public static function savedChatLoadExpression(string $conversationId): string
+    {
+        $paths = json_encode(['/backend-api/conversation/' . $conversationId,
+            '/backend-api/conversations/' . $conversationId], JSON_THROW_ON_ERROR);
+        return '(()=>{const b=eval(' . json_encode(self::baselineExpression(), JSON_THROW_ON_ERROR) . ');'
+            . 'const paths=' . $paths . ';const last=performance.getEntriesByType("resource").filter(e=>{'
+            . 'try{const u=new URL(e.name);return u.origin===location.origin&&paths.includes(u.pathname);}catch{return false;}'
+            . '}).sort((a,b)=>a.startTime-b.startTime).at(-1);return {url:b.url,editor_ready:b.editor_ready,'
+            . 'generation_running:b.generation_running,document_id:String(performance.timeOrigin),'
+            . 'http_status:last?.responseStatus||0,load_end_ms:last?.responseEnd||0};})()';
+    }
+
+    /** Recognize ChatGPT's explicit Cloudflare backend challenge without guessing from page text. */
     public static function isBackendSecurityChallenge(string $url, int $status, array $headers, string $modelUrl): bool
     {
         if ($status !== 403 || !self::isBackendUrl($url, $modelUrl)) return false;

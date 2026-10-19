@@ -1145,5 +1145,7 @@ window.GatewayTranslations = {
     "网页对话无法安全恢复；原始上下文和准确工具结果均已保留。": "The Web chat could not recover safely; the original context and exact tool results are preserved.",
     "消息流失败前已有部分回复送达；当前文字和工具结果均已保留，不会重新生成。": "The reply was partially delivered before the stream failed; its text and tool results are preserved without regeneration.",
     "普通对话异常恢复已排队": "Ordinary chat recovery queued",
-    "刷新原普通对话后仍找不到准确的连接器，消息未发送，原任务已保留。": "The exact connector is still unavailable after refreshing the saved Web chat; the message was not sent and the original task is preserved."
+    "刷新原普通对话后仍找不到准确的连接器，消息未发送，原任务已保留。": "The exact connector is still unavailable after refreshing the saved Web chat; the message was not sent and the original task is preserved.",
+    "ChatGPT 对话加载仍被限流，原对话和任务已保留，请稍后继续。": "ChatGPT is still limiting conversation loading; the original chat and task are preserved. Please continue later.",
+    "连接器选择状态发生变化，请重新检查。": "The selected connector changed before the check completed."
 };

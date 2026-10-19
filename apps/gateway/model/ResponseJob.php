@@ -70,10 +70,12 @@ final class ResponseJob
         // before browser admission; replaying a failure requires no live browser.
         $failedReplay = self::failedTurnReplayUnlocked($spec);
         if ($failedReplay !== null) return self::decode($failedReplay);
-        ModelCooldown::assertReady();
+        // An accepted tool result resumes an existing Web turn and sends no new browser
+        // message. Keep its exact receipt drainable while new submissions are cooling down.
+        $isToolContinuation = (array) ($spec['tool_outputs'] ?? []) !== [];
+        if (!$isToolContinuation) ModelCooldown::assertReady();
         $budget = $spec['budget'] ?? ContextBudget::snapshot($spec['model'], $spec['reasoning_effort'] ?? null);
         $spec['budget'] = $budget;
-        $isToolContinuation = (array) ($spec['tool_outputs'] ?? []) !== [];
         $activeSteeringCandidate = !$isToolContinuation && (self::potentialActiveUserSteering($spec)
             || ContextHistory::activeToolBoundarySteeringUnlocked($spec) !== null
             || ContextHistory::activeMailboxContextUpdateUnlocked($spec) !== null);
@@ -172,6 +174,9 @@ final class ResponseJob
             // here. Observe its durable failure instead of reserving another send.
             $failedReplay = self::failedTurnReplayUnlocked($spec);
             if ($failedReplay !== null) return (string) $failedReplay['id'];
+            // The incoming history may contain old outputs or a new user instruction.
+            // Only the normalized receipt-only continuation can bypass submission cooldown.
+            if (($spec['tool_outputs'] ?? []) === [] || !empty($spec['steering_restart'])) ModelCooldown::assertReady();
             // Historical tool outputs are normalized above. Only an actual receipt for this
             // task's pending invocation may continue without rediscovering the account catalog.
             if (($spec['tool_outputs'] ?? []) === [] && empty($spec['steering_restart'])) {
@@ -590,7 +595,8 @@ final class ResponseJob
     {
         $row = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find(
             'id,status,operation_kind,round_kind,previous_response_id,checkpoint_marker,'
-            . 'durable_turn_id,surface_id,generation_id,task_id,epoch_id,mcp_binding_id,command_id,submit_intent_at,submitted_document_nonce');
+            . 'durable_turn_id,surface_id,generation_id,task_id,epoch_id,mcp_binding_id,command_id,submit_intent_at,submitted_document_nonce,'
+            . 'accepted_at,transport_stage_sent,transport_stage_acked');
         if (!is_array($row)) throw new GatewayError('response_not_found', 'Responses 请求不存在。', 404);
         return $row;
     }

@@ -4,7 +4,7 @@ namespace app\gateway\model;
 
 use app\gateway\database\Schema;
 
-/** Durable proof that ChatGPT reached this project's local MCP through the configured Connector/Tunnel. */
+/** Connector readiness with an initial MCP receipt and account-bound visibility checks after restart. */
 final class ConnectorState
 {
     public static function snapshot(string $expectedName): array
@@ -32,7 +32,8 @@ final class ConnectorState
 
     /**
      * Fence connector proof when the owned tunnel starts a new runtime. Prior setup is remembered
-     * only to schedule one no-side-effect recheck; an old token can never verify the new runtime.
+     * to schedule one visibility check; an initial permission receipt survives only for the same name.
+     * Old probe tokens cannot verify the new runtime.
      * @param string $connectorName Current configured connector name.
      * @return void
      * @throws GatewayError When the durable state cannot be updated.
@@ -44,12 +45,14 @@ final class ConnectorState
             $row = self::row();
             $sameName = hash_equals((string) $row['connector_name'], $connectorName);
             $recheck = $sameName && ((string) $row['status'] === 'verified'
-                || (int) $row['recheck_required'] === 1 || $row['recheck_command_id'] !== null);
+                || !empty($row['permission_verified_at']) || (int) $row['recheck_required'] === 1 || $row['recheck_command_id'] !== null);
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_connector_state')->where('id', 1)->update([
                 'connector_name'=>$connectorName, 'runtime_generation'=>bin2hex(random_bytes(16)),
                 'status'=>'unverified', 'verified_at'=>null, 'verified_generation'=>null,
                 'probe_token_hash'=>null, 'probe_expires_at'=>null, 'probe_started_at'=>null, 'probe_generation'=>null,
                 'recheck_required'=>(int) $recheck, 'recheck_command_id'=>null, 'last_error'=>null, 'updated_at'=>time(),
+                'permission_verified_at'=>$sameName ? $row['permission_verified_at'] : null,
+                'permission_account_key'=>$sameName ? $row['permission_account_key'] : null,
             ]);
             if ($updated === false) throw new GatewayError('STORAGE_UNAVAILABLE', '无法记录工具连接重建状态。', 503);
         });
@@ -164,7 +167,7 @@ final class ConnectorState
         return max(10, min(90, (int) ceil((int) GatewaySettings::internal()['mcp_invoke_timeout_ms'] / 1000)));
     }
 
-    /** @throws GatewayError Unless the current owned runtime has an actual connector receipt. */
+    /** @throws GatewayError Unless the current runtime passed its initial probe or a qualified visibility check. */
     public static function assertRuntimeReady(): void
     {
         $row = self::row();
@@ -172,6 +175,60 @@ final class ConnectorState
             || !hash_equals((string) $row['runtime_generation'], (string) ($row['verified_generation'] ?? '')))) {
             throw new GatewayError('CHATGPT_CONNECTOR_NOT_READY', '工具连接尚未恢复，请在运行准备中检查连接器。', 503);
         }
+    }
+
+    /**
+     * Retain an actual permission receipt with the freshly observed browser account for later startups.
+     * @param string $connectorName Exact checked name. @param string $generation Current runtime fence.
+     * @param string $accountKey SHA-256 account fingerprint, never a credential.
+     * @return void
+     * @throws GatewayError If the probe receipt or current configuration changed before persistence.
+     */
+    public static function rememberPermissionProof(string $connectorName, string $generation, string $accountKey): void
+    {
+        Schema::transaction(static function () use ($connectorName, $generation, $accountKey): void {
+            $row = self::row();
+            if ($accountKey === '' || $row['connector_name'] !== $connectorName || $row['runtime_generation'] !== $generation
+                || $row['status'] !== 'verified' || $row['verified_generation'] !== $generation
+                || empty($row['probe_token_hash']) || empty($row['probe_started_at'])) {
+                throw new GatewayError('CHATGPT_CONNECTOR_RUNTIME_CHANGED', '工具连接已变化，旧检查已取消。', 409);
+            }
+            $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_connector_state')->where('id', 1)
+                ->where('runtime_generation', $generation)->update([
+                    'permission_verified_at'=>(int) $row['verified_at'], 'permission_account_key'=>$accountKey,
+                ]);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('STORAGE_UNAVAILABLE', '连接器检查状态无法保存。', 503);
+        });
+    }
+
+    /**
+     * Accept one exact visible connector only after this account's initial permission check succeeded.
+     * The browser caller must freshly observe a unique selected name; this does not claim a new MCP round trip.
+     * @param string $connectorName Exact visible name. @param string $generation Current runtime fence.
+     * @param string $accountKey Fresh browser account fingerprint.
+     * @return bool False requires an initial probe; true makes this runtime ready without a model message.
+     * @throws GatewayError When configuration changes or persistence fails.
+     */
+    public static function acceptVisibleConnector(string $connectorName, string $generation, string $accountKey): bool
+    {
+        return Schema::transaction(static function () use ($connectorName, $generation, $accountKey): bool {
+            $row = self::row();
+            if ($row['connector_name'] !== $connectorName || $row['runtime_generation'] !== $generation
+                || GatewaySettings::internal()['connector_name'] !== $connectorName) {
+                throw new GatewayError('CHATGPT_CONNECTOR_RUNTIME_CHANGED', '工具连接已变化，旧检查已取消。', 409);
+            }
+            if (empty($row['permission_verified_at']) || $accountKey === ''
+                || !hash_equals((string) ($row['permission_account_key'] ?? ''), $accountKey)) return false;
+            $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_connector_state')->where('id', 1)
+                ->where('runtime_generation', $generation)->update([
+                    'status'=>'verified', 'verified_at'=>time(), 'verified_generation'=>$generation,
+                    'recheck_required'=>0, 'recheck_command_id'=>null, 'last_error'=>null,
+                    'probe_token_hash'=>null, 'probe_expires_at'=>null, 'probe_started_at'=>null, 'probe_generation'=>null,
+                    'updated_at'=>time(),
+                ]);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('STORAGE_UNAVAILABLE', '连接器检查状态无法保存。', 503);
+            return true;
+        });
     }
 
     /** Issue a short-lived probe; optional generation fences an asynchronous browser operation. */
@@ -316,6 +373,8 @@ final class ConnectorState
             'probe_started_at' => null,
             'recheck_required' => 0,
             'recheck_command_id' => null,
+            'permission_verified_at' => null,
+            'permission_account_key' => null,
             'last_error' => null,
             'updated_at' => time(),
         ]);
