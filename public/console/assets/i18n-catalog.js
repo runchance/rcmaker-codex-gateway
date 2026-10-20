@@ -1146,5 +1146,15 @@ window.GatewayTranslations = {
     "普通对话异常恢复已排队": "Ordinary chat recovery queued",
     "刷新原普通对话后仍找不到准确的连接器，消息未发送，原任务已保留。": "The exact connector is still unavailable after refreshing the saved Web chat; the message was not sent and the original task is preserved.",
     "ChatGPT 对话加载仍被限流，原对话和任务已保留，请稍后继续。": "ChatGPT is still limiting conversation loading; the original chat and task are preserved. Please continue later.",
-    "连接器选择状态发生变化，请重新检查。": "The selected connector changed before the check completed."
+    "连接器选择状态发生变化，请重新检查。": "The selected connector changed before the check completed.",
+    "ChatGPT 暂时限流，正在等待自动恢复。": "ChatGPT is temporarily rate limited; waiting to resume automatically.",
+    "下次检查至少等待": "Minimum wait before the next check",
+    "限流等待中，任务已保留": "Waiting for rate limits; task preserved",
+    "限流恢复已达到本回合等待上限，原对话和工具结果已保留，请稍后继续。": "ChatGPT rate-limit recovery reached this turn’s waiting limit; the original chat and tool results are preserved. Please continue later.",
+    "ChatGPT 返回需要处理账号额度或账单的限制，已停止自动重试并保留任务结果。": "ChatGPT reported a quota or billing restriction that requires account action; automatic retries have stopped and task results are preserved.",
+    "暂时无法读取共享限流状态。": "The shared rate-limit state could not be read.",
+    "暂时无法保存共享限流状态。": "The shared rate-limit state could not be saved.",
+    "无法在 ChatGPT 编辑器中完整输入连接器搜索文字，未发送任务。": "The connector search text could not be entered completely in ChatGPT; the task was not sent.",
+    "选择工具连接器前无法清空 ChatGPT 编辑器。": "The ChatGPT composer could not be cleared before selecting the connector.",
+    "ChatGPT 中存在上次遗留草稿，且无法安全清空。": "ChatGPT contains a previous draft that could not be safely cleared."
 };

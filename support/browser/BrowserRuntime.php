@@ -2529,12 +2529,15 @@ JS;
      * Open mention autocomplete with native keystrokes, independent of the custom RCMAKER suffix.
      * The ASCII brand query supports Unicode suffixes; callers still select only the exact configured name.
      * Preserve the old query for existing non-RCMAKER connector names accepted by settings migration.
+     * @param callable():bool|null $isCurrent Optional saved-chat fence checked before every key.
      */
-    private function typeConnectorMention(CdpClient $client, ?string $sessionId, callable $callback, float $timeout = 5.0, string $connectorName = 'RCMAKER Codex'): void
+    private function typeConnectorMention(CdpClient $client, ?string $sessionId, callable $callback, float $timeout = 5.0,
+        string $connectorName = 'RCMAKER Codex', ?callable $isCurrent = null): void
     {
         $query = str_starts_with($connectorName, 'RCMAKER ') ? '@RCMAKER' : '@codex';
         $index = 0; $deadline = microtime(true) + $timeout;
-        $advance = function () use ($client, $sessionId, $callback, $query, &$index, $deadline, &$advance): void {
+        $advance = function () use ($client, $sessionId, $callback, $query, &$index, $deadline, &$advance, $isCurrent): void {
+            if ($isCurrent !== null && !$isCurrent()) return;
             // Once the final key was acknowledged, a slow callback does not undo successful input.
             if ($index >= strlen($query)) { $callback(null); return; }
             if (microtime(true) >= $deadline) { $callback(['code' => -2, 'message' => 'CONNECTOR_MENTION_TIMEOUT', 'mention_key_index'=>$index]); return; }
@@ -5323,6 +5326,31 @@ JS;
                     $this->prepareSelectedTaskConnector($responseId, $connectorName, $attempt);
                     return;
                 }
+                if (($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular') {
+                    $this->clearSavedTaskConnectorComposer($responseId,
+                        function (callable $isCurrent) use ($responseId, $connectorName, $attempt, $documentNonce): void {
+                            $turn = $this->chatGptTurns[$responseId];
+                            $this->typeConnectorMention($this->taskCdp, (string)$turn['session_id'],
+                                function ($insertError) use ($responseId, $connectorName, $attempt, $documentNonce, $isCurrent): void {
+                                    if (!$isCurrent()) return;
+                                    $this->evaluateTask($responseId, WebModelPage::composerTextExpression(),
+                                        function ($error, $draft) use ($responseId, $connectorName, $attempt, $documentNonce, $isCurrent): void {
+                                            if (!$isCurrent()) return;
+                                            $query = str_starts_with($connectorName, 'RCMAKER ') ? '@RCMAKER' : '@codex';
+                                            if ($error !== null || empty($draft['ok']) || trim((string)($draft['text'] ?? '')) !== $query) {
+                                                if ($attempt < 3) $this->prepareTaskConnector($responseId, $connectorName, $attempt + 1);
+                                                else $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_TRIGGER_FAILED',
+                                                    '无法在 ChatGPT 编辑器中完整输入连接器搜索文字，未发送任务。');
+                                                return;
+                                            }
+                                            // Keep a valid query in place while the asynchronous catalog loads.
+                                            $deadline = min((float)$this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0);
+                                            $this->waitTaskConnectorMenu($responseId, $connectorName, 3, $deadline, $documentNonce, $isCurrent);
+                                        }, 15.0);
+                                }, 30.0, $connectorName, $isCurrent);
+                        });
+                    return;
+                }
                 $this->evaluateTask($responseId, WebModelPage::focusAndClearExpression(),
                     function ($clearError, $cleared) use ($responseId, $connectorName, $attempt, $documentNonce): void {
                         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -5342,16 +5370,106 @@ JS;
             });
     }
 
+    /**
+     * Clear a saved-chat draft through native editing, then verify it after the editor has settled.
+     * Direct DOM deletion can leave the editor's persisted state unchanged and restore @RCMAKER.
+     * @param callable(callable():bool):void $after Receives a fence for subsequent mention typing.
+     * @param bool $searchOnly Before refresh/failure, remove only our search query; preserve unknown drafts.
+     */
+    private function clearSavedTaskConnectorComposer(string $responseId, callable $after, bool $searchOnly = false): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || ($turn['web_chat']['mode'] ?? '') !== 'regular') return;
+        try { $generationId = TaskLedger::pollExecution((string)($turn['logical_response_id'] ?? $responseId))['job']['generation_id']; }
+        catch (\Throwable) { return; }
+        $operation = bin2hex(random_bytes(8));
+        $this->chatGptTurns[$responseId]['connector_clear_id'] = $operation;
+        $keys = array_flip(['session_id','surface_id','target_id','document_nonce','owner_incarnation','fencing_version',
+            'logical_response_id','connector_catalog_refresh_pending','connector_attempt']);
+        $phase = array_intersect_key($turn, $keys);
+        $isCurrent = function () use ($responseId, $operation, $keys, $phase, $generationId): bool {
+            $current = $this->chatGptTurns[$responseId] ?? [];
+            if (($current['connector_clear_id'] ?? '') !== $operation || empty($current['connector_preparing'])
+                || array_intersect_key($current, $keys) !== $phase) return false;
+            try { $ledger = TaskLedger::pollExecution((string)($current['logical_response_id'] ?? $responseId)); }
+            catch (\Throwable) { return false; }
+            $surface = $ledger['surface'];
+            if (empty($current['continuation_sending']) && (int)($current['transport_stage_sent'] ?? 0) === 0
+                && (!empty($ledger['job']['submit_intent_at']) || !empty($ledger['job']['accepted_at']))) return false;
+            return in_array($ledger['job']['status'], ['queued','running'], true)
+                && $ledger['job']['generation_id'] === $generationId
+                && $ledger['job']['generation_id'] === $ledger['turn']['generation_id']
+                && !in_array($ledger['turn']['status'], ['failed','cancelled','superseded','committed','needs_attention'], true)
+                && !in_array($ledger['turn']['error_code'] ?? '',
+                    ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+                && $surface['id'] === $current['surface_id'] && $surface['task_id'] === $ledger['job']['task_id']
+                && $surface['session_id'] === $current['session_id']
+                && $surface['document_nonce'] === $current['document_nonce']
+                && $surface['owner_incarnation'] === $current['owner_incarnation']
+                && (int)$surface['fencing_version'] === (int)$current['fencing_version'];
+        };
+        $deadline = min((float)$turn['deadline'], microtime(true) + 60.0);
+        $read = null;
+        $read = function (int $keyIndex = -1, int $attempt = 0, bool $emptySeen = false) use (
+            $responseId, $after, $searchOnly, $isCurrent, $deadline, &$read): void {
+            if (!$isCurrent()) return;
+            $this->evaluateTask($responseId, WebModelPage::connectorComposerStateExpression($keyIndex >= 0),
+                function ($error, $state) use ($responseId, $after, $searchOnly, $isCurrent, $deadline,
+                    &$read, $keyIndex, $attempt, $emptySeen): void {
+                    if (!$isCurrent()) return;
+                    if ($error !== null || !is_array($state) || empty($state['ok'])) {
+                        if (microtime(true) < $deadline) {
+                            Timer::add(0.5, fn() => $read($keyIndex, $attempt, false), null, false);
+                        } else $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', '选择工具连接器前无法清空 ChatGPT 编辑器。');
+                        return;
+                    }
+                    if (!$this->taskChatMatches($responseId, (string)($state['url'] ?? ''), true)) return;
+                    $text = trim((string)($state['text'] ?? ''));
+                    $empty = $text === '' && (int)($state['connector_count'] ?? 0) === 0;
+                    if ($keyIndex < 0 && $empty) {
+                        if ($emptySeen) { $after($isCurrent); return; }
+                        Timer::add(0.25, fn() => $read(-1, $attempt, true), null, false);
+                        return;
+                    }
+                    $searchDraft = (int)($state['connector_count'] ?? 0) === 0
+                        && ($empty || str_starts_with('@RCMAKER', $text) || str_starts_with('@codex', $text)
+                            || preg_match('/\A(?:@RCMAKER|@codex)+\z/D', $text) === 1);
+                    if (($searchOnly && !$searchDraft) || $attempt >= 3 || microtime(true) >= $deadline) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', 'ChatGPT 中存在上次遗留草稿，且无法安全清空。');
+                        return;
+                    }
+                    if ($keyIndex < 0) { $read(0, $attempt); return; }
+                    // Escape closes stale autocomplete; native Select All/Backspace updates persisted editor state.
+                    $nativeKeys = ['Escape', PHP_OS_FAMILY === 'Darwin' ? 'Command+A' : 'Control+A', 'Backspace'];
+                    if (empty($state['focused']) || ($keyIndex === 2 && empty($state['selection_inside']))) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', '选择工具连接器前无法清空 ChatGPT 编辑器。');
+                        return;
+                    }
+                    $this->dispatchTaskKey($responseId, $nativeKeys[$keyIndex],
+                        function ($keyError) use ($read, $isCurrent, $keyIndex, $attempt): void {
+                            if (!$isCurrent()) return;
+                            // Missing CDP acknowledgement is uncertain: read back before repeating any edit.
+                            if ($keyError !== null || $keyIndex === 2) {
+                                Timer::add(0.25, fn() => $read(-1, $attempt + 1), null, false);
+                            } else $read($keyIndex + 1, $attempt);
+                        });
+                }, 15.0);
+        };
+        $read();
+    }
+
     /** Observe one preparation document; delayed menu callbacks cannot touch its refreshed replacement. */
     private function waitTaskConnectorMenu(string $responseId, string $connectorName, int $attempt, float $deadline,
-        ?string $expectedNonce = null): void
+        ?string $expectedNonce = null, ?callable $isCurrent = null): void
     {
+        if ($isCurrent !== null && !$isCurrent()) return;
         if (!isset($this->chatGptTurns[$responseId])) return;
         if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
         $expectedNonce ??= (string) ($this->chatGptTurns[$responseId]['document_nonce'] ?? '');
         if (($this->chatGptTurns[$responseId]['document_nonce'] ?? '') !== $expectedNonce) return;
         $this->evaluateTask($responseId, WebModelPage::connectorMenuExpression($connectorName),
-            function ($error, $menu) use ($responseId, $connectorName, $attempt, $deadline, $expectedNonce): void {
+            function ($error, $menu) use ($responseId, $connectorName, $attempt, $deadline, $expectedNonce, $isCurrent): void {
+                if ($isCurrent !== null && !$isCurrent()) return;
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])
                     || ($this->chatGptTurns[$responseId]['document_nonce'] ?? '') !== $expectedNonce) return;
@@ -5362,12 +5480,13 @@ JS;
                         return;
                     }
                     if ($count === 1) {
-                        $this->activateTaskConnectorChoice($responseId, $connectorName, 0);
+                        $this->activateTaskConnectorChoice($responseId, $connectorName, 0, $isCurrent);
                         return;
                     }
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.1, fn() => $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, $deadline, $expectedNonce), null, false);
+                    $delay = ($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular' ? 0.5 : 0.1;
+                    Timer::add($delay, fn() => $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, $deadline, $expectedNonce, $isCurrent), null, false);
                     return;
                 }
                 if ($attempt < 3) {
@@ -5397,11 +5516,15 @@ JS;
                         && empty($current['job']['submit_intent_at']) && empty($current['job']['accepted_at'])
                         && empty($turn['continuation_sending']);
                     $refreshed = !empty($turn['connector_catalog_refresh_used']) && $unsent;
-                    $this->taskFailTurn($responseId,
-                        $refreshed ? 'CHATGPT_CONNECTOR_UNAVAILABLE' : 'CHATGPT_CONNECTOR_STATE_UNAVAILABLE',
-                        $refreshed
-                            ? 'The exact connector is still unavailable after refreshing the saved Web chat; the message was not sent and the original task is preserved.'
-                            : '连接器菜单回调到达时任务提交状态无法安全确认；不会重发。', !$unsent);
+                    $fail = function () use ($responseId, $refreshed, $unsent): void {
+                        $this->taskFailTurn($responseId,
+                            $refreshed ? 'CHATGPT_CONNECTOR_UNAVAILABLE' : 'CHATGPT_CONNECTOR_STATE_UNAVAILABLE',
+                            $refreshed
+                                ? 'The exact connector is still unavailable after refreshing the saved Web chat; the message was not sent and the original task is preserved.'
+                                : '连接器菜单回调到达时任务提交状态无法安全确认；不会重发。', !$unsent);
+                    };
+                    if ($unsent) $this->clearSavedTaskConnectorComposer($responseId, $fail, true);
+                    else $fail();
                     return;
                 }
                 if (is_array($turn) && ($turn['compaction_phase'] ?? null) === 'preparing') {
@@ -5553,7 +5676,7 @@ JS;
                 if ($error === null && is_array($baseline) && !empty($baseline['editor_ready'])
                     && ($baseline['generation_running'] ?? null) === false
                     && $this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''), true)) {
-                    $reload(); return;
+                    $this->clearSavedTaskConnectorComposer($responseId, $reload, true); return;
                 }
                 if (microtime(true) < $deadline) {
                     Timer::add(1.0, fn() => $this->reloadTaskConnectorCatalog($responseId, $sessionId, $oldNonce, $deadline), null, false);
@@ -5664,21 +5787,24 @@ JS;
         $this->confirmTaskEditor($responseId);
     }
 
-    /** Activate the exact task Connector through the menu's native keyboard owner. */
-    private function activateTaskConnectorChoice(string $responseId, string $connectorName, int $step): void
+    /** Activate the exact task Connector through the menu's native keyboard owner; preserve an optional saved-chat fence. */
+    private function activateTaskConnectorChoice(string $responseId, string $connectorName, int $step, ?callable $isCurrent = null): void
     {
+        if ($isCurrent !== null && !$isCurrent()) return;
         if (!isset($this->chatGptTurns[$responseId])) return;
         $this->evaluateTask($responseId, WebModelPage::connectorMenuExpression($connectorName),
-            function ($error, $menu) use ($responseId, $connectorName, $step): void {
+            function ($error, $menu) use ($responseId, $connectorName, $step, $isCurrent): void {
+                if ($isCurrent !== null && !$isCurrent()) return;
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if ($error !== null || !is_array($menu) || (int) ($menu['exact_count'] ?? 0) !== 1) {
                     $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_FAILED', 'ChatGPT 工具连接器菜单状态发生变化。');
                     return;
                 }
                 if (!empty($menu['exact_highlighted'])) {
-                    $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $connectorName): void {
+                    $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $connectorName, $isCurrent): void {
+                        if ($isCurrent !== null && !$isCurrent()) return;
                         // Enter may have selected the item even if its acknowledgement was lost.
-                        $this->waitTaskConnectorSelected($responseId, $connectorName, microtime(true) + 3.0);
+                        $this->waitTaskConnectorSelected($responseId, $connectorName, microtime(true) + ($isCurrent === null ? 3.0 : 30.0), $isCurrent);
                     });
                     return;
                 }
@@ -5688,27 +5814,32 @@ JS;
                     return;
                 }
                 $this->evaluateTask($responseId, WebModelPage::focusComposerExpression(),
-                    function ($focusError, $focused) use ($responseId, $connectorName, $step): void {
+                    function ($focusError, $focused) use ($responseId, $connectorName, $step, $isCurrent): void {
+                        if ($isCurrent !== null && !$isCurrent()) return;
                         if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
                             $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_FAILED', '工具连接器菜单打开后输入框无法保持键盘焦点。');
                             return;
                         }
-                        $this->dispatchTaskKey($responseId, 'ArrowDown', function ($keyError) use ($responseId, $connectorName, $step): void {
+                        $this->dispatchTaskKey($responseId, 'ArrowDown', function ($keyError) use ($responseId, $connectorName, $step, $isCurrent): void {
+                            if ($isCurrent !== null && !$isCurrent()) return;
                             if ($keyError !== null) {
                                 $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_FAILED', '工具连接器菜单键盘导航未完成。');
                                 return;
                             }
-                            Timer::add(0.05, fn() => $this->activateTaskConnectorChoice($responseId, $connectorName, $step + 1), null, false);
+                            Timer::add(0.05, fn() => $this->activateTaskConnectorChoice($responseId, $connectorName, $step + 1, $isCurrent), null, false);
                         });
                     });
             });
     }
 
-    private function waitTaskConnectorSelected(string $responseId, string $connectorName, float $deadline): void
+    /** Confirm native selection without allowing an obsolete saved-chat callback to advance. */
+    private function waitTaskConnectorSelected(string $responseId, string $connectorName, float $deadline, ?callable $isCurrent = null): void
     {
+        if ($isCurrent !== null && !$isCurrent()) return;
         if (!isset($this->chatGptTurns[$responseId])) return;
         $this->evaluateTask($responseId, WebModelPage::connectorSelectedExpression($connectorName),
-            function ($error, $selected) use ($responseId, $connectorName, $deadline): void {
+            function ($error, $selected) use ($responseId, $connectorName, $deadline, $isCurrent): void {
+                if ($isCurrent !== null && !$isCurrent()) return;
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if ($error === null && is_array($selected) && (int) ($selected['count'] ?? 0) > 1) {
                     $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_DUPLICATE', 'ChatGPT 页面出现了重复的同名工具连接器。');
@@ -5719,7 +5850,7 @@ JS;
                     return;
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.1, fn() => $this->waitTaskConnectorSelected($responseId, $connectorName, $deadline), null, false);
+                    Timer::add(0.1, fn() => $this->waitTaskConnectorSelected($responseId, $connectorName, $deadline, $isCurrent), null, false);
                     return;
                 }
                 $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_FAILED', 'ChatGPT 未确认工具连接器已经选中。');
@@ -5743,6 +5874,11 @@ JS;
                 }
                 // ChatGPT can preserve an unsent draft across tabs. Delete the entire stale draft
                 // (including the old Connector pill), then run normal exact Connector selection again.
+                if (($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular') {
+                    $this->clearSavedTaskConnectorComposer($responseId,
+                        fn() => $this->prepareTaskConnector($responseId, $connectorName, $attempt));
+                    return;
+                }
                 $this->evaluateTask($responseId, WebModelPage::focusAndClearExpression(),
                     function ($clearError, $cleared) use ($responseId, $connectorName, $attempt): void {
                         if (!isset($this->chatGptTurns[$responseId])) return;

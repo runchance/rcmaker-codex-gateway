@@ -1152,5 +1152,8 @@
     "限流恢复已达到本回合等待上限，原对话和工具结果已保留，请稍后继续。": "ChatGPT rate-limit recovery reached this turn’s waiting limit; the original chat and tool results are preserved. Please continue later.",
     "ChatGPT 返回需要处理账号额度或账单的限制，已停止自动重试并保留任务结果。": "ChatGPT reported a quota or billing restriction that requires account action; automatic retries have stopped and task results are preserved.",
     "暂时无法读取共享限流状态。": "The shared rate-limit state could not be read.",
-    "暂时无法保存共享限流状态。": "The shared rate-limit state could not be saved."
+    "暂时无法保存共享限流状态。": "The shared rate-limit state could not be saved.",
+    "无法在 ChatGPT 编辑器中完整输入连接器搜索文字，未发送任务。": "The connector search text could not be entered completely in ChatGPT; the task was not sent.",
+    "选择工具连接器前无法清空 ChatGPT 编辑器。": "The ChatGPT composer could not be cleared before selecting the connector.",
+    "ChatGPT 中存在上次遗留草稿，且无法安全清空。": "ChatGPT contains a previous draft that could not be safely cleared."
 }

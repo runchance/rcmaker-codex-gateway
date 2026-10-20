@@ -713,6 +713,30 @@ JS);
     }
 
     /**
+     * Read the unique idle composer before native draft cleanup in a saved chat.
+     * @param bool $focus Focus that composer without editing its controlled state.
+     * @return string CDP expression returning draft/selection facts, never conversation text.
+     */
+    public static function connectorComposerStateExpression(bool $focus = false): string
+    {
+        return self::wrap(str_replace('__FOCUS__', $focus ? 'true' : 'false', <<<'JS'
+const composers=[...document.querySelectorAll(COMPOSER)].filter(visible);
+if(composers.length!==1)return {ok:false,code:'CHATGPT_EDITOR_MISSING'};
+const composer=composers[0];
+if(generationStop())return {ok:false,code:'CHATGPT_EDITOR_NOT_READY'};
+if(composer.disabled||composer.readOnly||composer.getAttribute('aria-disabled')==='true'
+    ||(!('value' in composer)&&!composer.isContentEditable))return {ok:false,code:'CHATGPT_EDITOR_NOT_READY'};
+if(__FOCUS__)composer.focus();
+const selection=getSelection(),inside='value' in composer
+    ?document.activeElement===composer
+    :!!selection&&composer.contains(selection.anchorNode)&&composer.contains(selection.focusNode);
+return {ok:true,url:String(location.href),focused:document.activeElement===composer,selection_inside:inside,
+    text:composerText(composer),
+    connector_count:composer.querySelectorAll('[data-id^="plugin:"],[app-mention-path^="app://"],[data-prompt-link-href^="app://"]').length};
+JS));
+    }
+
+    /**
      * Insert a complete prompt atomically into the focused ChatGPT composer.
      *
      * CDP Input.insertText is treated as live typing by ChatGPT's Lexical editor. Markdown-like
