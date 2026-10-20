@@ -1563,39 +1563,60 @@ final class BrowserRuntime
             }, 15.0);
     }
 
-    /** Resolve only the current-action ChatGPT confirmation for this exact Connector probe. */
+    /** Approve persistent permission on the exact probe card, then await the real MCP receipt. */
     private function resolveConnectorProbeConfirmation(int $commandId, string $connectorName, string $token, float $deadline): void
     {
+        $sessionId = $this->connectorProbeSessionId;
+        $targetId = $this->connectorProbeTargetId;
+        $generation = $this->connectorProbeGenerations[$commandId] ?? null;
+        $attempt = $this->connectorProbeAttempts[$commandId] ?? 0;
+        $current = fn(): bool => $sessionId !== null && $generation !== null && $this->connectorProbeSessionId === $sessionId
+            && $this->connectorProbeTargetId === $targetId
+            && ($this->connectorProbeGenerations[$commandId] ?? null) === $generation
+            && ($this->connectorProbeAttempts[$commandId] ?? 0) === $attempt;
+        $resume = function () use ($current, $commandId, $connectorName, $token, $deadline): void {
+            Timer::add(0.25, function () use ($current, $commandId, $connectorName, $token, $deadline): void {
+                if ($current()) $this->waitConnectorRuntimeProbe($commandId, $connectorName, $token, $deadline);
+            }, null, false);
+        };
         $this->evaluateConnectorProbe(WebModelPage::toolConfirmationExpression($connectorName),
-            function ($error, $confirmation) use ($commandId, $connectorName, $token, $deadline): void {
-                if ($error !== null || !is_array($confirmation) || empty($confirmation['visible'])) {
-                    Timer::add(0.25, fn() => $this->waitConnectorRuntimeProbe($commandId, $connectorName, $token, $deadline), null, false);
+            function ($error, $confirmation) use ($commandId, $connectorName, $current, $resume): void {
+                if (!$current()) return;
+                if ($error !== null || !is_array($confirmation) || empty($confirmation['visible'])) { $resume(); return; }
+                $failure = self::toolConfirmationFailure($confirmation, !empty(GatewaySettings::internal()['auto_approve_tool_calls']));
+                if ($failure !== null) {
+                    $this->connectorVerifyFail($commandId, $connectorName, ...$failure);
                     return;
                 }
-                if ((int) ($confirmation['dialog_count'] ?? 0) !== 1 || (int) ($confirmation['one_shot_count'] ?? 0) !== 1) {
-                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_TOOL_CONFIRMATION_UNSAFE', 'ChatGPT 工具确认窗口无法唯一识别一次性 Allow 操作，已停止自动操作。');
-                    return;
-                }
-                $settings = GatewaySettings::internal();
-                if (empty($settings['auto_approve_tool_calls'])) {
-                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_TOOL_CONFIRMATION_REQUIRED', 'ChatGPT 要求一次性工具确认。请在“设置”中开启自动确认一次性工具调用后重新检查。');
-                    return;
-                }
-                $this->evaluateConnectorProbe(WebModelPage::focusToolConfirmationExpression($connectorName),
-                    function ($focusError, $focused) use ($commandId, $connectorName, $token, $deadline): void {
-                        if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
-                            $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_TOOL_CONFIRMATION_UNSAFE', 'ChatGPT 一次性工具确认按钮无法安全获得焦点。');
-                            return;
-                        }
-                        $this->dispatchConnectorProbeKey('Enter', function ($keyError) use ($commandId, $connectorName, $token, $deadline): void {
-                            if ($keyError !== null) {
-                                $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_TOOL_CONFIRMATION_FAILED', 'ChatGPT 一次性工具确认未完成。');
-                                return;
-                            }
-                            Timer::add(0.25, fn() => $this->waitConnectorRuntimeProbe($commandId, $connectorName, $token, $deadline), null, false);
-                        });
+                if (empty($confirmation['ready']) || !empty($confirmation['pending'])) { $resume(); return; }
+                $this->evaluateConnectorProbe(WebModelPage::approveToolConfirmationExpression($connectorName, $confirmation['confirmation_id']),
+                    function () use ($current, $resume): void {
+                        // Click acknowledgement is not a saved permission or a successful probe.
+                        // Read back even after CDP timeout; the card itself prevents a repeat click.
+                        if ($current()) $resume();
                     });
             });
+    }
+
+    /**
+     * Shared probe/task permission policy; disabled or submitted controls keep waiting.
+     * @return array{string,string}|null Stable error code and localizable message, or no failure.
+     */
+    private static function toolConfirmationFailure(array $confirmation, bool $enabled): ?array
+    {
+        if (empty($confirmation['visible'])) return null;
+        if (!$enabled) return ['CHATGPT_TOOL_CONFIRMATION_REQUIRED',
+            'ChatGPT 正在等待连接器授权。请在设置中开启自动选择“始终允许”后重试。'];
+        if (!empty($confirmation['pending'])) return null;
+        if (($confirmation['code'] ?? '') === 'persistent_unavailable') return ['CHATGPT_TOOL_CONFIRMATION_UNAVAILABLE',
+            'ChatGPT 未提供“始终允许”选项，无法自动保存连接器授权；任务已保留，未选择“允许一次”。'];
+        if ((int) ($confirmation['dialog_count'] ?? 0) !== 1
+            || (int) ($confirmation['persistent_count'] ?? 0) !== 1
+            || empty($confirmation['confirmation_id'])) {
+            return ['CHATGPT_TOOL_CONFIRMATION_UNSAFE',
+                '无法唯一确认当前连接器的“始终允许”控件，已保留任务并停止自动授权。'];
+        }
+        return null;
     }
 
     /** Finish an owned check and disclose whether a new MCP probe or only qualified visibility was verified. */
@@ -8488,7 +8509,7 @@ JS;
         return false;
     }
 
-    /** Detect and optionally resolve a ChatGPT one-shot tool confirmation on the exact task surface. */
+    /** Resolve persistent connector permission and read it back without replaying any task/tool. */
     private function checkTaskToolConfirmation(string $responseId): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -8503,34 +8524,32 @@ JS;
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
                 if ($error !== null || !is_array($confirmation) || empty($confirmation['visible'])) {
+                    if ($error === null && is_array($confirmation) && !empty($turn['tool_confirmation_pending'])) {
+                        $this->chatGptTurns[$responseId]['tool_confirmations_approved'] = (int) ($turn['tool_confirmations_approved'] ?? 0) + 1;
+                        unset($this->chatGptTurns[$responseId]['tool_confirmation_pending']);
+                    }
                     $this->chatGptTurns[$responseId]['tool_confirmation_snapshot_next'] = true;
                     $this->scheduleTaskPoll($responseId, 0.01);
                     return;
                 }
-                if ((int) ($confirmation['dialog_count'] ?? 0) !== 1 || (int) ($confirmation['one_shot_count'] ?? 0) !== 1) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_TOOL_CONFIRMATION_UNSAFE', 'ChatGPT 工具确认窗口无法唯一识别一次性 Allow 操作，已停止自动操作。');
+                $failure = self::toolConfirmationFailure($confirmation, !empty($turn['auto_approve_tool_calls']));
+                if ($failure !== null) {
+                    $this->taskFailTurn($responseId, ...$failure);
                     return;
                 }
-                if (empty($turn['auto_approve_tool_calls'])) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_TOOL_CONFIRMATION_REQUIRED', 'ChatGPT 要求一次性工具确认。请在“设置”中开启自动确认一次性工具调用后重试。');
+                if (!empty($confirmation['pending'])) $this->chatGptTurns[$responseId]['tool_confirmation_pending'] = true;
+                if (empty($confirmation['ready']) || !empty($confirmation['pending'])) {
+                    $this->chatGptTurns[$responseId]['tool_confirmation_snapshot_next'] = true;
+                    $this->scheduleTaskPoll($responseId, 0.25);
                     return;
                 }
-                $this->evaluateTask($responseId, WebModelPage::focusToolConfirmationExpression($connectorName),
-                    function ($focusError, $focused) use ($responseId): void {
-                        if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
-                            $this->taskFailTurn($responseId, 'CHATGPT_TOOL_CONFIRMATION_UNSAFE', 'ChatGPT 一次性工具确认按钮无法安全获得焦点。');
-                            return;
-                        }
-                        $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId): void {
-                            if ($keyError !== null) {
-                                $this->taskFailTurn($responseId, 'CHATGPT_TOOL_CONFIRMATION_FAILED', 'ChatGPT 一次性工具确认未完成。');
-                                return;
-                            }
-                            if (!isset($this->chatGptTurns[$responseId])) return;
-                            $this->chatGptTurns[$responseId]['tool_confirmations_approved'] = (int) ($this->chatGptTurns[$responseId]['tool_confirmations_approved'] ?? 0) + 1;
-                            $this->chatGptTurns[$responseId]['tool_confirmation_snapshot_next'] = true;
-                            $this->scheduleTaskPoll($responseId, 0.05);
-                        });
+                $this->evaluateTask($responseId, WebModelPage::approveToolConfirmationExpression($connectorName, $confirmation['confirmation_id']),
+                    function ($clickError, $result) use ($responseId): void {
+                        if (!isset($this->chatGptTurns[$responseId])) return;
+                        if (is_array($result) && !empty($result['pending'])) $this->chatGptTurns[$responseId]['tool_confirmation_pending'] = true;
+                        // Do not fail or press Enter on an uncertain click. Observe the same page.
+                        $this->chatGptTurns[$responseId]['tool_confirmation_snapshot_next'] = true;
+                        $this->scheduleTaskPoll($responseId, 0.25);
                     });
             });
     }

@@ -448,8 +448,10 @@ Upgrades automatically update default contracts. Templates customized and saved 
 | Part acknowledgement / summary waits | Separate settings for context-part acknowledgements and compaction summaries |
 | Official-model handoff summary | Off by default; can obtain a readable summary of inaccessible official encrypted history and may use official quota |
 | Upload skill files | Skills normally travel as text; enabling file upload shares up to 10 slots with recent images |
-| Automatically confirm one-time ChatGPT tool calls | Applies only to single-use confirmation for this connector; Codex sandboxing and local approvals remain in effect |
+| Automatically select Always allow for the connector | Selects persistent permission only for the exact connector on its owned task or verification page; Codex sandboxing and local approvals remain in effect |
 | Weekly Pro tracking budget | Used only for a local balance estimate; it does not limit submissions or represent the official balance |
+
+The gateway recognizes native permission cards, action groups, menus and keyboard hints, with localized labels only as a compatibility aid. It does not guess button positions or send a global Enter. An uncertain click is followed by a page read, not another approval or task submission. If ChatGPT offers no Always allow option or the controls are ambiguous, the task is preserved with an explicit error; the gateway does not repeatedly approve once. Existing setting values are retained. Turning the setting off stops future automatic approval but does not revoke permission already saved in ChatGPT; revoke it in ChatGPT app permissions. Availability and scope of persistent permission depend on ChatGPT account and workspace rules.
 
 New requests use saved changes. Already-started work retains its budget and waiting settings. If the catalog has changed but Codex still shows old values, fully reopen Codex.
 

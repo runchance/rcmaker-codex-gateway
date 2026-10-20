@@ -1,5 +1,12 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "自动选择连接器的“始终允许”": "Automatically select Always allow for the connector",
+    "仅为当前连接器保存 ChatGPT 支持的后续操作授权；Codex 的权限审批保持不变。": "Saves permission for supported future ChatGPT actions by this connector only. Codex approval rules still apply.",
+    "关闭此项不会撤销已保存的 ChatGPT 授权。网页未提供持续授权时会说明原因，不会反复选择“允许一次”。": "Turning this off does not revoke permission already saved in ChatGPT. If persistent permission is unavailable, the gateway explains why instead of repeatedly allowing once.",
+    "ChatGPT 正在等待连接器授权。请在设置中开启自动选择“始终允许”后重试。": "ChatGPT is waiting for connector permission. Enable automatic Always allow in Settings and retry.",
+    "ChatGPT 未提供“始终允许”选项，无法自动保存连接器授权；任务已保留，未选择“允许一次”。": "ChatGPT did not offer Always allow. Connector permission could not be saved automatically; the task is preserved and Allow once was not selected.",
+    "无法唯一确认当前连接器的“始终允许”控件，已保留任务并停止自动授权。": "The Always allow control for the current connector could not be identified uniquely. The task is preserved and automatic approval has stopped.",
+    "连接器持续授权": "Persistent connector permission",
     "旧摘要工具连接无法退休。": "The previous checkpoint tool connection could not be retired.",
     "ChatGPT 网页连续停止且未返回最终答复，自动续做已达三次；原上下文和工具回执仍保留。": "ChatGPT stopped repeatedly without a final answer. Automatic continuation reached its three-attempt limit; the original context and tool receipts are preserved.",
     "摘要发布记录暂不可读取。": "Summary publication records are temporarily unavailable.",

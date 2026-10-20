@@ -107,7 +107,7 @@ final class GatewaySettings
                 'auto_cleanup_inactive_tasks' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'Inactive task cleanup'],
                 'expected_updated_at' => ['rule' => 'nnint', 'name' => '设置版本'],
                 'mcp_enabled' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'MCP 开关'],
-                'auto_approve_tool_calls' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '一次性工具确认'],
+                'auto_approve_tool_calls' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '连接器持续授权'],
                 'connector_name' => ['rule' => 'string', 'len' => [1, 80], 'name' => '连接器名称'],
                 'mcp_invoke_timeout_ms' => ['rule' => 'pint', 'range' => [10000, 110000], 'name' => '工具超时'],
                 'wait_poll_interval_ms' => ['rule' => 'pint', 'range' => [50, 5000], 'name' => '等待轮询'],

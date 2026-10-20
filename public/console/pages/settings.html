@@ -26,8 +26,9 @@
             </div>
             </details>
             <div class="field settings-confirmation-option">
-                <input id="auto-approve-tools" type="checkbox" title="自动确认 ChatGPT 的一次性工具调用">
-                <p class="muted">只确认当前连接器的单次调用；Codex 的权限审批保持不变。</p>
+                <input id="auto-approve-tools" type="checkbox" title="自动选择连接器的“始终允许”">
+                <p class="muted">仅为当前连接器保存 ChatGPT 支持的后续操作授权；Codex 的权限审批保持不变。</p>
+                <p class="muted">关闭此项不会撤销已保存的 ChatGPT 授权。网页未提供持续授权时会说明原因，不会反复选择“允许一次”。</p>
             </div>
             <div class="field settings-confirmation-option">
                 <input id="skill-transport" type="checkbox" title="上传技能文件">

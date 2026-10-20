@@ -1036,50 +1036,127 @@ button.click();return {ok:true};
 JS);
     }
 
-    /** Inspect only a one-shot ChatGPT approval dialog for the exact configured Connector. */
+    /**
+     * Inspect native permission UI for the configured connector, without approving it.
+     * @return string DOM expression returning a document-local confirmation ID and action readiness.
+     */
     public static function toolConfirmationExpression(string $connectorName): string
     {
-        $name = json_encode($connectorName, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        return self::wrap(str_replace('__CONNECTOR__', $name, <<<'JS'
-const name=__CONNECTOR__;
-const norm=value=>String(value||'').replace(/\s+/g,' ').trim();
-const text=el=>norm(el.innerText||el.textContent||'');
-const matchesTitle=value=>value.includes(`Allow ChatGPT to use ${name}?`)
-    ||value.includes(`允许 ChatGPT 使用 ${name} 吗？`)
-    ||value.includes(`允许 ChatGPT 使用 ${name} 吗?`)
-    ||value.includes(`允许 ChatGPT 使用 ${name}？`);
-const dialogs=[...document.querySelectorAll('[role="dialog"],[data-testid="tool-approval-card"]')]
-    .filter(el=>visible(el)&&matchesTitle(text(el)));
-if(dialogs.length!==1)return {visible:dialogs.length>0,dialog_count:dialogs.length,one_shot_count:0,deny_count:0,persistent_count:0};
-const buttons=[...dialogs[0].querySelectorAll('button')].filter(visible);
-const labels=buttons.map(button=>norm(button.getAttribute('aria-label')||button.innerText||button.textContent||''));
-const oneShot=labels.filter(label=>/^(Allow(?: once)?|Allow for this time|允许|允许一次|仅允许一次|本次允许)$/i.test(label));
-const deny=labels.filter(label=>/^(Deny|拒绝|不允许)$/i.test(label));
-const persistent=labels.filter(label=>/^(Always allow|始终允许|总是允许|一直允许)$/i.test(label));
-return {visible:true,dialog_count:1,one_shot_count:oneShot.length,deny_count:deny.length,persistent_count:persistent.length,labels};
-JS));
+        return self::toolPermissionExpression($connectorName, '');
     }
 
-    /** Focus the exact current-action approval button; activation is performed through native CDP Enter. */
-    public static function focusToolConfirmationExpression(string $connectorName): string
+    /**
+     * Click Always allow only on the exact card just observed, once per physical card.
+     * @param string $confirmationId Document-local ID returned by toolConfirmationExpression().
+     * @return string DOM expression; clicked means submitted, never proof that permission was saved.
+     */
+    public static function approveToolConfirmationExpression(string $connectorName, string $confirmationId): string
     {
-        $name = json_encode($connectorName, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        return self::wrap(str_replace('__CONNECTOR__', $name, <<<'JS'
-const name=__CONNECTOR__;
+        if ($confirmationId === '') throw new \InvalidArgumentException('A tool confirmation ID is required.');
+        return self::toolPermissionExpression($connectorName, $confirmationId);
+    }
+
+    /** Share structural recognition between read-back and activation; never dispatch a global Enter. */
+    private static function toolPermissionExpression(string $connectorName, string $confirmationId): string
+    {
+        $args = json_encode(['name'=>$connectorName, 'id'=>$confirmationId],
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        return self::wrap(str_replace('__PERMISSION__', $args, <<<'JS'
+const permission=__PERMISSION__;
 const norm=value=>String(value||'').replace(/\s+/g,' ').trim();
 const text=el=>norm(el.innerText||el.textContent||'');
-const matchesTitle=value=>value.includes(`Allow ChatGPT to use ${name}?`)
-    ||value.includes(`允许 ChatGPT 使用 ${name} 吗？`)
-    ||value.includes(`允许 ChatGPT 使用 ${name} 吗?`)
-    ||value.includes(`允许 ChatGPT 使用 ${name}？`);
-const dialogs=[...document.querySelectorAll('[role="dialog"],[data-testid="tool-approval-card"]')]
-    .filter(el=>visible(el)&&matchesTitle(text(el)));
-if(dialogs.length!==1)return {ok:false,code:dialogs.length>1?'CHATGPT_TOOL_CONFIRMATION_AMBIGUOUS':'CHATGPT_TOOL_CONFIRMATION_MISSING',dialog_count:dialogs.length};
-const buttons=[...dialogs[0].querySelectorAll('button')].filter(visible);
-const exact=buttons.filter(button=>/^(Allow(?: once)?|Allow for this time|允许|允许一次|仅允许一次|本次允许)$/i.test(norm(button.getAttribute('aria-label')||button.innerText||button.textContent||'')));
-if(exact.length!==1)return {ok:false,code:'CHATGPT_TOOL_CONFIRMATION_ACTION_UNSAFE',count:exact.length};
-exact[0].focus();
-return {ok:document.activeElement===exact[0],code:document.activeElement===exact[0]?null:'CHATGPT_TOOL_CONFIRMATION_FOCUS_FAILED'};
+const excluded='pre,code,.markdown,.prose,[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-markdown-text-style]';
+const rendered=el=>visible(el)&&!el.closest('[hidden],[inert],[aria-hidden="true"]');
+const native=el=>rendered(el)&&!el.closest(excluded);
+const buttons=el=>[...el.querySelectorAll('button,[role="button"]')].filter(rendered);
+const label=el=>{
+    const copy=el.cloneNode(true);
+    copy.querySelectorAll('kbd,svg,[aria-hidden="true"]').forEach(node=>node.remove());
+    return norm(el.getAttribute('aria-label')||copy.textContent);
+};
+const key=(el,pattern)=>pattern.test(norm(el.getAttribute('aria-keyshortcuts')))
+    ||[...el.querySelectorAll('kbd')].some(node=>pattern.test(text(node)));
+const named=el=>permission.name!==''&&[...el.querySelectorAll('*')].some(node=>
+    !node.closest('form')&&rendered(node)
+    &&node.childElementCount===0&&text(node)===norm(permission.name));
+// Native permission UI has a deny/Escape action and an Enter action paired with
+// a menu. The remaining action is persistent. Labels, CSS classes and order vary.
+const shape=el=>{
+    const forms=[...el.querySelectorAll('form')].filter(rendered);
+    if(forms.length!==1)return null;
+    const form=forms[0],all=buttons(form);
+    const menus=all.filter(button=>button.getAttribute('aria-haspopup')==='menu');
+    const deny=all.filter(button=>key(button,/^(?:Esc|Escape)$/i));
+    const once=all.filter(button=>key(button,/^(?:Enter|Return|↵|⏎)$/i));
+    if(menus.length!==1||deny.length!==1||once.length!==1||deny[0]===once[0])return null;
+    const split=menus[0].parentElement;
+    if(!split||split===form||!split.contains(once[0])||split.contains(deny[0])
+        ||buttons(split).length!==2)return null;
+    const persistent=all.filter(button=>!menus.includes(button)&&!deny.includes(button)&&!once.includes(button));
+    if(persistent.length>1||persistent.some(button=>split.contains(button)||button.hasAttribute('aria-haspopup')
+        ||button.hasAttribute('aria-keyshortcuts')||button.querySelector('kbd')))return null;
+    return {button:persistent[0]||null,kind:'native-structure'};
+};
+const selector='[data-codex-approval-surface],[data-testid="tool-approval-card"]';
+let cards=[...document.querySelectorAll(selector)].filter(native);
+// Tolerate a renamed card tag/marker only when the complete native form shape
+// and exact connector header agree. Never search arbitrary prose for Allow text.
+for(const form of document.querySelectorAll('form')){
+    if(!native(form)||form.closest(selector)||!shape(form.parentElement))continue;
+    let parent=form.parentElement;
+    for(let depth=0;parent&&depth<3;depth++,parent=parent.parentElement){
+        if(parent===document.body||!native(parent)||parent.querySelectorAll('form').length!==1)break;
+        if(named(parent)&&shape(parent)){cards.push(parent);break;}
+    }
+}
+// Retain old native dialogs, with explicit persistent labels only as a fallback.
+for(const dialog of document.querySelectorAll('[role="dialog"],[role="alertdialog"]')){
+    if(!native(dialog)||dialog.querySelector(selector)||dialog.closest(selector))continue;
+    const titles=[dialog.getAttribute('aria-label'),...[...dialog.querySelectorAll('h1,h2,h3,[role="heading"]')].map(text)].map(norm);
+    if(named(dialog)||titles.some(title=>[
+        `Allow ChatGPT to use ${permission.name}?`,`允许 ChatGPT 使用 ${permission.name} 吗？`,
+        `允许 ChatGPT 使用 ${permission.name} 吗?`,`允许 ChatGPT 使用 ${permission.name}？`
+    ].includes(title)))cards.push(dialog);
+}
+cards=[...new Set(cards)].filter(el=>!cards.some(other=>other!==el&&el.contains(other)));
+const base={visible:cards.length>0,dialog_count:cards.length,persistent_count:0,ready:false,clicked:false,pending:false};
+if(location.origin!=='https://chatgpt.com'||permission.name==='')return {...base,code:'scope_mismatch'};
+if(cards.length!==1)return {...base,code:cards.length?'ambiguous':'absent'};
+const card=cards[0];
+const titles=[card.getAttribute('aria-label'),...[...card.querySelectorAll('h1,h2,h3,[role="heading"]')].map(text)].map(norm);
+const legacyTitle=titles.some(title=>[
+    `Allow ChatGPT to use ${permission.name}?`,`允许 ChatGPT 使用 ${permission.name} 吗？`,
+    `允许 ChatGPT 使用 ${permission.name} 吗?`,`允许 ChatGPT 使用 ${permission.name}？`
+].includes(title));
+if(!named(card)&&!legacyTitle)return {...base,code:'connector_mismatch'};
+const registryKey=Symbol.for('rcmaker.tool.permission');
+const registry=globalThis[registryKey]??={cards:new WeakMap(),next:0,epoch:Date.now()+':'+Math.random().toString(36).slice(2)};
+let state=registry.cards.get(card);
+if(!state){state={id:registry.epoch+':'+(++registry.next),name:permission.name,clicked:false};registry.cards.set(card,state);}
+const result={...base,confirmation_id:state.id,pending:state.clicked};
+if(permission.id&&permission.id!==state.id)return {...result,code:'changed'};
+if(state.name!==permission.name)return {...result,code:'connector_mismatch'};
+if(state.clicked)return {...result,code:'pending'};
+let action=shape(card);
+if(!action&&!card.matches('[data-codex-approval-surface]')&&!card.querySelector('form')){
+    const all=buttons(card);
+    const always=all.filter(button=>/^(?:Always allow|始终允许|總是允許|总是允许|一直允许)$/i.test(label(button)));
+    const once=all.filter(button=>/^(?:Allow(?: once)?|Allow for this time|允许|允许一次|仅允许一次|本次允许)$/i.test(label(button)));
+    const deny=all.filter(button=>/^(?:Deny|拒绝|不允许)$/i.test(label(button)));
+    if(always.length===1&&once.length===1&&deny.length===1
+        &&all.every(button=>always.includes(button)||once.includes(button)||deny.includes(button)||button.hasAttribute('aria-haspopup')))
+        action={button:always[0],kind:'native-label-fallback'};
+}
+if(!action)return {...result,code:'unrecognized'};
+if(!action.button)return {...result,code:'persistent_unavailable'};
+const button=action.button;
+const ready=!button.disabled&&button.getAttribute('aria-disabled')!=='true'&&!button.closest('fieldset[disabled]');
+const snapshot={...result,persistent_count:1,ready,recognition:action.kind,code:state.clicked?'pending':ready?'ready':'disabled'};
+if(!permission.id||state.clicked||!ready)return snapshot;
+// Mark before click: a lost CDP acknowledgement must read back, not approve again.
+state.clicked=true;
+button.click();
+return {...snapshot,clicked:true,pending:true,ready:false,code:'submitted'};
 JS));
     }
 

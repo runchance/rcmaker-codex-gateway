@@ -29,7 +29,7 @@ final class WebModelAdapterRegistry
             'thinkCommandMenuExpression', 'baselineExpression',
             'focusAndClearExpression', 'focusComposerExpression', 'insertPlainTextExpression', 'composerTextExpression',
             'promptTextExpression', 'sendReadinessExpression', 'focusSendExpression', 'connectorMenuExpression',
-            'connectorSelectedExpression', 'toolConfirmationExpression', 'focusToolConfirmationExpression',
+            'connectorSelectedExpression', 'toolConfirmationExpression', 'approveToolConfirmationExpression',
             'personalizationStateExpression', 'personalizationOpenExpression', 'personalizationMenuExpression',
             'personalizationSelectExpression', 'acknowledgementExpression', 'attachmentStateExpression',
             'responseExpression', 'focusArtifactDownloadExpression', 'markdownAfterToolBoundary', 'stableMarkdownPrefix',
