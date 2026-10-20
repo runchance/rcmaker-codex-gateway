@@ -393,7 +393,8 @@ final class ChatGptTransport
     }
     /**
      * Settle visible progress snapshots before irreversible publication. A changing public
-     * status can be published again with a new source identity once its text stabilizes.
+     * summary can be published again with a new source identity once its text stabilizes.
+     * Native status chrome is never model-authored prose, regardless of its language.
      * Missing or changed DOM blocks reset their evidence; no reasoning is synthesized.
      * Keep the newest bounded window so old activity cannot starve later long-task progress.
      * @param array $previous Prior public block text and its first unchanged observation time.
@@ -409,6 +410,7 @@ final class ChatGptTransport
         $observed = []; $ready = []; $drafts = [];
         foreach (array_slice($blocks, -128) as $block) {
             if (!is_array($block)) continue;
+            if (!empty($block['public_status']) && empty($block['public_summary'])) continue;
             $key = (string) ($block['key'] ?? ''); $text = (string) ($block['text'] ?? '');
             if ($key === '' || $text === '') continue;
             $publicProse = !empty($block['public_prose'])

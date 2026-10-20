@@ -6862,7 +6862,10 @@ JS;
         $expression = WebModelPage::responseExpression((array) $turn['baseline_users'], (array) $turn['baseline_assistants'],
             (string)($turn['continuation_marker'] ?? ''), (string)($turn['bound_assistant_id'] ?? ''),
             self::hasLegacyCitationPrefix($turn),
-            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' && empty($turn['web_chat']['conversation_id']) ? $responseId : '',
+            // Keep the physical submission identity after its saved UUID is bound:
+            // the first response can still remount. The adapter requires an empty
+            // pre-submit baseline and same-document native evidence for that bridge.
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;

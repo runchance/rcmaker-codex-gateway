@@ -1219,6 +1219,8 @@ JS));
      * native recovery chrome is returned only as transport_recovery_visible metadata.
      * A new group wrapper may retain the bound answer through its unique native inner
      * message anchor, but never through another user's group or model-authored markup.
+     * The first ordinary submission can also retain its identity through ChatGPT's
+     * optimistic local-conversation remount, using same-document native conversation/message evidence.
      * @param array $baselineUserIds User identities captured before submitting this generation.
      * @param array $baselineAssistantIds Historical assistants excluded from the current answer.
      * @param string $continuationMarker Exact current continuation marker, or empty for initial work.
@@ -1286,7 +1288,8 @@ const unboundAnswer=sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAn
         :((newUser||users.length===0)&&identityAssistants.length===1?identityAssistants[0]:null);
 const boundMatches=boundResponseId?assistants.filter(entry=>entry.id===boundResponseId):[];
 const promoted=boundMatches.length===0
-    ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId):null;
+    ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
+        ||remountedInitialAssistant(assistants,beforeAssistants,boundResponseId,expectedInitialBinding,beforeUsers,users):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
 // Keep one document-local native response anchor for the first ordinary send.
 // This does not infer acceptance or ownership: stop callers still require the
@@ -1408,35 +1411,10 @@ if(answer){
         return text?{key:answer.id+':commentary:'+index,text,complete,public_summary:publicSummary,
             public_status:activityRoots.includes(root),public_prose:publicProse}:null;
     }).filter(Boolean);
-    // ChatGPT renders short, user-visible activity labels separately from Markdown. Keep
-    // only text shown in the status chrome; the nested Markdown and private COT panels
-    // are handled separately and must never be mistaken for a stable final answer.
-    const statusBlocks=statuses.filter(node=>publiclyVisible(node)&&!nativeRecoveryPanel(node)).slice(0,16).map((node,index)=>{
-        const copy=withoutNativeRecovery(node).cloneNode(true);
-        copy.querySelectorAll('.markdown,[data-testid^="cot-v5"],button,svg,pre,code,.loading-shimmer,[aria-hidden="true"]').forEach(child=>child.remove());
-        const label=String(copy.innerText||copy.textContent||'').replace(/\s+/g,' ').trim();
-        if(!label||label.length>160)return null;
-        return {key:answer.id+':status:'+index,text:label,complete:!running,public_status:true};
-    }).filter(Boolean);
-    // Action counters and current thought labels often live in a row anchor or its
-    // screen-reader label rather than in the status container's own text node.
+    // Status chrome and screen-reader announcements are not assistant messages.
+    // Retain them only as boundary/terminal observations, independently of locale.
+    // Public model-authored Markdown summaries remain in commentaryBlocks above.
     const overlaps=(node,group)=>group.some(root=>node===root||node.contains(root)||root.contains(node));
-    const statusRows=new Set();
-    for(const candidate of answer.el.querySelectorAll('button,[role="status"],[aria-busy="true"],[data-testid*="cot"],[data-testid*="reason"],[data-testid*="thought"]')){
-        if(!publiclyVisible(candidate)||nativeRecoveryPanel(candidate)||overlaps(candidate,roots)||overlaps(candidate,commentary))continue;
-        const row=candidate.closest('button')||candidate.closest('[data-item-anchor]')||candidate;
-        if(!publiclyVisible(row)||nativeRecoveryPanel(row)||overlaps(row,roots)||overlaps(row,commentary))continue;
-        if(row.matches('button')&&!row.closest('[data-streaming-response-status]'))continue;
-        statusRows.add(row);
-        if(statusRows.size>=32)break;
-    }
-    [...statusRows].forEach((row,index)=>{
-        const aria=String(row.getAttribute('aria-label')||'').trim();
-        const accessible=[...row.querySelectorAll('.sr-only')].map(el=>String(el.textContent||'').replace(/\s+/g,' ').trim()).find(Boolean)||'';
-        const label=(aria||accessible||transcriptVisibleText(row)).replace(/\s+/g,' ').trim();
-        if(label&&label.length<=160)statusBlocks.push({key:answer.id+':activity:'+index,text:label,complete:!running,public_status:true});
-    });
-    commentaryBlocks.push(...statusBlocks);
     visibleText=roots.map(root=>transcriptVisibleText(root).replace(/\u00a0/g,' ').trim()).filter(Boolean).join('\n\n');
     metricCardsObserved=false;
     markdown=roots.map(root=>toMarkdown(root,running)).filter(Boolean).join('\n\n');
@@ -1590,9 +1568,10 @@ if(generationStop())return {clicked:false,code:'generation_running'};
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
 const assistants=assistantTurns().map((el,i)=>({el,id:turnId(el,i,'assistant')}));
 const user=expected.user_id?users.find(entry=>entry.id===expected.user_id):null;
-const answer=expected.response_id?assistants.find(entry=>entry.id===expected.response_id):null;
+const answer=expected.response_id?(assistants.find(entry=>entry.id===expected.response_id)
+    ||retainedInitialAssistant(assistants,new Set(),expected.response_id)):null;
 if((expected.user_id&&!user)||(expected.response_id&&!answer))return {clicked:false,code:'response_changed'};
-if((user&&users.at(-1)?.id!==user.id)||(answer&&assistants.at(-1)?.id!==answer.id))return {clicked:false,code:'response_changed'};
+if((user&&users.at(-1)?.id!==user.id)||(answer&&assistants.at(-1)?.el!==answer.el))return {clicked:false,code:'response_changed'};
 const card=networkErrorCard(user,answer,expected.allow_message_stream===true);
 if(!card||card.descriptor.fingerprint!==expected.fingerprint
     ||card.descriptor.failure_id!==expected.failure_id)return {clicked:false,code:'error_changed'};
@@ -1937,6 +1916,54 @@ const observedInitialResponse=source=>{
     saved.url=url;saved.assistant=matches[0].id;
     return true;
 };
+// The first saved chat may replace its optimistic UUID group with fallback-turn-0
+// while retaining its exact local conversation identity in native DIL message wrappers.
+// A document-local witness from this submission bridges that one transition. Never
+// infer ownership from the URL alone, text, position, or a merely unique fallback row.
+const initialAssistantAnchor=(entry,conversation)=>{
+    if(!entry.el.querySelector('[data-chatgpt-agent-turn-start]'))return null;
+    const roots=[...entry.el.querySelectorAll('[data-markdown-text-style="assistant-message"]')];
+    for(const root of roots){
+        if(!ownedAssistantMessageRoot(root,entry.el,true))continue;
+        const selection=root.closest('[data-chatgpt-selection-message-id]');
+        if(selection.closest('.markdown,[data-markdown-text-style],pre,code,blockquote'))continue;
+        if(selection.getAttribute('data-chatgpt-selection-conversation-id')===conversation)
+            return selection.getAttribute('data-chatgpt-selection-message-id');
+    }
+    return null;
+};
+const retainedInitialAssistant=(assistants,beforeAssistants,boundId)=>{
+    const saved=globalThis[Symbol.for('rcmaker.initial.response.alias')];
+    if(!saved||saved.bound!==boundId||saved.url!==String(location.href)
+        ||beforeAssistants.size!==0||assistants.length!==1)return null;
+    const entry=assistants[0];
+    return entry.id===saved.native&&initialAssistantAnchor(entry,saved.conversation)===saved.anchor
+        ?{...entry,id:boundId}:null;
+};
+const remountedInitialAssistant=(assistants,beforeAssistants,boundId,source,beforeUsers,users)=>{
+    const prior=globalThis[Symbol.for('rcmaker.initial.response')];
+    if(!source||!boundId||prior?.source!==source||prior.assistant!==boundId
+        ||beforeUsers.size!==0||beforeAssistants.size!==0||users.length!==0||assistants.length!==1
+        ||globalThis[Symbol.for('rcmaker.initial.response.alias')])return null;
+    const entry=assistants[0];
+    if(!/^group:assistant:fallback-turn-\d+$/.test(entry.id))return null;
+    let conversation;
+    try{
+        const from=new URL(prior.url),to=new URL(location.href);
+        if(from.origin!==to.origin||from.searchParams.has('temporary-chat')||to.searchParams.has('temporary-chat')
+            ||!/^\/c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(to.pathname))return null;
+        conversation=decodeURIComponent(from.pathname.slice(3));
+        if(!from.pathname.startsWith('/c/')
+            ||!/^local-chatgpt:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(conversation))return null;
+    }catch(_){return null;}
+    const anchor=initialAssistantAnchor(entry,conversation);
+    if(!anchor)return null;
+    globalThis[Symbol.for('rcmaker.initial.response.alias')]={
+        source,bound:boundId,native:entry.id,url:String(location.href),conversation,anchor
+    };
+    prior.url=String(location.href);prior.assistant=entry.id;
+    return {...entry,id:boundId};
+};
 // ChatGPT promotes a streaming message into a stable user/assistant group. Preserve the
 // original identity only through one exact native anchor in the accepted user's fresh
 // group. A provisional group:assistant:fallback-turn-N keeps that same inner fallback
@@ -1944,6 +1971,8 @@ const observedInitialResponse=source=>{
 // Selection IDs, assistant search units and fallback turns are different renderer
 // identities; visible text, DOM position or a merely similar answer cannot establish one.
 const promotedAssistant=(assistants,beforeAssistants,boundId,sameGroupId)=>{
+    const retained=retainedInitialAssistant(assistants,beforeAssistants,boundId);
+    if(retained)return retained;
     const provisionalGroup=/^group:assistant:(fallback-turn-\d+)$/.exec(boundId||'');
     if(!boundId||!sameGroupId||(boundId.startsWith('group:')&&!provisionalGroup)||beforeAssistants.has(boundId)
         ||/^(?:conversation-turn|turn)-\d+$/.test(boundId))return null;
@@ -2049,8 +2078,14 @@ const withoutNativeRecovery=root=>{
     [...copy.querySelectorAll('.text-chatgpt-recovery')].map(nativeRecoveryPanel).filter(Boolean).forEach(panel=>panel.remove());
     return copy;
 };
+// Generic activity/accessibility chrome can remain after a Markdown-less shell stops.
+// Exclude it from fallback transcripts too; authored Markdown containing the same words stays intact.
+const nativeStatusChrome=el=>el.nodeType===Node.ELEMENT_NODE
+    &&!el.closest('.markdown,[data-markdown-text-style]')
+    &&([...el.classList].includes('sr-only')||el.hasAttribute('data-streaming-response-status')
+        ||el.getAttribute('role')==='status'||el.getAttribute('aria-busy')==='true');
 const ignored=el=>['BUTTON','SCRIPT','STYLE','SVG','SOURCE'].includes(el.nodeName)
-    ||nativeRecoveryPanel(el)!==null
+    ||nativeRecoveryPanel(el)!==null||nativeStatusChrome(el)
     ||el.hasAttribute?.('data-footnote-backref')
     ||el.getAttribute?.('aria-hidden')==='true'||el.hasAttribute?.('hidden')||el.hasAttribute?.('inert')
     ||(el.nodeType===Node.ELEMENT_NODE&&getComputedStyle(el).display==='none')
@@ -2059,8 +2094,10 @@ const ignored=el=>['BUTTON','SCRIPT','STYLE','SVG','SOURCE'].includes(el.nodeNam
 // Preserve the live renderer's visibility rules when removing recovery chrome from a fallback
 // container. Detached clone.textContent would also include its hidden/private descendants.
 const transcriptVisibleText=root=>{
-    if(nativeRecoveryPanel(root))return '';
-    if(![...root.querySelectorAll('.text-chatgpt-recovery')].some(node=>nativeRecoveryPanel(node)))return String(root.innerText||'');
+    if(nativeRecoveryPanel(root)||nativeStatusChrome(root))return '';
+    if(![...root.querySelectorAll('.text-chatgpt-recovery')].some(node=>nativeRecoveryPanel(node))
+        &&![...root.querySelectorAll('.sr-only,[data-streaming-response-status],[role="status"],[aria-busy="true"]')].some(nativeStatusChrome))
+        return String(root.innerText||'');
     const read=node=>{
         if(node.nodeType===Node.TEXT_NODE)return String(node.nodeValue||'');
         if(node.nodeType!==Node.ELEMENT_NODE||ignored(node))return '';
