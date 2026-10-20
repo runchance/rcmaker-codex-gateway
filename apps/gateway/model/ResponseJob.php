@@ -154,6 +154,7 @@ final class ResponseJob
             // Prove that receipt and acknowledge its original submission before reserving the next
             // round; later validation failures roll back both changes in this same transaction.
             ToolBroker::acknowledgeHostReceiptUnlocked($spec);
+            $spec = QuestionReply::prepareUnlocked($spec);
             $spec = SteeringContext::deferToolsUnlocked($spec);
             if (!empty($spec['operational_context_source_response_id'])) {
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
@@ -320,7 +321,8 @@ final class ResponseJob
                 $outputControl = ToolBroker::outputControlPrompt((array)($budget['output_control'] ?? []));
                 if ($outputControl !== '') $prompt = $outputControl . "\n" . $prompt;
             }
-            $prompt = WebContract::withSteeringNotice($prompt,
+            $questionPrompt = QuestionReply::pagePromptUnlocked($spec, $bridge);
+            $prompt = $questionPrompt ?? WebContract::withSteeringNotice($prompt,
                 ($spec['operation_kind'] ?? 'response') === 'response'
                     && (!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id'])
                         || !empty($spec['postcompact_user_input'])),

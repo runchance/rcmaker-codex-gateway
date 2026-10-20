@@ -15,7 +15,7 @@ final class McpProtocol
     private const AGENT_WAIT_POLL_MS = 30000;
     // Keep each tunnel command comfortably below its upstream response deadline.
     // Native execution/approval remains owned by the existing durable turn.
-    private const HOST_RPC_SLICE_MS = 60000;
+    public const HOST_RPC_SLICE_MS = 60000;
     // A page of native tool descriptions can exceed functions.exec's 10k-token default.
     private const NESTED_CATALOG_MAX_OUTPUT_TOKENS = 50000;
     private const AGENT_WAIT_NAMES = [
@@ -487,9 +487,9 @@ final class McpProtocol
                 // It never accepts a caller-selected cell or reissues the original exec.
                 $wait = ToolBroker::resumeCodeModeWait($token, $control['call_id']);
                 if (is_array($wait)) return !empty($wait['paused']) ? $wait
-                    : self::waitHostToolResult($token, (string) $wait['call_id']);
+                    : self::waitControlResult($token, (string) $wait['call_id']);
             }
-            return self::waitHostToolResult($token, $control['call_id']);
+            return self::waitControlResult($token, $control['call_id']);
         }
         if ($wireName === 'codex.control.compaction_handoff') {
             // This reserved operation is absent from inventory and has no normal turn binding.
@@ -557,7 +557,7 @@ final class McpProtocol
                 $nestedInput !== null ? ['patch'=>$nestedInput] : $nestedArguments, $nestedInput !== null);
             return self::invokeResolvedTool($token, $gateway, $callKey, null, $program);
         }
-        $activity = ToolBroker::beginActivity($token);
+        $activity = ToolBroker::beginActivity($token, $callKey);
         try {
             if ($wireName===TaskContext::WIRE_NAME) {
                 $context=ToolBroker::readContext($token,$arguments['arguments']??[]);
@@ -836,7 +836,7 @@ AWK;
 
     private static function invokeResolvedTool(string $token, array $tool, string $callKey, ?array $arguments, ?string $input): array
     {
-        $activity = ToolBroker::beginActivity($token);
+        $activity = ToolBroker::beginActivity($token, $callKey);
         try {
             $invocation = ToolBroker::registerInvocation(
                 $token,
@@ -848,6 +848,17 @@ AWK;
             return !empty($invocation['paused']) ? $invocation : self::waitHostToolResult($token, (string) $invocation['call_id']);
         } finally {
             ToolBroker::completeActivity((string) $activity['binding_id'], (string) $activity['activity_id']);
+        }
+    }
+
+    /** Make an existing-call poll visible as a return channel; never dispatch or replay a tool. */
+    private static function waitControlResult(string $token, string $callId): array
+    {
+        $activity = ToolBroker::beginReceiptActivity($token, $callId);
+        try {
+            return self::waitHostToolResult($token, $callId);
+        } finally {
+            if ($activity !== null) ToolBroker::completeActivity($activity['binding_id'], $activity['activity_id']);
         }
     }
 
@@ -906,9 +917,17 @@ AWK;
         // A native command or patch can return a nonzero status while its tool call
         // still completed normally. Preserve that receipt as data for the Web model;
         // MCP isError is reserved for an actual bridge/transport failure.
-        return self::hostToolResult($output, (array) ($result['steering_messages'] ?? []),
+        $native = self::hostToolResult($output, (array) ($result['steering_messages'] ?? []),
             is_string($result['compaction_instruction'] ?? null) ? $result['compaction_instruction'] : null,
             !empty($result['output_is_content_parts']), (array) ($result['tool_context_updates'] ?? []));
+        if (!empty($result['question_replies'])) {
+            // Keep the native receipt and its structuredContent exact. Answers are separate
+            // user-role records, not a fabricated return value of the earlier question tool.
+            $native['__mcp_result']['content'][] = ['type'=>'text', 'text'=>
+                "<codex_question_reply>\n" . QuestionReply::notice() . "\n"
+                . ContextHistory::canonical($result['question_replies']) . "\n</codex_question_reply>"];
+        }
+        return $native;
     }
 
     /** Keep the host result exact; carry user steering and non-user context in separate envelopes. */

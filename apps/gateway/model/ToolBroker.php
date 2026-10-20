@@ -380,7 +380,8 @@ final class ToolBroker
             self::acceptOutputsUnlocked($binding, $outputs, $responseId,
                 $activeCompaction ? [] : (array) ($spec['steering_messages'] ?? []),
                 (array) ($spec['budget'] ?? []), $activeCompaction, $parallelToolCalls,
-                (array) ($spec['tool_context_updates'] ?? []));
+                (array) ($spec['tool_context_updates'] ?? []),
+                (array) ($spec['question_reply_messages'] ?? []), $spec['question_reply_call_id'] ?? null);
             if (!$activeCompaction && !empty($spec['parallel_tool_calls_provided'])) {
                 $updated = $db->table('gateway_mcp_bindings')->where('id', (string) $binding['id'])->update([
                     'parallel_tool_calls' => !empty($spec['parallel_tool_calls']) ? 1 : 0,
@@ -1377,21 +1378,73 @@ final class ToolBroker
         });
     }
 
-    /** @return array{activity_id:string,binding_id:string} */
-    public static function beginActivity(string $token): array
+    /**
+     * Fence an active MCP operation until its finally block closes it.
+     * @param string $token Current task capability.
+     * @param string|null $receiptCallKey Native request identity if this RPC returns a tool receipt.
+     * @return array{activity_id:string,binding_id:string}
+     * @throws GatewayError On a stale capability or unavailable activity storage.
+     */
+    public static function beginActivity(string $token, ?string $receiptCallKey = null): array
     {
-        return Schema::transaction(function () use ($token): array {
+        return Schema::transaction(function () use ($token, $receiptCallKey): array {
             $binding = self::bindingByTokenUnlocked($token);
             self::assertLiveUnlocked($binding, true);
-            $id = self::opaque('activity');
-            $now = time();
-            if (!SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_activities')->add([
-                'id' => $id, 'binding_id' => (string) $binding['id'], 'status' => 'active',
-                'created_at' => $now, 'updated_at' => $now,
-            ])) throw new GatewayError('storage_unavailable', 'MCP 活动无法登记。', 503);
-            self::bumpRevisionUnlocked((string) $binding['id']);
-            return ['activity_id' => $id, 'binding_id' => (string) $binding['id']];
+            return self::newActivityUnlocked($binding, $receiptCallKey);
         });
+    }
+
+    /**
+     * Register a receipt-only MCP wait without reviving a retired capability or dispatching work.
+     * @param string $token Owned current or proven retired token.
+     * @param string $callId Exact existing native invocation.
+     * @return array|null Activity to close in finally, or null for an already settled/retired receipt.
+     * @throws GatewayError When the caller cannot access that receipt or storage is unavailable.
+     */
+    public static function beginReceiptActivity(string $token, string $callId): ?array
+    {
+        return Schema::transaction(static function () use ($token, $callId): ?array {
+            [$binding, $call, $retired] = self::receiptForTokenUnlocked($token, $callId);
+            if ($retired || $binding['status'] !== 'running'
+                || !in_array($call['status'], ['registered', 'delivered'], true)) return null;
+            return self::newActivityUnlocked($binding, (string) $call['call_key']);
+        });
+    }
+
+    /**
+     * Match a fresh MCP receiver to this exact invocation, not another inventory/read RPC.
+     * @param array $call Owned invocation from the current response reservation transaction.
+     * @return bool Whether a current RPC can still return this call's receipt.
+     * @throws GatewayError On unavailable activity storage.
+     */
+    public static function hasReceiptActivityUnlocked(array $call): bool
+    {
+        $prefix = 'activity_receipt_' . hash('sha256', (string) $call['call_key']) . '_';
+        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_activities')
+            ->where('binding_id', $call['binding_id'])->where('status', 'active')
+            ->where('created_at', '>=', time() - (int) ceil(McpProtocol::HOST_RPC_SLICE_MS / 1000))
+            ->select('id');
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '工具调用状态暂不可读取。', 503);
+        foreach ($rows as $row) {
+            if (str_starts_with((string) $row['id'], $prefix)) return true;
+        }
+        return false;
+    }
+
+    /** Caller owns the writer transaction and has already proved the current binding. */
+    private static function newActivityUnlocked(array $binding, ?string $receiptCallKey = null): array
+    {
+        // Keep the existing opaque activity primary key and schema; a scoped hash lets
+        // answer routing distinguish the actual receipt receiver from unrelated RPCs.
+        $id = self::opaque($receiptCallKey === null ? 'activity'
+            : 'activity_receipt_' . hash('sha256', $receiptCallKey));
+        $now = time();
+        if (!SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_activities')->add([
+            'id' => $id, 'binding_id' => (string) $binding['id'], 'status' => 'active',
+            'created_at' => $now, 'updated_at' => $now,
+        ])) throw new GatewayError('storage_unavailable', 'MCP 活动无法登记。', 503);
+        self::bumpRevisionUnlocked((string) $binding['id']);
+        return ['activity_id' => $id, 'binding_id' => (string) $binding['id']];
     }
 
     public static function completeActivity(string $bindingId, string $activityId): void
@@ -1478,6 +1531,7 @@ final class ToolBroker
                     'output_is_content_parts' => !empty($decoded['output_is_content_parts']),
                     'steering_messages' => is_array($decoded['steering_messages'] ?? null) ? $decoded['steering_messages'] : [],
                     'tool_context_updates' => is_array($decoded['tool_context_updates'] ?? null) ? $decoded['tool_context_updates'] : [],
+                    'question_replies' => (array) ($decoded['question_replies'] ?? []),
                     'wire_name' => (string) $row['wire_name'],
                 ];
             }
@@ -1530,6 +1584,7 @@ final class ToolBroker
                     'output_is_content_parts' => !empty($decoded['output_is_content_parts']),
                     'steering_messages' => is_array($decoded['steering_messages'] ?? null) ? $decoded['steering_messages'] : [],
                     'tool_context_updates' => is_array($decoded['tool_context_updates'] ?? null) ? $decoded['tool_context_updates'] : [],
+                    'question_replies' => (array) ($decoded['question_replies'] ?? []),
                     'wire_name' => (string) $row['wire_name'],
                 ];
             }
@@ -2340,7 +2395,7 @@ final class ToolBroker
             if ((string) $row['status'] !== 'completed' || isset($batch[(string) $row['call_id']])
                 || $row['result_delivered_at'] !== null) continue;
             $result = json_decode((string) $row['result_json'], true, 128, JSON_THROW_ON_ERROR);
-            unset($result['steering_messages'], $result['tool_context_updates']);
+            unset($result['steering_messages'], $result['tool_context_updates'], $result['question_replies']);
             $result['canonical_handoff_response_id'] = $newResponseId;
             $result['retired_token_hash'] = $oldTokenHash;
             $updated = $db->table('gateway_tool_invocations')->where('id', (string) $row['id'])
@@ -2379,7 +2434,7 @@ final class ToolBroker
             if (!self::canonicalReceiptMatches($row, $result, $receipts, $hash)) {
                 throw new GatewayError('tool_steering_context_incomplete', '新网页缺少准确的宿主工具回执。', 409);
             }
-            unset($result['steering_messages'], $result['tool_context_updates']);
+            unset($result['steering_messages'], $result['tool_context_updates'], $result['question_replies']);
             $result['canonical_handoff_response_id'] = $newResponseId;
             $result['retired_token_hash'] = $oldTokenHash;
             $updated = $db->table('gateway_tool_invocations')->where('id', (string) $row['id'])
@@ -2464,10 +2519,13 @@ final class ToolBroker
         return hash_equals($hash, ContextHistory::toolReceiptHash($receipts[$callId]));
     }
 
-    /** Accept complete host receipts under the HTTP envelope; preserve hashes and bind the next round. */
+    /**
+     * Accept complete host receipts under the HTTP envelope; preserve hashes and bind the next round.
+     * Verified question replies belong only to the selected, not-yet-returned receipt, outside its hash.
+     */
     private static function acceptOutputsUnlocked(array $binding, array $outputs, string $newResponseId,
         array $steering = [], array $budget = [], bool $activeCompaction = false, bool $parallelToolCalls = true,
-        array $contextUpdates = []): void
+        array $contextUpdates = [], array $questionReplies = [], ?string $questionCallId = null): void
     {
         self::assertLiveUnlocked($binding, true);
         $db = SDB(null, 'medoo', 'sqlite');
@@ -2497,6 +2555,7 @@ final class ToolBroker
             if (array_key_exists('content_parts', $output)) $result['output_is_content_parts'] = true;
             if ($index === 0 && $steering !== []) $result['steering_messages'] = $steering;
             if ($index === 0 && $contextUpdates !== []) $result['tool_context_updates'] = $contextUpdates;
+            if ($callId === $questionCallId && $questionReplies !== []) $result['question_replies'] = $questionReplies;
             $updated = $db->table('gateway_tool_invocations')->where('id', $row['id'])->where('status', 'delivered')->update([
                 'status' => 'completed',
                 'result_json' => json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
@@ -3315,7 +3374,7 @@ final class ToolBroker
             . 'When missing information, a preference or required approval materially affects the next action, the current Codex host advertises ' . $questionTool . '. '
             . 'Discover its exact current schema with query=' . $questionTool . ' and exact=true, and invoke it through codex_tool_call to ask in the Codex UI. Follow its mode and approval restrictions; do not invent availability or ask again for authorization already given. ';
         $notice .= $async !== ''
-            ? 'This asynchronous tool acknowledges that a question was shown; that receipt and any preselected option are not the user answer. The answer arrives as a later user message. Continue independent authorized work while waiting; do not perform dependent work until the answer arrives, and do not poll or resend the question. '
+            ? 'This asynchronous tool acknowledges that a question was shown; that receipt and any preselected option are not the user answer. The answer arrives as a later user message. Continue independent authorized work without waiting for a reply. An unanswered optional question does not prevent completing the task; do not idle, poll or resend it. Only steps requiring the missing decision or approval must wait. When an answer arrives, handle its actual intent together with the current task state, reusing work and results already completed. '
             : 'Use this tool only in a mode allowed by its current description. If unavailable, ask in ordinary public text; do not force a mode change. ';
         return $notice . "\n</codex_user_questions>";
     }
