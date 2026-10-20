@@ -153,6 +153,8 @@ class GitHubFixture {
         this.remoteCommit = COMMIT;
         this.latestTag = null;
         this.failUpload = null;
+        this.uploadFailures = [];
+        this.afterSleep = null;
         this.ambiguousUpload = false;
         this.ambiguousCreate = false;
         this.ambiguousPublish = false;
@@ -199,9 +201,9 @@ class GitHubFixture {
     response(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } }); }
 
     /** Return an API error fixture, including untrusted JSON/text and a request identifier. */
-    failure({ status, body, requestId = 'fixture-request-id', contentType = 'application/json' }) {
+    failure({ status, body, requestId = 'fixture-request-id', contentType = 'application/json', headers = {} }) {
         return new Response(typeof body === 'string' ? body : JSON.stringify(body), {
-            status, headers: { 'content-type': contentType, 'x-github-request-id': requestId },
+            status, headers: { 'content-type': contentType, 'x-github-request-id': requestId, ...headers },
         });
     }
 
@@ -226,6 +228,13 @@ class GitHubFixture {
             const name = url.searchParams.get('name');
             const data = await this.payload(options.body);
             assert.equal(Number(headers.get('content-length')), data.length);
+            const failure = this.uploadFailures.shift();
+            if (failure) {
+                if (failure.starter) this.addAsset(name, Buffer.alloc(0), { state: 'starter' });
+                if (failure.delayed) this.pendingUpload = { name, data };
+                if (failure.transport) throw new Error('fixture transport disconnected', { cause: { code: 'ECONNRESET' } });
+                return this.failure(failure);
+            }
             if (this.failUpload === name || this.failUpload === '*') return this.response({ message: 'failed' }, 502);
             const asset = this.addAsset(name, data, this.corruptUploadDigest ? { digest: `sha256:${'0'.repeat(64)}` } : {});
             if (this.ambiguousUpload) { this.ambiguousUpload = false; throw new Error('lost upload response'); }
@@ -302,7 +311,10 @@ async function execute(fixture, server) {
     const delays = [];
     let result;
     try {
-        result = await run({ env: fixture.env, fetch: server.fetch.bind(server), sleep: async milliseconds => delays.push(milliseconds), log: message => logs.push(message) });
+        result = await run({ env: fixture.env, fetch: server.fetch.bind(server), sleep: async milliseconds => {
+            delays.push(milliseconds);
+            if (server.afterSleep) await server.afterSleep(milliseconds);
+        }, log: message => logs.push(message) });
     } finally {
         assert.ok(logs.every(message => !message.includes(fixture.env.GITHUB_TOKEN)));
     }
@@ -530,6 +542,111 @@ test('upload failure never publishes a partial draft', async t => {
     await execute(local, server);
     assert.equal(server.release.draft, false);
     assert.equal(server.mutations('POST').filter(call => call.url.startsWith(ROOT)).length, 1);
+});
+
+test('transient upload failures retry fresh streams after reconciliation and preserve completed assets', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture({ draft: true });
+    const keptName = targetNames(TAG, TARGETS[0]).binary;
+    const kept = server.addAsset(keptName, await fsp.readFile(local.locations.get(keptName)));
+    server.uploadFailures = [{ status: 502, body: { message: 'upstream unavailable' } },
+        { transport: true }, { status: 503, body: { message: 'try later' }, headers: { 'retry-after': '25' } }];
+    const { delays } = await execute(local, server);
+    assert.equal(server.release.draft, false);
+    assert.equal(server.assets.find(asset => asset.name === keptName).id, kept.id);
+    assert.equal(server.mutations('DELETE').length, 0);
+    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 14);
+    assert.ok(delays.includes(5000) && delays.includes(10000) && delays.includes(25000));
+});
+
+test('502 empty starter is reconciled then replaced only in the same unpublished draft', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.uploadFailures = [{ status: 502, body: { message: 'upstream' }, starter: true }];
+    await execute(local, server);
+    assert.equal(server.release.draft, false);
+    assert.equal(server.mutations('DELETE').length, 1);
+    assert.equal(server.assets.length, 12);
+    assert.equal(new Set(server.assets.map(asset => asset.name)).size, 12);
+});
+
+test('delayed successful upload after a lost response is reused without another POST', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.uploadFailures = [{ transport: true, delayed: true }];
+    server.afterSleep = () => {
+        if (server.pendingUpload) {
+            server.addAsset(server.pendingUpload.name, server.pendingUpload.data);
+            server.pendingUpload = null;
+        }
+    };
+    await execute(local, server);
+    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 12);
+    assert.equal(server.mutations('DELETE').length, 0);
+});
+
+test('exhausted uploads retain bounded API cause and request ID with the release still private', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.uploadFailures = Array.from({ length: 4 }, () => ({
+        status: 502, requestId: 'upload-fixture-id', body: { message: `Bad gateway\n${local.env.GITHUB_TOKEN}` },
+    }));
+    await assert.rejects(execute(local, server), error => {
+        assert.match(error.message, /HTTP 502/);
+        assert.match(error.message, /upload-fixture-id/);
+        assert.ok(!error.message.includes(local.env.GITHUB_TOKEN));
+        assert.doesNotMatch(error.message, /[\x00-\x1f\x7f]/);
+        return true;
+    });
+    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 4);
+    assert.equal(server.mutations('PATCH').length, 0);
+    assert.equal(server.release.draft, true);
+});
+
+test('permission, rate-limit and validation upload failures are not repeatedly posted', async t => {
+    for (const status of [401, 403, 422, 429]) {
+        const local = await fixture(t);
+        const server = new GitHubFixture();
+        server.uploadFailures = [{ status, body: { message: 'permanent or rate-limited' } }];
+        await assert.rejects(execute(local, server), new RegExp(`HTTP ${status}`));
+        assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 1);
+        assert.equal(server.mutations('PATCH').length, 0);
+    }
+});
+
+test('an unknown in-progress starter is never deleted after a transport interruption', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.uploadFailures = [{ transport: true, starter: true }];
+    await assert.rejects(execute(local, server), /ECONNRESET/);
+    assert.equal(server.mutations('DELETE').length, 0);
+    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 1);
+    assert.equal(server.release.draft, true);
+});
+
+test('upload retry refuses a changed tag or a release published during the wait', async t => {
+    for (const changed of ['tag', 'published']) {
+        const local = await fixture(t);
+        const server = new GitHubFixture();
+        server.uploadFailures = [{ status: 502, body: { message: 'upstream' }, starter: true }];
+        server.afterSleep = () => {
+            if (changed === 'tag') server.remoteCommit = 'b'.repeat(40);
+            else server.release.draft = false;
+        };
+        await assert.rejects(execute(local, server), changed === 'tag' ? /Remote tag commit differs/ : /already published/);
+        assert.equal(server.mutations('DELETE').length, 0);
+        assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 1);
+        assert.equal(server.mutations('PATCH').length, 0);
+    }
+});
+
+test('upload retry does not shorten a server cooldown longer than its bounded retry budget', async t => {
+    const local = await fixture(t);
+    const server = new GitHubFixture();
+    server.uploadFailures = [{ status: 503, body: { message: 'long cooldown' }, headers: { 'retry-after': '3600' } }];
+    await assert.rejects(execute(local, server), /HTTP 503/);
+    assert.equal(server.mutations('POST').filter(call => call.url.startsWith('https://uploads.github.com')).length, 1);
+    assert.equal(server.release.draft, true);
 });
 
 test('uploaded asset with incorrect server digest never allows publication', async t => {

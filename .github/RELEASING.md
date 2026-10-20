@@ -45,6 +45,8 @@ Extract the archive for your system. Run `rcmaker-codex-gateway.exe` on Windows 
 - To repair missing or incorrect notes on an immutable historical commit, add `.github/release-notes/commits/<full-sha>.en.json`, a nonempty JSON array of single-line English changes. The release reads it from the tagged tree; it overrides that commit's note fields without exposing its private body or rewriting history. A version override still takes precedence.
 - Run `node .github/scripts/release-notes.cjs --check` after committing and before tagging. The lightweight `release-note-preflight.yml` also checks pushes and pull requests, including the most recent release range and a just-tagged HEAD. Missing notes are reported together. Fixes must be committed into the tree selected by the release tag: rerunning an old tag does not load newer branch files. Do not move an already published release tag to repair its notes.
 - In Actions, choose **Release encrypted binaries → Run workflow**, enter an existing tag, and leave **publish** disabled for a full build rehearsal. Enable it to retry a failed publication. An incomplete draft can resume. A published Release is verified against its existing manifest and never overwritten with newly encrypted bytes, including schema-1 releases with a standalone Windows EXE and older bilingual releases.
+- Upload transport failures and HTTP 5xx responses are reconciled against the draft before retrying, with at most four upload attempts. Complete files are reused only after size and SHA-256 verification; a confirmed empty `starter` left by HTTP 502 may be removed from that draft. Unknown in-progress uploads, duplicate files, permission/rate-limit errors and checksum mismatches stop publication with diagnostic details. Server cooldowns are honored; excessive cooldowns leave the draft for a later run.
+- To apply a publishing-script fix to an existing tag, push the fix to the branch selected in **Run workflow**, enter the unchanged release tag, and enable **publish**. Build inputs remain pinned to the tag; the publisher comes from the workflow commit. **Re-run failed jobs** on an old run still uses that run's old workflow commit and does not load the newer publisher.
 - `release-checks.yml` runs isolated CI contract tests for changes to the automation or version entry points. Dependabot opens monthly PRs for pinned Action updates; it does not auto-merge them.
 
 ### Storage and retention
@@ -87,6 +89,10 @@ Release 共 12 个附件：四份 Unix 可执行文件、五份压缩包、一�
 提交后、打 tag 前运行 `node .github/scripts/release-notes.cjs --check`；独立轻量预检也会在 push 和 PR 时运行，覆盖最近版本范围和刚打 tag 的 HEAD，一次列出所有缺项。修复必须包含在发布 tag 指向的提交中，重跑旧 tag 不会加载分支上的新文件；不要为补说明移动已经正式发布的 tag。
 
 Actions 中可手动运行 **Release encrypted binaries**：输入已有 tag，关闭 **publish** 可先做完整构建演练；开启则进行发布或失败重试。草稿可以续传，已经公开的版本只验证、不覆盖。工作流检查自动运行，依赖 Action 固定 SHA，Dependabot 每月提交更新 PR。
+
+上传网络故障或 HTTP 5xx 后，发布器先核对草稿附件，最多尝试上传四次。已完成文件通过大小与 SHA-256 校验后直接复用；HTTP 502 留下且确认仍为空的 `starter` 可在当前草稿内清理。状态不明的进行中上传、重复附件、权限／限流错误和校验不一致会停止发布并保留诊断原因。遵守服务端等待时间；等待要求过长时保留草稿，稍后再运行。
+
+要让已有 tag 使用修复后的发布脚本，先将修复推送到分支，再在 **Run workflow** 选择该分支，输入原 tag 并开启 **publish**。二进制源代码仍固定为原 tag，只有发布器取自所选工作流提交。旧运行的 **Re-run failed jobs** 仍使用旧工作流提交，不会加载新的发布脚本；无需因此移动版本标签。
 
 历史 Release、下载附件和 Git tags 均保留，不再发布一个版本就删除旧版本。GitHub Release 没有总容量或下载带宽限制，每个 Release 最多 1,000 个附件，每个附件小于 2 GiB；这些附件不写入 Git 仓库，也不使用 Git LFS。
 

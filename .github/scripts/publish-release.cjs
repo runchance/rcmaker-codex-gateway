@@ -349,10 +349,11 @@ async function localRelease(config) {
 /** Repository-scoped REST client: tokens never follow redirects or untrusted response URLs. */
 class GitHub {
     /** Accept injectable transport/delay only for offline tests. */
-    constructor(config, fetchImpl, sleep) {
+    constructor(config, fetchImpl, sleep, log = () => {}) {
         this.config = config;
         this.fetch = fetchImpl;
         this.sleep = sleep;
+        this.log = log;
         this.base = `${config.apiRoot}/repos/${config.repositoryPath}`;
     }
 
@@ -379,7 +380,11 @@ class GitHub {
         const route = endpoint.startsWith('/') ? endpoint.split('?')[0] : new URL(endpoint).pathname;
         const cause = diagnostic(detail, this.config.token);
         const requestId = diagnostic(response.headers.get('x-github-request-id') || '', this.config.token, 192);
-        return new Error(`GitHub ${method} ${diagnostic(route, this.config.token, 240)} failed with HTTP ${response.status}${cause ? ': ' + cause : '.'}${requestId ? ' [request-id: ' + requestId + ']' : ''}`);
+        const retryAfter = response.headers.get('retry-after');
+        const retryAfterMs = retryAfter === null ? 0 : /^\d+$/.test(retryAfter)
+            ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now());
+        return Object.assign(new Error(`GitHub ${method} ${diagnostic(route, this.config.token, 240)} failed with HTTP ${response.status}${cause ? ': ' + cause : '.'}${requestId ? ' [request-id: ' + requestId + ']' : ''}`),
+            { status: response.status, retryable: response.status >= 500 && response.status < 600, retryAfterMs });
     }
 
     /** Retry safe reads/deletes on bounded rate limits or transient upstream failures. */
@@ -399,15 +404,19 @@ class GitHub {
         const retrySafe = method === 'GET' || method === 'DELETE';
         for (let attempt = 0; ; attempt++) {
             let response;
+            let payload;
             try {
                 const headers = { Accept: accept, Authorization: `Bearer ${config.token}`, 'X-GitHub-Api-Version': '2022-11-28' };
                 if (body !== undefined) headers['Content-Type'] = contentType || 'application/json';
                 if (contentLength !== undefined) headers['Content-Length'] = String(contentLength);
-                const payload = typeof body === 'function' ? body() : body === undefined ? undefined : JSON.stringify(body);
+                payload = typeof body === 'function' ? body() : body === undefined ? undefined : JSON.stringify(body);
                 response = await this.fetch(url.href, { method, headers, body: payload, redirect: 'manual', signal: AbortSignal.timeout(120000), ...(upload ? { duplex: 'half' } : {}) });
-            } catch {
+            } catch (error) {
+                if (upload && typeof payload?.destroy === 'function') payload.destroy();
                 if (retrySafe && attempt < 3) { await this.sleep(Math.min(1000 * 2 ** attempt, 10000)); continue; }
-                throw new Error(`GitHub ${method} request failed; remote outcome may be unknown.`);
+                const cause = diagnostic([error?.name, error?.cause?.code || error?.code, error?.message].filter(Boolean).join(': '), config.token, 900);
+                throw Object.assign(new Error(`GitHub ${method} request failed; remote outcome may be unknown.${cause ? ' ' + cause : ''}`),
+                    { retryable: true, retryAfterMs: 0 });
             }
             if (retrySafe && (response.status === 429 || response.status >= 500 || (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0')) && attempt < 3) {
                 const retryAfter = Number(response.headers.get('retry-after'));
@@ -580,20 +589,59 @@ class GitHub {
         return 'false';
     }
 
-    /** Upload once; reconcile ambiguous POST outcomes by listing and validating the asset. */
+    /**
+     * Reconcile each upload before a bounded retry of transport/5xx failures.
+     * Reuse verified bytes, remove only a confirmed empty 502 starter in this draft,
+     * and never retry permission, identity, duplicate or checksum failures.
+     */
     async upload(release, record) {
-        const current = await this.draft(release.id);
-        requireThat(typeof current.upload_url === 'string', 'Draft has no upload endpoint.');
-        const endpoint = new URL(current.upload_url.replace(/\{.*\}$/, ''));
-        requireThat(endpoint.pathname.endsWith(`/releases/${this.id(release.id)}/assets`), 'Upload endpoint does not match this release ID.');
-        endpoint.searchParams.set('name', record.name);
         let failure;
-        try {
-            await this.request(endpoint.href, { method: 'POST', upload: true, contentType: 'application/octet-stream', contentLength: record.bytes, body: () => fs.createReadStream(record.path) });
-        } catch (error) { failure = error; }
-        const matches = (await this.list(`/releases/${this.id(release.id)}/assets`)).filter(asset => asset.name === record.name);
-        requireThat(matches.length === 1, failure ? `Upload failed without a complete asset: ${record.name}.` : `Upload did not produce a unique asset: ${record.name}.`);
-        await this.verifyAssets(matches, [record]);
+        const endpointPath = `/releases/${this.id(release.id)}/assets`;
+        const failed = () => new Error(`Upload failed without a complete asset: ${record.name}.${failure ? ' ' + diagnostic(failure.message, this.config.token, 2200) : ''}`);
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const current = await this.draft(release.id);
+            if (attempt > 0) {
+                await this.verifyTag();
+                const matches = (await this.list(endpointPath)).filter(asset => asset.name === record.name);
+                requireThat(matches.length <= 1, `Upload produced duplicate assets: ${record.name}.`);
+                if (matches[0]?.state === 'uploaded') { await this.verifyAssets(matches, [record]); return; }
+                if (matches.length) {
+                    // GitHub documents an empty "starter" left by an upstream 502 as safe to delete.
+                    // A transport timeout alone does not prove an in-progress upload is abandoned.
+                    if (failure?.status !== 502 || matches[0].state !== 'starter' || matches[0].size !== 0) throw failed();
+                    await this.draft(release.id);
+                    await this.request(`/releases/assets/${this.id(matches[0].id)}`, { method: 'DELETE', allow404: true });
+                }
+            }
+            requireThat(typeof current.upload_url === 'string', 'Draft has no upload endpoint.');
+            const endpoint = new URL(current.upload_url.replace(/\{.*\}$/, ''));
+            requireThat(endpoint.pathname.endsWith(`/releases/${this.id(release.id)}/assets`), 'Upload endpoint does not match this release ID.');
+            endpoint.searchParams.set('name', record.name);
+            failure = null;
+            try {
+                const response = await this.request(endpoint.href, { method: 'POST', upload: true, contentType: 'application/octet-stream', contentLength: record.bytes, body: () => fs.createReadStream(record.path) });
+                await response.body?.cancel();
+            } catch (error) { failure = error; }
+            // A lost acknowledgement or delayed asset listing must not cause a duplicate POST.
+            // Rate/permission rejections are reported immediately, without further polling.
+            if (failure && [401, 403, 429].includes(failure.status)) throw failed();
+            if (failure?.retryable) {
+                // Respect Retry-After before even the reconciliation reads, not only before a new POST.
+                if (!Number.isFinite(failure.retryAfterMs) || failure.retryAfterMs > 180000) throw failed();
+                if (failure.retryAfterMs > 0) await this.sleep(failure.retryAfterMs);
+            }
+            const observations = failure && !failure.retryable ? 1 : 3;
+            for (let observation = 0; observation < observations; observation++) {
+                if (observation > 0) await this.sleep(2000 * observation);
+                const matches = (await this.list(endpointPath)).filter(asset => asset.name === record.name);
+                requireThat(matches.length <= 1, `Upload produced duplicate assets: ${record.name}.`);
+                if (matches[0]?.state === 'uploaded') { await this.verifyAssets(matches, [record]); return; }
+            }
+            if (!failure?.retryable || attempt === 3) throw failed();
+            const delay = 5000 * 2 ** attempt;
+            this.log(`Retrying draft asset ${record.name} after reconciliation (${attempt + 2}/4) in ${delay / 1000}s. ${diagnostic(failure.message, this.config.token, 1900)}`);
+            await this.sleep(delay);
+        }
     }
 }
 
@@ -604,7 +652,7 @@ class GitHub {
  */
 async function run({ env = process.env, fetch: fetchImpl = globalThis.fetch, sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)), log = console.log } = {}) {
     const config = configuration(env);
-    const github = new GitHub(config, fetchImpl, sleep);
+    const github = new GitHub(config, fetchImpl, sleep, log);
     // Validate every matrix artifact even on reruns: a broken workflow must fail closed.
     const local = await localRelease(config);
     await github.verifyTag();
