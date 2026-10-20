@@ -394,7 +394,7 @@ final class TaskWebChat
      * @param array $expected Current execution identity. @param string $url Observed URL.
      * @param string $accountKey Fresh browser account fingerprint, never a token or email.
      * @param string $modelUrl Configured model origin.
-     * @param bool $initialMessageWitness Exact physical request marker observed in the current DOM.
+     * @param bool $initialMessageWitness Exact physical request marker, or its previously observed native initial reply, in the current document.
      * @param string|null $physicalResponseId Original browser submission pinned by native receipt rounds or exact retained steering.
      * @return array Pinned conversation state. @throws GatewayError On identity or storage conflict.
      */

@@ -3509,7 +3509,7 @@ JS;
                     return;
                 }
                 if ($error === null && is_array($state) && !empty($state['owned'])) {
-                    if ($initialBinding !== '' && !empty($state['initial_binding_witness'])
+                    if ($initialBinding !== '' && (!empty($state['initial_binding_witness']) || !empty($state['initial_response_witness']))
                         && empty($this->taskSessions[$sessionId]['web_chat']['conversation_id'])) {
                         try {
                             $expected = TaskLedger::pollExecution($responseId);
@@ -8718,9 +8718,16 @@ JS;
         preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string)$physical['prompt'], $tokens);
         $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$physical['prompt']];
         if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
+        $owner = $this->taskSessions[$turn['session_id']] ?? [];
+        $chat = $turn['web_chat'] ?? [];
+        $verifiedSavedChat = ($chat['mode'] ?? 'temporary') === 'regular' && !empty($chat['conversation_id'])
+            && !empty($chat['account_key']) && !empty($owner['account_key'])
+            && ($owner['account_document_nonce'] ?? '') === $ledger['surface']['document_nonce']
+            && hash_equals($chat['account_key'], $owner['account_key'])
+            && WebModelPage::isTaskChatUrl((string)$ledger['surface']['url'], self::modelUrl(), 'regular', $chat['conversation_id']);
         $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
             (array)$physical['baseline_users'], !$state['clicked'], true, self::acceptedInitialUser($physical, $ledger['surface']),
-            $turn['web_chat']['mode'] ?? 'temporary', false, true,
+            $turn['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true,
             self::submittedChatBindingMarker($physical, $ledger['surface'], $turn['web_chat']['mode'] ?? 'temporary')),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;

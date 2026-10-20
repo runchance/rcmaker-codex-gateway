@@ -1723,7 +1723,7 @@ final class TaskLedger
             if ($loading || $cooling) $data += ['http_status'=>429,'attempt'=>max(0,min(64,(int)($observation['attempt']??0))),
                 'retry_after_seconds'=>max(1,min(86400,(int)($observation['retry_after_seconds']??30)))];
             if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed',
-                'initial_binding_witness', 'token_witness', 'retained_identity_witness'] as $key) {
+                'initial_binding_witness', 'initial_response_witness', 'token_witness', 'retained_identity_witness'] as $key) {
                 $data[$key] = isset($observation[$key]) ? (bool) $observation[$key] : null;
             }
             if ($steering) foreach (['user_count', 'stop_count'] as $key) {

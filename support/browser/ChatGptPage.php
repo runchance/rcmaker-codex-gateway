@@ -567,7 +567,7 @@ JS);
      * @param bool $click False reads acknowledgement; true may click the unique semantic Stop control.
      * @param bool $requireWitness Require the exact task message even when the composer is idle.
      * @param bool $acceptedInitialUser Durable proof that the current document accepted its first user submission.
-     * @param bool $verifiedSavedChat Caller verified the exact saved chat, account, document and current owner.
+     * @param bool $verifiedSavedChat Caller verified the exact saved chat, account, document and current owner; user bubbles may be virtualized.
      * @param bool $confirm Allow the known native stop confirmation during this owned stop operation; false is read-only when click is false.
      * @param string $initialBindingMarker Exact physical response ID whose binding header was durably submitted in this ordinary document.
      * @return string CDP expression returning ownership, composer readiness and generation state.
@@ -594,6 +594,11 @@ const bindingUser=latest?.querySelector('[data-user-message-bubble]')||latest;
 const initialBindingWitness=expected.chatMode==='regular'&&!!expected.initialBindingMarker
     &&[bindingUser?.innerText,bindingUser?.textContent].some(text=>String(text||'').includes(
         '<rcmaker_chat_binding>'+expected.initialBindingMarker+'</rcmaker_chat_binding>'));
+// Initial ordinary replies can render Activity without any user bubble. Reuse only
+// the native answer already observed for this accepted first submission, in this
+// same document. A new page, another response or another saved URL has no witness.
+const initialResponseWitness=expected.chatMode==='regular'&&expected.acceptedInitialUser
+    &&expected.users.length===0&&rows.length===0&&observedInitialResponse(expected.initialBindingMarker);
 // ChatGPT truncates long user bubbles in the DOM, not merely their visible layout.
 // On the exact retained URL, one fresh native group after still-present baseline
 // groups proves the submitted user turn without requiring its hidden token tail.
@@ -607,13 +612,14 @@ const initialWitness=expected.acceptedInitialUser&&expected.users.length===0&&id
 const retainedIdentityWitness=String(location.href||'')===expected.url&&(baselineWitness||initialWitness)
     &&fresh.length===1&&fresh[0]===identity
     &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
-let witness=tokenWitness||initialBindingWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
+let witness=tokenWitness||initialBindingWitness||initialResponseWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
 const evidence={url:String(location.href||''),initial_binding_witness:initialBindingWitness,token_witness:tokenWitness,
-    retained_identity_witness:retainedIdentityWitness,user_count:rows.length};
+    initial_response_witness:initialResponseWitness,retained_identity_witness:retainedIdentityWitness,user_count:rows.length};
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
 // A just-submitted root page may acquire its saved UUID during the stop read.
-// Only its exact front marker can authorize this first transition, never UUID A -> B.
-const initialNavigation=initialBindingWitness&&sameOrigin&&new URL(expected.url).pathname==='/'
+// Only its exact message or previously observed native reply authorizes this
+// first transition, never UUID A -> B.
+const initialNavigation=(initialBindingWitness||initialResponseWitness)&&sameOrigin&&new URL(expected.url).pathname==='/'
     &&/^(?:\/c\/)[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(location.pathname);
 const regular=sameOrigin&&expected.chatMode==='regular'&&!new URLSearchParams(location.search).has('temporary-chat')
     &&(String(location.href||'')===expected.url||initialNavigation)
@@ -623,9 +629,13 @@ if(!temporary)return {...evidence,owned:false,page_invalid:true,generation_runni
 // A persisted ordinary conversation can contain several accepted incremental/continuation
 // messages after its first physical response. Its freshly verified account/UUID ownership
 // is authoritative; the original token need not be repeated in its latest user bubble.
-if(regular&&expected.verifiedSavedChat&&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||''))witness=true;
+if(regular&&String(location.href||'')===expected.url&&expected.verifiedSavedChat)witness=true;
 const owned=String(location.href||'')===expected.url||witness;
-const stops=[...document.querySelectorAll('[data-testid="stop-button"]')].filter(visible);
+const stops=[...new Set([
+    ...document.querySelectorAll('[data-testid="stop-button"]'),
+    ...[...(composer?.closest('form')?.querySelectorAll('button[aria-label]')||[])]
+        .filter(button=>/^(?:Stop|Stop generating|停止|停止生成)$/.test(String(button.getAttribute('aria-label')||'').trim()))
+])].filter(visible);
 evidence.stop_count=stops.length;
 if(stops.length>1)return {...evidence,owned:false,generation_running:true,editor_ready:!!composer,stopped:false};
 const stop=generationStop(),confirmation=generationStopConfirmation();
@@ -1278,6 +1288,21 @@ const boundMatches=boundResponseId?assistants.filter(entry=>entry.id===boundResp
 const promoted=boundMatches.length===0
     ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
+// Keep one document-local native response anchor for the first ordinary send.
+// This does not infer acceptance or ownership: stop callers still require the
+// durable accepted submission, current task fence and freshly verified account.
+// Never seed it from a historical answer, prose, an assistant quote or a count alone.
+if(expectedInitialBinding&&beforeUsers.size===0&&beforeAssistants.size===0&&answer
+    &&strong(answer.id)
+    &&!new URLSearchParams(location.search).has('temporary-chat')){
+    const key=Symbol.for('rcmaker.initial.response'),prior=globalThis[key];
+    const url=String(location.href||'');
+    const nativeId=turnId(answer.el,assistants.findIndex(entry=>entry.el===answer.el),'assistant');
+    if(!prior)globalThis[key]={source:expectedInitialBinding,url,assistant:nativeId};
+    else if(prior.source===expectedInitialBinding&&initialResponseUrlMatches(prior.url,url)){
+        prior.url=url;prior.assistant=nativeId;
+    }
+}
 const running=!!generationStop();
 // An empty composer normally disables Send after generation. Its visible semantic
 // identity, not enabledness, is the idle-state witness; Stop always wins above.
@@ -1886,6 +1911,32 @@ const turnId=(el,index,role)=>el.hasAttribute('data-turn-key')
     ||el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids')?.split(/\s+/)[0]
     ||el.getAttribute('data-testid')||el.getAttribute('data-content-search-unit-key')
     ||el.getAttribute('data-content-search-turn-key')||('turn-'+index);
+// The first native response may acquire its saved UUID after being rendered at /.
+// Pin that first UUID; a later SPA navigation must never move this witness to chat B.
+const initialResponseUrlMatches=(from,to)=>{
+    try{
+        const a=new URL(from),b=new URL(to);
+        const chat=/^\/c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+        return a.origin===b.origin&&!a.searchParams.has('temporary-chat')&&!b.searchParams.has('temporary-chat')
+            &&(a.pathname==='/'||chat.test(a.pathname))&&(b.pathname==='/'||chat.test(b.pathname))
+            &&(from===to||(a.pathname==='/'&&chat.test(b.pathname)));
+    }catch(_){return false;}
+};
+// Metadata only, scoped to this JavaScript document; no message text or tool token.
+// Retain the anchor through a transient bubble unmount, not through a new answer.
+const observedInitialResponse=source=>{
+    const saved=globalThis[Symbol.for('rcmaker.initial.response')];
+    const url=String(location.href||'');
+    if(!source||saved?.source!==source||!initialResponseUrlMatches(saved.url,url))return false;
+    const matches=assistantTurns().map((el,i)=>({el,id:turnId(el,i,'assistant')}));
+    if(matches.length!==1)return false;
+    // Reuse the existing native-anchor promotion check for a streaming group
+    // acquiring its permanent ID; never accept an unrelated replacement answer.
+    if(matches[0].id!==saved.assistant
+        &&!promotedAssistant(matches,new Set(),saved.assistant,matches[0].id))return false;
+    saved.url=url;saved.assistant=matches[0].id;
+    return true;
+};
 // ChatGPT promotes a streaming message into a stable user/assistant group. Preserve the
 // original identity only through one exact native anchor in the accepted user's fresh
 // group. A provisional group:assistant:fallback-turn-N keeps that same inner fallback
