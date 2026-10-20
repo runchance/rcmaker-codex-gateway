@@ -726,11 +726,20 @@ JS);
     /**
      * Read the unique idle composer before native draft cleanup in a saved chat.
      * @param bool $focus Focus that composer without editing its controlled state.
+     * @param array $expected Optional exact URL and latest staged ACK, checked before any focus.
      * @return string CDP expression returning draft/selection facts, never conversation text.
      */
-    public static function connectorComposerStateExpression(bool $focus = false): string
+    public static function connectorComposerStateExpression(bool $focus = false, array $expected = []): string
     {
-        return self::wrap(str_replace('__FOCUS__', $focus ? 'true' : 'false', <<<'JS'
+        return self::wrap(str_replace(['__FOCUS__', '__EXPECTED__'], [$focus ? 'true' : 'false',
+            json_encode($expected, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)], <<<'JS'
+const expected=__EXPECTED__;
+if(expected.url&&String(location.href)!==expected.url)return {ok:false,code:'CHATGPT_CHAT_IDENTITY_CHANGED'};
+if(expected.stage_ack){
+    const texts=assistantTurns().map(el=>{const root=el.querySelector('.markdown,[data-markdown-text-style]')||el.querySelector('[data-message-author-role="assistant"]')||el;return String(root.innerText||root.textContent||'').replace(/\u00a0/g,' ').trim()});
+    if(texts.at(-1)!==expected.stage_ack||texts.filter(text=>text===expected.stage_ack).length!==1)
+        return {ok:false,code:'CHATGPT_CHAT_IDENTITY_CHANGED'};
+}
 const composers=[...document.querySelectorAll(COMPOSER)].filter(visible);
 if(composers.length!==1)return {ok:false,code:'CHATGPT_EDITOR_MISSING'};
 const composer=composers[0];

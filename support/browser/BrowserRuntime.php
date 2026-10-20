@@ -5381,20 +5381,41 @@ JS;
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || ($turn['web_chat']['mode'] ?? '') !== 'regular') return;
-        try { $generationId = TaskLedger::pollExecution((string)($turn['logical_response_id'] ?? $responseId))['job']['generation_id']; }
+        try { $execution = TaskLedger::pollExecution((string)($turn['logical_response_id'] ?? $responseId)); }
         catch (\Throwable) { return; }
+        $generationId = $execution['job']['generation_id'];
+        // Inert stages create the ordinary /c/ route before the final tool-capable message.
+        // Prove that exact staged transaction; do not bind the saved chat before its final message witness.
+        $stages = (array)($turn['multipart']['stages'] ?? []);
+        $stageCount = count($stages);
+        $staged = empty($turn['web_chat']['conversation_id']) && $stageCount > 0
+            && (int)($turn['transport_stage_sent'] ?? 0) === $stageCount
+            && (int)($turn['transport_stage_acked'] ?? 0) === $stageCount
+            && (int)$execution['job']['transport_stage_sent'] === $stageCount
+            && (int)$execution['job']['transport_stage_acked'] === $stageCount
+            && (int)$execution['job']['transport_parts_total'] === $stageCount + 1
+            && !empty($turn['transport_transaction_id'])
+            && $turn['transport_transaction_id'] === ($turn['multipart']['transaction_id'] ?? null)
+            && $turn['transport_transaction_id'] === $execution['job']['transport_transaction_id'];
+        $stagedUrl = $staged ? (string)($turn['multipart_chat_url'] ?? '') : '';
+        $stageAck = $staged && $stagedUrl === '' ? trim((string)($stages[$stageCount - 1]['ack'] ?? '')) : '';
+        $expected = $stagedUrl !== '' ? ['url'=>$stagedUrl] : ($stageAck !== '' ? ['stage_ack'=>$stageAck] : []);
         $operation = bin2hex(random_bytes(8));
         $this->chatGptTurns[$responseId]['connector_clear_id'] = $operation;
         $keys = array_flip(['session_id','surface_id','target_id','document_nonce','owner_incarnation','fencing_version',
-            'logical_response_id','connector_catalog_refresh_pending','connector_attempt']);
+            'logical_response_id','connector_catalog_refresh_pending','connector_attempt',
+            'transport_transaction_id','transport_stage_sent','transport_stage_acked']);
         $phase = array_intersect_key($turn, $keys);
-        $isCurrent = function () use ($responseId, $operation, $keys, $phase, $generationId): bool {
+        $isCurrent = function () use ($responseId, $operation, $keys, $phase, $generationId, $staged, $stageCount): bool {
             $current = $this->chatGptTurns[$responseId] ?? [];
             if (($current['connector_clear_id'] ?? '') !== $operation || empty($current['connector_preparing'])
                 || array_intersect_key($current, $keys) !== $phase) return false;
             try { $ledger = TaskLedger::pollExecution((string)($current['logical_response_id'] ?? $responseId)); }
             catch (\Throwable) { return false; }
             $surface = $ledger['surface'];
+            if ($staged && ($ledger['job']['transport_transaction_id'] !== $current['transport_transaction_id']
+                || (int)$ledger['job']['transport_stage_sent'] !== $stageCount
+                || (int)$ledger['job']['transport_stage_acked'] !== $stageCount)) return false;
             if (empty($current['continuation_sending']) && (int)($current['transport_stage_sent'] ?? 0) === 0
                 && (!empty($ledger['job']['submit_intent_at']) || !empty($ledger['job']['accepted_at']))) return false;
             return in_array($ledger['job']['status'], ['queued','running'], true)
@@ -5412,19 +5433,43 @@ JS;
         $deadline = min((float)$turn['deadline'], microtime(true) + 60.0);
         $read = null;
         $read = function (int $keyIndex = -1, int $attempt = 0, bool $emptySeen = false) use (
-            $responseId, $after, $searchOnly, $isCurrent, $deadline, &$read): void {
+            $responseId, $after, $searchOnly, $isCurrent, $deadline, $stageAck, &$expected, &$read): void {
             if (!$isCurrent()) return;
-            $this->evaluateTask($responseId, WebModelPage::connectorComposerStateExpression($keyIndex >= 0),
+            $this->evaluateTask($responseId, WebModelPage::connectorComposerStateExpression($keyIndex >= 0, $expected),
                 function ($error, $state) use ($responseId, $after, $searchOnly, $isCurrent, $deadline,
-                    &$read, $keyIndex, $attempt, $emptySeen): void {
+                    $stageAck, &$expected, &$read, $keyIndex, $attempt, $emptySeen): void {
                     if (!$isCurrent()) return;
+                    if ($error === null && ($state['code'] ?? '') === 'CHATGPT_CHAT_IDENTITY_CHANGED') {
+                        $this->taskFailTurn($responseId, 'CHATGPT_CHAT_IDENTITY_CHANGED',
+                            'The saved Web chat identity could not be confirmed.');
+                        return;
+                    }
                     if ($error !== null || !is_array($state) || empty($state['ok'])) {
                         if (microtime(true) < $deadline) {
                             Timer::add(0.5, fn() => $read($keyIndex, $attempt, false), null, false);
                         } else $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', '选择工具连接器前无法清空 ChatGPT 编辑器。');
                         return;
                     }
-                    if (!$this->taskChatMatches($responseId, (string)($state['url'] ?? ''), true)) return;
+                    $url = (string)($state['url'] ?? '');
+                    if (!$this->taskChatMatches($responseId, $url, $stageAck === '')) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_CHAT_IDENTITY_CHANGED',
+                            'The saved Web chat identity could not be confirmed.');
+                        return;
+                    }
+                    // The first exact ACK establishes the page identity once. Later native edits
+                    // use that URL, so rendering/collapsing historical ACK rows cannot block progress.
+                    $expected = ['url'=>$url];
+                    if ($stageAck !== '' && empty($this->chatGptTurns[$responseId]['multipart_chat_url'])) {
+                        $owner = $this->chatGptTurns[$responseId];
+                        try {
+                            TaskLedger::observeSurface((string)$owner['surface_id'], (string)$owner['owner_incarnation'],
+                                (int)$owner['fencing_version'], $url);
+                        } catch (GatewayError $failure) {
+                            $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage());
+                            return;
+                        }
+                        $this->chatGptTurns[$responseId]['multipart_chat_url'] = $url;
+                    }
                     $text = trim((string)($state['text'] ?? ''));
                     $empty = $text === '' && (int)($state['connector_count'] ?? 0) === 0;
                     if ($keyIndex < 0 && $empty) {
@@ -10222,6 +10267,10 @@ JS;
         // Legacy observer snapshots predate chat modes; they may still match only an explicit Temporary Chat.
         // Missing metadata must never authorize an ordinary conversation.
         if (!is_array($chat)) $chat = ['mode' => 'temporary'];
+        $stagedUrl = (string)($this->chatGptTurns[$responseId]['multipart_chat_url'] ?? '');
+        if ($chat['mode'] === 'regular' && empty($chat['conversation_id']) && $stagedUrl !== '') {
+            return $url === $stagedUrl && WebModelPage::isTaskChatUrl($url, self::modelUrl(), 'regular');
+        }
         return $start ? WebModelPage::isTaskChatStartUrl($url, self::modelUrl(), $chat['mode'], $chat['conversation_id'] ?? null)
             : WebModelPage::isTaskChatUrl($url, self::modelUrl(), $chat['mode'], $chat['conversation_id'] ?? null);
     }
