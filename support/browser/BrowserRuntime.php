@@ -16,6 +16,7 @@ use app\gateway\model\CodexCancellation;
 use app\gateway\model\GatewayError;
 use app\gateway\model\GatewaySettings;
 use app\gateway\model\NetworkSettings;
+use app\gateway\model\ModelCooldown;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\TaskLedger;
 use app\gateway\model\TaskWebChat;
@@ -26,6 +27,10 @@ use support\process\OwnedRuntime;
 /** Owns one dedicated browser, its CDP session, screenshot surface, and serialized input command stream. */
 final class BrowserRuntime
 {
+    /** One cancellable asynchronous cooldown observer per physical task, never an API sleep. */
+    private array $taskCooldownWaits = [];
+    /** Coalesce user-visible waiting notices; polling must not turn into frequent SQLite writes. */
+    private array $taskCooldownNotices = [];
     private const CONNECTOR_NO_START_MAX_RETRIES = 3;
     private const CONNECTOR_RUNTIME_PROBE_MAX_RETRIES = 3;
     /** A terminal DOM must remain unchanged before completion. */
@@ -2972,12 +2977,72 @@ JS;
         }, 5.0);
     }
 
+    /**
+     * Yield a browser mutation during a shared cooldown without blocking tools or HTTP.
+     * Every wake-up verifies the exact durable generation/document; stale timers do nothing.
+     * A caller that acquired a paced slot must still perform its normal UI/receipt checks.
+     */
+    private function deferTaskCooldown(string $responseId, callable $resume, bool $dispatch = false): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        $logicalId = (string) ($turn['logical_response_id'] ?? $responseId);
+        $ledger = TaskLedger::pollExecution($logicalId);
+        if (!in_array($ledger['job']['status'], ['queued', 'running'], true)
+            || !in_array($ledger['turn']['status'], ['queued', 'submit_intent', 'submitted', 'running'], true)
+            || ($ledger['turn']['response_id'] ?? '') !== $logicalId
+            || ($ledger['turn']['generation_id'] ?? '') !== $ledger['job']['generation_id']
+            || in_array($ledger['turn']['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS', 'CODEX_USER_STOPPED'], true)) return true;
+        $surface = $ledger['surface'];
+        if (!in_array($surface['status'], ['reserved', 'attaching', 'ready', 'busy'], true)) return true;
+        if (is_array($turn) && ($surface['id'] !== $turn['surface_id']
+            || $surface['owner_incarnation'] !== $turn['owner_incarnation']
+            || (int) $surface['fencing_version'] !== (int) $turn['fencing_version'])) return true;
+        $delay = $dispatch ? ModelCooldown::dispatchDelay() : ModelCooldown::remainingSeconds();
+        if (time() >= (int) $ledger['turn']['deadline_at'] && ($delay > 0 || isset($this->taskCooldownNotices[$responseId]))) {
+            $this->taskFailTurn($responseId, 'CHATGPT_RATE_LIMIT_WAIT_TIMEOUT',
+                'ChatGPT rate-limit recovery reached this turn’s waiting limit; the original chat and tool results are preserved. Please continue later.');
+            return true;
+        }
+        if ($delay <= 0) return false;
+        if (isset($this->taskCooldownWaits[$responseId])) return true;
+        $key = bin2hex(random_bytes(8));
+        $this->taskCooldownWaits[$responseId] = $key;
+        if (time() - ($this->taskCooldownNotices[$responseId] ?? 0) >= 30) {
+            $this->taskCooldownNotices[$responseId] = time();
+            try { TaskLedger::observationDelayed($logicalId, 'rate_limit', ['retry_after_seconds'=>$delay]); }
+            catch (\Throwable) { /* A diagnostic failure cannot authorize an early dispatch. */ }
+        }
+        $expected = [$ledger['job']['generation_id'], $surface['id'], $surface['owner_incarnation'],
+            (int)$surface['fencing_version'], $surface['document_nonce'], $surface['session_id'], $surface['target_id']];
+        Timer::add(min(5.0, (float)$delay), function () use ($responseId, $logicalId, $key, $expected, $resume): void {
+            if (($this->taskCooldownWaits[$responseId] ?? '') !== $key) return;
+            unset($this->taskCooldownWaits[$responseId]);
+            try {
+                $current = TaskLedger::pollExecution($logicalId);
+                $surface = $current['surface'];
+                if ([$current['job']['generation_id'], $surface['id'], $surface['owner_incarnation'],
+                    (int)$surface['fencing_version'], $surface['document_nonce'], $surface['session_id'], $surface['target_id']] !== $expected) return;
+                if (($current['turn']['response_id'] ?? '') !== $logicalId
+                    || !in_array($current['job']['status'], ['queued', 'running'], true)
+                    || !in_array($current['turn']['status'], ['queued', 'submit_intent', 'submitted', 'running'], true)
+                    || in_array($current['turn']['error_code'] ?? '',
+                        ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)) return;
+                $resume();
+            } catch (GatewayError $failure) {
+                $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+            }
+        }, null, false);
+        return true;
+    }
+
     private function prepareTaskSurface(string $responseId, int $commandId, bool $recover): void
     {
         if ((TaskLedger::execution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
             $this->finishCommand($commandId, ['status' => 'user_stop_pending']);
             return;
         }
+        if (!$recover && $this->deferTaskCooldown($responseId,
+            fn() => $this->prepareTaskSurface($responseId, $commandId, $recover), true)) return;
         if (!$this->taskCdp->ready()) {
             if ($recover) $this->pendingResumes[$responseId] = true;
             else {
@@ -3872,11 +3937,9 @@ JS;
             return false;
         }
         if (!empty($this->taskSessions[$sessionId]['saved_load_wait'])) return true;
-        $now = microtime(true);
         $deadline = min((float) $ledger['turn']['deadline_at'], (float) ($this->chatGptTurns[$responseId]['deadline'] ?? PHP_FLOAT_MAX));
         $phase = ['id'=>bin2hex(random_bytes(8)), 'generation_id'=>$ledger['job']['generation_id'],
-            'deadline'=>min($deadline, $now + max(120, (int) Config::get('gateway','browser_start_timeout_seconds'))),
-            'ceiling'=>min($deadline, $now + 600), 'turn_deadline'=>$deadline,
+            'deadline'=>$deadline, 'turn_deadline'=>$deadline,
             'attempt'=>0, 'not_before'=>0.0, 'failure_key'=>'', 'seen_429'=>false, 'reload_document'=>null];
         $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
         $this->pollSavedChatLoad($responseId, $sessionId, $phase['id'], $resume);
@@ -3944,9 +4007,10 @@ JS;
                 if ($status === 429 && ($owned || !empty($load['request_id']))) {
                     $key = (string) ($load['request_id'] ?? ($snapshot['document_id'] . ':' . ($snapshot['load_end_ms'] ?? 0)));
                     if ($phase['failure_key'] !== $key) {
-                        $delay = $load['retry_after_seconds'] ?? min(120, 30 * (2 ** $phase['attempt']));
-                        $phase['not_before'] = $now + max(1, (int) $delay);
-                        $phase['deadline'] = min($phase['ceiling'], max($phase['deadline'], $phase['not_before'] + 30));
+                        $headers = isset($load['retry_after_seconds']) ? ['Retry-After'=>(string)$load['retry_after_seconds']] : [];
+                        $until = $load['cooldown_until'] ?? ModelCooldown::observeRateLimit($sessionId . ':' . $key, $headers);
+                        $delay = max(0, $until - time());
+                        $phase['not_before'] = $until;
                         $phase['failure_key'] = $key; $phase['seen_429'] = true;
                         $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
                         try { TaskLedger::observationDelayed($responseId, 'saved_chat_load',
@@ -3966,13 +4030,14 @@ JS;
                     $phase['reload_document'] = null;
                     $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
                 }
-                if ($now >= $phase['deadline'] || ($phase['attempt'] >= 3 && $phase['reload_document'] === null && $status === 429)) {
+                if ($now >= $phase['deadline'] || ($phase['attempt'] >= 64 && $phase['reload_document'] === null && $status === 429)) {
                     $this->taskFailTurn($responseId, 'CHATGPT_CHAT_LOAD_RATE_LIMITED',
-                        'ChatGPT is still limiting conversation loading; the original chat and task are preserved. Please continue later.');
+                        'ChatGPT rate-limit recovery reached this turn’s waiting limit; the original chat and tool results are preserved. Please continue later.');
                     return;
                 }
                 if ($owned && $status === 429 && $now >= $phase['not_before'] && $phase['reload_document'] === null
                     && ($snapshot['generation_running'] ?? null) === false) {
+                    if (ModelCooldown::dispatchDelay() > 0) { $again(); return; }
                     $phase['attempt']++; $phase['reload_document'] = (string) $snapshot['document_id'];
                     $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
                     $this->taskCdp->send('Page.reload', ['ignoreCache'=>false], $sessionId, fn() => $again(), 15.0);
@@ -4790,8 +4855,13 @@ JS;
 
     private function waitMultipartStageSendReady(string $responseId, int $stage, float $deadline, string $text): void
     {
+        if ($this->deferTaskCooldown($responseId,
+            fn() => $this->waitMultipartStageSendReady($responseId, $stage,
+                min((float)($this->chatGptTurns[$responseId]['deadline'] ?? $deadline), microtime(true) + 120), $text))) return;
         $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(), function ($error, $ready) use ($responseId, $stage, $deadline, $text): void {
             if ($error === null && is_array($ready) && !empty($ready['ready'])) {
+                if ($this->deferTaskCooldown($responseId, fn() => $this->waitMultipartStageSendReady($responseId, $stage,
+                    min((float)($this->chatGptTurns[$responseId]['deadline'] ?? $deadline), microtime(true) + 120), $text), true)) return;
                 $mode = (array) ($this->chatGptTurns[$responseId]['staging_mode'] ?? []);
                 $this->verifyModelSelection($responseId, $mode, function () use ($responseId, $stage, $text, $mode): void {
                     try {
@@ -5442,6 +5512,8 @@ JS;
      */
     private function reloadTaskConnectorCatalog(string $responseId, string $sessionId, string $oldNonce, float $deadline): void
     {
+        if ($this->deferTaskCooldown($responseId, fn() => $this->reloadTaskConnectorCatalog($responseId, $sessionId,
+            $oldNonce, min((float)($this->chatGptTurns[$responseId]['deadline'] ?? $deadline), microtime(true) + 120)), true)) return;
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || $turn['session_id'] !== $sessionId
             || empty($turn['connector_catalog_refresh_pending'])) return;
@@ -5960,6 +6032,8 @@ JS;
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        if ($this->deferTaskCooldown($responseId,
+            fn() => $this->waitTaskSendReady($responseId, min((float)$turn['deadline'], microtime(true) + 120), $owner))) return;
         $keys = array_flip(['surface_id', 'target_id', 'session_id', 'document_nonce', 'owner_incarnation',
             'fencing_version', 'logical_response_id', 'transport_transaction_id', 'transport_stage_sent', 'transport_stage_acked']);
         $owner ??= array_intersect_key($turn, $keys);
@@ -6237,6 +6311,8 @@ JS;
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        if ($this->deferTaskCooldown($responseId,
+            fn() => $this->waitTaskSendReady($responseId, min((float)$turn['deadline'], microtime(true) + 120)), true)) return;
         $this->evaluateTask($responseId, WebModelPage::capabilityExpression(),
             function ($surfaceError, $surface) use ($responseId): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
@@ -6259,6 +6335,8 @@ JS;
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        if ($this->deferTaskCooldown($responseId,
+            fn() => $this->waitTaskSendReady($responseId, min((float)$turn['deadline'], microtime(true) + 120)))) return;
         try {
             ResponseJob::recordTransportSelection((string) ($turn['logical_response_id'] ?? $responseId),
                 (array) ($turn['requested_mode'] ?? []));
@@ -6641,6 +6719,36 @@ JS;
                 return;
             }
             $session = $this->taskSessions[(string)$turn['session_id']] ?? [];
+            if ((int)($session['submission_http_status'] ?? 0) === 429
+                && !empty($session['submission_rate_limit_key']) && ($snapshot['generation_running'] ?? null) === false) {
+                if (ModelCooldown::remainingSeconds() > 0
+                    || (!empty($session['submission_limit_body_pending'])
+                        && microtime(true) < (float)($session['submission_limit_body_deadline'] ?? 0))) {
+                    // Keep native calls/results moving while only the rejected Web send waits.
+                    $this->deliverPendingToolWithoutSnapshot($responseId);
+                    $this->scheduleTaskPoll($responseId, 5.0);
+                    return;
+                }
+                if (!empty($session['submission_limit_requires_action'])) {
+                    $this->deliverPendingToolWithoutSnapshot($responseId);
+                    $current = ResponseJob::pollState((string)($turn['logical_response_id'] ?? $responseId));
+                    $db = SDB(null, 'medoo', 'sqlite');
+                    $pending = $db->table('gateway_tool_invocations')->where('task_id', $current['task_id'])
+                        ->where('status', 'IN', ['registered', 'delivered'])->count();
+                    $active = empty($current['mcp_binding_id']) ? 0 : $db->table('gateway_mcp_activities')
+                        ->where('binding_id', $current['mcp_binding_id'])->where('status', 'active')->count();
+                    if (!is_numeric($pending) || !is_numeric($active) || (int)$pending + (int)$active > 0) {
+                        $this->scheduleTaskPoll($responseId, 1.0); return;
+                    }
+                    $this->taskFailTurn($responseId, 'CHATGPT_LIMIT_REQUIRES_ACTION',
+                        'ChatGPT reported a quota or billing restriction that requires account action; automatic retries have stopped and task results are preserved.');
+                    return;
+                }
+                // An owned HTTP rejection, rather than model-authored text, selects this path.
+                // Existing button, identity and exact-receipt fences still authorize the action.
+                $snapshot['error'] = ['code'=>'CHATGPT_MESSAGE_STREAM_ERROR',
+                    'message'=>'ChatGPT temporarily limited this request; waiting to resume the same chat.'];
+            }
             if (self::compactionSourceIdleControls($turn, $snapshot)
                 && (empty($session['submission_request_id']) || (!empty($session['submission_finished'])
                     && !empty($session['submission_failed']) && ($session['submission_canceled'] ?? null) === false))
@@ -8431,6 +8539,7 @@ JS;
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        if (ModelCooldown::remainingSeconds() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return; }
         $logicalResponseId = (string)($turn['logical_response_id'] ?? $responseId);
         try {
             $job = ResponseJob::execution($logicalResponseId);
@@ -8496,6 +8605,13 @@ JS;
         if (!is_array($turn) || ($turn['web_chat']['mode'] ?? 'temporary') !== 'regular'
             || empty($turn['tool_capable']) || ($turn['operation_kind'] ?? 'response') !== 'response') return false;
         $logicalId = (string) ($turn['logical_response_id'] ?? $responseId);
+        if (ModelCooldown::remainingSeconds() > 0) {
+            $this->scheduleTaskPoll($responseId, 5.0);
+            return true;
+        }
+        $session = $this->taskSessions[(string)$turn['session_id']] ?? [];
+        $rateLimitKey = (int)($session['submission_http_status'] ?? 0) === 429
+            ? (string)($session['submission_rate_limit_key'] ?? '') : '';
         $state = TaskLedger::regularStreamRecoveryState($logicalId);
         $stoppedThinking = ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING';
         $failed = $stoppedThinking || in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true);
@@ -8515,8 +8631,10 @@ JS;
             $this->scheduleTaskPoll($responseId, 0.5);
             return true;
         }
-        $key = hash('sha256', json_encode([$snapshot['new_user_id'], $snapshot['response_id'],
-            $snapshot['error']['code'] ?? '', $retry['failure_id'] ?? '', $retry['fingerprint'] ?? ''], JSON_THROW_ON_ERROR));
+        $identity = [$snapshot['new_user_id'], $snapshot['response_id'],
+            $snapshot['error']['code'] ?? '', $retry['failure_id'] ?? '', $retry['fingerprint'] ?? ''];
+        if ($rateLimitKey !== '') $identity[] = $rateLimitKey;
+        $key = hash('sha256', json_encode($identity, JSON_THROW_ON_ERROR));
         $observed = $turn['regular_stopped_observation'] ?? [];
         if (($observed['key'] ?? '') !== $key) {
             $this->chatGptTurns[$responseId]['regular_stopped_observation'] = ['key'=>$key, 'since'=>microtime(true)];
@@ -8527,8 +8645,12 @@ JS;
             $this->scheduleTaskPoll($responseId, 0.5);
             return true;
         }
+        if ($rateLimitKey !== '' && ($state['failure_key'] ?? '') === $key) {
+            $this->scheduleTaskPoll($responseId, 1.0);
+            return true;
+        }
         $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression(),
-            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed, $stoppedThinking): void {
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed, $stoppedThinking, $rateLimitKey): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || ($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
@@ -8540,13 +8662,15 @@ JS;
                     return;
                 }
                 try {
+                    if (ModelCooldown::dispatchDelay() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return; }
                     $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId, $turn['owner_incarnation'],
                         (int) $turn['fencing_version'], $turn['document_nonce'], $key, $nativeRetry, false,
                         ['user_id'=>$snapshot['new_user_id'], 'assistant_id'=>$snapshot['response_id'],
                             'document_id'=>(string) $baseline['document_id'],
                             'terminal'=>$failed || !empty($snapshot['completion_action_visible']),
-                            'action'=>$stoppedThinking ? 'stopped_thinking'
-                                : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : ''),
+                            'rate_limit_key'=>$rateLimitKey,
+                            'action'=>$rateLimitKey !== '' ? 'rate_limit' : ($stoppedThinking ? 'stopped_thinking'
+                                : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : '')),
                             'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']]);
                     if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 1.0); return; }
                     if (!empty($reservation['published'])) {
@@ -8620,13 +8744,19 @@ JS;
             $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
             return;
         }
+        if ($this->deferTaskCooldown($responseId, fn() => $this->waitRegularStreamRefresh($responseId))) {
+            if (isset($this->chatGptTurns[$responseId])) $this->chatGptTurns[$responseId]['regular_refresh_ready_since'] = time();
+            return;
+        }
+        $readySince = (int)($this->chatGptTurns[$responseId]['regular_refresh_ready_since'] ?? $state['intent_at']);
+        $this->chatGptTurns[$responseId]['regular_refresh_ready_since'] = $readySince;
         $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression(),
-            function ($error, $baseline) use ($responseId, $logicalId, $state): void {
+            function ($error, $baseline) use ($responseId, $logicalId, $state, $readySince): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['document_id'])
                     || !$this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''))) {
-                    if (time() - (int) $state['intent_at'] >= 180) {
+                    if (time() - $readySince >= 180) {
                         $this->taskFailTurn($responseId, 'CHATGPT_RECOVERY_REFRESH_NOT_READY',
                             'The Web chat refresh did not become ready; no duplicate message was sent.', true);
                         return;
@@ -8636,13 +8766,26 @@ JS;
                 if (($baseline['generation_running'] ?? null) !== false) {
                     $this->scheduleTaskPoll($responseId, 1.0); return;
                 }
+                $load = $this->taskSessions[(string)$turn['session_id']]['saved_chat_load'] ?? [];
+                if ((int)($load['status'] ?? 0) === 429 && empty($baseline['editor_ready'])) {
+                    // A rate-limited reload is not proof that the saved conversation vanished.
+                    // Never recreate it, and never repeat a reload whose document has not changed.
+                    if (($turn['rate_limit_reload_document'] ?? '') !== $baseline['document_id']
+                        && ModelCooldown::dispatchDelay() === 0) {
+                        $this->chatGptTurns[$responseId]['rate_limit_reload_document'] = $baseline['document_id'];
+                        $this->taskCdp->send('Page.reload', ['ignoreCache'=>false], $turn['session_id'],
+                            fn() => $this->scheduleTaskPoll($responseId, 1.0), 15.0);
+                    } else $this->scheduleTaskPoll($responseId, 5.0);
+                    return;
+                }
                 if ($baseline['document_id'] === $state['document_id']) {
-                    if (time() - (int) $state['intent_at'] >= 180) {
+                    if (time() - $readySince >= 180) {
                         $this->taskFailTurn($responseId, 'CHATGPT_RECOVERY_REFRESH_NOT_READY',
                             'The Web chat refresh did not become ready; no duplicate message was sent.', true);
                         return;
                     }
                     if (empty($turn['regular_reload_issued'])) {
+                        if (ModelCooldown::dispatchDelay() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return; }
                         $this->chatGptTurns[$responseId]['regular_reload_issued'] = true;
                         $this->taskCdp->send('Page.reload', ['ignoreCache'=>false], $turn['session_id'],
                             fn() => $this->scheduleTaskPoll($responseId, 1.0), 15.0);
@@ -8652,7 +8795,7 @@ JS;
                 if (empty($baseline['editor_ready'])
                     || !in_array($state['user_id'], (array) ($baseline['user_ids'] ?? []), true)
                     || !in_array($state['assistant_id'], (array) ($baseline['assistant_ids'] ?? []), true)) {
-                    if (time() - (int) $state['intent_at'] >= 180) {
+                    if (time() - $readySince >= 180) {
                         $this->taskFailTurn($responseId, 'CHATGPT_RECOVERY_REFRESH_NOT_READY',
                             'The Web chat refresh did not become ready; no duplicate message was sent.', true);
                         return;
@@ -8662,11 +8805,11 @@ JS;
                 try { $observedNonce = TaskLedger::pollExecution($logicalId)['surface']['document_nonce']; }
                 catch (GatewayError) { $this->scheduleTaskPoll($responseId, 1.0); return; }
                 $this->evaluateTask($responseId, WebModelPage::accountFingerprintExpression(),
-                    function ($error, $account) use ($responseId, $logicalId, $state, $baseline, $observedNonce): void {
+                    function ($error, $account) use ($responseId, $logicalId, $state, $baseline, $observedNonce, $readySince): void {
                         $turn = $this->chatGptTurns[$responseId] ?? null;
                         if (!is_array($turn)) return;
                         if ($error !== null || !is_array($account) || empty($account['verified'])) {
-                            if (time() - (int) $state['intent_at'] >= 180) {
+                            if (time() - $readySince >= 180) {
                                 $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', true);
                                 return;
                             }
@@ -8835,6 +8978,7 @@ JS;
         $descriptor = $snapshot['network_retry'] ?? null;
         if (!is_array($descriptor) || empty($descriptor['failure_id']) || empty($descriptor['fingerprint'])) return false;
         if (!empty($snapshot['generation_running'])) return false;
+        if (ModelCooldown::remainingSeconds() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return true; }
         $nativeControlAvailable = !empty($descriptor['available']);
         $logicalResponseId = (string)($turn['logical_response_id'] ?? $responseId);
         $failureKey = hash('sha256', (string)$descriptor['failure_id'].'|'.(string)$descriptor['fingerprint']);
@@ -8902,6 +9046,7 @@ JS;
             $job = ResponseJob::execution($logicalResponseId);
             if (!in_array((string)$job['operation_kind'], ['compact_v1','compact_v2'], true)
                 || empty($job['previous_response_id'])) return false;
+            if (ModelCooldown::remainingSeconds() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return true; }
             $descriptor = $snapshot['network_retry'] ?? null;
             $failureKey = is_array($descriptor) && !empty($descriptor['failure_id'])
                 && !empty($descriptor['fingerprint'])
@@ -9356,6 +9501,7 @@ JS;
 
     private function releaseTaskSession(string $responseId): void
     {
+        unset($this->taskCooldownWaits[$responseId], $this->taskCooldownNotices[$responseId]);
         $turn = $this->chatGptTurns[$responseId] ?? null;
         foreach ($this->taskDownloads as $guid => $download) {
             if ((string) ($download['response_id'] ?? '') === $responseId) $this->discardTaskDownload((string) $guid);
@@ -9460,6 +9606,28 @@ JS;
         }
     }
 
+    /** Accept a limit only from this session's tracked request and current durable owner. */
+    private function observeTaskRateLimit(string $sessionId, string $requestId, array $headers): ?int
+    {
+        $owner = $this->taskSessions[$sessionId] ?? null;
+        if (!is_array($owner) || $requestId === '') return null;
+        $seen = $owner['rate_limit_observations'] ?? [];
+        if (isset($seen[$requestId])) return (int)$seen[$requestId];
+        $physicalId = (string)($owner['response_id'] ?? '');
+        $logicalId = (string)($this->chatGptTurns[$physicalId]['logical_response_id'] ?? $physicalId);
+        $ledger = TaskLedger::pollExecution($logicalId);
+        $surface = $ledger['surface'];
+        if ($surface['id'] !== $owner['surface_id'] || $surface['session_id'] !== $sessionId
+            || $surface['owner_incarnation'] !== $owner['owner_incarnation']
+            || (int)$surface['fencing_version'] !== (int)$owner['fencing_version']
+            || !in_array($ledger['turn']['status'], ['queued','submit_intent','submitted','running'], true)
+            || ($ledger['turn']['generation_id'] ?? '') !== $ledger['job']['generation_id']) return null;
+        $until = ModelCooldown::observeRateLimit($sessionId . ':' . $requestId, $headers);
+        $seen[$requestId] = $until;
+        $this->taskSessions[$sessionId]['rate_limit_observations'] = array_slice($seen, -8, null, true);
+        return $until;
+    }
+
     private function onTaskEvent(array $message): void
     {
         $method = (string) ($message['method'] ?? '');
@@ -9504,6 +9672,9 @@ JS;
                     'submission_failed'=>false,
                     'submission_canceled'=>false, 'submission_error_code'=>null, 'submission_http_status'=>null,
                     'submission_protocol'=>null,
+                    'submission_rate_limit_key'=>null,
+                    'submission_limit_requires_action'=>false,
+                    'submission_limit_body_pending'=>false,
                     'submission_body_pending'=>false, 'submission_body_checked'=>false, 'submission_error_wait_until'=>0.0,
                 ]);
                 $this->observeTaskUserMessagePost($sessionId, $params);
@@ -9512,6 +9683,21 @@ JS;
         }
         if (in_array($method, ['Network.loadingFinished','Network.loadingFailed'], true)) {
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
+                if ($method === 'Network.loadingFinished' && (int)($owner['submission_http_status'] ?? 0) === 429) {
+                    $requestId = (string)$params['requestId'];
+                    $this->taskCdp->send('Network.getResponseBody', ['requestId'=>$requestId], $sessionId,
+                        function ($error, $result) use ($sessionId, $requestId): void {
+                            $session = $this->taskSessions[$sessionId] ?? [];
+                            if (($session['submission_request_id'] ?? '') !== $requestId) return;
+                            $this->taskSessions[$sessionId]['submission_limit_body_pending'] = false;
+                            if ($error !== null || !is_array($result)) return;
+                            $body = (string)($result['body'] ?? '');
+                            if (!empty($result['base64Encoded'])) $body = base64_decode($body, true) ?: '';
+                            if (ModelCooldown::requiresUserAction($body)) {
+                                $this->taskSessions[$sessionId]['submission_limit_requires_action'] = true;
+                            }
+                        }, 15.0);
+                }
                 $this->taskSessions[$sessionId]['submission_finished'] = true;
                 $this->taskSessions[$sessionId]['submission_finished_at'] = microtime(true);
                 $this->taskSessions[$sessionId]['submission_failed'] = $method === 'Network.loadingFailed';
@@ -9545,12 +9731,24 @@ JS;
                     $seconds = ctype_digit(trim($value)) ? (int)trim($value) : max(0, (int)strtotime($value)-time());
                     if ($seconds>0) $load['retry_after_seconds']=min(86400,$seconds);
                 }
+                if ($load['status'] === 429) {
+                    $load['cooldown_until'] = $this->observeTaskRateLimit($sessionId,
+                        (string)$params['requestId'], (array)($response['headers'] ?? []));
+                }
                 $this->taskSessions[$sessionId]['saved_chat_load'] = $load;
                 if (in_array($load['status'], [404,410], true)) $this->taskSessions[$sessionId]['saved_chat_missing'] = true;
             }
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
                 $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
                 $this->taskSessions[$sessionId]['submission_http_status'] = (int) round((float) ($response['status'] ?? 0));
+                if ((int)($response['status'] ?? 0) === 429) {
+                    $until = $this->observeTaskRateLimit($sessionId, (string)$params['requestId'], (array)($response['headers'] ?? []));
+                    if ($until !== null && ($owner['submission_rate_limit_key'] ?? '') !== hash('sha256', $sessionId . ':' . $params['requestId'])) {
+                        $this->taskSessions[$sessionId]['submission_rate_limit_key'] = hash('sha256', $sessionId . ':' . $params['requestId']);
+                        $this->taskSessions[$sessionId]['submission_limit_body_pending'] = true;
+                        $this->taskSessions[$sessionId]['submission_limit_body_deadline'] = microtime(true) + 30;
+                    }
+                }
                 $this->recordTaskTransportObservation((string) ($owner['response_id'] ?? ''), 'response_http', [
                     'request_bytes' => $owner['submission_request_bytes'] ?? null,
                     'protocol' => $response['protocol'] ?? null,

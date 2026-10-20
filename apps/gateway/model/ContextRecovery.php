@@ -349,7 +349,8 @@ final class ContextRecovery
         // A transient composer/menu failure is not loss of the conversation. Reconcile it
         // on the same page; rebuilding here discards retained context and repeats staging.
         if (!$staging && $code !== 'CHATGPT_SURFACE_MISSING') return null;
-        ModelCooldown::assertReady();
+        // Browser dispatch observes the shared cooldown asynchronously. Merely preparing
+        // the durable repair must not turn a temporary upstream limit into an API failure.
         return Schema::transaction(static function () use ($responseId, $code, $staging): ?array {
             $db = SDB(null, 'medoo', 'sqlite');
             $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();

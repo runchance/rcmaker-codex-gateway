@@ -516,6 +516,11 @@ final class Schema
                 'ALTER TABLE gateway_connector_state ADD COLUMN permission_verified_at INTEGER',
                 'ALTER TABLE gateway_connector_state ADD COLUMN permission_account_key TEXT',
             ],
+            63 => [
+                'ALTER TABLE gateway_model_cooldowns ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0',
+                'ALTER TABLE gateway_model_cooldowns ADD COLUMN last_event_key TEXT',
+                'ALTER TABLE gateway_model_cooldowns ADD COLUMN next_probe_at INTEGER NOT NULL DEFAULT 0',
+            ],
         ];
     }
 

@@ -262,6 +262,10 @@
     /** Render transport observations as diagnostics, separately from task or model completion. */
     function eventDetail(event) {
         const data = event.data || {};
+        if (event.type === 'browser_observation_delayed' && ['rate_limit', 'saved_chat_load'].includes(data.phase)) {
+            return I18n.t('ChatGPT 暂时限流，正在等待自动恢复。')
+                + (Number.isFinite(data.retry_after_seconds) ? ' · ' + I18n.t('下次检查至少等待') + ' ' + data.retry_after_seconds + 's' : '');
+        }
         if (event.type === 'browser_response_transport') {
             const labels = {
                 recovery_visible: '网页正在自动恢复', recovery_cleared: '网页恢复提示已消失',
@@ -623,7 +627,10 @@
             const dot = document.createElement('span'); dot.className = 'task-timeline-dot';
             const content = document.createElement('div');
             const top = document.createElement('div'); top.className = 'task-timeline-title';
-            const eventTitle = document.createElement('strong'); eventTitle.textContent = I18n.t(eventLabels[event.type] || event.type);
+            const eventTitle = document.createElement('strong');
+            eventTitle.textContent = event.type === 'browser_observation_delayed'
+                && ['rate_limit', 'saved_chat_load'].includes(event.data?.phase)
+                ? I18n.t('限流等待中，任务已保留') : I18n.t(eventLabels[event.type] || event.type);
             const time = document.createElement('span'); time.className = 'muted'; time.textContent = formatTime(event.created_at);
             top.append(eventTitle, time);
             content.append(top);

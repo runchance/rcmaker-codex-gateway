@@ -1566,7 +1566,10 @@ final class TaskLedger
             if (($state['marker'] ?? '') !== $marker) throw new GatewayError('continuation_marker_mismatch', '网页继续消息与持久化意图不一致。', 409);
             if (empty($state['pending'])) return;
             $budget = json_decode((string) ($job['budget_json'] ?? ''), true);
-            $deadline = max((int) $turn['deadline_at'], time() + (int) ($budget['response_timeout_seconds'] ?? 600));
+            // An accepted recovery message is not proof that the server lifted its limit.
+            // Keep that wait bounded; actual task progress retains its normal renewal path.
+            $deadline = ($state['reason'] ?? '') === 'rate_limit_recovery' ? (int)$turn['deadline_at']
+                : max((int) $turn['deadline_at'], time() + (int) ($budget['response_timeout_seconds'] ?? 600));
             $renewed = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', (string) $turn['id'])
                 ->where('status', (string) $turn['status'])->update(['deadline_at'=>$deadline, 'updated_at'=>time()]);
             if (!$renewed || $renewed->rowCount() !== 1) throw new GatewayError('storage_unavailable', '网页续做接收截止时间无法保存。', 503);
@@ -1708,10 +1711,11 @@ final class TaskLedger
             $steering = $phase === 'steering_stop' && SteeringContext::isDelta($job) && $turn['status'] === 'queued';
             $loading = $phase === 'saved_chat_load' && $job['status'] === 'running'
                 && $job['operation_kind'] === 'response' && $turn['status'] === 'queued' && empty($job['submit_intent_at']);
-            if (!$steering && !$loading && ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true))) return;
+            $cooling = $phase === 'rate_limit' && in_array($job['status'], ['queued', 'running'], true);
+            if (!$steering && !$loading && !$cooling && ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true))) return;
             $data = ['deadline_at' => (int) $turn['deadline_at'],
-                'phase' => $loading ? 'saved_chat_load' : ($steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response'))];
-            if ($loading) $data += ['http_status'=>429,'attempt'=>max(0,min(3,(int)($observation['attempt']??0))),
+                'phase' => $cooling ? 'rate_limit' : ($loading ? 'saved_chat_load' : ($steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response')))];
+            if ($loading || $cooling) $data += ['http_status'=>429,'attempt'=>max(0,min(64,(int)($observation['attempt']??0))),
                 'retry_after_seconds'=>max(1,min(86400,(int)($observation['retry_after_seconds']??30)))];
             if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed'] as $key) {
                 $data[$key] = isset($observation[$key]) ? (bool) $observation[$key] : null;
@@ -2355,7 +2359,7 @@ final class TaskLedger
             $epoch = $db->table('gateway_task_epochs')->where('id', $job['epoch_id'])->find();
             $binding = empty($job['mcp_binding_id']) ? null
                 : $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
-            $stoppedBeforeStart = ($regularRecovery['action'] ?? '') === 'stopped_thinking'
+            $stoppedBeforeStart = in_array($regularRecovery['action'] ?? '', ['stopped_thinking', 'rate_limit'], true)
                 && is_array($binding) && $binding['status'] === 'awaiting_start' && !empty($binding['sent_at']);
             if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
                 || $job['operation_kind'] !== 'response' || !in_array($turn['status'], ['submitted','running'], true)
@@ -2545,8 +2549,30 @@ final class TaskLedger
         if (($state['stage'] ?? '') === 'resume' && $hostCalls > (int) $state['host_calls']
             && !self::regularStreamRecoveryPending($job['id'])) $state = [];
         $stoppedThinking = ($facts['action'] ?? '') === 'stopped_thinking';
+        $rateLimited = ($facts['action'] ?? '') === 'rate_limit'
+            && preg_match('/\A[a-f0-9]{64}\z/D', (string)($facts['rate_limit_key'] ?? '')) === 1;
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
-        if ($stoppedThinking) {
+        if ($rateLimited) {
+            if (empty($facts['terminal']) || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
+                || !in_array($facts['user_id'], $facts['user_ids'], true) || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            if (($state['failure_key'] ?? '') === $failureKey) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
+            $rateAttempts = (int)($state['rate_limit_attempts'] ?? 0) + 1;
+            if ($rateAttempts > 64) return array_replace($idle, ['exhausted'=>true]);
+            if ($hostCalls > 0) {
+                // Regenerating an answer that already called native tools can repeat work.
+                // Resume with the existing exact receipts and a unique control-only marker.
+                $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
+                    $failureKey, $hostCalls, $idle, 'rate_limit_recovery');
+                if (empty($continued['continue'])) return $continued;
+                $stage = 'resume';
+            } else {
+                $stage = $nativeControl ? 'retry' : 'refresh';
+            }
+        } elseif ($stoppedThinking) {
             if (empty($facts['terminal']) || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
                 || !in_array($facts['user_id'], $facts['user_ids'], true) || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
@@ -2585,7 +2611,8 @@ final class TaskLedger
             if (!$validResume) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
             }
-            $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding, $failureKey, $hostCalls, $idle);
+            $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding, $failureKey, $hostCalls, $idle,
+                !empty($state['rate_limit_attempts']) ? 'rate_limit_recovery' : 'stream_recovery');
             if (empty($continued['continue'])) return $continued;
             $stage = 'resume';
         } elseif (($state['stage'] ?? '') === 'resume') {
@@ -2613,8 +2640,11 @@ final class TaskLedger
             'document_nonce'=>$surface['document_nonce'], 'document_id'=>$facts['document_id'],
             'conversation_id'=>$chat['conversation_id'], 'user_id'=>$facts['user_id'],
             'assistant_id'=>$facts['assistant_id'], 'failure_key'=>$failureKey, 'host_calls'=>$hostCalls,
-            'intent_at'=>time()] + ($stoppedThinking ? ['stopped_thinking_attempts'=>$stoppedAttempts] : [])
-            + ($stage === 'resume' ? ['marker'=>$continued['marker'], 'refreshed'=>$stoppedThinking ? false : !$resumeAfterRetry]
+            'intent_at'=>time()] + ($rateLimited ? ['rate_limit_attempts'=>$rateAttempts]
+                : (!empty($state['rate_limit_attempts']) ? ['rate_limit_attempts'=>$state['rate_limit_attempts']] : []))
+            + ($stoppedThinking ? ['stopped_thinking_attempts'=>$stoppedAttempts] : [])
+            + ($stage === 'resume' ? ['marker'=>$continued['marker'],
+                'refreshed'=>$rateLimited ? !empty($state['refreshed']) : ($stoppedThinking ? false : !$resumeAfterRetry)]
                 : ($stage === 'replace' ? ['marker'=>$state['marker']] : []));
         if ($stage === 'resume') {
             $write = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['id'])
@@ -2655,10 +2685,12 @@ final class TaskLedger
             && ($reason !== 'stopped_thinking_recovery' || $hostCalls <= (int) ($previous['host_calls'] ?? 0));
         $streamAttempt = $sameFamily
             ? (int)($previous['stream_recovery_attempt'] ?? 0) + 1 : 1;
-        if ($streamAttempt > 3) return array_replace($idle, ['exhausted'=>true,'attempt'=>3]);
+        $maximum = $reason === 'rate_limit_recovery' ? 64 : 3;
+        if ($streamAttempt > $maximum) return array_replace($idle, ['exhausted'=>true,'attempt'=>$maximum]);
         $marker = 'RCMAKER-CONTINUE-' . substr(hash('sha256', (string)$turn['id'] . "\0" . $attempt), 0, 16);
         $budget = json_decode((string)$job['budget_json'], true);
-        $deadline = max((int)$turn['deadline_at'], time() + (int)($budget['response_timeout_seconds'] ?? 600));
+        $deadline = $reason === 'rate_limit_recovery' ? (int)$turn['deadline_at']
+            : max((int)$turn['deadline_at'], time() + (int)($budget['response_timeout_seconds'] ?? 600));
         $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_turns')->where('id', $turn['id'])
             ->where('status', $turn['status'])->update(['deadline_at'=>$deadline,'updated_at'=>time()]);
         if (!$updated || $updated->rowCount() !== 1) {

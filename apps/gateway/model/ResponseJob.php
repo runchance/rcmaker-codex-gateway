@@ -73,7 +73,8 @@ final class ResponseJob
         // An accepted tool result resumes an existing Web turn and sends no new browser
         // message. Keep its exact receipt drainable while new submissions are cooling down.
         $isToolContinuation = (array) ($spec['tool_outputs'] ?? []) !== [];
-        if (!$isToolContinuation) ModelCooldown::assertReady();
+        // Reserve durably even during a shared 429 cooldown. The browser worker waits
+        // asynchronously before dispatch; HTTP subscribers keep their existing heartbeats.
         $budget = $spec['budget'] ?? ContextBudget::snapshot($spec['model'], $spec['reasoning_effort'] ?? null);
         $spec['budget'] = $budget;
         $activeSteeringCandidate = !$isToolContinuation && (self::potentialActiveUserSteering($spec)
@@ -174,9 +175,8 @@ final class ResponseJob
             // here. Observe its durable failure instead of reserving another send.
             $failedReplay = self::failedTurnReplayUnlocked($spec);
             if ($failedReplay !== null) return (string) $failedReplay['id'];
-            // The incoming history may contain old outputs or a new user instruction.
-            // Only the normalized receipt-only continuation can bypass submission cooldown.
-            if (($spec['tool_outputs'] ?? []) === [] || !empty($spec['steering_restart'])) ModelCooldown::assertReady();
+            // Receipt identity still follows the normal validation below. New messages
+            // remain queued at browser dispatch rather than failing their HTTP admission.
             // Historical tool outputs are normalized above. Only an actual receipt for this
             // task's pending invocation may continue without rediscovering the account catalog.
             if (($spec['tool_outputs'] ?? []) === [] && empty($spec['steering_restart'])) {
