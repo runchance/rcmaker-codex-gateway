@@ -533,6 +533,9 @@ final class ContextHistory
      */
     public static function prepareUnlocked(array $spec): array
     {
+        // Receipt normalization may retain an older ledger turn. Keep the actual native
+        // user revision separately so its later Stop still belongs to the resumed work.
+        $incomingNativeTurn = (string) ($spec['turn_id'] ?? '');
         $db = SDB(null, 'medoo', 'sqlite');
         $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $context = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
@@ -655,6 +658,9 @@ final class ContextHistory
                 $round = self::compile(array_merge($response['output'] ?? [], $spec['tool_outputs']), '');
                 $priorFull = json_decode((string) $prior['context_json'], true, 128, JSON_THROW_ON_ERROR);
                 $steering = self::toolRoundSteering($context, $priorFull, $spec['tool_outputs']);
+                if ($steering !== [] && CodexCancellation::uuid($incomingNativeTurn)) {
+                    $spec['steering_native_turn_id'] = $incomingNativeTurn;
+                }
                 $contextUpdates = self::toolRoundContextUpdates($context, $priorFull, $spec['tool_outputs']);
                 $pending = TaskLedger::pendingOperationalContextUnlocked($prior);
                 if ($pending['messages'] !== []) {
@@ -1306,6 +1312,9 @@ final class ContextHistory
         $full = self::canonical($context);
         $spec['steering_restart'] = true;
         $spec['steering_messages'] = $newUsers;
+        if (CodexCancellation::uuid((string) ($spec['turn_id'] ?? ''))) {
+            $spec['steering_native_turn_id'] = (string) $spec['turn_id'];
+        }
         $spec['turn_id'] = (string) $turn['client_turn_id'];
         $spec['previous_response_id'] = $sourceId;
         $spec['budget'] = json_decode((string) $source['budget_json'], true, 32, JSON_THROW_ON_ERROR);

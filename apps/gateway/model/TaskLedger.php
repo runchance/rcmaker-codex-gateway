@@ -72,7 +72,7 @@ final class TaskLedger
         return null;
     }
 
-    /** Read only the native UUID journaled by a proven tool-batch join for this exact durable turn. */
+    /** Read the native UUID journaled by a proven tool-batch join or human revision on this exact durable turn. */
     private static function rejoinedNativeTurn(array $job): ?string
     {
         if (empty($job['task_id']) || empty($job['durable_turn_id'])) return null;
@@ -82,6 +82,25 @@ final class TaskLedger
         $data = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
         $native = (string) ($data['native_turn_id'] ?? '');
         return CodexCancellation::uuid($native) ? $native : null;
+    }
+
+    /**
+     * Retain the native owner of an admitted human revision even when receipts reuse a ledger turn.
+     * Call only inside response reservation after ContextHistory proved the new user revision.
+     * @param string $responseId Newly reserved current response. @param string $nativeTurnId Original request UUID.
+     * @return void
+     * @throws GatewayError If reservation ownership changed before the provenance was recorded.
+     */
+    public static function recordSteeringNativeTurnUnlocked(string $responseId, string $nativeTurnId): void
+    {
+        if (!CodexCancellation::uuid($nativeTurnId)) return;
+        [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+        if (!self::ownsCurrentGeneration($job, $turn)) {
+            throw new GatewayError('steering_source_superseded', 'The user revision no longer owns this task turn.', 409);
+        }
+        if (self::rejoinedNativeTurn($job) === $nativeTurnId) return;
+        self::eventUnlocked((string) $job['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'],
+            'native_tool_batch_rejoined', ['native_turn_id' => $nativeTurnId]);
     }
 
     /**
@@ -144,9 +163,11 @@ final class TaskLedger
     }
 
     /**
-     * Defer a proven manual stop until accepted tool calls and MCP receipts settle, then fence the page.
+     * Preserve tool receipts for a proven manual stop, then fence the turn when they settle.
+     * The browser may pause immediately in WAITING_TOOLS without revoking the receipt capability.
      * @param string $responseId Current logical response. @param array $evidence Exact local interruption metadata.
-     * @return bool True when this generation is waiting for Web stop confirmation.
+     * @return bool True when receipts have settled and terminal stop confirmation is allowed.
+     * False means rejected or waiting for receipts; WAITING_TOOLS still permits an owned Web pause.
      * @throws GatewayError If the stop intent/capability revocation cannot commit atomically.
      */
     public static function requestUserStop(string $responseId, array $evidence): bool
@@ -205,7 +226,7 @@ final class TaskLedger
         $actual = self::execution((string) $expected['job']['id']);
         if (!self::ownsCurrentGeneration($actual['job'], $actual['turn'])
             || !self::userStopEligible($actual['job'], $actual['turn'], $actual['surface'])
-            || ($actual['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_PENDING') return false;
+            || !in_array($actual['turn']['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS'], true)) return false;
         foreach (['id', 'generation_id', 'surface_id', 'response_id'] as $key) {
             if ($actual['turn'][$key] !== $expected['turn'][$key]) return false;
         }
@@ -213,6 +234,37 @@ final class TaskLedger
             if ($actual['surface'][$key] !== $expected['surface'][$key]) return false;
         }
         return true;
+    }
+
+    /**
+     * Avoid repeating a confirmed Web pause while the exact stopped generation awaits host receipts.
+     * @param array $expected Current fenced execution. @return bool True only for its exact page/owner.
+     */
+    public static function userStopPagePaused(array $expected): bool
+    {
+        $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('turn_id', $expected['turn']['id'])->where('event_type', 'codex_user_stop_page_paused')
+            ->order([['id', 'DESC']])->limit(1)->find('data_json');
+        $data = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
+        if (!is_array($data) || ($data['generation_id'] ?? null) !== $expected['turn']['generation_id']) return false;
+        foreach (['target_id', 'document_nonce', 'owner_incarnation', 'fencing_version'] as $key) {
+            if (($data[$key] ?? null) !== $expected['surface'][$key]) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Recover the already-proven stop intent while receipts drain, including after a worker restart.
+     * @param array $execution Current waiting execution. @return ?array Stored native evidence, revalidated by requestUserStop.
+     */
+    public static function deferredUserStopEvidence(array $execution): ?array
+    {
+        if (($execution['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_WAITING_TOOLS') return null;
+        $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('task_id', $execution['job']['task_id'])->where('turn_id', $execution['turn']['id'])
+            ->where('event_type', 'codex_user_stop_waiting_tools')->order([['id', 'DESC']])->limit(1)->find('data_json');
+        $data = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
+        return is_array($data) && ($data['turn_id'] ?? null) === self::cancellationNativeTurn($execution) ? $data : null;
     }
 
     /**
@@ -231,10 +283,11 @@ final class TaskLedger
     }
 
     /**
-     * Release only a proven manually stopped turn. Retain its target/context and immutable tool receipts.
+     * Confirm an owned Web pause; release the stopped turn only after host receipts have settled.
+     * Retain its target/context and immutable tool receipts.
      * @param array $expected Exact stop ownership. @param bool $missing Successful target inventory proved absence.
-     * @param bool $invalid Owned target was read successfully but no longer contains a Temporary Chat.
-     * @return bool False for a stale callback; true after durable terminal acknowledgement.
+     * @param bool $invalid Owned target was read successfully but no longer contains its expected Web chat.
+     * @return bool False for a stale callback; true after durable page-pause or terminal acknowledgement.
      * @throws GatewayError If the stop confirmation or response terminal cannot be committed.
      */
     public static function confirmUserStop(array $expected, bool $missing = false, bool $invalid = false): bool
@@ -244,6 +297,17 @@ final class TaskLedger
             [$job, $turn, $surface] = self::executionRowsUnlocked((string) $expected['job']['id']);
             $db = SDB(null, 'medoo', 'sqlite');
             $now = time();
+            if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
+                // Pausing the Web model must not cancel, fabricate or consume an accepted host call.
+                // Keep the original turn and capability until its accurate receipts settle.
+                if (!self::userStopPagePaused($expected)) {
+                    self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], (string) $job['id'],
+                        (string) $surface['id'], 'codex_user_stop_page_paused',
+                        ['generation_id' => $turn['generation_id'], 'page_missing' => $missing, 'page_invalid' => $invalid]
+                            + array_intersect_key($surface, array_flip(['target_id', 'document_nonce', 'owner_incarnation', 'fencing_version'])));
+                }
+                return true;
+            }
             $updated = $db->table('gateway_task_turns')->where('id', $turn['id'])->where('response_id', $job['id'])
                 ->where('error_code', 'CODEX_USER_STOP_PENDING')->update([
                     'status' => 'cancelled', 'error_code' => 'CODEX_USER_STOPPED', 'retired_at' => $now, 'updated_at' => $now,

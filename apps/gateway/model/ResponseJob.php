@@ -384,6 +384,10 @@ final class ResponseJob
                 throw new GatewayError('storage_unavailable', 'Responses 请求无法保存。', 503);
             }
             AttachmentStore::bindResponseUnlocked($responseId, $attachments);
+            if (!empty($spec['steering_restart']) && (array) ($spec['steering_messages'] ?? []) !== []
+                && !empty($spec['steering_native_turn_id'])) {
+                TaskLedger::recordSteeringNativeTurnUnlocked($responseId, (string) $spec['steering_native_turn_id']);
+            }
             TaskLedger::attachOperationalContextUnlocked($reservation, $responseId,
                 (array) ($spec['operational_context_event_ids'] ?? []));
             if (!empty($spec['mailbox_context_restart'])) {

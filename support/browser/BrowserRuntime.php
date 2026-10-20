@@ -375,9 +375,14 @@ final class BrowserRuntime
                 $evidence = $native !== null && is_array($task)
                     ? $this->codexCancellation->interruption((string) ($task['thread_id'] ?? ''), $native,
                         (int) $execution['turn']['created_at']) : null;
-                if ($evidence === null || !TaskLedger::requestUserStop($id, $evidence)) continue;
+                $evidence ??= TaskLedger::deferredUserStopEvidence($execution);
+                if ($evidence === null) continue;
+                $settled = TaskLedger::requestUserStop($id, $evidence);
                 $execution = TaskLedger::execution($id);
+                if (!$settled && ($execution['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_WAITING_TOOLS') continue;
             }
+            if (($execution['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS'
+                && TaskLedger::userStopPagePaused($execution)) continue;
             // Detaching cancels queued callbacks, not the browser target. A dedicated observer confirms Stop.
             foreach ($this->chatGptTurns as $observer => $turn) {
                 if (($turn['durable_turn_id'] ?? '') === $execution['turn']['id']) $this->releaseTaskSession((string) $observer);
