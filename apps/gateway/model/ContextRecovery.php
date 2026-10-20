@@ -7,6 +7,30 @@ use app\gateway\database\Schema;
 /** Bounded page rebuilds from proven inert work or confirmed receipts, preserving durable context. */
 final class ContextRecovery
 {
+    /**
+     * Allow a new full native request to reselect an inert ordinary-chat staging import.
+     * The caller owns admission's transaction; this never retries the old browser message.
+     * @param array $spec Current routed request, with its own model and native tool environment.
+     * @param array|null $prior Latest response read for that exact durable task.
+     * @return bool Whether no final submission, host work, active round or saved-chat binding exists.
+     * @throws GatewayError When ownership or execution evidence cannot be read.
+     */
+    public static function canReimportFailedStagingUnlocked(array $spec, ?array $prior): bool
+    {
+        if (!is_array($prior) || ($spec['operation_kind'] ?? 'response') !== 'response'
+            || !empty($spec['tool_outputs']) || !empty($spec['steering_restart'])
+            || !empty($spec['steering_messages']) || !empty($spec['budget']['regular_chat'])
+            || ($prior['operation_kind'] ?? '') !== 'response' || ($prior['status'] ?? '') !== 'failed'
+            || ($prior['task_id'] ?? '') !== 'task_' . substr((string) ($spec['task_key'] ?? ''), 0, 24)
+            || ($prior['model'] ?? '') !== ($spec['model'] ?? '')
+            || ($prior['reasoning_effort'] ?? null) !== ($spec['reasoning_effort'] ?? null)
+            || (int) ($prior['transport_parts_total'] ?? 0) < 2
+            || (int) ($prior['transport_stage_sent'] ?? 0) < 1) return false;
+        $chat = TaskWebChat::state((string) $prior['task_id']);
+        return $chat['mode'] === 'regular' && empty($chat['conversation_id'])
+            && self::canRetryFailedBeforeCommitUnlocked((string) $prior['id']);
+    }
+
     /** Prove that a failed Codex retry never reached the executable Web commit or a host effect. */
     public static function canRetryFailedBeforeCommitUnlocked(string $responseId): bool
     {

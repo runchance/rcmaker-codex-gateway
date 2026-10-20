@@ -212,7 +212,9 @@ final class ResponseJob
                     $spec['checkpoint_marker'] = LunaCheckpoint::marker($spec);
                 }
                 $spec = ContextWindow::exposeMultipartSource($spec);
-                $spec = ContextWindow::selectImportedHistory($spec, $noGatewayHistory, is_array($historyJob) ? $historyJob : null);
+                $inertStagingRetry = ContextRecovery::canReimportFailedStagingUnlocked($spec, $historyJob);
+                $spec = ContextWindow::selectImportedHistory($spec, $noGatewayHistory,
+                    is_array($historyJob) ? $historyJob : null, $inertStagingRetry);
                 if (!empty($spec['steering_restart']) && isset($spec['imported_budget_context_json'])) {
                     // Steering starts a fresh physical page. Carry the verified selected
                     // history plus every new instruction/receipt, not its oversized archive.

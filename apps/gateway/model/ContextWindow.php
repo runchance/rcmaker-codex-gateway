@@ -180,7 +180,7 @@ final class ContextWindow
      * @param array $spec Prepared request with its pinned model budget and complete readable history.
      * @param bool $noGatewayHistory Caller proved this task has no local history or live epoch.
      * @param ?array $prior Owned local response carrying the persisted selection and original archive.
-     * @param bool $verifiedInertRecovery Only ContextRecovery may set this after proving no executable commit/tool effects.
+     * @param bool $verifiedInertRecovery ContextRecovery proved no executable commit/tool effects before this new import.
      * @return array Request with selected transport and imported_budget_context_json for logical usage.
      * @throws GatewayError If the current request/instructions or their atomic tool block cannot fit.
      */
@@ -213,10 +213,11 @@ final class ContextWindow
             && ($budget['message_limit_source_response_id'] ?? null) === $recoverySource['id']
             && ($verifiedInertRecovery || (($recoverySource['status'] ?? null) === 'failed'
                 && ($priorError['error']['code'] ?? null) === 'CHATGPT_MESSAGE_TOO_LARGE'));
-        if ($sizeRecovery) {
-            // Re-import only after a proven size failure, preserving all current instructions,
-            // human requirements and whole native call/result blocks. The full source remains
-            // the archive; this is never applied to a live receipt or retained-page steering.
+        $inertReimport = $verifiedInertRecovery && $reader && !$receiptOrSteering;
+        if ($sizeRecovery || $inertReimport) {
+            // A proven inert failure has no executable Web context to preserve. Recompute its
+            // working view from the current native history, including changed session instructions.
+            // Keep every human requirement and whole call/result blocks in source or its exact archive.
             $selection = null;
             unset($spec['budget']['imported_history_selection'], $spec['budget']['context_min_parts']);
             $budget = $spec['budget'];
@@ -252,8 +253,8 @@ final class ContextWindow
             return $spec;
         }
 
-        if ((!$noGatewayHistory && !$sizeRecovery) || $receiptOrSteering || !empty($spec['input_is_delta'])
-            || (!$sizeRecovery && (!empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
+        if ((!$noGatewayHistory && !$sizeRecovery && !$inertReimport) || $receiptOrSteering || !empty($spec['input_is_delta'])
+            || (!$sizeRecovery && !$inertReimport && (!empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
                 || isset($context['continuation']))) || !empty($spec['verified_compaction_source'])) return $spec;
         $reserve = (int) $budget['contract_reserve_tokens'] + (int) $budget['output_reserve_tokens'];
         $capacity = min((int)$budget['context_tokens'], (int)($budget['browser_context_tokens'] ?? $budget['context_tokens'])) - $reserve;
@@ -274,7 +275,7 @@ final class ContextWindow
             }
         }
         $protected = self::importProtectedIndices($messages);
-        if ($sizeRecovery) {
+        if ($sizeRecovery || $inertReimport) {
             foreach ($messages as $index => $message) {
                 if (($message['role'] ?? null) === 'user') $protected[$index] = true;
             }
