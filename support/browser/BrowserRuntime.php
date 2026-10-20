@@ -7377,6 +7377,7 @@ JS;
                 && ((!empty($emptySession['submission_finished']) && !empty($emptySession['submission_failed']))
                     || empty($emptySession['submission_request_id']));
             if (!$activeCompact || $stoppedCompactSource) {
+                $regularEmptyIdle = !$activeCompact && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular';
                 $emptyTransportSettled = !empty($emptySession['submission_request_id'])
                     && !empty($emptySession['submission_finished']) && empty($emptySession['submission_failed'])
                     && (!is_string($postToolBaseline) || $sourceTransportSettled);
@@ -7397,10 +7398,11 @@ JS;
                         'post_tool_baseline'=>$postToolBaseline,
                         'source_transport_unsettled'=>$toolCapable && !$emptyTransportSettled,
                         'allow_empty_terminal'=>true,
+                        'allow_regular_idle'=>$regularEmptyIdle,
                     ], $now);
                 $this->chatGptTurns[$responseId]['empty_response_ui_observation'] = $emptyUiTransition['observation'];
                 $emptyUiReceiptsSettled = $toolCapable && $deliveredAt !== null
-                    && $deliverySignature !== '' && ($snapshot['send_button_visible'] ?? null) === true
+                    && $deliverySignature !== '' && ChatGptTransport::idleComposerVisible($snapshot, $regularEmptyIdle)
                     && ($snapshot['generation_running'] ?? null) === false
                     && ($stoppedCompactSource || $emptyUiTransition['settled']);
                 if ($this->observeEmptyResponseSettlement($responseId, $logicalResponseId, $snapshot, [
@@ -7419,6 +7421,7 @@ JS;
                     'transport_failed' => !empty($emptySession['submission_failed'])
                         && ($emptySession['submission_canceled'] ?? null) !== true,
                     'ui_receipts_settled' => $emptyUiReceiptsSettled,
+                    'allow_regular_idle' => $regularEmptyIdle,
                     'checkpoint_source_stopped' => $stoppedCompactSource,
                     'round_markdown' => $roundMarkdown,
                     'has_artifacts' => $hasArtifacts,
@@ -8995,7 +8998,7 @@ JS;
      * generation never enters this path. The ledger's durable marker bounds retries across
      * lost acknowledgements/restarts; unknown effects still prohibit all automatic recovery.
      * @param string $responseId Physical observer, possibly following a newer native receipt round.
-     * @param array $snapshot Bound stopped response with Send state and an optional native error.
+     * @param array $snapshot Bound stopped response with Send state, or settled ordinary Voice idle, and an optional native error.
      * @param string|null $recoveryCause Explicitly settled empty cause, or the snapshot's observed error.
      * @return bool Whether this path owns waiting, preparation or failure; false retains legacy recovery.
      */
@@ -9004,7 +9007,8 @@ JS;
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || empty($turn['tool_capable'])
             || ($snapshot['generation_running'] ?? null) !== false
-            || ($snapshot['send_button_visible'] ?? null) !== true
+            || !ChatGptTransport::idleComposerVisible($snapshot,
+                $recoveryCause === 'CHATGPT_EMPTY_RESPONSE' && ($turn['web_chat']['mode'] ?? '') === 'regular')
             || empty($snapshot['new_user_id']) || empty($snapshot['response_id'])
             || (string)$snapshot['response_id'] !== (string)($turn['bound_assistant_id'] ?? '')) return false;
         $logicalId = (string)($turn['logical_response_id'] ?? $responseId);

@@ -26,15 +26,28 @@ final class ChatGptTransport
      * still applies stable text, drained MCP revision and transactional completion fencing.
      * @param array $snapshot Current owned response DOM metadata.
      * @param bool $transportSettled Exact post-receipt request settlement or verified UI generation.
+     * @param bool $regularIdle Permit the saved-chat Voice idle control after caller-owned verification.
      * @return bool Whether UI evidence permits beginning the existing completion settlement.
      */
-    public static function hasTerminalAnswer(array $snapshot, bool $transportSettled): bool
+    public static function hasTerminalAnswer(array $snapshot, bool $transportSettled, bool $regularIdle = false): bool
     {
         return ($snapshot['generation_running'] ?? null) === false
             && ($snapshot['response_present'] ?? null) === true
             && !is_array($snapshot['error'] ?? null)
             && (!empty($snapshot['completion_action_visible'])
-                || ($transportSettled && ($snapshot['send_button_visible'] ?? null) === true));
+                || ($transportSettled && self::idleComposerVisible($snapshot, $regularIdle)));
+    }
+
+    /**
+     * Recognize the existing Send idle control, or an explicitly authorized ordinary-chat Voice control.
+     * @param array $snapshot Owned DOM facts. @param bool $regularIdle Caller opted in for a saved chat.
+     * @return bool A semantic idle control is present; callers must separately reject active generation.
+     */
+    public static function idleComposerVisible(array $snapshot, bool $regularIdle = false): bool
+    {
+        return ($snapshot['send_button_visible'] ?? null) === true
+            || ($regularIdle && ($snapshot['temporary_chat'] ?? null) === false
+                && ($snapshot['recovery_idle_button_visible'] ?? null) === true);
     }
 
     /**
@@ -49,6 +62,7 @@ final class ChatGptTransport
      *     receipt_signature, receipt_at_us, source_transport_unsettled and post_tool_baseline.
      *     allow_empty_terminal also permits observing a Stop-to-Send transition without answer text;
      *     the separate empty health rule still requires a prolonged drained-tool window.
+     *     allow_regular_idle accepts Voice in a verified ordinary chat under those same witness rules.
      * @param float $now Current observation time in seconds.
      * @return array{observation:?array,settled:bool} Updated witness and optional terminal UI evidence.
      * @throws \JsonException When the exact observation identity cannot be encoded.
@@ -82,7 +96,7 @@ final class ChatGptTransport
         if (!is_array($previous) || ($previous['signature'] ?? null) !== $signature
             || !is_numeric($previous['observed_at'] ?? null) || (float)$previous['observed_at'] > $now
             || $now - (float)$previous['observed_at'] > self::EMPTY_RESPONSE_MAX_OBSERVATION_GAP_SECONDS
-            || ($snapshot['send_button_visible'] ?? null) !== true
+            || !self::idleComposerVisible($snapshot, ($evidence['allow_regular_idle'] ?? null) === true)
             || !is_string($snapshot['markdown'] ?? null)) return $empty;
         $emptyTerminal = ($evidence['allow_empty_terminal'] ?? null) === true && trim($snapshot['markdown']) === '';
         if (!$emptyTerminal && (trim($snapshot['markdown']) === ''
@@ -153,6 +167,7 @@ final class ChatGptTransport
      *     ui_receipts_settled (optional, exact source receipts plus a witnessed Stop-to-Send transition),
      *     checkpoint_source_stopped (optional, an explicitly stopped native compaction source),
      *     transport_failed (optional, an observed non-cancelled request failure),
+     *     allow_regular_idle (optional, permit ordinary-chat Voice under the same settlement rules),
      *     mcp_revision (null while tools are pending), round_markdown and has_artifacts.
      * @param float $now Current observation time in seconds; tests may use a deterministic clock.
      * @return array{candidate:?array,error_code:?string} Updated private observation and optional failure.
@@ -162,14 +177,15 @@ final class ChatGptTransport
     {
         $empty = ['candidate' => null, 'error_code' => null];
         $transportFailed = ($evidence['transport_failed'] ?? null) === true;
+        $regularIdle = ($evidence['allow_regular_idle'] ?? null) === true;
         $uiOnlyToolPause = ($evidence['transport_settled'] ?? null) !== true && !$transportFailed
             && ($evidence['checkpoint_source_stopped'] ?? null) !== true;
         $settled = ($evidence['transport_settled'] ?? null) === true
             || (($evidence['ui_receipts_settled'] ?? null) === true
-                && ($snapshot['send_button_visible'] ?? null) === true);
+                && self::idleComposerVisible($snapshot, $regularIdle));
         if (!is_finite($now) || $now < 0.0
             || (($snapshot['transport_recovery_visible'] ?? null) === true && !$transportFailed)
-            || !self::hasTerminalAnswer($snapshot, $settled)
+            || !self::hasTerminalAnswer($snapshot, $settled, $regularIdle)
             || ($snapshot['content_present'] ?? null) !== false
             || !is_string($snapshot['markdown'] ?? null) || trim($snapshot['markdown']) !== ''
             || !is_string($snapshot['visible_text'] ?? null) || trim($snapshot['visible_text']) !== ''
@@ -189,6 +205,7 @@ final class ChatGptTransport
             $evidence['source_receipt_signature'] ?? '', $snapshot['response_html'] ?? '',
             $snapshot['commentary_blocks'] ?? [], $snapshot['send_button_visible'] ?? null,
             $snapshot['completion_action_visible'] ?? null,
+            $regularIdle, $snapshot['recovery_idle_button_visible'] ?? null,
             $transportFailed, $snapshot['transport_recovery_visible'] ?? null,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         $since = $now;
