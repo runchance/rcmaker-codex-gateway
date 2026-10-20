@@ -521,6 +521,13 @@ final class Schema
                 'ALTER TABLE gateway_model_cooldowns ADD COLUMN last_event_key TEXT',
                 'ALTER TABLE gateway_model_cooldowns ADD COLUMN next_probe_at INTEGER NOT NULL DEFAULT 0',
             ],
+            64 => [
+                // Count only new failures after this migration; historical errors are never backfilled.
+                'ALTER TABLE gateway_tasks ADD COLUMN consecutive_gateway_errors INTEGER NOT NULL DEFAULT 0',
+                'ALTER TABLE gateway_tasks ADD COLUMN gateway_rebuild_pending INTEGER NOT NULL DEFAULT 0',
+                'CREATE TABLE gateway_task_error_attempts (request_key TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES gateway_tasks(id) ON DELETE CASCADE, error_code TEXT NOT NULL, created_at INTEGER NOT NULL)',
+                'CREATE INDEX gateway_task_error_attempts_task ON gateway_task_error_attempts(task_id)',
+            ],
         ];
     }
 

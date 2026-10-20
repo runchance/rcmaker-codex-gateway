@@ -12,22 +12,26 @@ final class TaskWebChat
      * Pin a new task's preference, or move the same conversation's binding across an admitted recovery.
      * @param string $taskId Newly created durable task ID.
      * @param string|null $sourceTaskId Retired/reconciled source selected by TaskLedger's existing recovery guards.
+     * @param bool $freshConversation Start a new chat of the source mode after verified repeated-failure retirement.
      * @return void
      * @throws GatewayError On unavailable settings/storage or a foreign recovery scope.
      */
-    public static function createUnlocked(string $taskId, ?string $sourceTaskId = null): void
+    public static function createUnlocked(string $taskId, ?string $sourceTaskId = null, bool $freshConversation = false): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $settings = $db->table('gateway_settings')->where('id', 1)->find('web_chat_mode');
         if (!is_array($settings)) throw new GatewayError('storage_unavailable', 'Web chat preference could not be saved.', 503);
         $values = ['task_id' => $taskId, 'mode' => (string) $settings['web_chat_mode'], 'updated_at' => time()];
         $source = $sourceTaskId === null ? null : self::state($sourceTaskId);
-        if (is_array($source) && $source['mode'] === 'regular' && !empty($source['conversation_id'])) {
+        if (is_array($source) && ($freshConversation || ($source['mode'] === 'regular' && !empty($source['conversation_id'])))) {
             $oldTask = $db->table('gateway_tasks')->where('id', $sourceTaskId)->find('client_id,thread_id,branch_id');
             $newTask = $db->table('gateway_tasks')->where('id', $taskId)->find('client_id,thread_id,branch_id');
             if ($sourceTaskId === $taskId || !is_array($oldTask) || !is_array($newTask) || $oldTask !== $newTask) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
             }
+        }
+        if ($freshConversation && is_array($source)) $values['mode'] = $source['mode'];
+        if (!$freshConversation && is_array($source) && $source['mode'] === 'regular' && !empty($source['conversation_id'])) {
             // An internal task ID rotation is not deletion of its saved Web conversation.
             // Release the unique UUID conditionally before assigning it to the same native conversation.
             // The enclosing ledger transaction rolls both writes back if any later reservation fails.
@@ -88,7 +92,8 @@ final class TaskWebChat
      */
     public static function prepareModeChangeUnlocked(array $spec): array
     {
-        if (empty($spec['task_key']) || (!empty($spec['tool_outputs']) && empty($spec['steering_restart']))) {
+        if (!empty($spec['gateway_error_rebuild']) || empty($spec['task_key'])
+            || (!empty($spec['tool_outputs']) && empty($spec['steering_restart']))) {
             return $spec;
         }
         if ((GatewaySettings::internal()['web_chat_mode'] ?? 'temporary') !== 'regular') {

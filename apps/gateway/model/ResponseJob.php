@@ -34,7 +34,17 @@ final class ResponseJob
     public static function createOrReuse(array $spec, ?string $idempotencyKey): array
     {
         Schema::initialize();
-        return TaskMaintenance::withAdmission(static fn(): array => self::reserveOrReuse($spec, $idempotencyKey));
+        try {
+            return TaskMaintenance::withAdmission(static fn(): array => self::reserveOrReuse($spec, $idempotencyKey));
+        } catch (GatewayError $error) {
+            try { TaskFailureState::admissionFailed($spec, $error->errorCode); }
+            catch (\Throwable) { /* Preserve the original admission failure if storage is unavailable. */ }
+            throw $error;
+        } catch (\Throwable $error) {
+            try { TaskFailureState::admissionFailed($spec, 'gateway_admission_failed'); }
+            catch (\Throwable) { /* Diagnostics must not replace the original unexpected failure. */ }
+            throw $error;
+        }
     }
 
     /** Preserve the existing reservation protocol inside the shared maintenance admission boundary. */
@@ -1137,6 +1147,7 @@ final class ResponseJob
                 'sequence_next' => (int) $job['sequence_next'], 'terminal_type' => 'response.completed', 'finished_at' => time(),
             ]);
             if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Responses 完成状态无法保存。', 503);
+            TaskFailureState::succeededUnlocked($job);
         });
         TaskLedger::committed($responseId);
         $job = self::row($responseId);
@@ -1287,6 +1298,7 @@ final class ResponseJob
                     'finished_at' => time(),
                 ]);
             if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '工具调用 Responses Round 无法提交。', 503);
+            TaskFailureState::succeededUnlocked($job);
         });
     }
 
@@ -1341,6 +1353,7 @@ final class ResponseJob
                 'sequence_next' => (int) $job['sequence_next'], 'terminal_type' => 'response.failed', 'finished_at' => time(),
             ]);
             if (!$updated) throw new GatewayError('storage_unavailable', 'Responses 失败状态无法保存。', 503);
+            TaskFailureState::failedJobUnlocked($job, $code);
         });
         TaskLedger::failed($responseId, $code, $outcomeUnknown ?? self::outcomeUnknown($code));
         ContextRecovery::retireFailedStaging($responseId);

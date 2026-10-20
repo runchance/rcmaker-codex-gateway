@@ -53,7 +53,9 @@
         mcp_capability_revoked: I18n.t('MCP 能力已撤销'),
         original_context_read: I18n.t('已查询本任务的原始历史'),
         task_conversation_restarted: I18n.t('已在新任务继续此 Codex 对话'),
-        task_restarted_from: I18n.t('从旧任务继续此 Codex 对话')
+        task_restarted_from: I18n.t('从旧任务继续此 Codex 对话'),
+        gateway_failure_recorded: I18n.t('已记录本任务的网关错误'),
+        gateway_failure_streak_reset: I18n.t('本任务已成功恢复，连续错误计数已清零')
     };
 
     /** Poll small cleanup metadata; progress never reloads or replaces the open task transcript. */
@@ -194,6 +196,10 @@
             const phase = document.createElement('td');
             phase.append(badge(taskLabels[task.status] || task.status, task.status));
             phase.append(secondary(task.turn_status ? (turnLabels[task.turn_status] || task.turn_status) : I18n.t('等待首个回合')));
+            if (Number(task.consecutive_gateway_errors) > 0) {
+                phase.append(secondary(I18n.t('本任务连续网关错误：') + task.consecutive_gateway_errors + ' / 3'));
+            }
+            if (task.gateway_rebuild_pending) phase.append(badge(I18n.t('下次续发将重建任务页面'), 'needs_attention'));
 
             const page = document.createElement('td');
             const pageStatus = task.surface_status || '—';

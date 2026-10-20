@@ -2442,14 +2442,35 @@ final class ContextCompaction
      */
     public static function assertClosedWaitReceiptCoverageUnlocked(array $spec, array $call, string $taskId): void
     {
+        self::assertClosedWaitReceiptsCoverageUnlocked($spec, [$call], $taskId);
+    }
+
+    /**
+     * Check a recovery batch with one decoding/indexing pass over the readable transcript.
+     * @param array $spec Exact normalized recovery request, never a caller-supplied receipt index.
+     * @param array $calls Persisted completed invocations owned by the routed task.
+     * @param string $taskId Exact task whose receipts and checkpoint lineage are required.
+     * @return void All original single-receipt proofs remain required; no state is changed.
+     * @throws GatewayError If any receipt lacks exact output or verified checkpoint coverage.
+     */
+    public static function assertClosedWaitReceiptsCoverageUnlocked(array $spec, array $calls, string $taskId): void
+    {
+        if ($calls === []) return;
+        $requested = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $receipts = self::receiptOutputs($requested);
+        foreach ($calls as $call) self::assertClosedWaitCoverageUnlocked($spec, $call, $taskId, $requested, $receipts);
+    }
+
+    /** Verify one persisted receipt against the immutable context/index built by the batch entry point. */
+    private static function assertClosedWaitCoverageUnlocked(array $spec, array $call, string $taskId,
+        array $requested, array $receipts): void
+    {
         $result = json_decode((string)($call['result_json'] ?? ''), true);
         $hash = (string)($call['result_hash'] ?? '');
         if (($call['task_id'] ?? '') !== $taskId || !is_string($result['output'] ?? null)
             || $hash === '' || !hash_equals($hash, hash('sha256', $result['output']))) {
             throw new GatewayError('compaction_context_incomplete', '已结束工具连接的持久回执无法验证，原记录已保留。', 409);
         }
-        $requested = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
-        $receipts = self::receiptOutputs($requested);
         if (array_key_exists($call['call_id'], $receipts)) {
             if (self::matchesPersistedReceipt($receipts[$call['call_id']], $result['output'], $hash,
                 !empty($result['output_is_content_parts']))) return;

@@ -1156,5 +1156,9 @@ window.GatewayTranslations = {
     "暂时无法保存共享限流状态。": "The shared rate-limit state could not be saved.",
     "无法在 ChatGPT 编辑器中完整输入连接器搜索文字，未发送任务。": "The connector search text could not be entered completely in ChatGPT; the task was not sent.",
     "选择工具连接器前无法清空 ChatGPT 编辑器。": "The ChatGPT composer could not be cleared before selecting the connector.",
-    "ChatGPT 中存在上次遗留草稿，且无法安全清空。": "ChatGPT contains a previous draft that could not be safely cleared."
+    "ChatGPT 中存在上次遗留草稿，且无法安全清空。": "ChatGPT contains a previous draft that could not be safely cleared.",
+    "已记录本任务的网关错误": "Gateway error recorded for this task",
+    "本任务已成功恢复，连续错误计数已清零": "This task succeeded; its consecutive error count was reset",
+    "本任务连续网关错误：": "Consecutive gateway errors for this task: ",
+    "下次续发将重建任务页面": "Task page will be rebuilt on the next continuation"
 };

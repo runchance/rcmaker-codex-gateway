@@ -432,6 +432,9 @@ final class TaskLedger
                 $hasToolOutputs = false;
             }
         }
+        $errorRebuild = is_array($task) && $newUserMessage && !$hasToolOutputs
+            && ContextRecovery::retireRepeatedFailurePageUnlocked($spec, $task);
+        if ($errorRebuild) $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
         $precommitRetry = false;
         if (is_array($task) && $task['status'] === 'active' && !$hasToolOutputs
             && $operation === 'response' && $newUserMessage && !empty($spec['turn_id'])) {
@@ -520,12 +523,14 @@ final class TaskLedger
         $now = time();
         if (!$db->table('gateway_tasks')->add(['id' => $newTaskId, 'client_id' => $spec['client_id'] ?? 'responses',
             'thread_id' => $spec['thread_id'] ?? null, 'branch_id' => $spec['branch_id'] ?? 'main',
-            'owner_key' => $ownerKey, 'status' => 'active', 'created_at' => $now, 'updated_at' => $now])) {
+            'owner_key' => $ownerKey, 'status' => 'active', 'created_at' => $now, 'updated_at' => $now,
+            'consecutive_gateway_errors'=>$errorRebuild ? 0 : (int)($task['consecutive_gateway_errors'] ?? 0),
+            'gateway_rebuild_pending'=>$errorRebuild ? 0 : (int)($task['gateway_rebuild_pending'] ?? 0)])) {
             throw new GatewayError('storage_unavailable', '续聊任务无法创建。', 503);
         }
         // Recovery creates the task before reserveTurnUnlocked sees it. Pin the saved
         // chat preference here too; otherwise this new task looks like a legacy temporary task.
-        TaskWebChat::createUnlocked($newTaskId, $taskId);
+        TaskWebChat::createUnlocked($newTaskId, $taskId, $errorRebuild);
         $newChat = TaskWebChat::state($newTaskId);
         if ($newChat['mode'] === 'regular' && !empty($newChat['conversation_id'])) {
             $sourceJob = ResponseJob::latestForTaskUnlocked($taskId);
@@ -553,8 +558,8 @@ final class TaskLedger
             ? $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->update($values)
             : $db->table('gateway_task_conversations')->add(['base_task_id' => $baseTaskId] + $values);
         if (!$written) throw new GatewayError('storage_unavailable', '续聊任务映射无法保存。', 503);
-        $restartReason = $detachedRestart ? 'client_detached_new_turn' : ($lateReceiptsRecovered ? 'late_native_receipts_confirmed' : ($sourceWaitingSuperseded ? 'source_waiting_compaction_superseded' : ($precommitRetry ? 'precommit_retry'
-            : ($failedHandoffRecovered && $task['status'] === 'active' ? 'unsent_model_handoff_failed' : $task['status']))));
+        $restartReason = $errorRebuild ? 'consecutive_gateway_errors' : ($detachedRestart ? 'client_detached_new_turn' : ($lateReceiptsRecovered ? 'late_native_receipts_confirmed' : ($sourceWaitingSuperseded ? 'source_waiting_compaction_superseded' : ($precommitRetry ? 'precommit_retry'
+            : ($failedHandoffRecovered && $task['status'] === 'active' ? 'unsent_model_handoff_failed' : $task['status'])))));
         self::eventUnlocked($taskId, null, null, null, 'task_conversation_restarted',
             ['new_task_id' => $newTaskId, 'reason' => $restartReason, 'generation' => $generation]);
         self::eventUnlocked($newTaskId, null, null, null, 'task_restarted_from',
@@ -3715,6 +3720,8 @@ final class TaskLedger
             'web_chat_mode' => $chat['mode'], 'web_conversation_id' => $chat['conversation_id'] ?? null,
             'thread_id' => $task['thread_id'], 'branch_id' => (string) $task['branch_id'],
             'status' => (string) $task['status'], 'current_epoch_id' => $task['current_epoch_id'],
+            'consecutive_gateway_errors'=>(int)($task['consecutive_gateway_errors'] ?? 0),
+            'gateway_rebuild_pending'=>!empty($task['gateway_rebuild_pending']),
             'epoch_no' => is_array($epoch) ? (int) $epoch['epoch_no'] : null,
             'surface_status' => is_array($surface) ? (string) $surface['status'] : null,
             'turn_status' => is_array($turn) ? (string) $turn['status'] : null,

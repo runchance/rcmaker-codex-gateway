@@ -8,6 +8,81 @@ use app\gateway\database\Schema;
 final class ContextRecovery
 {
     /**
+     * Retire one repeatedly failing task page before a new explicit ordinary request.
+     * Existing task routing creates the replacement in the same transaction; failed admission
+     * rolls back retirement. Accepted tools and unconfirmed receipts always keep their page.
+     * @param array $spec Routed request, updated with complete readable history and a fresh-page flag.
+     * @param array $task Exact owned task carrying the future-only failure counter.
+     * @return bool Whether this task was safely retired for a fresh conversation of the same mode.
+     * @throws GatewayError On unavailable storage. Caller owns the admission transaction.
+     */
+    public static function retireRepeatedFailurePageUnlocked(array &$spec, array $task): bool
+    {
+        if (empty($task['gateway_rebuild_pending'])
+            || (int)$task['consecutive_gateway_errors'] < TaskFailureState::REBUILD_THRESHOLD
+            || ($spec['operation_kind'] ?? 'response') !== 'response' || empty($spec['turn_id'])
+            || !empty($spec['tool_outputs']) || !empty($spec['steering_restart'])
+            || !empty($spec['operational_context_source_response_id'])
+            || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
+            || $task['thread_id'] !== ($spec['thread_id'] ?? null)
+            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')
+            || $task['owner_key'] !== ($spec['browser_owner_key'] ?? null)) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $calls = $db->table('gateway_tool_invocations')->where('task_id', $task['id'])->select();
+        $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $task['id'])->select();
+        if (!is_array($calls) || !is_array($bindings)) throw new GatewayError('storage_unavailable', 'Task recovery evidence is unavailable.', 503);
+        foreach ($calls as $call) {
+            if ($call['status'] !== 'completed' || $call['result_delivered_at'] === null) return false;
+        }
+        foreach ($bindings as $binding) {
+            $active = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])->where('status', 'active')->count();
+            if (!is_numeric($active)) throw new GatewayError('storage_unavailable', 'MCP recovery evidence is unavailable.', 503);
+            if ((int)$active !== 0) return false;
+        }
+        $checkpoints = $db->table('gateway_context_checkpoints')->where('task_id', $task['id'])->where('state', 'generating')->select();
+        if (!is_array($checkpoints)) throw new GatewayError('storage_unavailable', 'Checkpoint recovery evidence is unavailable.', 503);
+        foreach ($checkpoints as $checkpoint) {
+            $producer = empty($checkpoint['response_id']) ? null
+                : $db->table('gateway_response_jobs')->where('id', $checkpoint['response_id'])->find('status');
+            if (!is_array($producer) || $producer['status'] !== 'failed' || $checkpoint['summary'] !== null
+                || $checkpoint['response_json'] !== null || $checkpoint['committed_at'] !== null) return false;
+        }
+        $latest = ResponseJob::latestForTaskUnlocked((string)$task['id']);
+        if (!is_array($latest)) return false;
+        $prepared = $spec;
+        if (!empty($prepared['input_is_delta'])) $prepared['previous_response_id'] = $latest['id'];
+        $prepared = ContextHistory::prepareUnlocked($prepared);
+        // A live mailbox join must finish through its current owner, never be
+        // carried onto a replacement task after revoking that owner's capability.
+        if (!empty($prepared['operational_context_source_response_id'])) return false;
+        $full = json_decode((string)($prepared['full_context_json'] ?? $prepared['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $last = $full['messages'][array_key_last($full['messages'] ?? [])] ?? [];
+        if (($last['role'] ?? '') !== 'user' || ContextHistory::isOperationalUserMessage($last)) return false;
+        try { ContextCompaction::assertClosedWaitReceiptsCoverageUnlocked($prepared, $calls, (string)$task['id']); }
+        catch (GatewayError $error) {
+            if ($error->errorCode === 'compaction_context_incomplete') return false;
+            throw $error;
+        }
+        ToolBroker::revokeTaskUnlocked((string)$task['id'], 'consecutive_gateway_errors');
+        $retired = TaskLedger::cancelTaskUnlocked((string)$task['id']);
+        foreach ($retired['response_ids'] as $id) ResponseJob::failSupersededUnlocked($id);
+        foreach ($checkpoints as $checkpoint) $db->table('gateway_context_checkpoints')->where('id', $checkpoint['id'])
+            ->where('state', 'generating')->update(['state'=>'abandoned']);
+        $write = $db->table('gateway_tasks')->where('id', $task['id'])->where('gateway_rebuild_pending', 1)
+            ->update(['gateway_rebuild_pending'=>0]);
+        if (!$write || $write->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Task recovery state could not be saved.', 503);
+        unset($full['continuation']);
+        $spec = $prepared;
+        $spec['context_json'] = $spec['full_context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($full);
+        $spec['prompt'] = ContextHistory::plainPrompt($full);
+        $spec['previous_response_id'] = $spec['continuation_source_response_id'] = $spec['rolling_source_response_id'] = null;
+        unset($spec['steering_restart'], $spec['steering_messages'], $spec['steering_delta'],
+            $spec['budget']['steering_delta'], $spec['budget']['regular_chat'], $spec['budget']['postcompact_page']);
+        $spec['gateway_error_rebuild'] = true;
+        return true;
+    }
+
+    /**
      * Allow a new full native request to reselect an inert ordinary-chat staging import.
      * The caller owns admission's transaction; this never retries the old browser message.
      * @param array $spec Current routed request, with its own model and native tool environment.
