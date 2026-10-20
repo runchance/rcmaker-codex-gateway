@@ -395,7 +395,7 @@ final class TaskWebChat
      * @param string $accountKey Fresh browser account fingerprint, never a token or email.
      * @param string $modelUrl Configured model origin.
      * @param bool $initialMessageWitness Exact physical request marker observed in the current DOM.
-     * @param string|null $physicalResponseId Original browser submission when native tool receipts advanced the logical round.
+     * @param string|null $physicalResponseId Original browser submission pinned by native receipt rounds or exact retained steering.
      * @return array Pinned conversation state. @throws GatewayError On identity or storage conflict.
      */
     public static function observe(array $expected, string $url, string $accountKey, string $modelUrl,
@@ -430,11 +430,21 @@ final class TaskWebChat
             $physicalResponseId ??= $current['job']['id'];
             $submission = $current['job'];
             if ($physicalResponseId !== $current['job']['id']) {
-                // A native receipt can finish before the first DOM poll. Only the same physical
-                // capability, task, turn and document may supply that original submission witness.
+                // Receipts or an interjection can advance before the first binding observation.
+                // Only the same capability or pinned steering source, task, turn and document
+                // may supply that original physical submission witness.
                 $submission = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $physicalResponseId)->find();
-                if (!is_array($submission) || empty($submission['mcp_binding_id'])
-                    || $submission['mcp_binding_id'] !== $current['job']['mcp_binding_id']
+                $sameCapability = is_array($submission) && !empty($submission['mcp_binding_id'])
+                    && $submission['mcp_binding_id'] === $current['job']['mcp_binding_id'];
+                $steeringSource = false;
+                if (!$sameCapability && is_array($submission)) {
+                    // Text-only interjections also pin a physical source. Never substitute
+                    // an arbitrary older request merely because it belongs to this task.
+                    $steering = ResponseJob::execution((string)$current['job']['id']);
+                    $steeringSource = ($steering['budget']['steering_delta']['witness_response_id'] ?? null) === $physicalResponseId
+                        && SteeringContext::retained($steering, $current['surface']);
+                }
+                if (!is_array($submission) || (!$sameCapability && !$steeringSource)
                     || $submission['task_id'] !== $current['turn']['task_id']
                     || $submission['durable_turn_id'] !== $current['turn']['id']
                     || $submission['surface_id'] !== $current['surface']['id']) {

@@ -1722,8 +1722,12 @@ final class TaskLedger
                 'phase' => $cooling ? 'rate_limit' : ($loading ? 'saved_chat_load' : ($steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response')))];
             if ($loading || $cooling) $data += ['http_status'=>429,'attempt'=>max(0,min(64,(int)($observation['attempt']??0))),
                 'retry_after_seconds'=>max(1,min(86400,(int)($observation['retry_after_seconds']??30)))];
-            if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed'] as $key) {
+            if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed',
+                'initial_binding_witness', 'token_witness', 'retained_identity_witness'] as $key) {
                 $data[$key] = isset($observation[$key]) ? (bool) $observation[$key] : null;
+            }
+            if ($steering) foreach (['user_count', 'stop_count'] as $key) {
+                $data[$key] = isset($observation[$key]) ? max(0, min(10000, (int)$observation[$key])) : null;
             }
             self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'],
                 'browser_observation_delayed', $data);

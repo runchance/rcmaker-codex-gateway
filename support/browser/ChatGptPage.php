@@ -569,22 +569,31 @@ JS);
      * @param bool $acceptedInitialUser Durable proof that the current document accepted its first user submission.
      * @param bool $verifiedSavedChat Caller verified the exact saved chat, account, document and current owner.
      * @param bool $confirm Allow the known native stop confirmation during this owned stop operation; false is read-only when click is false.
+     * @param string $initialBindingMarker Exact physical response ID whose binding header was durably submitted in this ordinary document.
      * @return string CDP expression returning ownership, composer readiness and generation state.
      */
     public static function userStopExpression(string $url, array $tokens, array $users, bool $click,
         bool $requireWitness = false, bool $acceptedInitialUser = false, string $chatMode = 'temporary',
-        bool $verifiedSavedChat = false, bool $confirm = false): string
+        bool $verifiedSavedChat = false, bool $confirm = false, string $initialBindingMarker = ''): string
     {
         $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users),
             'click' => $click, 'requireWitness' => $requireWitness,
             'acceptedInitialUser' => $acceptedInitialUser, 'chatMode' => $chatMode,
-            'verifiedSavedChat' => $verifiedSavedChat, 'confirm' => $confirm], JSON_THROW_ON_ERROR);
+            'verifiedSavedChat' => $verifiedSavedChat, 'confirm' => $confirm,
+            'initialBindingMarker' => $initialBindingMarker], JSON_THROW_ON_ERROR);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
 // A long user bubble may hide its tail when collapsed. Its exact transport witness
 // can remain in textContent even though innerText omits it; never search older turns.
 const tokenWitness=expected.tokens.some(token=>[latest?.innerText,latest?.textContent].some(text=>String(text||'').includes(token)));
+// The ordinary-chat binding header is at the front of the accepted physical message.
+// Its exact identity survives collapsed tails and provisional native group IDs.
+// Native groups contain both roles; an assistant quoting the header is not a witness.
+const bindingUser=latest?.querySelector('[data-user-message-bubble]')||latest;
+const initialBindingWitness=expected.chatMode==='regular'&&!!expected.initialBindingMarker
+    &&[bindingUser?.innerText,bindingUser?.textContent].some(text=>String(text||'').includes(
+        '<rcmaker_chat_binding>'+expected.initialBindingMarker+'</rcmaker_chat_binding>'));
 // ChatGPT truncates long user bubbles in the DOM, not merely their visible layout.
 // On the exact retained URL, one fresh native group after still-present baseline
 // groups proves the submitted user turn without requiring its hidden token tail.
@@ -598,25 +607,33 @@ const initialWitness=expected.acceptedInitialUser&&expected.users.length===0&&id
 const retainedIdentityWitness=String(location.href||'')===expected.url&&(baselineWitness||initialWitness)
     &&fresh.length===1&&fresh[0]===identity
     &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
-let witness=tokenWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
+let witness=tokenWitness||initialBindingWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
+const evidence={url:String(location.href||''),initial_binding_witness:initialBindingWitness,token_witness:tokenWitness,
+    retained_identity_witness:retainedIdentityWitness,user_count:rows.length};
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
+// A just-submitted root page may acquire its saved UUID during the stop read.
+// Only its exact front marker can authorize this first transition, never UUID A -> B.
+const initialNavigation=initialBindingWitness&&sameOrigin&&new URL(expected.url).pathname==='/'
+    &&/^(?:\/c\/)[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(location.pathname);
 const regular=sameOrigin&&expected.chatMode==='regular'&&!new URLSearchParams(location.search).has('temporary-chat')
-    &&String(location.href||'')===expected.url&&/^\/(?:c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?$/i.test(location.pathname);
+    &&(String(location.href||'')===expected.url||initialNavigation)
+    &&/^\/(?:c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?$/i.test(location.pathname);
 const temporary=sameOrigin&&(expected.chatMode==='temporary'?temporaryChatPage(location.pathname,location.search):regular);
-if(!temporary)return {owned:false,page_invalid:true,generation_running:false,editor_ready:!!composer,stopped:false};
+if(!temporary)return {...evidence,owned:false,page_invalid:true,generation_running:false,editor_ready:!!composer,stopped:false};
 // A persisted ordinary conversation can contain several accepted incremental/continuation
 // messages after its first physical response. Its freshly verified account/UUID ownership
 // is authoritative; the original token need not be repeated in its latest user bubble.
 if(regular&&expected.verifiedSavedChat&&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||''))witness=true;
 const owned=String(location.href||'')===expected.url||witness;
 const stops=[...document.querySelectorAll('[data-testid="stop-button"]')].filter(visible);
-if(stops.length>1)return {owned:false,generation_running:true,editor_ready:!!composer,stopped:false};
+evidence.stop_count=stops.length;
+if(stops.length>1)return {...evidence,owned:false,generation_running:true,editor_ready:!!composer,stopped:false};
 const stop=generationStop(),confirmation=generationStopConfirmation();
 // An idle owned composer acknowledges a stop; a running answer also needs its task message witness.
 if(!owned||((stop||confirmation.present||expected.requireWitness)&&!witness))
-    return {owned:false,generation_running:!!stop||confirmation.present,editor_ready:!!composer,stopped:false};
+    return {...evidence,owned:false,generation_running:!!stop||confirmation.present,editor_ready:!!composer,stopped:false};
 const action=actOnGenerationStop(expected.click,expected.confirm,JSON.stringify([expected.url,expected.tokens,identity]));
-return {owned:true,generation_running:action.running,editor_ready:!!composer&&!action.confirmation_pending,
+return {...evidence,owned:true,generation_running:action.running,editor_ready:!!composer&&!action.confirmation_pending,
     stopped:action.stopped,confirmation_pending:action.confirmation_pending,confirmation_clicked:action.confirmation_clicked};
 JS);
     }

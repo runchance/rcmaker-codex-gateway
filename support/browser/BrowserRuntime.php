@@ -3452,6 +3452,8 @@ JS;
      * Stop the proven source, observe idle twice, then submit the incremental user message.
      * A slow stop observation retains this document until the existing durable deadline;
      * only positively invalid/lost page evidence permits full-context recovery.
+     * Repair a missed initial ordinary-chat binding from its submitted header before
+     * handing the retained page to composer checks, which otherwise require a new empty chat.
      */
     private function prepareSteeringSurface(string $responseId, int $commandId, string $sessionId,
         float $deadline, bool $clicked = false, ?float $idleSince = null): void
@@ -3470,6 +3472,7 @@ JS;
         }
         $source = ResponseJob::execution((string) $job['budget']['steering_delta']['witness_response_id']);
         $owner = $this->taskSessions[$sessionId];
+        $initialBinding = self::submittedChatBindingMarker($source, $surface, $owner['web_chat']['mode'] ?? 'temporary');
         $savedChat = TaskWebChat::retained($job, $surface);
         if ($savedChat && !WebModelPage::isTaskChatUrl((string) $surface['url'], self::modelUrl(),
             'regular', (string) ($owner['web_chat']['conversation_id'] ?? ''))) {
@@ -3477,7 +3480,7 @@ JS;
             $this->releaseSteeringPreparation($responseId, $sessionId);
             return;
         }
-        if ($savedChat && ($owner['account_document_nonce'] ?? '') !== $surface['document_nonce']) {
+        if (($savedChat || $initialBinding !== '') && ($owner['account_document_nonce'] ?? '') !== $surface['document_nonce']) {
             $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, false, $deadline);
             return;
         }
@@ -3488,9 +3491,9 @@ JS;
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
             (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface),
-            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true);
+            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true, $initialBinding);
         $this->evaluateTaskSession($sessionId, $expression,
-            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface): void {
+            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface, $initialBinding): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
                     $this->releaseSteeringPreparation($responseId, $sessionId);
                     return;
@@ -3506,8 +3509,27 @@ JS;
                     return;
                 }
                 if ($error === null && is_array($state) && !empty($state['owned'])) {
+                    if ($initialBinding !== '' && !empty($state['initial_binding_witness'])
+                        && empty($this->taskSessions[$sessionId]['web_chat']['conversation_id'])) {
+                        try {
+                            $expected = TaskLedger::pollExecution($responseId);
+                            $observedUrl = (string)($state['url'] ?? $surface['url']);
+                            $chat = TaskWebChat::observe($expected, $observedUrl,
+                                (string)($this->taskSessions[$sessionId]['account_key'] ?? ''), self::modelUrl(), true, $initialBinding);
+                            if (!empty($chat['conversation_id'])) {
+                                TaskLedger::observeSurface((string)$surface['id'], (string)$surface['owner_incarnation'],
+                                    (int)$surface['fencing_version'], $observedUrl);
+                            }
+                            $this->taskSessions[$sessionId]['web_chat'] = $chat;
+                        } catch (GatewayError $failure) {
+                            $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                            $this->releaseSteeringPreparation($responseId, $sessionId);
+                            return;
+                        }
+                    }
                     $clicked = $clicked || !empty($state['stopped']);
-                    if (empty($state['generation_running']) && !empty($state['editor_ready'])) {
+                    $bindingReady = $initialBinding === '' || !empty($this->taskSessions[$sessionId]['web_chat']['conversation_id']);
+                    if (empty($state['generation_running']) && !empty($state['editor_ready']) && $bindingReady) {
                         if ($idleSince !== null && microtime(true) - $idleSince >= 1.0) {
                             $this->startTaskTurn($responseId, $commandId, $sessionId, false);
                             return;
@@ -8560,6 +8582,24 @@ JS;
     }
 
     /**
+     * Recover the exact ordinary binding header from an accepted physical submission.
+     * The caller still fences the task, target, account and document before using it.
+     * @param array $source Physical response including its prompt and submission metadata.
+     * @param array $surface Current task-owned surface. @param string $mode Pinned chat mode.
+     * @return string Physical response ID, or empty when this document has no such proof.
+     */
+    private static function submittedChatBindingMarker(array $source, array $surface, string $mode): string
+    {
+        if ($mode !== 'regular' || empty($source['submit_intent_at']) || empty($source['accepted_at'])
+            || empty($surface['document_nonce']) || ($source['task_id'] ?? null) !== ($surface['task_id'] ?? null)
+            || ($source['surface_id'] ?? null) !== ($surface['id'] ?? null)
+            || ($source['submitted_document_nonce'] ?? null) !== $surface['document_nonce']) return '';
+        $id = (string)($source['id'] ?? '');
+        return $id !== '' && str_starts_with((string)($source['prompt'] ?? ''), '<rcmaker_chat_binding>' . $id . "</rcmaker_chat_binding>\n")
+            ? $id : '';
+    }
+
+    /**
      * Prove an intentionally empty baseline from the accepted physical submission, including
      * logical receipt rounds whose own submit/accept fields are empty. Ownership and current
      * generation remain checked by each stop caller; an unsent job alone grants no DOM witness.
@@ -8680,7 +8720,8 @@ JS;
         if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
         $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
             (array)$physical['baseline_users'], !$state['clicked'], true, self::acceptedInitialUser($physical, $ledger['surface']),
-            $turn['web_chat']['mode'] ?? 'temporary', false, true),
+            $turn['web_chat']['mode'] ?? 'temporary', false, true,
+            self::submittedChatBindingMarker($physical, $ledger['surface'], $turn['web_chat']['mode'] ?? 'temporary')),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
