@@ -541,14 +541,22 @@ return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.
 JS);
     }
 
-    /** Stop only the currently generating answer after a durable internal control receipt. */
-    public static function stopGenerationExpression(): string
+    /**
+     * Stop/read a checkpoint generator after its durable receipt, including a native confirmation.
+     * @param bool $click Whether to initiate Stop; confirmation may complete an already initiated stop.
+     * @param array $expected Exact observed URL/user/assistant identities, fenced by the caller.
+     * @return string CDP action; running stays true while a dialog awaits acknowledgement.
+     */
+    public static function stopGenerationExpression(bool $click = true, array $expected = []): string
     {
-        return self::wrap(<<<'JS'
-const stop=generationStop();
-if(!stop)return {running:false,stopped:false};
-stop.click();
-return {running:true,stopped:true};
+        $data = json_encode($expected + ['click' => $click], JSON_THROW_ON_ERROR);
+        return self::wrap('const expectedStop=' . $data . ";\n" . <<<'JS'
+const users=userTurns(),answers=assistantTurns();
+if((expectedStop.url&&String(location.href)!==expectedStop.url)
+    ||(expectedStop.user_id&&(!users.length||turnId(users.at(-1),users.length-1,'user')!==expectedStop.user_id))
+    ||(expectedStop.response_id&&(!answers.length||turnId(answers.at(-1),answers.length-1,'assistant')!==expectedStop.response_id)))
+    return {running:true,stopped:false,owned:false};
+return {owned:true,...actOnGenerationStop(expectedStop.click,true,JSON.stringify([expectedStop.url,expectedStop.user_id,expectedStop.response_id]))};
 JS);
     }
 
@@ -560,16 +568,17 @@ JS);
      * @param bool $requireWitness Require the exact task message even when the composer is idle.
      * @param bool $acceptedInitialUser Durable proof that the current document accepted its first user submission.
      * @param bool $verifiedSavedChat Caller verified the exact saved chat, account, document and current owner.
+     * @param bool $confirm Allow the known native stop confirmation during this owned stop operation; false is read-only when click is false.
      * @return string CDP expression returning ownership, composer readiness and generation state.
      */
     public static function userStopExpression(string $url, array $tokens, array $users, bool $click,
         bool $requireWitness = false, bool $acceptedInitialUser = false, string $chatMode = 'temporary',
-        bool $verifiedSavedChat = false): string
+        bool $verifiedSavedChat = false, bool $confirm = false): string
     {
         $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users),
             'click' => $click, 'requireWitness' => $requireWitness,
             'acceptedInitialUser' => $acceptedInitialUser, 'chatMode' => $chatMode,
-            'verifiedSavedChat' => $verifiedSavedChat], JSON_THROW_ON_ERROR);
+            'verifiedSavedChat' => $verifiedSavedChat, 'confirm' => $confirm], JSON_THROW_ON_ERROR);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
@@ -602,11 +611,13 @@ if(regular&&expected.verifiedSavedChat&&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4})
 const owned=String(location.href||'')===expected.url||witness;
 const stops=[...document.querySelectorAll('[data-testid="stop-button"]')].filter(visible);
 if(stops.length>1)return {owned:false,generation_running:true,editor_ready:!!composer,stopped:false};
-const stop=generationStop();
+const stop=generationStop(),confirmation=generationStopConfirmation();
 // An idle owned composer acknowledges a stop; a running answer also needs its task message witness.
-if(!owned||((stop||expected.requireWitness)&&!witness))return {owned:false,generation_running:!!stop,editor_ready:!!composer,stopped:false};
-if(stop&&expected.click)stop.click();
-return {owned:true,generation_running:!!stop,editor_ready:!!composer,stopped:!!stop&&expected.click};
+if(!owned||((stop||confirmation.present||expected.requireWitness)&&!witness))
+    return {owned:false,generation_running:!!stop||confirmation.present,editor_ready:!!composer,stopped:false};
+const action=actOnGenerationStop(expected.click,expected.confirm,JSON.stringify([expected.url,expected.tokens,identity]));
+return {owned:true,generation_running:action.running,editor_ready:!!composer&&!action.confirmation_pending,
+    stopped:action.stopped,confirmation_pending:action.confirmation_pending,confirmation_clicked:action.confirmation_clicked};
 JS);
     }
 
@@ -1424,7 +1435,7 @@ else if(/your session has expired|你的工作階段已過期|您的工作階段
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,error};
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__'],
@@ -1683,6 +1694,43 @@ const generationStop=()=>{
     const composer=visibleOne(COMPOSER),form=composer?.closest('form');if(!form)return null;
     return [...form.querySelectorAll('button[aria-label]')].filter(visible).find(button=>
         /^(?:Stop|Stop generating|停止|停止生成)$/.test(String(button.getAttribute('aria-label')||'').trim()))||null;
+};
+// This is native Stop confirmation chrome, never a tool permission or message-body button.
+// A visible unrecognized/ambiguous modal blocks Stop as well as idle acknowledgement.
+const generationStopConfirmation=()=>{
+    const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')]
+        .filter(el=>modelRendered(el)&&!el.closest(USER+','+ASSISTANT+',pre,code'));
+    if(dialogs.length!==1)return {present:dialogs.length>0,button:null};
+    const dialog=dialogs[0],norm=value=>String(value||'').replace(/\s+/g,' ').trim();
+    const titles=[norm(dialog.getAttribute('aria-label'))];
+    const labelled=norm(dialog.getAttribute('aria-labelledby')).split(' ').filter(Boolean)
+        .map(id=>document.getElementById(id)).filter(el=>el&&dialog.contains(el));
+    if(labelled.length)titles.push(norm(labelled.map(el=>el.textContent).join(' ')));
+    for(const heading of dialog.querySelectorAll('h1,h2,h3,[role="heading"]'))titles.push(norm(heading.textContent));
+    const title=/^(?:要停止生成这条回复吗[？?]?|停止生成这条回复[？?]|Stop generating this response[?]?|Stop generating[?])$/i;
+    if(!titles.some(text=>title.test(text)))return {present:true,button:null};
+    const buttons=[...dialog.querySelectorAll('button')].filter(modelRendered);
+    const label=el=>norm(el.getAttribute('aria-label')||el.innerText||el.textContent);
+    const stops=buttons.filter(el=>/^(?:停止|停止生成|Stop|Stop generating)$/i.test(label(el)));
+    const keep=buttons.filter(el=>/^(?:继续思考|继续生成|Keep thinking|Continue thinking|Keep generating|Continue generating)$/i.test(label(el)));
+    const button=stops.length===1&&keep.length===1&&!stops[0].disabled
+        &&stops[0].getAttribute('aria-disabled')!=='true'?stops[0]:null;
+    return {present:true,button};
+};
+// Confirm at most once per physical button and stop scope. An uncertain CDP response
+// reads back the same dialog; it must not toggle Stop again or approve unrelated UI.
+const actOnGenerationStop=(click,confirm,scope)=>{
+    const dialog=generationStopConfirmation(),stop=generationStop();
+    if(dialog.present){
+        let clicked=false;
+        if(confirm&&dialog.button){
+            const key=Symbol.for('rcmaker.stop.confirmation');
+            if(dialog.button[key]!==scope){dialog.button[key]=scope;dialog.button.click();clicked=true;}
+        }
+        return {running:true,stopped:false,confirmation_pending:true,confirmation_clicked:clicked};
+    }
+    if(stop&&click)stop.click();
+    return {running:!!stop,stopped:!!stop&&click,confirmation_pending:false,confirmation_clicked:false};
 };
 const temporaryChatPage=(path,search)=>{
     const flags=new URLSearchParams(search||'').getAll('temporary-chat');

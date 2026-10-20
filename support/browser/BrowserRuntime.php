@@ -448,7 +448,8 @@ final class BrowserRuntime
         if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl($chat['mode'], $chat['conversation_id'] ?? null);
         $expression = WebModelPage::userStopExpression($url, $witnesses, $users,
             !$stop['clicked'] && empty($stop['verify_only']), false,
-            self::acceptedInitialUser($expected['job'], $expected['surface']), $chat['mode']);
+            self::acceptedInitialUser($expected['job'], $expected['surface']), $chat['mode'], false,
+            empty($stop['verify_only']));
         $sessionId = (string) $stop['session_id'];
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $result) use ($responseId, $expected, $sessionId): void {
@@ -3466,7 +3467,7 @@ JS;
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
             (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface),
-            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat);
+            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true);
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
@@ -8009,7 +8010,7 @@ JS;
             $stopUnconfirmed = empty($turn['compaction_stop_clicked']);
             $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
                 (array)$turn['baseline_users'], $stopUnconfirmed, !$closedSource && $stopUnconfirmed,
-                self::acceptedInitialUser($source, $surface), $turn['web_chat']['mode'] ?? 'temporary');
+                self::acceptedInitialUser($source, $surface), $turn['web_chat']['mode'] ?? 'temporary', false, true);
         } catch (GatewayError $error) {
             if ($error->errorCode === 'STORAGE_BUSY') {
                 $this->scheduleTaskPoll($responseId, 1.0);
@@ -8299,14 +8300,13 @@ JS;
                         $this->taskFailTurn($responseId, $auditError->errorCode, $auditError->getMessage(), true);
                         return;
                     }
-                    if (!empty($snapshot['generation_running'])) {
-                        $this->evaluateTask($responseId, WebModelPage::stopGenerationExpression(),
-                            function () use ($responseId, $logicalResponseId): void {
-                                $this->commitRetainedCompactionHandoff($responseId, $logicalResponseId);
-                            });
-                        return;
-                    }
-                    $this->commitRetainedCompactionHandoff($responseId, $logicalResponseId);
+                    // A durable summary is not proof that its Web generator stopped.
+                    // Finish the same page's native confirmation and observe idle before
+                    // committing; never leave a modal behind for the next continuation.
+                    if (!empty($snapshot['generation_running']) || !empty($snapshot['stop_confirmation_pending'])
+                        || ($turn['handoff_stop_response'] ?? null) === $logicalResponseId) {
+                        $this->finishRetainedCompactionStop($responseId, $logicalResponseId, $snapshot);
+                    } else $this->commitRetainedCompactionHandoff($responseId, $logicalResponseId);
                     return;
                 }
                 if (is_array($snapshot['error'] ?? null)) {
@@ -8365,6 +8365,65 @@ JS;
                 }
                 $this->scheduleTaskPoll($responseId, 0.15);
             }, 3.0);
+    }
+
+    /**
+     * Read/finish the checkpoint's native Stop dialog without resending its accepted summary.
+     * Late callbacks cannot commit after manual stop, a new logical turn or document takeover.
+     * @param string $responseId Physical observer for the retained page.
+     * @param string $logicalResponseId Current compact response whose receipt is already durable.
+     * @param array $snapshot Observed native user/assistant identities on that page.
+     */
+    private function finishRetainedCompactionStop(string $responseId, string $logicalResponseId, array $snapshot): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || ($turn['compaction_phase'] ?? null) !== 'waiting') return;
+        try { $ledger = TaskLedger::pollExecution($logicalResponseId); }
+        catch (GatewayError $failure) {
+            if ($failure->errorCode === 'STORAGE_BUSY') $this->scheduleTaskPoll($responseId, 0.5);
+            else $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+            return;
+        }
+        $surface = $ledger['surface'];
+        if ($ledger['turn']['response_id'] !== $logicalResponseId || !empty($ledger['turn']['error_code'])
+            || !in_array($ledger['turn']['status'], ['submitted', 'running'], true)
+            || $surface['owner_incarnation'] !== $turn['owner_incarnation']
+            || (int)$surface['fencing_version'] !== (int)$turn['fencing_version']
+            || $surface['document_nonce'] !== $turn['document_nonce']
+            || ($turn['logical_response_id'] ?? $responseId) !== $logicalResponseId) return;
+        $expression = WebModelPage::stopGenerationExpression(($turn['handoff_stop_response'] ?? null) !== $logicalResponseId, [
+            'url' => (string)$surface['url'],
+            'user_id' => (string)($snapshot['new_user_id'] ?? ''),
+            'response_id' => (string)($snapshot['response_id'] ?? ''),
+        ]);
+        $this->evaluateTask($responseId, $expression,
+            function ($error, $state) use ($responseId, $logicalResponseId, $ledger, $surface): void {
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($turn) || ($turn['compaction_phase'] ?? null) !== 'waiting'
+                    || ($turn['logical_response_id'] ?? $responseId) !== $logicalResponseId) return;
+                try { $fresh = TaskLedger::pollExecution($logicalResponseId); }
+                catch (GatewayError $failure) {
+                    if ($failure->errorCode === 'STORAGE_BUSY') $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                if ($fresh['turn']['response_id'] !== $logicalResponseId || !empty($fresh['turn']['error_code'])
+                    || $fresh['turn']['generation_id'] !== $ledger['turn']['generation_id']
+                    || $fresh['surface']['document_nonce'] !== $surface['document_nonce']
+                    || $fresh['surface']['owner_incarnation'] !== $surface['owner_incarnation']
+                    || $fresh['surface']['fencing_version'] !== $surface['fencing_version']) return;
+                if ($error !== null || !is_array($state) || empty($state['owned'])) {
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                if (!empty($state['stopped']) || !empty($state['confirmation_pending'])) {
+                    $this->chatGptTurns[$responseId]['handoff_stop_response'] = $logicalResponseId;
+                }
+                if (($state['running'] ?? null) !== false) {
+                    $this->scheduleTaskPoll($responseId, 0.25);
+                    return;
+                }
+                $this->commitRetainedCompactionHandoff($responseId, $logicalResponseId);
+            }, 15.0);
     }
 
     private function commitRetainedCompactionHandoff(string $responseId, string $logicalResponseId): void
@@ -8532,14 +8591,17 @@ JS;
                 }
             }
             $state['checked_at'] = $now;
-            if (!$state['pending']) $state['clicked'] = false;
+            if (!$state['pending']) {
+                $state['clicked'] = false;
+                $state['idle_confirmed'] = false;
+            }
             $this->chatGptTurns[$responseId]['pending_steering_stop'] = $state;
         }
         if (!$state['pending']) return false;
         // The page's Stop button affects its generator, not the native invocation ledger.
         // Registered calls remain deliverable even after the Web stream disconnects.
         $this->deliverPendingToolWithoutSnapshot($responseId);
-        if ($state['clicked']) {
+        if (!empty($state['idle_confirmed'])) {
             $this->scheduleTaskPoll($responseId, 0.25);
             return true;
         }
@@ -8553,8 +8615,8 @@ JS;
         $witnesses = count(array_unique($tokens[0])) === 1 ? [$tokens[0][0]] : [(string)$physical['prompt']];
         if (!empty($physical['transport_transaction_id'])) $witnesses[] = (string)$physical['transport_transaction_id'];
         $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
-            (array)$physical['baseline_users'], true, true, self::acceptedInitialUser($physical, $ledger['surface']),
-            $turn['web_chat']['mode'] ?? 'temporary'),
+            (array)$physical['baseline_users'], !$state['clicked'], true, self::acceptedInitialUser($physical, $ledger['surface']),
+            $turn['web_chat']['mode'] ?? 'temporary', false, true),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
@@ -8578,6 +8640,10 @@ JS;
                 }
                 if ($error === null && is_array($snapshot) && !empty($snapshot['owned']) && !empty($snapshot['stopped'])) {
                     $this->chatGptTurns[$responseId]['pending_steering_stop']['clicked'] = true;
+                }
+                if ($error === null && is_array($snapshot) && !empty($snapshot['owned'])
+                    && ($snapshot['generation_running'] ?? null) === false && !empty($snapshot['editor_ready'])) {
+                    $this->chatGptTurns[$responseId]['pending_steering_stop']['idle_confirmed'] = true;
                 }
                 $this->scheduleTaskPoll($responseId, 0.25);
             }, 3.0);
