@@ -437,19 +437,26 @@ final class BrowserRuntime
             }, 3.0);
             return;
         }
-        preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $expected['job']['prompt'], $tokens);
-        $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [];
-        if (!empty($expected['job']['transport_transaction_id']) && (int) ($expected['job']['transport_stage_sent'] ?? 0) > 0) {
-            $witnesses[] = (string) $expected['job']['transport_transaction_id'];
-        }
-        $users = json_decode((string) ($expected['job']['baseline_users_json'] ?? '[]'), true) ?: [];
-        $url = (string) $expected['surface']['url'];
         $chat = TaskWebChat::state((string) $expected['turn']['task_id']);
+        // Tool receipt rounds share a browser command but do not submit a user message.
+        // Resolve once within this fenced stop observer; keep the original physical witness.
+        $source = $expected['job'];
+        if ($chat['mode'] === 'regular') {
+            $source = $stop['physical_source'] ?? self::manualStopSource($source, $expected['surface']);
+            $this->codexUserStops[$responseId]['physical_source'] = $source;
+        }
+        preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $source['prompt'], $tokens);
+        $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [];
+        if (!empty($source['transport_transaction_id']) && (int) ($source['transport_stage_sent'] ?? 0) > 0) {
+            $witnesses[] = (string) $source['transport_transaction_id'];
+        }
+        $users = json_decode((string) ($source['baseline_users_json'] ?? '[]'), true) ?: [];
+        $url = (string) $expected['surface']['url'];
         if ($url === 'about:blank' && empty($expected['job']['submit_intent_at'])) $url = self::taskModelUrl($chat['mode'], $chat['conversation_id'] ?? null);
         $expression = WebModelPage::userStopExpression($url, $witnesses, $users,
             !$stop['clicked'] && empty($stop['verify_only']), false,
-            self::acceptedInitialUser($expected['job'], $expected['surface']), $chat['mode'], false,
-            empty($stop['verify_only']));
+            self::acceptedInitialUser($source, $expected['surface']), $chat['mode'], false,
+            empty($stop['verify_only']), self::submittedChatBindingMarker($source, $expected['surface'], $chat['mode']));
         $sessionId = (string) $stop['session_id'];
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $result) use ($responseId, $expected, $sessionId): void {
@@ -8600,6 +8607,26 @@ JS;
         $id = (string)($source['id'] ?? '');
         return $id !== '' && str_starts_with((string)($source['prompt'] ?? ''), '<rcmaker_chat_binding>' . $id . "</rcmaker_chat_binding>\n")
             ? $id : '';
+    }
+
+    /**
+     * Resolve a receipt round's physical browser submission for manual Stop only.
+     * A unique accepted job must share the current task, surface, document and browser command.
+     * Missing or ambiguous legacy evidence keeps the existing logical witness, without a guess.
+     * @param array $job Fenced logical response job. @param array $surface Current owned document.
+     * @return array Physical submission, or the original job when no exact source is available.
+     */
+    private static function manualStopSource(array $job, array $surface): array
+    {
+        if (!empty($job['submit_intent_at']) && !empty($job['accepted_at'])) return $job;
+        if (empty($surface['document_nonce']) || empty($job['command_id'])
+            || ($job['surface_id'] ?? null) !== ($surface['id'] ?? null)
+            || ($job['task_id'] ?? null) !== ($surface['task_id'] ?? null)) return $job;
+        $sources = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+            ->where('task_id', $job['task_id'])->where('surface_id', $surface['id'])
+            ->where('command_id', $job['command_id'])->where('submitted_document_nonce', $surface['document_nonce'])
+            ->where('submit_intent_at', '<>', null)->where('accepted_at', '<>', null)->limit(2)->select();
+        return count($sources) === 1 ? $sources[0] : $job;
     }
 
     /**

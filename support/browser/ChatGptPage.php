@@ -1711,13 +1711,16 @@ JS
 const visible=el=>{if(!el)return false;const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)!==0&&r.width>0&&r.height>0};
 const visibleOne=selector=>[...document.querySelectorAll(selector)].find(visible)||null;
 // DIL phase prose can sit outside role/search-unit wrappers within the bound assistant turn.
-// Require all three renderer message references; user/code and nested foreign groups never qualify.
-const ownedAssistantMessageRoot=(root,owner,requireRendered=false)=>{
+// Require matching native renderer references; user/code and nested foreign groups never qualify.
+// Only first-send remount recovery may substitute a unique search reference before selection hydrates.
+const ownedAssistantMessageRoot=(root,owner,requireRendered=false,allowSearchReference=false)=>{
     if(root.getAttribute('data-markdown-text-style')!=='assistant-message'
         ||root.closest('[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-content-search-unit-key$=":user"],pre,code'))return false;
     const group=root.closest('[data-turn-key]');
     if(group&&group!==owner)return false;
-    const selection=root.closest('[data-chatgpt-selection-message-id]');
+    const selection=root.closest(allowSearchReference
+        ?'[data-chatgpt-selection-message-id],[data-chatgpt-selection-conversation-id]'
+        :'[data-chatgpt-selection-message-id]');
     if(!selection||!owner.contains(selection))return false;
     // Response extraction retains hidden root identities so it cannot fall back to a whole
     // transcript when all prose is collapsed; its existing visibility filters exclude their text.
@@ -1727,12 +1730,25 @@ const ownedAssistantMessageRoot=(root,owner,requireRendered=false)=>{
         if(node.hasAttribute('hidden')||node.hasAttribute('inert')||node.getAttribute('aria-hidden')==='true'
             ||style.display==='none'||style.visibility==='hidden'||Number(style.opacity||1)===0)return false;
     }
-    const id=String(selection.getAttribute('data-chatgpt-selection-message-id')||'');
+    const id=assistantMessageReference(selection,owner,allowSearchReference);
     if(!id)return false;
     return [...root.querySelectorAll('[data-dil-message-id]')].some(message=>
         message.getAttribute('data-dil-message-id')===id
-        &&message.closest('[data-chatgpt-selection-message-id]')===selection
+        &&message.closest(allowSearchReference
+            ?'[data-chatgpt-selection-message-id],[data-chatgpt-selection-conversation-id]'
+            :'[data-chatgpt-selection-message-id]')===selection
         &&message.closest('[data-dil-source-message-id]')?.getAttribute('data-dil-source-message-id')===id);
+};
+// Duplicate tokens in the native search wrapper are normal. Conflicting IDs, quoted
+// wrappers and explicitly present but invalid selection IDs never get a fallback.
+const assistantMessageReference=(selection,owner,allowSearchReference)=>{
+    if(selection.hasAttribute('data-chatgpt-selection-message-id'))
+        return String(selection.getAttribute('data-chatgpt-selection-message-id')||'');
+    if(!allowSearchReference)return '';
+    const search=selection.closest('[data-chatgpt-search-message-ids]');
+    if(!search||!owner.contains(search)||search.closest('.markdown,[data-markdown-text-style],pre,code,blockquote'))return '';
+    const ids=[...new Set(String(search.getAttribute('data-chatgpt-search-message-ids')||'').split(/\s+/).filter(Boolean))];
+    return ids.length===1?ids[0]:'';
 };
 // Model controls can remain laid out while their advanced panel is inert. Keep
 // this stricter check local to model selection; streaming extraction is unchanged.
@@ -1806,7 +1822,9 @@ const generationStop=()=>{
 // A visible unrecognized/ambiguous modal blocks Stop as well as idle acknowledgement.
 const generationStopConfirmation=()=>{
     const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')]
-        .filter(el=>modelRendered(el)&&!el.closest(USER+','+ASSISTANT+',pre,code'));
+        .filter(el=>modelRendered(el)&&!el.closest(USER+','+ASSISTANT+',pre,code')
+            // The native floating backend panel is a nonmodal dialog, not Stop confirmation.
+            &&!el.matches('[aria-modal="false"][data-quick-chat-drag-handle="true"][data-pip-obstacle="quick-chat"]'));
     if(dialogs.length!==1)return {present:dialogs.length>0,button:null};
     const dialog=dialogs[0],norm=value=>String(value||'').replace(/\s+/g,' ').trim();
     const titles=[norm(dialog.getAttribute('aria-label'))];
@@ -1906,9 +1924,14 @@ const initialResponseUrlMatches=(from,to)=>{
 const observedInitialResponse=source=>{
     const saved=globalThis[Symbol.for('rcmaker.initial.response')];
     const url=String(location.href||'');
-    if(!source||saved?.source!==source||!initialResponseUrlMatches(saved.url,url))return false;
+    if(!source||saved?.source!==source)return false;
     const matches=assistantTurns().map((el,i)=>({el,id:turnId(el,i,'assistant')}));
     if(matches.length!==1)return false;
+    // Manual Stop may arrive before the next response poll bridges the initial remount.
+    // Use that same exact native proof, never a looser URL-only transition.
+    if(!initialResponseUrlMatches(saved.url,url)){
+        if(!remountedInitialAssistant(matches,new Set(),saved.assistant,source,new Set(),userTurns()))return false;
+    }
     // Reuse the existing native-anchor promotion check for a streaming group
     // acquiring its permanent ID; never accept an unrelated replacement answer.
     if(matches[0].id!==saved.assistant
@@ -1924,11 +1947,11 @@ const initialAssistantAnchor=(entry,conversation)=>{
     if(!entry.el.querySelector('[data-chatgpt-agent-turn-start]'))return null;
     const roots=[...entry.el.querySelectorAll('[data-markdown-text-style="assistant-message"]')];
     for(const root of roots){
-        if(!ownedAssistantMessageRoot(root,entry.el,true))continue;
-        const selection=root.closest('[data-chatgpt-selection-message-id]');
+        if(!ownedAssistantMessageRoot(root,entry.el,true,true))continue;
+        const selection=root.closest('[data-chatgpt-selection-message-id],[data-chatgpt-selection-conversation-id]');
         if(selection.closest('.markdown,[data-markdown-text-style],pre,code,blockquote'))continue;
         if(selection.getAttribute('data-chatgpt-selection-conversation-id')===conversation)
-            return selection.getAttribute('data-chatgpt-selection-message-id');
+            return assistantMessageReference(selection,entry.el,true);
     }
     return null;
 };
