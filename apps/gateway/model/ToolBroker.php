@@ -3110,8 +3110,13 @@ final class ToolBroker
         ]);
     }
 
+    /** Persist a tool event; stage timestamps observe gateway boundaries, not model or host CPU time. */
     private static function eventUnlocked(string $taskId, string $turnId, string $responseId, string $type, array $data): void
     {
+        if (in_array($type, ['tool_registered', 'tool_delivered', 'tool_result_received', 'tool_result_delivered'], true)) {
+            // Reuse the existing event write/transaction. No extra query, table or polling work.
+            $data['observed_at_us'] = (int) floor(microtime(true) * 1000000);
+        }
         $ok = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->add([
             'task_id' => $taskId,
             'turn_id' => $turnId !== '' ? $turnId : null,
@@ -3238,6 +3243,9 @@ final class ToolBroker
         ], $ordinaryFollowup);
         $browserNotice = self::browserToolNotice($hostToolNames, $contextJson);
         if (!$contextOnly) {
+            if ($hostToolNames !== []) {
+                $browserNotice = trim(self::efficientToolNotice($hostToolNames) . "\n" . $browserNotice);
+            }
             $execName = in_array('functions__exec', $hostToolNames, true) ? 'functions__exec'
                 : (in_array('exec', $hostToolNames, true) ? 'exec' : '');
             if ($execName !== '') {
@@ -3267,7 +3275,7 @@ final class ToolBroker
     {
         return "<codex_native_code_mode>\n"
             . 'The current Codex runtime advertises ' . $execName . ', its native JavaScript tool orchestrator. '
-            . 'Discover its current description/schema through codex_tool_inventory, then invoke it through codex_tool_call with that exact wire_name and the JavaScript in input. '
+            . 'Discover its current description/schema through codex_tool_inventory with query=' . $execName . ' and exact=true, then invoke it through codex_tool_call with that exact wire_name and the JavaScript in input. '
             . 'Use one outer exec call at a time; do not overlap it with another outer tool. The outer parallel_tool_calls setting remains authoritative. '
             . 'Inside exec, use awaited Promise.allSettled for small groups of independent reads, searches or independent tests when their tool descriptions permit concurrency. '
             . 'Keep dependencies, approvals, shared browser interactions and edits to the same files sequential. Respect every tool-specific ordering rule. '
@@ -3279,6 +3287,37 @@ final class ToolBroker
             . 'After user interjection or stop, start no superseded work; preserve accepted operations and their exact receipts. Give the required public acknowledgement before new tools. '
             . 'Direct tools remain available for dependent work and runtimes without exec; never invent a missing tool or permissions.\n'
             . '</codex_native_code_mode>';
+    }
+
+    /**
+     * Reduce avoidable tool round trips without changing authorization, receipts or task routing.
+     * Interaction guidance is conditional on the current host catalog, including customized prompts.
+     * @param array<string> $hostToolNames Exact wire names in this turn's authorized registry.
+     * @return string Small execution and optional user-question notice; no history or schemas duplicated.
+     */
+    private static function efficientToolNotice(array $hostToolNames): string
+    {
+        $notice = "<codex_tool_efficiency>\n"
+            . 'Match effort to the request. For a small, well-specified change, read the relevant code, make the authorized edit and run the smallest meaningful check; avoid unrelated investigation and repeating unchanged checks. '
+            . 'Plan the next small group of required observations before calling tools. Batch independent reads/searches/tests when supported; keep dependent steps sequential and inspect their results before choosing a mutation. '
+            . 'For a known wire_name use codex_tool_inventory with query set to that name and exact=true. Reuse its returned definition within this turn; rediscover after a capability change or an unavailable-tool result, not before every call. '
+            . 'Search narrowly and read relevant ranges. Choose appropriate native output limits before execution; retain errors, exit status, useful evidence and continuation handles. Do not dump entire catalogs, logs or files when only a few records are needed, and do not hide failed or pending operations. '
+            . 'When needed evidence already exists in this page or exact tool receipts, use it; query archived history only for missing facts or a required recovery check. '
+            . 'These are efficiency rules, not permission to skip required checks, public progress replies, approvals or unresolved results.'
+            . "\n</codex_tool_efficiency>";
+        $async = in_array('request_user_input_async', $hostToolNames, true) ? 'request_user_input_async'
+            : (in_array('functions__request_user_input_async', $hostToolNames, true) ? 'functions__request_user_input_async' : '');
+        $blocking = in_array('request_user_input', $hostToolNames, true) ? 'request_user_input'
+            : (in_array('functions__request_user_input', $hostToolNames, true) ? 'functions__request_user_input' : '');
+        if ($async === '' && $blocking === '') return $notice;
+        $questionTool = $async !== '' ? $async : $blocking;
+        $notice .= "\n<codex_user_questions>\n"
+            . 'When missing information, a preference or required approval materially affects the next action, the current Codex host advertises ' . $questionTool . '. '
+            . 'Discover its exact current schema with query=' . $questionTool . ' and exact=true, and invoke it through codex_tool_call to ask in the Codex UI. Follow its mode and approval restrictions; do not invent availability or ask again for authorization already given. ';
+        $notice .= $async !== ''
+            ? 'This asynchronous tool acknowledges that a question was shown; that receipt and any preselected option are not the user answer. The answer arrives as a later user message. Continue independent authorized work while waiting; do not perform dependent work until the answer arrives, and do not poll or resend the question. '
+            : 'Use this tool only in a mode allowed by its current description. If unavailable, ask in ordinary public text; do not force a mode change. ';
+        return $notice . "\n</codex_user_questions>";
     }
 
     /** Explain the actual host browser route only when this turn advertises it and the task needs it. */

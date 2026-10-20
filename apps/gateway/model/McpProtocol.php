@@ -212,9 +212,15 @@ final class McpProtocol
             'message'=>'This normal Codex Web turn finishes through the ordinary assistant answer. Continue any needed work, then write that answer after the last required tool result.'];
     }
 
+    /** Discover current tools; an exact bound name needs no native registry execution. */
     private static function inventoryTool(mixed $rpcId, array $arguments): array
     {
         $token = self::turnToken($arguments);
+        $exact = array_key_exists('exact', $arguments) ? $arguments['exact'] : false;
+        if (!is_bool($exact) || ($exact && (!is_string($arguments['query'] ?? null)
+            || trim($arguments['query']) === ''))) {
+            throw new GatewayError('tool_arguments_invalid', 'exact must be a boolean; exact lookup requires a nonempty query.', 400);
+        }
         if (str_starts_with($token, 'probe_')) {
             $query = isset($arguments['query']) && is_string($arguments['query']) ? trim($arguments['query']) : '';
             if ($query !== 'RCMAKER_PERMISSION_PROBE') {
@@ -236,9 +242,12 @@ final class McpProtocol
         try {
             $inventory = ToolBroker::inventorySnapshot($token);
             $outer = $inventory['tools'];
-            $query = isset($arguments['query']) && is_string($arguments['query']) ? trim(mb_strtolower($arguments['query'])) : '';
+            $query = isset($arguments['query']) && is_string($arguments['query']) ? trim($arguments['query']) : '';
+            if (!$exact) $query = mb_strtolower($query);
             $search = self::inventorySearchPlan($query);
-            $tools = self::searchInventoryTools($outer, $search);
+            $tools = $exact
+                ? array_values(array_filter($outer, static fn(array $tool): bool => $tool['wire_name'] === $query))
+                : self::searchInventoryTools($outer, $search);
             $offset = isset($arguments['offset']) && is_int($arguments['offset']) ? max(0, min(100000, $arguments['offset'])) : 0;
             $limit = isset($arguments['limit']) && is_int($arguments['limit']) ? max(1, min(50, $arguments['limit'])) : 20;
             $includeSchema = !array_key_exists('include_schema', $arguments) || $arguments['include_schema'] === true;
@@ -247,7 +256,9 @@ final class McpProtocol
                 static fn(array $tool): array => self::inventoryPageEntry($tool, $includeSchema),
                 array_slice($tools, $offset, $limit)
             );
-            $gateway = self::execGateway($token);
+            // Reuse this capability's snapshot, not a process-wide catalog or another
+            // binding. A bound exact match is authoritative even on later pages.
+            $gateway = $exact && $total > 0 ? null : self::execGatewayIn($outer);
             if ($gateway !== null) {
                 $excluded = $inventory['bound_wire_names'];
                 $nestedOffset = max(0, $offset - $total);
@@ -256,7 +267,7 @@ final class McpProtocol
                 // Identify this catalog within native status headers, while keeping exact
                 // RPC retries on the same generated program and idempotency key.
                 $marker = 'rcmaker-tool-catalog:' . substr(hash_hmac('sha256', $callKey, $token), 0, 32) . ':';
-                $program = self::nestedCatalogProgram($query, $nestedOffset, $nestedLimit, $excluded, $marker);
+                $program = self::nestedCatalogProgram($query, $nestedOffset, $nestedLimit, $excluded, $marker, $exact);
                 $native = self::invokeResolvedTool($token, $gateway, $callKey, null, $program);
                 if (!empty($native['paused'])) {
                     // Recovery, a queued user update or checkpoint deliberately prevents new discovery.
@@ -293,7 +304,7 @@ final class McpProtocol
                     $page[] = $tool;
                 }
             }
-            $discovery = self::discoveryToolsForQuery($outer, $query, $includeSchema);
+            $discovery = $exact && $total > 0 ? [] : self::discoveryToolsForQuery($outer, $query, $includeSchema);
             return [
                 'tools' => $page,
                 'total' => $total,
@@ -973,7 +984,13 @@ AWK;
     /** The current Codex harness may expose all native tools only inside functions.exec. */
     private static function execGateway(string $token): ?array
     {
-        foreach (ToolBroker::inventory($token) as $tool) {
+        return self::execGatewayIn(ToolBroker::inventory($token));
+    }
+
+    /** Select only an advertised native exec from the already authorized request snapshot. */
+    private static function execGatewayIn(array $tools): ?array
+    {
+        foreach ($tools as $tool) {
             if (!is_array($tool) || empty($tool['freeform'])) continue;
             if (($tool['name'] ?? null) === 'exec'
                 && in_array($tool['namespace'] ?? null, [null, 'functions'], true)) return $tool;
@@ -1099,8 +1116,8 @@ AWK;
             . ' return normalized === bridge || normalized.endsWith("_" + bridge); }));';
     }
 
-    /** Emit one identified registry page, without executing any discovered tool. */
-    private static function nestedCatalogProgram(string $query, int $offset, int $limit, array $excluded, string $marker): string
+    /** Emit one identified registry page; exact names never match descriptions or similar tools. */
+    private static function nestedCatalogProgram(string $query, int $offset, int $limit, array $excluded, string $marker, bool $exact = false): string
     {
         $search = json_encode(self::inventorySearchPlan($query), JSON_THROW_ON_ERROR);
         $excludedJson = json_encode($excluded, JSON_THROW_ON_ERROR);
@@ -1110,7 +1127,9 @@ AWK;
             'const excluded = new Set(' . $excludedJson . ');',
             self::bridgeRegistryGuardProgram(),
             'const search = ' . $search . ';',
+            'const exactName = ' . json_encode($exact ? $query : null, JSON_THROW_ON_ERROR) . ';',
             'const matchScore = tool => {',
+            '  if (exactName !== null) return tool.name === exactName ? 10000 : 0;',
             '  const name = tool.name.toLowerCase();',
             '  const description = tool.description.toLowerCase();',
             '  if (!search.phrase) return 1;',
@@ -1406,12 +1425,16 @@ AWK;
             [
                 'name' => 'codex_tool_inventory',
                 'title' => 'Discover tools from the current Codex harness',
-                'description' => 'Search the exact tool registry supplied to the current outer Codex turn, including configured MCP/app tools.',
+                'description' => 'Search the tool registry supplied to the current outer Codex turn, including configured MCP/app tools. '
+                    . 'For a known wire_name, set query to that name and exact=true: an already bound tool returns its current schema without a native discovery call. '
+                    . 'Otherwise discovery still searches the current native nested registry. Reuse discovered definitions within this turn unless the runtime reports a capability change.',
                 'inputSchema' => [
                     '$schema' => 'http://json-schema.org/draft-07/schema#', 'type' => 'object',
                     'properties' => [
                         'turn_token' => $turnToken,
                         'query' => ['type' => 'string', 'maxLength' => 500],
+                        'exact' => ['type' => 'boolean', 'default' => false,
+                            'description' => 'Match query as a case-sensitive wire_name, not descriptive text. Requires a nonempty query. Default false preserves keyword search.'],
                         'offset' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 100000, 'default' => 0],
                         'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 50, 'default' => 20],
                         'include_schema' => ['type' => 'boolean', 'default' => true],
