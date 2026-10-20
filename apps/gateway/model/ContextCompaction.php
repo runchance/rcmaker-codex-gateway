@@ -1442,8 +1442,10 @@ final class ContextCompaction
      * Running replacement requires new human intent; terminal recovery accepts the exact
      * source, including a completed source fence whose summary was never submitted. Missing-page
      * replay remains on the original active scope. No rows mutate or authorize historical tools.
-     * A known pre-summary receipt rejection still requires complete byte-verified results;
-     * genuinely unknown source outcomes keep their independent completion-fence requirement.
+     * A known pre-summary receipt rejection, or an expired ordinary-chat source wait with
+     * a saved conversation, still requires complete byte-verified results. Its old token is
+     * revoked by the routing transaction before read-only recovery, never revived. Other
+     * unknown source outcomes keep their independent completion-fence requirement.
      * @param string $taskId Routed task whose owner is encoded in the request.
      * @param array $spec Complete normalized read-only checkpoint request.
      * @param bool $missingReplay Inspect only queued/running same-scope page recovery.
@@ -1526,16 +1528,26 @@ final class ContextCompaction
                 $failureCode = (string)($error['error']['code'] ?? '');
                 $knownReceiptFailure = $failureCode === 'compaction_context_incomplete'
                     && ($turn['error_code'] ?? '') === $failureCode;
-                if ((!$knownReceiptFailure && ($failureCode !== 'RECOVERY_OUTCOME_UNKNOWN'
+                $unsentOrdinaryTimeout = $failureCode === 'CHATGPT_RESPONSE_TIMEOUT'
+                    && ($turn['error_code'] ?? '') === $failureCode
+                    && (int) $turn['deadline_at'] > 0
+                    && (int) $job['finished_at'] >= (int) $turn['deadline_at'];
+                if ($unsentOrdinaryTimeout) {
+                    $chat = TaskWebChat::state($taskId);
+                    $unsentOrdinaryTimeout = $chat['mode'] === 'regular'
+                        && !empty($chat['conversation_id']) && !empty($chat['account_key']);
+                }
+                $knownUnsentFailure = $knownReceiptFailure || $unsentOrdinaryTimeout;
+                if ((!$knownUnsentFailure && ($failureCode !== 'RECOVERY_OUTCOME_UNKNOWN'
                         || ($turn['error_code'] ?? '') !== 'RECOVERY_OUTCOME_UNKNOWN'))
                     || (string) $turn['generation_id'] !== (string) $job['generation_id']
                     || !in_array($epoch['status'], ['needs_attention', 'retired'], true)
                     || !in_array($surface['status'], ['needs_attention', 'retired'], true)) return null;
-                // A receipt-comparison rejection cannot have submitted a summary: the
-                // no-send checks above and the exact receipt proof below must both pass.
-                // It can release its failed scope without pretending the model finished.
-                // Genuine unknown source outcomes still require their completion fence.
-                $settledSourceRequired = !$knownReceiptFailure;
+                // No-summary evidence above and exact delivered receipts below prove a
+                // read-only recovery boundary, not successful completion of the source.
+                // Ordinary empty-composer timeouts must not strand an unsent checkpoint;
+                // temporary chats and other unknown outcomes keep their existing fence.
+                $settledSourceRequired = !$knownUnsentFailure;
             }
         }
         $otherJobs = $db->table('gateway_response_jobs')->where('task_id', $taskId)->where('id', '<>', (string) $job['id'])
@@ -2072,28 +2084,39 @@ final class ContextCompaction
         if ($regularChat !== null && !is_array($activeSource)) {
             // A persistent conversation is the source even after Chrome closed its disposable tab.
             // Require the same canonical source proof; a mismatch cannot authorize a history replay.
-            if (!is_array($last) || $last['operation_kind'] !== 'response' || $last['round_kind'] !== 'text') {
-                throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint source could not be confirmed.', 409);
-            }
-            $known = json_decode((string) $last['context_json'], true, 128, JSON_THROW_ON_ERROR);
-            $known['messages'][] = ['role' => 'assistant', 'content' => (string) $last['output_text']];
+            // Source-waiting retirement has a separate proof issued only by the task router
+            // in this transaction, after receipt verification and capability revocation.
+            $recovery = $spec['regular_compaction_recovery'] ?? null;
+            $recoveredSourceId = is_array($recovery)
+                && !empty($recovery['source_response_id'])
+                && ($recovery['source_response_id'] ?? null) === ($spec['regular_recovery_source_response_id'] ?? null)
+                && hash_equals((string) ($recovery['context_sha256'] ?? ''),
+                    hash('sha256', (string) ($spec['full_context_json'] ?? $spec['context_json'])))
+                ? (string) $recovery['source_response_id'] : null;
             $requested = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
-            // Native Responses may annotate the exact just-completed answer as final_answer.
-            // Its phase is transport metadata; preserve every earlier record and all tool receipts.
-            $answerIndex = count($known['messages']) - 1;
-            if (($requested['messages'][$answerIndex]['role'] ?? '') === 'assistant'
-                && ($requested['messages'][$answerIndex]['phase'] ?? '') === 'final_answer'
-                && ($requested['messages'][$answerIndex]['content'] ?? null) === $last['output_text']) {
-                unset($requested['messages'][$answerIndex]['phase']);
-            }
-            if (ContextHistory::canonical($known) !== ContextHistory::canonical($requested)) {
-                throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint history does not match the current task.', 409);
+            if ($recoveredSourceId === null) {
+                if (!is_array($last) || $last['operation_kind'] !== 'response' || $last['round_kind'] !== 'text') {
+                    throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint source could not be confirmed.', 409);
+                }
+                $known = json_decode((string) $last['context_json'], true, 128, JSON_THROW_ON_ERROR);
+                $known['messages'][] = ['role' => 'assistant', 'content' => (string) $last['output_text']];
+                // Native Responses may annotate the exact just-completed answer as final_answer.
+                // Its phase is transport metadata; preserve every earlier record and all tool receipts.
+                $answerIndex = count($known['messages']) - 1;
+                if (($requested['messages'][$answerIndex]['role'] ?? '') === 'assistant'
+                    && ($requested['messages'][$answerIndex]['phase'] ?? '') === 'final_answer'
+                    && ($requested['messages'][$answerIndex]['content'] ?? null) === $last['output_text']) {
+                    unset($requested['messages'][$answerIndex]['phase']);
+                }
+                if (ContextHistory::canonical($known) !== ContextHistory::canonical($requested)) {
+                    throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint history does not match the current task.', 409);
+                }
             }
             $spec['prompt'] = self::prompt(ContextHistory::canonical($requested), true);
             $spec['verified_compaction_source'] = true;
-            $spec['continuation_source_response_id'] = $last['id'];
+            $spec['continuation_source_response_id'] = $recoveredSourceId ?? $last['id'];
             $spec['budget']['regular_chat'] = ['task_id' => $taskId, 'conversation_id' => $regularChat['conversation_id'],
-                'request_hash' => $spec['request_hash'], 'source_response_id' => $last['id']];
+                'request_hash' => $spec['request_hash'], 'source_response_id' => $spec['continuation_source_response_id']];
             $spec['context_json'] = $spec['transport_context_json'] = ContextHistory::canonical(['version' => 3, 'system' => [], 'messages' => []]);
         }
         if (isset($spec['compact_id'])) return null;

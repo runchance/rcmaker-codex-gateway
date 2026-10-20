@@ -313,6 +313,7 @@ final class TaskLedger
      * Route a Codex conversation to its current task or open a fresh task after a verified retirement boundary.
      * The caller owns the response reservation transaction; browser sends and host effects never occur here.
      * Recovery-created tasks pin the saved mode or retain their own proven ordinary conversation binding.
+     * Retired source-only checkpoints carry a digest-bound, transaction-local proof into summary reservation.
      * @param array $spec Normalized request carrying the client, owner, branch and readable context.
      * @return array{spec:array,prepared:bool} Routed request and whether its full context is already prepared.
      * @throws GatewayError If ownership conflicts or the durable routing/retirement evidence cannot be saved.
@@ -531,6 +532,13 @@ final class TaskLedger
             if (is_array($sourceJob)) {
                 $spec['regular_recovery_source_response_id'] = $sourceJob['id'];
                 $spec['regular_recovery_source_task_id'] = $taskId;
+                if ($sourceWaitingSuperseded && $newCheckpoint) {
+                    // The same transaction proved every source receipt and revoked its
+                    // capability. The saved chat holds that source even though no final
+                    // assistant answer or successful checkpoint was ever produced.
+                    $spec['regular_compaction_recovery'] = ['source_response_id' => $sourceJob['id'],
+                        'context_sha256' => hash('sha256', (string) $spec['full_context_json'])];
+                }
             }
         }
         if ($precommitRetry || ($failedHandoffRecovered && $task['status'] === 'active') || $lateReceiptsRecovered) {

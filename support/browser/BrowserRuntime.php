@@ -6641,8 +6641,7 @@ JS;
                 return;
             }
             $session = $this->taskSessions[(string)$turn['session_id']] ?? [];
-            if (($snapshot['generation_running'] ?? null) === false
-                && ($snapshot['send_button_visible'] ?? null) === true
+            if (self::compactionSourceIdleControls($turn, $snapshot)
                 && (empty($session['submission_request_id']) || (!empty($session['submission_finished'])
                     && !empty($session['submission_failed']) && ($session['submission_canceled'] ?? null) === false))
                 && in_array($snapshot['error']['code'] ?? '', ['', 'CHATGPT_STOPPED_THINKING',
@@ -7704,6 +7703,24 @@ JS;
     }
 
     /**
+     * Recognize an idle composer for source-to-checkpoint handoff, never task completion.
+     * Ordinary ChatGPT replaces Send with Start voice when its composer is empty. The
+     * adapter proves that control belongs to the single visible composer; Stop still
+     * wins. Temporary chats retain their Send-only rule. Caller must also prove the
+     * exact document/owner, drained native work and stable idle before any handoff.
+     * @param array $turn Current task observer, including its persisted chat mode.
+     * @param array $snapshot Read-only controls from that task's fenced document.
+     * @return bool Whether the visible controls positively prove an idle composer.
+     */
+    private static function compactionSourceIdleControls(array $turn, array $snapshot): bool
+    {
+        return ($snapshot['generation_running'] ?? null) === false
+            && (($snapshot['send_button_visible'] ?? null) === true
+                || (($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                    && ($snapshot['recovery_idle_button_visible'] ?? null) === true));
+    }
+
+    /**
      * Drain accepted host receipts, stop the exact old generation, then request only a checkpoint.
      * This never reports the interrupted partial answer as completion of the human task.
      * After an owned Stop, confirm idle on the fenced document even if historical DOM groups change.
@@ -7787,12 +7804,13 @@ JS;
             }
             $turn = $this->chatGptTurns[$responseId];
             $read = WebModelPage::responseExpression((array)$turn['baseline_users'], (array)$turn['baseline_assistants'],
-                '', (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn));
+                '', (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), '',
+                ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
             $this->evaluateTask($responseId, $read, function ($readError, $snapshot) use ($responseId, $logicalResponseId, $revision): void {
                 if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
                 $closedSource = !empty($this->chatGptTurns[$responseId]['compaction_closed_source']);
                 if ($readError !== null || !is_array($snapshot) || !empty($snapshot['generation_running'])
-                    || ($closedSource && ($snapshot['send_button_visible'] ?? null) !== true)) {
+                    || ($closedSource && !self::compactionSourceIdleControls($this->chatGptTurns[$responseId], $snapshot))) {
                     $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
                     if ($closedSource && !empty($snapshot['generation_running'])) {
                         $this->chatGptTurns[$responseId]['compaction_closed_source'] = false;
