@@ -7960,9 +7960,13 @@ JS;
         }
         if ($health['error_code'] === 'CHATGPT_MESSAGE_STREAM_ERROR') {
             // The original HTTP stream failed while MCP tools continued. A drained empty
-            // Send state cannot change that into a successful/empty model final. Reuse the
-            // existing bounded recovery, which verifies and carries all confirmed receipts.
+            // idle state cannot change that into a successful/empty model final. Saved
+            // chats must enter the same durable Retry/refresh/resume path as DOM errors;
+            // their generic fresh-page fallback is intentionally forbidden by the ledger.
             $this->recordEmptyResponseObservation($responseId, 'empty_stream_recovery', $snapshot, $evidence, $health['candidate'], $now);
+            $recoverySnapshot = $snapshot;
+            $recoverySnapshot['error'] = ['code' => 'CHATGPT_MESSAGE_STREAM_ERROR'];
+            if ($this->recoverRegularTaskStream($responseId, $recoverySnapshot, true)) return true;
             if (!$this->retryTaskNetworkError($responseId, $snapshot)) {
                 $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_MESSAGE_STREAM_ERROR');
             }
@@ -8949,9 +8953,11 @@ JS;
      * composer may show Voice instead of Send, so an exact clickable native Retry is also
      * a terminal witness. Retry cannot authorize new host effects until short resume acceptance.
      * @param string $responseId Physical observer. @param array $snapshot Current fenced DOM observation.
+     * @param bool $settledEmptyStream A failed transport with stable empty idle UI and drained tools
+     *     has passed observeEmptyResponseSettlement; permits ordinary Voice idle under those proofs.
      * @return bool Whether ordinary recovery owns this poll; temporary and compact paths are unchanged.
      */
-    private function recoverRegularTaskStream(string $responseId, array $snapshot): bool
+    private function recoverRegularTaskStream(string $responseId, array $snapshot, bool $settledEmptyStream = false): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || ($turn['web_chat']['mode'] ?? 'temporary') !== 'regular'
@@ -8973,7 +8979,8 @@ JS;
         $nativeRetry = !empty($retry['available']) && !empty($retry['failure_id']) && !empty($retry['fingerprint']);
         if (($snapshot['generation_running'] ?? null) !== false
             || (empty($snapshot['send_button_visible']) && !$nativeRetry && empty($snapshot['completion_action_visible'])
-                && !(($stoppedThinking || ($state['stage'] ?? '') === 'retry') && !empty($snapshot['recovery_idle_button_visible'])))
+                && !(($stoppedThinking || ($state['stage'] ?? '') === 'retry' || $settledEmptyStream)
+                    && !empty($snapshot['recovery_idle_button_visible'])))
             || empty($snapshot['new_user_id']) || empty($snapshot['response_id'])
             || $snapshot['response_id'] !== ($turn['bound_assistant_id'] ?? '')
             || !$this->taskChatMatches($responseId, (string) ($snapshot['url'] ?? ''))) {
