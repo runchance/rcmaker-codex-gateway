@@ -7572,10 +7572,19 @@ JS;
                         && !$sourceTransportSettled,
                 ], $now);
             $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = $uiSettlement['observation'];
-            if ($activeCompact && $toolCapable && !empty($snapshot['generation_running']) && empty($snapshot['error'])) {
+            // A canceled source stream can keep serving tools after its answer is virtualized.
+            // Once a saved page is positively idle, compaction can acknowledge that idle state
+            // through the existing drained fence; it need not recover the old answer's DOM ID.
+            $cancelledCompactIdle = $activeCompact && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                && !empty($terminalSession['submission_finished']) && !empty($terminalSession['submission_failed'])
+                && ($terminalSession['submission_canceled'] ?? null) === true
+                && self::compactionSourceIdleControls($turn, $snapshot);
+            if ($activeCompact && $toolCapable && (!empty($snapshot['generation_running']) || $cancelledCompactIdle)
+                && empty($snapshot['error'])) {
                 // Keep all post-receipt/Retry evidence before Stop attempts. If its
                 // message witness cannot be proved, ordinary settlement still works.
                 $this->chatGptTurns[$responseId]['compaction_phase'] = 'stopping_source';
+                $this->chatGptTurns[$responseId]['compaction_idle_source'] = $cancelledCompactIdle;
                 $this->stopCompactionSource($responseId, $logicalResponseId);
                 return;
             }
@@ -8080,6 +8089,8 @@ JS;
      * This never reports the interrupted partial answer as completion of the human task.
      * After an owned Stop, confirm idle on the fenced document even if historical DOM groups change.
      * A failed source transport uses read-only idle confirmation and exact native checkpoint receipts.
+     * A canceled ordinary source may acknowledge idle without its virtualized message witness,
+     * but uses the normal fully delivered receipt fence and never clicks Stop or its confirmation.
      * @param string $responseId Physical source observer.
      * @param string $logicalResponseId Its currently reserved compact response.
      * @return void Polling retains the durable deadline and never cancels a host invocation.
@@ -8088,6 +8099,8 @@ JS;
     {
         if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
         $turn = $this->chatGptTurns[$responseId];
+        $idleSource = !empty($turn['compaction_idle_source'])
+            && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular';
         try {
             $closedSource = (!empty($turn['compaction_closed_source']) && !empty($turn['compaction_stop_clicked']))
                 || $this->compactionSourceTransportClosed($logicalResponseId,
@@ -8116,8 +8129,8 @@ JS;
             // a running generation still requires that witness inside userStopExpression, even without a click.
             $stopUnconfirmed = empty($turn['compaction_stop_clicked']);
             $expression = WebModelPage::userStopExpression((string)$surface['url'], $witnesses,
-                (array)$turn['baseline_users'], $stopUnconfirmed, !$closedSource && $stopUnconfirmed,
-                self::acceptedInitialUser($source, $surface), $turn['web_chat']['mode'] ?? 'temporary', false, true);
+                (array)$turn['baseline_users'], $stopUnconfirmed && !$idleSource, !$closedSource && $stopUnconfirmed && !$idleSource,
+                self::acceptedInitialUser($source, $surface), $turn['web_chat']['mode'] ?? 'temporary', false, !$idleSource);
         } catch (GatewayError $error) {
             if ($error->errorCode === 'STORAGE_BUSY') {
                 $this->scheduleTaskPoll($responseId, 1.0);
@@ -8136,6 +8149,7 @@ JS;
                 // a missing witness turn into a permanently latched stopping phase.
                 if (empty($this->chatGptTurns[$responseId]['compaction_stop_clicked'])) {
                     $this->chatGptTurns[$responseId]['compaction_phase'] = null;
+                    unset($this->chatGptTurns[$responseId]['compaction_idle_source']);
                 }
                 $this->scheduleTaskPoll($responseId, 0.25);
                 return;
@@ -8144,9 +8158,11 @@ JS;
             if (!empty($state['generation_running']) || empty($state['editor_ready'])) {
                 $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
                 if (!empty($state['generation_running']) && empty($state['stopped'])
-                    && !empty($this->chatGptTurns[$responseId]['compaction_closed_source'])) {
+                    && (!empty($this->chatGptTurns[$responseId]['compaction_closed_source'])
+                        || !empty($this->chatGptTurns[$responseId]['compaction_idle_source']))) {
                     $this->chatGptTurns[$responseId]['compaction_closed_source'] = false;
                     $this->chatGptTurns[$responseId]['compaction_phase'] = null;
+                    unset($this->chatGptTurns[$responseId]['compaction_idle_source']);
                 }
                 $this->scheduleTaskPoll($responseId, 0.25);
                 return;
@@ -8164,12 +8180,14 @@ JS;
             $this->evaluateTask($responseId, $read, function ($readError, $snapshot) use ($responseId, $logicalResponseId, $revision): void {
                 if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
                 $closedSource = !empty($this->chatGptTurns[$responseId]['compaction_closed_source']);
+                $idleSource = !empty($this->chatGptTurns[$responseId]['compaction_idle_source']);
                 if ($readError !== null || !is_array($snapshot) || !empty($snapshot['generation_running'])
-                    || ($closedSource && !self::compactionSourceIdleControls($this->chatGptTurns[$responseId], $snapshot))) {
+                    || (($closedSource || $idleSource) && !self::compactionSourceIdleControls($this->chatGptTurns[$responseId], $snapshot))) {
                     $this->chatGptTurns[$responseId]['compaction_stop_idle_since'] = null;
-                    if ($closedSource && !empty($snapshot['generation_running'])) {
+                    if (($closedSource || $idleSource) && !empty($snapshot['generation_running'])) {
                         $this->chatGptTurns[$responseId]['compaction_closed_source'] = false;
                         $this->chatGptTurns[$responseId]['compaction_phase'] = null;
+                        unset($this->chatGptTurns[$responseId]['compaction_idle_source']);
                     }
                     $this->scheduleTaskPoll($responseId, 0.25);
                     return;
@@ -8246,6 +8264,7 @@ JS;
     {
         if (!isset($this->chatGptTurns[$responseId])) return;
         $this->chatGptTurns[$responseId]['compaction_source_answer'] = $sourceAnswer;
+        unset($this->chatGptTurns[$responseId]['compaction_idle_source']);
         $this->chatGptTurns[$responseId]['compaction_repair_used'] = false;
         $this->chatGptTurns[$responseId]['compaction_baseline_since'] = microtime(true);
         $this->chatGptTurns[$responseId]['compaction_phase'] = 'baseline';
