@@ -1076,7 +1076,7 @@ final class ToolBroker
                 // Only exact existing IDs above may reuse receipts until the gateway's
                 // same-chat resume contract is visibly accepted.
                 return ['ok'=>true, 'paused'=>true,
-                    'instruction'=>'The gateway is reconciling this stopped Web response. This new action was not registered or executed. Existing call_id receipts remain available. Do not create replacement actions or claim completion; end this recovery response and wait for the gateway resume message.'];
+                    'instruction'=>'The gateway is reconciling this stopped Web response. This new action was not registered or executed. Existing call_id receipts remain available. Do not create replacement actions or claim completion; end this recovery response and wait for the gateway resume message. This pause applies only to the interrupted response; a later gateway resume message supersedes it.'];
             }
             $turn = $db->table('gateway_task_turns')->where('id', $binding['turn_id'])->find();
             if (is_array($turn) && ($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
@@ -3758,7 +3758,8 @@ final class ToolBroker
      * @param string $responseId Current ordinary native response owning the live capability.
      * @param string $marker Durable continuation marker reserved by TaskLedger.
      * @param bool $audit Request an evidence audit of the existing task.
-     * @param bool $streamRecovery Reconcile a failed stream or settled empty tool response, respecting human pause/cancellation.
+     * @param bool $streamRecovery Reconcile a failed stream or settled empty tool response, respecting human pause/cancellation;
+     *     a saved-chat resume explicitly supersedes the interrupted response's recovery-only pause.
      * @return string Bounded contract containing exactly the current tool token and continuation intent.
      * @throws GatewayError If the live binding or its original verified token cannot be recovered.
      */
@@ -3784,15 +3785,20 @@ final class ToolBroker
         }
         $tokens = array_values($tokens);
         if (count($tokens) !== 1) throw new GatewayError('continuation_token_missing', '无法核对当前工具令牌，已停止网页续做。', 409);
+        $regularResume = $streamRecovery && TaskWebChat::state((string)$job['task_id'])['mode'] === 'regular';
         $purpose = $streamRecovery
             ? 'The prior webpage response stopped before this Codex task was settled. All accepted host calls and their exact results have now settled. Check the actual latest human goal, including steering instructions, and the confirmed receipts; continue only the remaining authorized work. If the work is already complete, give its verified final answer. If the human paused or cancelled it, acknowledge that and do not resume development. '
             : ($audit
             ? 'Your preceding answer followed several host-tool calls. Before closing this same Codex turn, audit EVERY outcome requested by the latest human user against actual native tool receipts and verification. If any authorized item is missing, continue implementing and testing it now; if all are complete, give the final answer with concrete evidence. '
             : 'Your preceding answer explicitly left authorized work unfinished. Continue that original task now in its original workspace and scope. ');
         return $marker . "\nThis message continues the SAME active Codex user turn. " . $purpose
+            . ($regularResume ? 'This is the gateway resume message and supersedes any earlier recovery-pause instruction for the interrupted response. Do not wait for another context-restoration message. '
+                : '')
             . 'Use the attached RCMAKER Connector and current verified native tools; '
             . 'use turn_token ' . $tokens[0] . ' for every Connector call. Inspect prior successful tool receipts before editing; do not repeat already completed or uncertain host effects. '
-            . ($streamRecovery ? 'Use codex_tool_inventory/codex_tool_call to read rcmaker.context_read when prior details or receipts are missing from this page; do not infer missing results from promises. ' : '')
+            . ($streamRecovery ? ($regularResume
+                ? 'When prior details or receipts are missing from this page, discover the same-task reader with codex_tool_inventory(query="rcmaker.context_read", exact=true), then invoke that returned wire_name through codex_tool_call. Use its actual records, not promises; an empty unrelated catalog search is not evidence that the connection is unavailable. '
+                : 'Use codex_tool_inventory/codex_tool_call to read rcmaker.context_read when prior details or receipts are missing from this page; do not infer missing results from promises. ') : '')
             . 'Finish outstanding implementation and run relevant verification in this turn. Send intermediate visible progress as you work. '
             . 'Do not end with another promise of future work. If a real blocker remains, report its exact evidence and remaining work. '
             . 'Respect any original planning-only or deferred phase boundary. Do not quote this continuation marker to the Codex user.';

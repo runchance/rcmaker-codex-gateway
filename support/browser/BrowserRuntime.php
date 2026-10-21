@@ -5542,7 +5542,9 @@ JS;
                     if ($error !== null || !is_array($state) || empty($state['ok'])) {
                         if (microtime(true) < $deadline) {
                             Timer::add(0.5, fn() => $read($keyIndex, $attempt, false), null, false);
-                        } else $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', '选择工具连接器前无法清空 ChatGPT 编辑器。');
+                        } else $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED',
+                            '选择工具连接器前无法清空 ChatGPT 编辑器。'
+                            . self::connectorClearFailureDetail($error, $state, $keyIndex, $attempt));
                         return;
                     }
                     $url = (string)($state['url'] ?? '');
@@ -5576,14 +5578,18 @@ JS;
                         && ($empty || str_starts_with('@RCMAKER', $text) || str_starts_with('@codex', $text)
                             || preg_match('/\A(?:@RCMAKER|@codex)+\z/D', $text) === 1);
                     if (($searchOnly && !$searchDraft) || $attempt >= 3 || microtime(true) >= $deadline) {
-                        $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', 'ChatGPT 中存在上次遗留草稿，且无法安全清空。');
+                        $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED',
+                            'ChatGPT 中存在上次遗留草稿，且无法安全清空。'
+                            . self::connectorClearFailureDetail(null, $state, $keyIndex, $attempt));
                         return;
                     }
                     if ($keyIndex < 0) { $read(0, $attempt); return; }
                     // Escape closes stale autocomplete; native Select All/Backspace updates persisted editor state.
                     $nativeKeys = ['Escape', PHP_OS_FAMILY === 'Darwin' ? 'Command+A' : 'Control+A', 'Backspace'];
                     if (empty($state['focused']) || ($keyIndex === 2 && empty($state['selection_inside']))) {
-                        $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', '选择工具连接器前无法清空 ChatGPT 编辑器。');
+                        $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED',
+                            '选择工具连接器前无法清空 ChatGPT 编辑器。'
+                            . self::connectorClearFailureDetail(null, $state, $keyIndex, $attempt));
                         return;
                     }
                     $this->dispatchTaskKey($responseId, $nativeKeys[$keyIndex],
@@ -5597,6 +5603,37 @@ JS;
                 }, 15.0);
         };
         $read();
+    }
+
+    /** Explain a failed native cleanup using only machine codes, counts and flags; never draft/exception text. */
+    private static function connectorClearFailureDetail(?array $error, mixed $state, int $keyIndex, int $attempt): string
+    {
+        $facts = ['key_index'=>$keyIndex, 'attempt'=>$attempt];
+        if ($error !== null) {
+            $facts['reason'] = 'CDP_ERROR';
+            if (is_numeric($error['code'] ?? null)) $facts['cdp_code'] = (int)$error['code'];
+            if (in_array($error['message'] ?? '', ['BROWSER_CDP_TIMEOUT','BROWSER_CDP_DISCONNECTED','TASK_SURFACE_MISSING'], true)) {
+                $facts['reason'] = $error['message'];
+            }
+        } elseif (!is_array($state)) $facts['reason'] = 'INVALID_OBSERVATION';
+        else {
+            $facts['reason'] = in_array($state['code'] ?? '',
+                ['CHATGPT_EDITOR_MISSING','CHATGPT_EDITOR_NOT_READY','CHATGPT_EDITOR_OBSERVATION_FAILED'], true)
+                ? $state['code'] : (!empty($state['ok']) ? 'NATIVE_CLEAR_NOT_CONFIRMED' : 'INVALID_OBSERVATION');
+            foreach (['composer_count','connector_count'] as $key) {
+                if (isset($state[$key]) && is_numeric($state[$key])) $facts[$key] = max(0, min(999, (int)$state[$key]));
+            }
+            foreach (['generation_running','disabled','read_only','aria_disabled','editable','focused','selection_inside'] as $key) {
+                if (isset($state[$key]) && is_bool($state[$key])) $facts[$key] = (int)$state[$key];
+            }
+            if (isset($state['text']) && is_string($state['text'])) $facts['draft_bytes'] = strlen($state['text']);
+            if (in_array($state['exception_name'] ?? '', ['Error','TypeError','ReferenceError','RangeError','SyntaxError',
+                'DOMException','SecurityError','InvalidStateError','NotSupportedError','AbortError'], true)) {
+                $facts['exception_name'] = $state['exception_name'];
+            }
+        }
+        return ' [' . implode(', ', array_map(static fn($key, $value) => $key . '=' . $value,
+            array_keys($facts), array_values($facts))) . ']';
     }
 
     /** Observe one preparation document; delayed menu callbacks cannot touch its refreshed replacement. */

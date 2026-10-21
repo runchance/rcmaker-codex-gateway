@@ -754,11 +754,12 @@ JS);
      * Read the unique idle composer before native draft cleanup in a saved chat.
      * @param bool $focus Focus that composer without editing its controlled state.
      * @param array $expected Optional exact URL and latest staged ACK, checked before any focus.
-     * @return string CDP expression returning draft/selection facts, never conversation text.
+     * @return string CDP expression returning draft/selection facts and bounded failure diagnostics,
+     *     never conversation text or exception messages. Exceptions remain a failed observation.
      */
     public static function connectorComposerStateExpression(bool $focus = false, array $expected = []): string
     {
-        return self::wrap(str_replace(['__FOCUS__', '__EXPECTED__'], [$focus ? 'true' : 'false',
+        $expression = self::wrap(str_replace(['__FOCUS__', '__EXPECTED__'], [$focus ? 'true' : 'false',
             json_encode($expected, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)], <<<'JS'
 const expected=__EXPECTED__;
 if(expected.url&&String(location.href)!==expected.url)return {ok:false,code:'CHATGPT_CHAT_IDENTITY_CHANGED'};
@@ -768,19 +769,28 @@ if(expected.stage_ack){
         return {ok:false,code:'CHATGPT_CHAT_IDENTITY_CHANGED'};
 }
 const composers=[...document.querySelectorAll(COMPOSER)].filter(visible);
-if(composers.length!==1)return {ok:false,code:'CHATGPT_EDITOR_MISSING'};
+if(composers.length!==1)return {ok:false,code:'CHATGPT_EDITOR_MISSING',composer_count:composers.length};
 const composer=composers[0];
-if(generationStop())return {ok:false,code:'CHATGPT_EDITOR_NOT_READY'};
-if(composer.disabled||composer.readOnly||composer.getAttribute('aria-disabled')==='true'
-    ||(!('value' in composer)&&!composer.isContentEditable))return {ok:false,code:'CHATGPT_EDITOR_NOT_READY'};
+const facts={composer_count:1,generation_running:!!generationStop(),disabled:!!composer.disabled,
+    read_only:!!composer.readOnly,aria_disabled:composer.getAttribute('aria-disabled')==='true',
+    editable:'value' in composer||composer.isContentEditable};
+if(facts.generation_running||facts.disabled||facts.read_only||facts.aria_disabled||!facts.editable)
+    return {ok:false,code:'CHATGPT_EDITOR_NOT_READY',...facts};
 if(__FOCUS__)composer.focus();
 const selection=getSelection(),inside='value' in composer
     ?document.activeElement===composer
     :!!selection&&composer.contains(selection.anchorNode)&&composer.contains(selection.focusNode);
-return {ok:true,url:String(location.href),focused:document.activeElement===composer,selection_inside:inside,
+return {ok:true,...facts,url:String(location.href),focused:document.activeElement===composer,selection_inside:inside,
     text:composerText(composer),
     connector_count:composer.querySelectorAll('[data-id^="plugin:"],[app-mention-path^="app://"],[data-prompt-link-href^="app://"]').length};
 JS));
+        // Runtime.evaluate reports script exceptions separately from transport errors. Keep this
+        // reader's existing failure behavior while retaining a safe reason instead of losing it.
+        return '(function(){try{return ' . $expression . ';}catch(error){return {ok:false,'
+            . 'code:"CHATGPT_EDITOR_OBSERVATION_FAILED",exception_name:'
+            . '["Error","TypeError","ReferenceError","RangeError","SyntaxError","DOMException",'
+            . '"SecurityError","InvalidStateError","NotSupportedError","AbortError"].includes(error?.name)'
+            . '?error.name:"Error"};}})()';
     }
 
     /**
