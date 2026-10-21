@@ -1145,7 +1145,7 @@ final class TaskLedger
                 }
                 $updated = $db->table('gateway_task_turns')->where('id', $existingTurn['id'])->where('status', (string) $existingTurn['status'])->update($nextValues);
                 if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable', '下一 Response Round 无法登记。', 503);
-                if ($steeringRestart && !empty($spec['steering_delta'])) {
+                if ($steeringRestart && !empty($spec['steering_delta']) && empty($spec['receipt_model_switch'])) {
                     // Fence the old observer immediately, retaining only its physical document.
                     $fence = (int) $surface['fencing_version'] + 1;
                     $claimed = $db->table('gateway_browser_surfaces')->where('id', $surface['id'])
@@ -1332,7 +1332,7 @@ final class TaskLedger
         ]);
     }
 
-    /** A proven native human or mailbox revision owns a fresh physical page in the same Codex turn. */
+    /** A proven revision rotates its epoch; model handoffs may transfer the task's owned saved-chat page. */
     private static function rotateContextSurfaceUnlocked(array $spec, string $responseId, array $task,
         array $turn, array $surface, int $roundNo, string $generationId, int $now, string $sourceResponseId): array
     {
@@ -1356,27 +1356,37 @@ final class TaskLedger
         $last = $db->table('gateway_task_epochs')->where('task_id', (string) $task['id'])
             ->order([['epoch_no', 'DESC']])->limit(1)->find();
         $newEpochId = 'epoch_' . bin2hex(random_bytes(12));
+        $modelSwitch = !empty($spec['receipt_model_switch']);
+        $leaseKey = (string) ($modelSwitch ? $spec['browser_lease_key'] : $surface['lease_key']);
         if (!$db->table('gateway_task_epochs')->add([
             'id' => $newEpochId, 'task_id' => (string) $task['id'],
             'epoch_no' => (int) ($last['epoch_no'] ?? $epoch['epoch_no']) + 1,
-            'lease_key' => (string) $surface['lease_key'], 'model' => (string) $epoch['model'],
-            'reasoning_effort' => $epoch['reasoning_effort'],
+            'lease_key' => $leaseKey, 'model' => (string) ($modelSwitch ? $spec['model'] : $epoch['model']),
+            'reasoning_effort' => $modelSwitch ? ($spec['reasoning_effort'] ?? null) : $epoch['reasoning_effort'],
             'compaction_epoch' => (string) $epoch['compaction_epoch'],
             'status' => 'active', 'created_at' => $now,
         ])) throw new GatewayError('storage_unavailable', '中途指令无法创建新上下文代次。', 503);
         $newSurfaceId = 'surf_' . bin2hex(random_bytes(12));
         if (!$db->table('gateway_browser_surfaces')->add([
             'id' => $newSurfaceId, 'task_id' => (string) $task['id'], 'epoch_id' => $newEpochId,
-            'lease_key' => (string) $surface['lease_key'], 'status' => 'reserved',
+            'lease_key' => $leaseKey, 'status' => 'reserved',
             'generation' => 1, 'document_nonce' => bin2hex(random_bytes(12)),
             'owner_incarnation' => 'unclaimed', 'fencing_version' => 1,
             'created_at' => $now, 'updated_at' => $now,
         ])) throw new GatewayError('storage_unavailable', '中途指令无法创建新网页租约。', 503);
+        $newFence = 1;
+        if ($modelSwitch && !empty($spec['budget']['regular_chat'])) {
+            $targets = (array) \RC\Config::get('gateway', 'probe_targets');
+            TaskWebChat::transferPageUnlocked((string) $task['id'], (string) $epoch['id'], $newSurfaceId,
+                (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'));
+            $transferred = $db->table('gateway_browser_surfaces')->where('id', $newSurfaceId)->find('fencing_version');
+            $newFence = (int) $transferred['fencing_version'];
+        }
         $turnUpdated = $db->table('gateway_task_turns')->where('id', (string) $turn['id'])
             ->where('response_id', $responseId)->update([
                 'epoch_id' => $newEpochId, 'surface_id' => $newSurfaceId,
                 'generation_id' => $generationId, 'status' => 'queued',
-                'owner_incarnation' => 'unclaimed', 'fencing_version' => 1,
+                'owner_incarnation' => 'unclaimed', 'fencing_version' => $newFence,
                 'submit_intent_at' => null, 'submitted_at' => null, 'committed_at' => null,
                 'retired_at' => null, 'error_code' => null, 'updated_at' => $now,
             ]);

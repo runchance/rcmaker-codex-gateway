@@ -154,7 +154,9 @@ final class ResponseJob
             // Prove that receipt and acknowledge its original submission before reserving the next
             // round; later validation failures roll back both changes in this same transaction.
             ToolBroker::acknowledgeHostReceiptUnlocked($spec);
-            $spec = QuestionReply::prepareUnlocked($spec);
+            // Even a question answer needs a new generation when the human selected
+            // another model; sending it only to the old MCP waiter would lose that choice.
+            if (empty($spec['receipt_model_switch'])) $spec = QuestionReply::prepareUnlocked($spec);
             $spec = SteeringContext::deferToolsUnlocked($spec);
             if (!empty($spec['operational_context_source_response_id'])) {
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
@@ -190,7 +192,8 @@ final class ResponseJob
             // remain queued at browser dispatch rather than failing their HTTP admission.
             // Historical tool outputs are normalized above. Only an actual receipt for this
             // task's pending invocation may continue without rediscovering the account catalog.
-            if (($spec['tool_outputs'] ?? []) === [] && empty($spec['steering_restart'])) {
+            if ((($spec['tool_outputs'] ?? []) === [] && empty($spec['steering_restart']))
+                || !empty($spec['receipt_model_switch'])) {
                 $route = ModelCatalog::resolveForOperation($spec['model'], $spec['reasoning_effort'] ?? null,
                     (string) ($spec['operation_kind'] ?? 'response'));
                 $outputControl = (array)($spec['budget']['output_control'] ?? []);
@@ -384,7 +387,8 @@ final class ResponseJob
                 throw new GatewayError('storage_unavailable', 'Responses 请求无法保存。', 503);
             }
             AttachmentStore::bindResponseUnlocked($responseId, $attachments);
-            if (!empty($spec['steering_restart']) && (array) ($spec['steering_messages'] ?? []) !== []
+            if (((!empty($spec['steering_restart']) && (array) ($spec['steering_messages'] ?? []) !== [])
+                || !empty($spec['budget']['deferred_model_selection']))
                 && !empty($spec['steering_native_turn_id'])) {
                 TaskLedger::recordSteeringNativeTurnUnlocked($responseId, (string) $spec['steering_native_turn_id']);
             }

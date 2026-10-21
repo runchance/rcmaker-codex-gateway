@@ -278,6 +278,50 @@ final class ContextHistory
     }
 
     /**
+     * Separate an exact receipt's source model from a proven human selection for the next generation.
+     * Deferred selections live in the source job's budget until its queued human revision can run.
+     * @param array $spec History-prepared request with fresh and queued human records already identified.
+     * @param array $prior Exact task-owned tool-call response, inside the reservation transaction.
+     * @param bool $freshSteering Whether this request itself supplies a new human revision.
+     * @return array Request selecting a new generation, or the unchanged pinned receipt.
+     * @throws GatewayError When a bare receipt or compaction attempts to change model scope.
+     */
+    private static function prepareReceiptModelSelection(array $spec, array $prior, bool $freshSteering): array
+    {
+        $selection = $spec['budget']['deferred_model_selection'] ?? null;
+        $hasHuman = ($spec['steering_messages'] ?? []) !== [];
+        $responseOperation = ($spec['operation_kind'] ?? 'response') === 'response';
+        $sameSource = $prior['model'] === $spec['model']
+            && $prior['reasoning_effort'] === ($spec['reasoning_effort'] ?? null);
+        if ($responseOperation && $hasHuman && !$freshSteering && is_array($selection)) {
+            // A later batch may carry only its own results. The saved human choice, not
+            // an arbitrary model on that bare receipt, authorizes the eventual handoff.
+            if (!$sameSource && ($selection['model'] !== $spec['model']
+                || $selection['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null))) {
+                throw new GatewayError('tool_result_scope_mismatch', '工具回执必须使用发起该调用时的模型和档位。', 409);
+            }
+            $spec['model'] = $selection['model'];
+            $spec['reasoning_effort'] = $selection['reasoning_effort'];
+            $spec['browser_lease_key'] = $selection['browser_lease_key'];
+            if (CodexCancellation::uuid((string) ($selection['native_turn_id'] ?? ''))) {
+                $spec['steering_native_turn_id'] = $selection['native_turn_id'];
+            }
+        }
+        $changed = $prior['model'] !== $spec['model']
+            || $prior['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null);
+        if ($changed) {
+            if (!$responseOperation || !$hasHuman || (!$freshSteering && !is_array($selection))) {
+                throw new GatewayError('tool_result_scope_mismatch', '工具回执必须使用发起该调用时的模型和档位。', 409);
+            }
+            // The broker still verifies the original task, capability, complete batch,
+            // output types, immutable result hashes and execution environment.
+            $spec['receipt_model_switch'] = true;
+        }
+        if ($responseOperation && $hasHuman) unset($spec['budget']['deferred_model_selection']);
+        return $spec;
+    }
+
+    /**
      * Convert text-only message blocks; reject attachments and unsupported parts without altering them.
      * @param mixed $content A string or ordered input_text/output_text/text blocks.
      * @return string Readable text with block boundaries preserved as newlines.
@@ -630,9 +674,6 @@ final class ContextHistory
         if (($spec['tool_outputs'] ?? []) !== []) {
             $prior = $db->table('gateway_response_jobs')->where('id', $previous)->find();
             if (is_array($prior) && $prior['task_id'] === $taskId && $prior['round_kind'] === 'tool_call') {
-                if ($prior['model'] !== $spec['model'] || $prior['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)) {
-                    throw new GatewayError('tool_result_scope_mismatch', '工具回执必须使用发起该调用时的模型和档位。', 409);
-                }
                 // Codex retains its original metadata turn_id after auto-compaction;
                 // the exact locally issued call belongs to the new ledger turn.
                 if (str_starts_with((string) ($prior['turn_id'] ?? ''), 'postcompact_')) {
@@ -640,8 +681,11 @@ final class ContextHistory
                 }
                 $sourceTurn = $db->table('gateway_task_turns')->where('id', $prior['durable_turn_id'])->find();
                 if (is_array($sourceTurn) && $sourceTurn['response_id'] === $prior['id']
-                    && ($sourceTurn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
-                    // A new native turn may carry the exact receipt for work accepted before Stop.
+                    && (($sourceTurn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS'
+                        || ($incomingNativeTurn !== (string) $prior['turn_id'] && CodexCancellation::uuid($incomingNativeTurn)
+                            && TaskLedger::cancellationNativeTurn(['job' => $prior, 'turn' => $sourceTurn]) === $incomingNativeTurn))) {
+                    // A stopped or proven rejoined native turn still returns receipts to
+                    // its original durable turn. An unrelated UUID cannot claim that alias.
                     $spec['turn_id'] = (string) $prior['turn_id'];
                 }
                 // A receipt belongs to an already executing physical turn, including its budget.
@@ -658,6 +702,7 @@ final class ContextHistory
                 $round = self::compile(array_merge($response['output'] ?? [], $spec['tool_outputs']), '');
                 $priorFull = json_decode((string) $prior['context_json'], true, 128, JSON_THROW_ON_ERROR);
                 $steering = self::toolRoundSteering($context, $priorFull, $spec['tool_outputs']);
+                $freshSteering = $steering !== [];
                 if ($steering !== [] && CodexCancellation::uuid($incomingNativeTurn)) {
                     $spec['steering_native_turn_id'] = $incomingNativeTurn;
                 }
@@ -683,6 +728,7 @@ final class ContextHistory
                     $spec['operational_context_event_ids'] = $pending['event_ids'];
                 }
                 $spec['steering_messages'] = $steering;
+                $spec = self::prepareReceiptModelSelection($spec, $prior, $freshSteering);
                 if ($steering !== []) {
                     $spec['turn_id'] = (string) $prior['turn_id'];
                     TaskLedger::supersedeDeferredStopUnlocked($prior);

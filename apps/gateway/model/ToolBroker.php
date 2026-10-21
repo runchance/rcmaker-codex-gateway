@@ -76,6 +76,8 @@ final class ToolBroker
      * when the DOM poll is late. Connector arrival alone never supplies this proof. The caller must
      * own the short response-reservation transaction so every later admission failure rolls back
      * this acknowledgement together with the new round; no Web message or host call is replayed.
+     * A history-proven human model change still acknowledges the original issued batch;
+     * it does not change that batch's identity or authorize a bare receipt to switch models.
      *
      * @param array $spec Routed, history-prepared request carrying the original issued call IDs.
      * @return void Unrelated requests and already acknowledged turns keep their existing behavior.
@@ -92,8 +94,8 @@ final class ToolBroker
         if (!is_array($source) || (string) $source['task_id'] !== $taskId
             || (string) $source['status'] !== 'completed' || (string) $source['round_kind'] !== 'tool_call'
             || (string) $source['operation_kind'] !== 'response'
-            || (string) $source['model'] !== (string) $spec['model']
-            || ($source['reasoning_effort'] ?? null) !== ($spec['reasoning_effort'] ?? null)
+            || (empty($spec['receipt_model_switch']) && ((string) $source['model'] !== (string) $spec['model']
+                || ($source['reasoning_effort'] ?? null) !== ($spec['reasoning_effort'] ?? null)))
             || (string) ($source['turn_id'] ?? '') !== (string) ($spec['turn_id'] ?? '')
             || empty($source['submit_intent_at']) || empty($source['submitted_document_nonce'])
             || empty($source['mcp_binding_id'])) return;

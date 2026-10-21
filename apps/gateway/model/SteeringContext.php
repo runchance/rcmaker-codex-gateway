@@ -33,6 +33,18 @@ final class SteeringContext
         // This request must still return the next queued batch. Do not alias its identity to
         // the old batch, and do not mark the deferred human records as already attached.
         TaskLedger::queueOperationalContextUnlocked($source, $updates, $spec['request_hash'], null, false, true, false);
+        if (!empty($spec['receipt_model_switch'])) {
+            // Drain previously accepted batches under their physical source model. Keep
+            // the human's next selection durable across receipt-only requests and restarts.
+            $spec['budget']['deferred_model_selection'] = ['model' => $spec['model'],
+                'reasoning_effort' => $spec['reasoning_effort'] ?? null,
+                'browser_lease_key' => $spec['browser_lease_key'],
+                'native_turn_id' => $spec['steering_native_turn_id'] ?? null];
+            $spec['model'] = $source['model'];
+            $spec['reasoning_effort'] = $source['reasoning_effort'];
+            $spec['browser_lease_key'] = $source['browser_lease_key'];
+            unset($spec['receipt_model_switch']);
+        }
         $keys = array_fill_keys(array_map([ContextHistory::class, 'canonical'], $messages), true);
         foreach (['context_json', 'full_context_json', 'transport_context_json'] as $key) {
             if (empty($spec[$key])) continue;

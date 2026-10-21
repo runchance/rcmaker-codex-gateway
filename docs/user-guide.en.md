@@ -404,6 +404,8 @@ A standalone “Connection interrupted / Waiting for the full response” notice
 
 Both interjection delivery modes and continuation after a manual stop follow the intent-first order. Changes to goals, scope, priorities or constraints require a brief explanation of the adjustment before the remaining steps, preserving completed work that still applies. During executing work, after discussion or a side question, continue the still-applicable original task. A standalone discussion after execution ended does not restart it. An explicit stop ends new task actions, followed by a factual account of completed work, unfinished work and tools still settling. Respect explicit cancellations, replacements and investigation-only requests. Contracts do not accumulate each round or change tool receipts, context budgets or compaction.
 
+After selecting another Web model or reasoning level, send “Continue” or a new request. If that request also returns results from the previous model's tools, the gateway settles them under their original call identities first. Already accepted queued tools finish before the new selection takes over. Exact results are retained without replaying tools, and ordinary mode keeps the task's bound Web conversation. The selected model must be available to the signed-in Web account; a bare old tool receipt or compaction request cannot independently change its source model.
+
 ### Browser workspace
 
 The workspace retains up to five task pages, labeled active/idle and managed by the gateway. At capacity, wait for work to release a page or close an idle page the interface permits you to close. **Closing a page and deleting a task record are different actions.**
