@@ -14,7 +14,7 @@ final class ToolBroker
 {
     /** A receipt worker gets one full RPC slice plus scheduling grace before it can be proven orphaned. */
     private const RECEIPT_ORPHAN_GRACE_SECONDS = 15;
-    private const CLOSED_WAIT_TRANSPORT_CODES = ['tool_wait_scope_changed', 'tool_receipt_transport_lost'];
+    private const CLOSED_WAIT_TRANSPORT_CODES = ['tool_wait_scope_changed', 'tool_receipt_transport_lost', 'tool_receipt_wait_closed'];
 
     private const BRIDGE_NAMES = [
         'codex_turn_start', 'codex_exec', 'codex_write_stdin', 'codex_apply_patch', 'codex_view_image',
@@ -1698,12 +1698,12 @@ final class ToolBroker
     }
 
     /**
-     * Seal only an expired receipt receiver whose child transport disappeared after native work settled.
+     * Seal an expired receipt receiver, or a completed receipt wait without a delivery acknowledgement.
      * The browser caller has already proved a stable, non-empty Web final. This method never acknowledges
      * result delivery and never replays a tool; it only turns an otherwise permanent activity fence into a
      * typed failed transport that the existing terminal path can close.
      *
-     * @return bool Whether at least one exact expired receipt activity was sealed atomically.
+     * @return bool Whether an exact undelivered receipt's closed wait was recorded atomically.
      */
     public static function sealExpiredReceiptTransportForResponse(string $responseId, string $answer,
         string $incarnation, int $fence): bool
@@ -1761,7 +1761,7 @@ final class ToolBroker
 
             $activities = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
                 ->where('status', 'active')->select();
-            if (!is_array($activities) || $activities === []) return false;
+            if (!is_array($activities)) return false;
             $now = time();
             $cutoff = $now - (int)ceil(McpProtocol::HOST_RPC_SLICE_MS / 1000)
                 - self::RECEIPT_ORPHAN_GRACE_SECONDS;
@@ -1777,26 +1777,41 @@ final class ToolBroker
                 }
                 if ($matched === null) return false;
                 $activityIds[] = (string)$activity['id'];
-                $orphanedCalls[$matched] = true;
+                $orphanedCalls[$matched] = 'tool_receipt_transport_lost';
             }
             foreach ($undelivered as $callId => $_call) {
-                if (!isset($knownFailures[$callId]) && !isset($orphanedCalls[$callId])) return false;
+                if (!isset($knownFailures[$callId]) && !isset($orphanedCalls[$callId])) {
+                    // A successful pending RPC also runs completeActivity in finally. Native
+                    // execution can finish afterwards, leaving no active receiver and no ACK.
+                    // Require the exact call-key receiver and a full quiet slice; a completed
+                    // unrelated activity or a fresh retry is never proof of a closed wait.
+                    $prefix = 'activity_receipt_' . hash('sha256', (string)$_call['call_key']) . '_';
+                    $closed = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                        ->where('status', 'completed')->where('id', 'LIKE', $prefix . '%')
+                        ->order([['created_at', 'DESC']])->limit(1)->find();
+                    if (!is_array($closed) || !str_starts_with((string)$closed['id'], $prefix)
+                        || (int)$closed['created_at'] > $cutoff
+                        || (int)$closed['updated_at'] > $resultCutoff) return false;
+                    $orphanedCalls[$callId] = 'tool_receipt_wait_closed';
+                }
                 if (isset($orphanedCalls[$callId])
                     && (empty($_call['completed_at']) || (int)$_call['completed_at'] > $resultCutoff)) return false;
             }
-
-            $updated = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
-                ->where('status', 'active')->where('id', 'IN', $activityIds)
-                ->update(['status' => 'completed', 'updated_at' => $now]);
-            if (!$updated || $updated->rowCount() !== count($activityIds)) {
-                throw new GatewayError('storage_unavailable', '过期工具回执活动无法原子收敛。', 503);
+            if ($orphanedCalls === []) return false;
+            if ($activityIds !== []) {
+                $updated = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                    ->where('status', 'active')->where('id', 'IN', $activityIds)
+                    ->update(['status' => 'completed', 'updated_at' => $now]);
+                if (!$updated || $updated->rowCount() !== count($activityIds)) {
+                    throw new GatewayError('storage_unavailable', '过期工具回执活动无法原子收敛。', 503);
+                }
             }
             self::bumpRevisionUnlocked((string)$binding['id']);
             foreach (array_keys($orphanedCalls) as $callId) {
                 if (isset($knownFailures[$callId])) continue;
                 $call = $undelivered[$callId];
                 self::eventUnlocked((string)$call['task_id'], (string)$call['turn_id'], (string)$call['response_id'],
-                    'tool_result_transport_failed', ['invocation_id'=>$callId, 'code'=>'tool_receipt_transport_lost']);
+                    'tool_result_transport_failed', ['invocation_id'=>$callId, 'code'=>$orphanedCalls[$callId]]);
             }
             return true;
         });

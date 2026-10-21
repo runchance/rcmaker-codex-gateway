@@ -876,13 +876,53 @@ final class BrowserRuntime
     {
         if (!$this->taskCdp->ready()) { $this->failCommand($commandId, 'BROWSER_NOT_READY', '浏览器控制连接尚未就绪。'); return; }
         (new BackgroundModelProbe($this->taskCdp, BrowserState::state(), function ($error, $capabilities) use ($commandId): void {
+            $ok = false;
+            $result = ['code'=>'MODEL_PROBE_FAILED', 'message'=>'后台模型检测暂未完成，保留原模型和额度记录。'];
             try {
-                if ($error instanceof GatewayError) { $this->failCommand($commandId, $error->errorCode, $error->getMessage()); return; }
+                if ($error instanceof GatewayError) {
+                    $result = ['code'=>$error->errorCode, 'message'=>$error->getMessage()];
+                    $this->settleBackgroundProbeCommand($commandId, false, $result);
+                    return;
+                }
                 \app\gateway\model\ModelCatalog::observe($capabilities);
                 $this->observeUsageAccount();
-                $this->finishCommand($commandId, ['models'=>\app\gateway\model\ModelCatalog::routes($capabilities)]);
-            } catch (\Throwable) { $this->failCommand($commandId, 'MODEL_PROBE_FAILED', '后台模型检测暂未完成，保留原模型和额度记录。'); }
+                $ok = true;
+                $result = ['models'=>\app\gateway\model\ModelCatalog::routes($capabilities)];
+            } catch (\Throwable $failure) {
+                self::recordQuietBrowserFailure('model_probe_observation', $failure);
+            }
+            $this->settleBackgroundProbeCommand($commandId, $ok, $result);
         }))->start(self::taskModelUrl());
+    }
+
+    /**
+     * Finish an isolated probe without allowing a transient SQLite failure to kill the browser
+     * event loop. Keep the command slot fenced while retrying the exact same terminal result;
+     * BrowserState::finish is conditional, so a terminal command also makes a late retry harmless.
+     */
+    private function settleBackgroundProbeCommand(int $commandId, bool $ok, array $result, int $attempt = 0): void
+    {
+        if ($this->stopping) return;
+        try {
+            BrowserState::finish($commandId, $ok, $result);
+            $this->commandBusy = false;
+        } catch (\Throwable $failure) {
+            if ($attempt === 0) self::recordQuietBrowserFailure('model_probe_terminal_retry', $failure);
+            $delays = [1.0, 3.0, 10.0, 30.0];
+            $delay = $delays[min($attempt, count($delays) - 1)];
+            Timer::add($delay, fn() => $this->settleBackgroundProbeCommand(
+                $commandId, $ok, $result, $attempt + 1), null, false);
+        }
+    }
+
+    /** Persist bounded browser diagnostics in the already exported file without polluting stdout. */
+    private static function recordQuietBrowserFailure(string $event, \Throwable $failure): void
+    {
+        $payload = json_encode(['event'=>$event, 'error'=>get_class($failure),
+            'file'=>basename($failure->getFile()), 'line'=>$failure->getLine()], JSON_UNESCAPED_UNICODE);
+        if (!is_string($payload)) return;
+        @file_put_contents((string) Config::get('gateway', 'browser_log_dir') . '/runtime-errors.log',
+            date('c') . ' ' . $payload . PHP_EOL, FILE_APPEND);
     }
 
     /** Observe the logged-in account controls without sending a message or changing its chosen model. */

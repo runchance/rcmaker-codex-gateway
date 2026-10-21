@@ -266,13 +266,17 @@ final class ResponseJob
             // incoming source remains stored separately as read-only evidence.
             $budgetAttachments = AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $budgetContext, false);
             $attachmentTokens = AttachmentStore::tokenReserve($budgetAttachments, $budget);
-            $inputTokens = ContextBudget::inputTokens($budgetContext, $budget, $attachmentTokens);
+            // The exact immutable budget context previously went through the tokenizer twice:
+            // once for usage and again for admission. Reuse that same count while retaining the
+            // original reporting, reserve and rejection rules.
+            $contextTokens = ContextBudget::tokens($budgetContext, $budget);
+            $inputTokens = ContextBudget::inputTokensFromCount($contextTokens, $budget, $attachmentTokens);
             // A genuine result continues the already-submitted Web generation. It must settle
             // before native auto-compaction can take ownership; it never uploads this full history.
             // prepareRoundUnlocked still proves the exact pending call/binding and rejects forged receipts.
             $receiptContinuation = (array) ($spec['tool_outputs'] ?? []) !== [] && empty($spec['steering_restart']);
             if (($spec['operation_kind'] ?? 'response') === 'response' && !$receiptContinuation) {
-                ContextBudget::validate($budgetContext, $budget, $attachmentTokens);
+                ContextBudget::validateTokens($contextTokens, $budget, $attachmentTokens);
             }
             if (($spec['operation_kind'] ?? 'response') !== 'response') {
                 $reuse = ContextCompaction::reserveUnlocked($spec, $responseId);

@@ -268,15 +268,12 @@ final class TaskMaintenance
         }
         $sql = DB('medoo', 'sqlite');
         $parameters = [':task'=>$taskId];
-        // While another task is working, release the writer after one response's heavy payload.
-        // Explicit idle cleanup keeps the whole-task path; retention always takes one response
-        // so a large old conversation cannot monopolize admission merely because the gateway is idle.
-        $otherWork = !$automatic && $sql->query('SELECT 1 FROM gateway_tasks t WHERE t.id<>:task AND (' . self::WORKING . ') LIMIT 1', $parameters)->fetchColumn() !== false;
-        $responseId = null;
-        if ($otherWork || $automatic) {
-            $responseId = $sql->query('SELECT id FROM gateway_response_jobs WHERE task_id=:task ORDER BY rowid DESC LIMIT 1', $parameters)->fetchColumn();
-            $responseId = is_string($responseId) ? $responseId : null;
-        }
+        // Every cleanup mode releases the writer after one response's payload. A manual
+        // all-idle request can own years of history even when no other task is currently
+        // running; deleting that whole task in one transaction starves browser/CDP state
+        // persistence. The durable deleting_rows item resumes the same task on later ticks.
+        $responseId = $sql->query('SELECT id FROM gateway_response_jobs WHERE task_id=:task ORDER BY rowid DESC LIMIT 1', $parameters)->fetchColumn();
+        $responseId = is_string($responseId) ? $responseId : null;
         GatewayUsage::archiveTaskUnlocked($taskId, $responseId);
         $jobWhere = 'task_id=:task' . ($responseId === null ? '' : ' AND id=:response');
         if ($responseId !== null) $parameters[':response'] = $responseId;

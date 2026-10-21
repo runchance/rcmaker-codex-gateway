@@ -255,14 +255,26 @@ final class ContextBudget
     /** Include the platform reserve in reported usage so the native trigger precedes rejection. */
     public static function inputTokens(string $text, array $budget, int $attachmentTokens = 0): int
     {
-        return self::tokens($text, $budget) + max(0, $attachmentTokens)
+        return self::inputTokensFromCount(self::tokens($text, $budget), $budget, $attachmentTokens);
+    }
+
+    /** Reuse an exact count made for the same immutable context and pinned budget. */
+    public static function inputTokensFromCount(int $contextTokens, array $budget, int $attachmentTokens = 0): int
+    {
+        return max(0, $contextTokens) + max(0, $attachmentTokens)
             + ((int) ($budget['version'] ?? 1) >= 2 ? (int) $budget['contract_reserve_tokens'] : 0);
     }
 
     /** Reject oversized full histories before a browser submission or SSE response begins. */
     public static function validate(string $context, array $budget, int $attachmentTokens = 0): int
     {
-        $count = self::tokens($context, $budget) + max(0, $attachmentTokens);
+        return self::validateTokens(self::tokens($context, $budget), $budget, $attachmentTokens);
+    }
+
+    /** Apply the unchanged capacity rule to an exact count already used for input reporting. */
+    public static function validateTokens(int $contextTokens, array $budget, int $attachmentTokens = 0): int
+    {
+        $count = max(0, $contextTokens) + max(0, $attachmentTokens);
         $capacity = min((int)$budget['context_tokens'], (int)($budget['browser_context_tokens'] ?? $budget['context_tokens']));
         if ($count + $budget['output_reserve_tokens'] + $budget['contract_reserve_tokens'] > $capacity) {
             throw new GatewayError('context_length_exceeded', '当前上下文超过所选账号、模型和扩展设置的预算，请先压缩上下文再继续。', 400);

@@ -23,6 +23,17 @@ final class BrowserTimezone
     private float $retryAt = 0.0;
     private int $retryAttempt = 0;
 
+    /**
+     * A renderer may be unable to service CDP while its JavaScript thread is busy or the browser
+     * worker is briefly waiting on shared storage. Keep this below the bounded browser-start
+     * budget, but do not turn the generic five-second RPC default into a false timezone failure.
+     */
+    private static function sessionCommandTimeout(): float
+    {
+        $startup = (float) Config::get('gateway', 'browser_start_timeout_seconds');
+        return max(15.0, min(30.0, $startup / 6.0));
+    }
+
     /** Accept IANA names, including UTC, rather than fixed offsets that lose daylight-saving rules.
      * @param string $timezone Candidate IANA identifier. @return bool Whether PHP recognizes the identifier.
      */
@@ -103,8 +114,7 @@ final class BrowserTimezone
                 if ($this->retryAt === 0.0) {
                     $this->retryAt = microtime(true) + [1, 3, 10, 30][min($this->retryAttempt++, 3)];
                     $failure = $this->error ?? reset($this->sessionErrors);
-                    error_log('[browser-timezone] ' . json_encode(['method'=>$failure['method'] ?? '',
-                        'code'=>$failure['code'] ?? 0, 'message'=>mb_substr((string) ($failure['message'] ?? ''), 0, 200)]));
+                    self::recordDiagnostic($failure);
                     throw new GatewayError('BROWSER_TIMEZONE_APPLY_FAILED', '浏览器时区控制暂未就绪，正在自动重新检查；也可返回第一步调整时区。', 503);
                 }
                 if (microtime(true) < $this->retryAt || $this->pending > 0 || !$this->client?->ready()) return false;
@@ -141,7 +151,8 @@ final class BrowserTimezone
             if (($event['method'] ?? '') !== 'Target.attachedToTarget') return;
             if (!in_array($event['params']['targetInfo']['type'] ?? '', ['page', 'iframe'], true)) {
                 // Workers inherit the renderer timezone but still need their debugger-start gate released.
-                $client->send('Runtime.runIfWaitingForDebugger', [], $session, static function (): void {});
+                $client->send('Runtime.runIfWaitingForDebugger', [], $session, static function (): void {},
+                    self::sessionCommandTimeout());
                 return;
             }
             $this->configureSession($client, $session, $generation);
@@ -163,7 +174,7 @@ final class BrowserTimezone
                 if ($generation !== $this->generation) return;
                 $this->error = $error === null ? null : $error + ['method'=>'Target.setAutoAttach'];
                 $this->enabled = $error === null;
-            });
+            }, self::sessionCommandTimeout());
     }
 
     /** Include page targets and cross-origin frames; Chrome propagates the renderer timezone to workers. */
@@ -195,9 +206,20 @@ final class BrowserTimezone
                                 unset($this->sessions[$session]);
                                 $this->pending--;
                                 $this->recordSessionError($session, $resumeError, 'Runtime.runIfWaitingForDebugger');
-                            });
-                    });
-            });
+                            }, self::sessionCommandTimeout());
+                    }, self::sessionCommandTimeout());
+            }, self::sessionCommandTimeout());
+    }
+
+    /** Keep transient protocol facts in the existing exported browser diagnostic, not stdout. */
+    private static function recordDiagnostic(array $failure): void
+    {
+        $payload = json_encode(['event'=>'browser_timezone_retry', 'method'=>$failure['method'] ?? '',
+            'code'=>$failure['code'] ?? 0,
+            'message'=>mb_substr((string) ($failure['message'] ?? ''), 0, 200)], JSON_UNESCAPED_UNICODE);
+        if (!is_string($payload)) return;
+        @file_put_contents((string) Config::get('gateway', 'browser_log_dir') . '/runtime-errors.log',
+            date('c') . ' ' . $payload . PHP_EOL, FILE_APPEND);
     }
 
     /** A page may close between any two acknowledgements; that does not invalidate the browser subscription. */
