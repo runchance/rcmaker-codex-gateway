@@ -15,7 +15,7 @@ final class ChatGptTransport
     private const MAX_EDITOR_STAGE_CHARS = 130000;
     /** Allow ten seconds for a completed empty answer to receive its final content. */
     private const EMPTY_RESPONSE_GRACE_SECONDS = 10.0;
-    /** A UI-only tool pause is ambiguous; require ten continuously quiet minutes before recovery. */
+    /** Preserve the established conservative fallback for Temporary Chat UI-only pauses. */
     private const EMPTY_TOOL_IDLE_SECONDS = 600.0;
     /** An unreadable or suspended observer cannot accumulate a continuous terminal verdict. */
     private const EMPTY_RESPONSE_MAX_OBSERVATION_GAP_SECONDS = 5.0;
@@ -61,7 +61,7 @@ final class ChatGptTransport
      * @param array $evidence Exact response/session/document/owner/fence/assistant/request identity,
      *     receipt_signature, receipt_at_us, source_transport_unsettled and post_tool_baseline.
      *     allow_empty_terminal also permits observing a Stop-to-Send transition without answer text;
-     *     the separate empty health rule still requires a prolonged drained-tool window.
+     *     the separate empty health rule applies a mode-specific drained-tool grace.
      *     allow_regular_idle accepts Voice in a verified ordinary chat under those same witness rules.
      * @param float $now Current observation time in seconds.
      * @return array{observation:?array,settled:bool} Updated witness and optional terminal UI evidence.
@@ -158,9 +158,9 @@ final class ChatGptTransport
      * a missing fence, changing ownership, activity, content or observation gap resets the window.
      * A confirmed non-cancelled network failure is a stream-recovery cause, not an empty
      * model answer. A native recovery notice without that evidence cannot settle the turn.
-     * UI-only ordinary tool pauses require ten quiet minutes after a verified Stop-to-Send
-     * transition. Real request completion/failure and explicitly stopped checkpoint sources
-     * retain their normal short final-content settlement. Active generation never settles.
+     * A UI-only terminal is accepted only after a verified Stop-to-idle transition, exact
+     * delivered receipts and a drained MCP fence. Saved chats use the normal short final-content
+     * grace; Temporary Chat keeps its established conservative window. Active generation never settles.
      * @param array|null $previous Prior candidate from this exact runtime turn, or null.
      * @param array $snapshot Current responseExpression() observation.
      * @param array $evidence Owned response/session/document/assistant/request IDs, transport_settled,
@@ -217,7 +217,8 @@ final class ChatGptTransport
         }
         return [
             'candidate' => ['signature' => $signature, 'since' => $since, 'observed_at' => $now],
-            'error_code' => $now - $since >= ($uiOnlyToolPause ? self::EMPTY_TOOL_IDLE_SECONDS : self::EMPTY_RESPONSE_GRACE_SECONDS)
+            'error_code' => $now - $since >= ($uiOnlyToolPause && !$regularIdle
+                ? self::EMPTY_TOOL_IDLE_SECONDS : self::EMPTY_RESPONSE_GRACE_SECONDS)
                 ? ($transportFailed ? 'CHATGPT_MESSAGE_STREAM_ERROR' : 'CHATGPT_EMPTY_RESPONSE') : null,
         ];
     }

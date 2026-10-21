@@ -2504,7 +2504,8 @@ final class TaskLedger
                     $allReceiptsDelivered = false;
                     $closedWaitFailure ??= ToolBroker::settledWaitTransportFailureForResponse($responseId);
                     if ($call['binding_id'] === ($binding['id'] ?? null)
-                        && $closedWaitFailure === 'tool_wait_scope_changed' && $call['result_json'] !== null) {
+                        && in_array($closedWaitFailure, ['tool_wait_scope_changed', 'tool_receipt_transport_lost',
+                            'tool_result_transport_failed'], true) && $call['result_json'] !== null) {
                         // The old wait failed conclusively, rather than remaining in flight.
                         // Reuse the exact receipt/checkpoint coverage proof; do not acknowledge
                         // delivery to the Web page or execute the completed host action again.

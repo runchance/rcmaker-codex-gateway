@@ -7487,8 +7487,9 @@ JS;
                     && (!is_string($postToolBaseline) || $sourceTransportSettled);
                 // A disabled Send control or canceled HTTP stream alone cannot prove a
                 // tool-only response ended. Observe Stop after the exact latest receipt,
-                // then its return to Send; ordinary UI-only pauses also need a long quiet
-                // MCP window below. Explicit checkpoint source stops keep their own handoff.
+                // then its return to an idle composer. Saved chats use a short final-content
+                // grace; Temporary Chat keeps its conservative quiet window. Explicit checkpoint
+                // source stops keep their own handoff.
                 $emptyUiTransition = ChatGptTransport::postReceiptUiSettlement(
                     $this->chatGptTurns[$responseId]['empty_response_ui_observation'] ?? null, $snapshot, [
                         'response_id'=>$logicalResponseId, 'session_id'=>(string)$turn['session_id'],
@@ -7672,6 +7673,11 @@ JS;
                     // all genuine tool calls and results above already share this response.
                     $waitFailure = !$activeCompact
                         ? ToolBroker::settledWaitTransportFailureForResponse($logicalResponseId) : null;
+                    if ($waitFailure === null && !$activeCompact
+                        && ToolBroker::sealExpiredReceiptTransportForResponse($logicalResponseId, $roundMarkdown,
+                            (string)$turn['owner_incarnation'], (int)$turn['fencing_version'])) {
+                        $waitFailure = ToolBroker::settledWaitTransportFailureForResponse($logicalResponseId);
+                    }
                     if ($waitFailure !== null) {
                         // All native effects are known, but a typed failed RPC never
                         // delivered their last result. Preserve the Web model's final

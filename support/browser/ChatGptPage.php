@@ -1313,9 +1313,19 @@ const endComposer=visibleOne(COMPOSER);
 const endSend=endComposer?composerSendButtons(endComposer):[];
 const sendButtonVisible=endSend.length===1&&endSend[0].getAttribute('data-testid')!=='stop-button'
     &&!/^(?:Stop|Stop generating|停止|停止生成)$/i.test(String(endSend[0].getAttribute('aria-label')||'').trim());
+const endForm=endComposer?.closest('form')||null;
+// An empty saved-chat composer replaces Send with one primary voice action. Its label is
+// localized and can change independently of the control shape, so prefer the native primary
+// action structure. Retain the observed labels only as compatibility for older renderers.
+const structuralIdleActions=endForm?[...endForm.querySelectorAll('button[type="button"]')].filter(button=>visible(button)
+    &&button.getAttribute('data-testid')!=='stop-button'&&button.getAttribute('data-testid')!=='send-button'
+    &&!button.hasAttribute('aria-haspopup')&&!button.hasAttribute('data-composer-navigation-target')
+    &&button.classList.contains('bg-composer-primary')&&!!button.querySelector('svg.icon-primary-action')):[];
+const legacyVoiceActions=endForm?[...endForm.querySelectorAll('button[aria-label]')].filter(button=>visible(button)
+    &&/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(String(button.getAttribute('aria-label')||'').trim())):[];
 const recoveryIdleButtonVisible=__REGULAR_RECOVERY__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length===1
-    &&!!endComposer?.closest('form')&&[...endComposer.closest('form').querySelectorAll('button[aria-label]')].filter(visible)
-        .some(button=>/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(String(button.getAttribute('aria-label')||'').trim()));
+    &&!!endForm&&(structuralIdleActions.length===1
+        ||(structuralIdleActions.length===0&&legacyVoiceActions.length===1));
 let markdown='';let markdownSegments=[];let metricCardLegacy=null;let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;let transportRecoveryVisible=false;
 if(answer){
     responsePresent=true;
@@ -1506,7 +1516,14 @@ if(answer){
         if(overlaps(candidate,userContentRoots)||candidate.closest(userContentSelector))return false;
         return statusRendered(candidate);
     };
-    stoppedThinkingVisible=[...answer.el.querySelectorAll('[aria-label]')]
+    // Newer renderers expose a locale-independent terminal state on the exact owned turn.
+    // Scope it to the bound answer ancestry so a historical cancelled turn cannot stop this one.
+    const cancelledTurnState=[actionHost,...actionHost.querySelectorAll('[data-talvt-turn-state]')]
+        .some(candidate=>String(candidate.getAttribute('data-talvt-turn-state')||'').toLowerCase()==='cancelled'
+            &&(candidate===actionHost||candidate.contains(answer.el)||answer.el.contains(candidate))
+            &&statusRendered(candidate));
+    stoppedThinkingVisible=!running&&cancelledTurnState;
+    if(!stoppedThinkingVisible)stoppedThinkingVisible=[...answer.el.querySelectorAll('[aria-label]')]
         .some(candidate=>isStoppedLabel(candidate.getAttribute('aria-label'))&&isStoppedStatus(candidate));
     if(!stoppedThinkingVisible){
         const walker=document.createTreeWalker(answer.el,NodeFilter.SHOW_TEXT);

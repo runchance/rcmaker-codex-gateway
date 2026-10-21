@@ -12,6 +12,10 @@ use app\gateway\database\Schema;
  */
 final class ToolBroker
 {
+    /** A receipt worker gets one full RPC slice plus scheduling grace before it can be proven orphaned. */
+    private const RECEIPT_ORPHAN_GRACE_SECONDS = 15;
+    private const CLOSED_WAIT_TRANSPORT_CODES = ['tool_wait_scope_changed', 'tool_receipt_transport_lost'];
+
     private const BRIDGE_NAMES = [
         'codex_turn_start', 'codex_exec', 'codex_write_stdin', 'codex_apply_patch', 'codex_view_image',
         'codex_tool_inventory', 'codex_tool_call', 'codex_context_read', 'codex_work_update', 'codex_turn_complete',
@@ -1679,13 +1683,123 @@ final class ToolBroker
         $failed = [];
         foreach (is_array($events) ? $events : [] as $event) {
             $data = json_decode($event['data_json'], true);
-            if (($data['code'] ?? null) === 'tool_wait_scope_changed') $failed[$data['invocation_id'] ?? ''] = true;
+            $code = $data['code'] ?? null;
+            if (in_array($code, self::CLOSED_WAIT_TRANSPORT_CODES, true)) {
+                $failed[$data['invocation_id'] ?? ''] = $code;
+            }
         }
+        $codes = [];
         foreach ($undelivered as $call) {
             if (!isset($failed[$call['id']]) || !is_string($call['result_json'])
                 || !is_array(json_decode($call['result_json'], true))) return null;
+            $codes[$failed[$call['id']]] = true;
         }
-        return 'tool_wait_scope_changed';
+        return count($codes) === 1 ? (string) array_key_first($codes) : 'tool_result_transport_failed';
+    }
+
+    /**
+     * Seal only an expired receipt receiver whose child transport disappeared after native work settled.
+     * The browser caller has already proved a stable, non-empty Web final. This method never acknowledges
+     * result delivery and never replays a tool; it only turns an otherwise permanent activity fence into a
+     * typed failed transport that the existing terminal path can close.
+     *
+     * @return bool Whether at least one exact expired receipt activity was sealed atomically.
+     */
+    public static function sealExpiredReceiptTransportForResponse(string $responseId, string $answer,
+        string $incarnation, int $fence): bool
+    {
+        if (trim($answer) === '') return false;
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence): bool {
+            $ledger = TaskLedger::execution($responseId);
+            if (($ledger['turn']['response_id'] ?? null) !== $responseId
+                || ($ledger['surface']['status'] ?? null) !== 'busy'
+                || ($ledger['surface']['owner_incarnation'] ?? null) !== $incarnation
+                || (int)($ledger['surface']['fencing_version'] ?? -1) !== $fence
+                || ($ledger['turn']['task_id'] ?? null) !== ($ledger['job']['task_id'] ?? null)
+                || ($ledger['surface']['task_id'] ?? null) !== ($ledger['job']['task_id'] ?? null)
+                || ($ledger['turn']['surface_id'] ?? null) !== ($ledger['surface']['id'] ?? null)
+                || ($ledger['job']['surface_id'] ?? null) !== ($ledger['surface']['id'] ?? null)
+                || ($ledger['turn']['epoch_id'] ?? null) !== ($ledger['job']['epoch_id'] ?? null)
+                || ($ledger['surface']['epoch_id'] ?? null) !== ($ledger['job']['epoch_id'] ?? null)
+                || !in_array($ledger['turn']['status'] ?? null, ['submitted', 'running'], true)) return false;
+
+            $db = SDB(null, 'medoo', 'sqlite');
+            $binding = self::bindingByResponseUnlocked($responseId);
+            if ((string)$binding['status'] !== 'running'
+                || (string)$binding['task_id'] !== (string)$ledger['job']['task_id']
+                || (string)$binding['turn_id'] !== (string)$ledger['turn']['id']) return false;
+            $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
+            if (!is_array($job) || (string)$job['status'] !== 'running'
+                || (string)$job['round_kind'] !== 'text' || (string)$job['operation_kind'] !== 'response'
+                || (string)$job['task_id'] !== (string)$binding['task_id']
+                || (string)$job['durable_turn_id'] !== (string)$binding['turn_id']
+                || (string)$job['mcp_binding_id'] !== (string)$binding['id']) return false;
+
+            $calls = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])->select();
+            if (!is_array($calls) || $calls === []) return false;
+            $undelivered = [];
+            foreach ($calls as $call) {
+                if ((string)$call['status'] !== 'completed') return false;
+                if ($call['result_delivered_at'] !== null) continue;
+                if (!is_string($call['result_json']) || !is_array(json_decode($call['result_json'], true))
+                    || !is_string($call['call_key']) || $call['call_key'] === '') return false;
+                $undelivered[(string)$call['id']] = $call;
+            }
+            if ($undelivered === []) return false;
+
+            $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+                ->where('event_type', 'tool_result_transport_failed')->select('data_json');
+            if (!is_array($events)) throw new GatewayError('storage_unavailable', '工具等待失败记录暂不可读取。', 503);
+            $knownFailures = [];
+            foreach ($events as $event) {
+                $data = json_decode((string)$event['data_json'], true);
+                if (isset($undelivered[$data['invocation_id'] ?? ''])
+                    && in_array($data['code'] ?? null, self::CLOSED_WAIT_TRANSPORT_CODES, true)) {
+                    $knownFailures[(string)$data['invocation_id']] = (string)$data['code'];
+                }
+            }
+
+            $activities = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                ->where('status', 'active')->select();
+            if (!is_array($activities) || $activities === []) return false;
+            $now = time();
+            $cutoff = $now - (int)ceil(McpProtocol::HOST_RPC_SLICE_MS / 1000)
+                - self::RECEIPT_ORPHAN_GRACE_SECONDS;
+            $resultCutoff = $now - self::RECEIPT_ORPHAN_GRACE_SECONDS;
+            $activityIds = [];
+            $orphanedCalls = [];
+            foreach ($activities as $activity) {
+                if ((int)$activity['created_at'] > $cutoff) return false;
+                $matched = null;
+                foreach ($undelivered as $callId => $call) {
+                    $prefix = 'activity_receipt_' . hash('sha256', (string)$call['call_key']) . '_';
+                    if (str_starts_with((string)$activity['id'], $prefix)) { $matched = $callId; break; }
+                }
+                if ($matched === null) return false;
+                $activityIds[] = (string)$activity['id'];
+                $orphanedCalls[$matched] = true;
+            }
+            foreach ($undelivered as $callId => $_call) {
+                if (!isset($knownFailures[$callId]) && !isset($orphanedCalls[$callId])) return false;
+                if (isset($orphanedCalls[$callId])
+                    && (empty($_call['completed_at']) || (int)$_call['completed_at'] > $resultCutoff)) return false;
+            }
+
+            $updated = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                ->where('status', 'active')->where('id', 'IN', $activityIds)
+                ->update(['status' => 'completed', 'updated_at' => $now]);
+            if (!$updated || $updated->rowCount() !== count($activityIds)) {
+                throw new GatewayError('storage_unavailable', '过期工具回执活动无法原子收敛。', 503);
+            }
+            self::bumpRevisionUnlocked((string)$binding['id']);
+            foreach (array_keys($orphanedCalls) as $callId) {
+                if (isset($knownFailures[$callId])) continue;
+                $call = $undelivered[$callId];
+                self::eventUnlocked((string)$call['task_id'], (string)$call['turn_id'], (string)$call['response_id'],
+                    'tool_result_transport_failed', ['invocation_id'=>$callId, 'code'=>'tool_receipt_transport_lost']);
+            }
+            return true;
+        });
     }
 
     /**
@@ -1743,7 +1857,8 @@ final class ToolBroker
         if (!is_array($events)) throw new GatewayError('storage_unavailable', '工具等待失败记录暂不可读取。', 503);
         foreach ($events as $event) {
             $data = json_decode($event['data_json'], true);
-            if (($data['invocation_id'] ?? '') !== $call['id'] || ($data['code'] ?? '') !== 'tool_wait_scope_changed') continue;
+            if (($data['invocation_id'] ?? '') !== $call['id']
+                || !in_array($data['code'] ?? '', self::CLOSED_WAIT_TRANSPORT_CODES, true)) continue;
             ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($spec, $call, $taskId);
             return true;
         }
@@ -1781,7 +1896,7 @@ final class ToolBroker
             $facts = json_decode((string)$event['data_json'], true);
             $code = $facts['code'] ?? '';
             if (($facts['invocation_id'] ?? '') !== $call['id']
-                || !in_array($code, ['tool_wait_scope_changed', 'compaction_source_stopped'], true)
+                || !in_array($code, [...self::CLOSED_WAIT_TRANSPORT_CODES, 'compaction_source_stopped'], true)
                 || ($call['response_id'] === $source['id'] && $code !== 'compaction_source_stopped')) continue;
             ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($spec, $call, (string)$source['task_id']);
             return true;
@@ -1859,24 +1974,25 @@ final class ToolBroker
         string $incarnation, int $fence): bool
     {
         if (trim($answer) === '') return false;
-        $frozen = Schema::transaction(function () use ($responseId, $incarnation, $fence): bool {
+        $failureCode = Schema::transaction(function () use ($responseId, $incarnation, $fence): ?string {
             $ledger = TaskLedger::execution($responseId);
+            $code = self::settledWaitTransportFailureForResponse($responseId);
             if ($ledger['turn']['response_id'] !== $responseId || $ledger['surface']['status'] !== 'busy'
                 || $ledger['surface']['owner_incarnation'] !== $incarnation
                 || (int)$ledger['surface']['fencing_version'] !== $fence
                 || !in_array($ledger['turn']['status'], ['submitted','running'], true)
-                || self::settledWaitTransportFailureForResponse($responseId) === null) return false;
+                || $code === null) return null;
             $binding = self::bindingByResponseUnlocked($responseId);
             // Freeze only this closed capability before the separate idempotent
             // response writers. Those own their transactions; do not nest them.
             self::revokeBindingUnlocked($binding, 'closed_result_transport');
-            return true;
+            return $code;
         });
-        if (!$frozen) return false;
+        if ($failureCode === null) return false;
         ResponseJob::appendCommentary($responseId, $answer, 'failed-wait-final:' . hash('sha256',$answer));
         WebMessageAudit::recordIncoming($responseId, 'transport_failed_final', $answer);
         ResponseJob::fail($responseId, 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED',
-            '网页回答已结束，但工具结果等待连接提前失败（tool_wait_scope_changed）。本机执行结果和网页答复已保留，未重发或重复执行工具。', false);
+            '网页回答已结束，但工具结果等待连接提前失败（' . $failureCode . '）。本机执行结果和网页答复已保留，未重发或重复执行工具。', false);
         return true;
     }
 
@@ -1886,6 +2002,15 @@ final class ToolBroker
         Schema::transaction(function () use ($token, $callId): void {
             [$binding, $row, $retiredReceipt] = self::receiptForTokenUnlocked($token, $callId);
             $db = SDB(null, 'medoo', 'sqlite');
+            if ((string)$binding['status'] === 'revoked') {
+                $revocations = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+                    ->where('event_type', 'mcp_capability_revoked')->order([['id', 'DESC']])->limit(1)->select('data_json');
+                if ((json_decode($revocations[0]['data_json'] ?? '{}', true)['reason'] ?? '') === 'closed_result_transport') {
+                    // A stable final already proved that this receiver was closed. A late
+                    // worker flush cannot retroactively claim that the Web model consumed it.
+                    return;
+                }
+            }
             if ((string) $row['status'] !== 'completed') {
                 throw new GatewayError('tool_result_not_ready', '工具结果尚未完成，不能登记 MCP 回执。', 409);
             }
