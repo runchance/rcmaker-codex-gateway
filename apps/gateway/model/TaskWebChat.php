@@ -394,14 +394,17 @@ final class TaskWebChat
      * @param array $expected Current execution identity. @param string $url Observed URL.
      * @param string $accountKey Fresh browser account fingerprint, never a token or email.
      * @param string $modelUrl Configured model origin.
-     * @param bool $initialMessageWitness Exact physical request marker, or its previously observed native initial reply, in the current document.
+     * @param bool $initialMessageWitness Exact physical request marker, or its previously observed native initial reply.
      * @param string|null $physicalResponseId Original browser submission pinned by native receipt rounds or exact retained steering.
+     * @param bool $observedSubmission Exact fenced browser POST observed for this physical request before the page rendered its user turn.
      * @return array Pinned conversation state. @throws GatewayError On identity or storage conflict.
      */
     public static function observe(array $expected, string $url, string $accountKey, string $modelUrl,
-        bool $initialMessageWitness = false, ?string $physicalResponseId = null): array
+        bool $initialMessageWitness = false, ?string $physicalResponseId = null,
+        bool $observedSubmission = false): array
     {
-        return Schema::transaction(static function () use ($expected, $url, $accountKey, $modelUrl, $initialMessageWitness, $physicalResponseId): array {
+        return Schema::transaction(static function () use ($expected, $url, $accountKey, $modelUrl,
+            $initialMessageWitness, $physicalResponseId, $observedSubmission): array {
             $current = TaskLedger::pollExecution((string) $expected['job']['id']);
             foreach (['id', 'task_id', 'generation_id', 'response_id'] as $key) {
                 if (($current['turn'][$key] ?? null) !== ($expected['turn'][$key] ?? null)) {
@@ -451,8 +454,26 @@ final class TaskWebChat
                     throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
                 }
             }
-            if (!$initialMessageWitness || empty($submission['submit_intent_at'])
-                || ($submission['submitted_document_nonce'] ?? null) !== $current['surface']['document_nonce']) {
+            $submissionProof = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+                ->where('id', $physicalResponseId)
+                ->find('prompt,submit_intent_at,submitted_document_nonce,baseline_users_json');
+            if (!is_array($submissionProof)) {
+                throw new GatewayError('storage_unavailable', 'The initial Web chat submission could not be verified.', 503);
+            }
+            $baselineUsers = json_decode((string)($submissionProof['baseline_users_json'] ?? ''), true);
+            $initialPrompt = '<rcmaker_chat_binding>' . $physicalResponseId . "</rcmaker_chat_binding>\n";
+            $initialSubmission = is_array($baselineUsers) && $baselineUsers === []
+                && str_starts_with((string)($submissionProof['prompt'] ?? ''), $initialPrompt);
+            $submittedDocument = (string)($submissionProof['submitted_document_nonce'] ?? '');
+            // Most first saved chats switch / -> /c/<uuid> inside the same document. Some
+            // ChatGPT deployments perform a real main-frame navigation instead, and newer
+            // renderers can omit the literal binding header from the visible user bubble.
+            // Accept only the exact physical first submission: either its native user/reply
+            // witness, or its fenced browser POST. Empty baseline, marker prefix, task,
+            // surface, account, unique UUID and current ledger ownership remain mandatory.
+            $physicalWitness = $initialMessageWitness || $observedSubmission;
+            if (!$physicalWitness || !$initialSubmission || empty($submissionProof['submit_intent_at'])
+                || $submittedDocument === '' || empty($current['surface']['document_nonce'])) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'A new task must start in an empty Web chat.', 409);
             }
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_task_web_chats')->where('task_id', $chat['task_id'])

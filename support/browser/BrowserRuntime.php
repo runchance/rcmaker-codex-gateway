@@ -6900,7 +6900,13 @@ JS;
             $this->taskFailTurn($responseId, 'CHATGPT_STATE_UNAVAILABLE', '任务页面状态暂不可读取。', true);
             return;
         }
-        if (microtime(true) >= $deadline) {
+        $deadlineExpired = microtime(true) >= $deadline;
+        $stateAwareRegularDeadline = $deadlineExpired
+            && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+            && ($ledger['job']['operation_kind'] ?? '') === 'response'
+            && !empty($turn['tool_capable']);
+        $this->chatGptTurns[$responseId]['response_deadline_expired'] = $deadlineExpired;
+        if ($deadlineExpired && !$stateAwareRegularDeadline) {
             $this->taskFailTurn($responseId, 'CHATGPT_RESPONSE_TIMEOUT', 'ChatGPT 网页生成超过本回合截止时间；结果无法确认且不会自动重发。', true);
             return;
         }
@@ -6953,7 +6959,7 @@ JS;
             self::hasLegacyCitationPrefix($turn),
             // Keep the physical submission identity after its saved UUID is bound:
             // the first response can still remount. The adapter requires an empty
-            // pre-submit baseline and same-document native evidence for that bridge.
+            // pre-submit baseline plus the exact rendered marker or fenced POST witness.
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
@@ -7024,11 +7030,45 @@ JS;
                     && empty($turn['web_chat']['conversation_id'])
                     && WebModelPage::regularConversationId($snapshotUrl, self::modelUrl()) !== null) {
                     $expected = TaskLedger::pollExecution((string) ($turn['logical_response_id'] ?? $responseId));
+                    $sessionId = (string)$turn['session_id'];
+                    if (($this->taskSessions[$sessionId]['account_document_nonce'] ?? '')
+                        !== (string)$expected['surface']['document_nonce']) {
+                        $this->verifyInitialRegularChatAccount($responseId, $sessionId,
+                            (string)$expected['surface']['document_nonce']);
+                        return;
+                    }
+                    $initialBindingWitness = !empty($snapshot['initial_binding_witness']);
+                    $observedSubmission = !empty($turn['initial_submission_observed']);
+                    try {
+                        TaskLedger::initialChatBindingObserved(
+                            (string)($turn['logical_response_id'] ?? $responseId), [
+                                'generation_running'=>($snapshot['generation_running'] ?? null) === true,
+                                'initial_binding_witness'=>$initialBindingWitness,
+                                'observed_submission'=>$observedSubmission,
+                                'document_changed'=>(string)($turn['document_nonce'] ?? '')
+                                    !== (string)$expected['surface']['document_nonce'],
+                                'account_verified'=>true,
+                                'submit_intent'=>!empty($expected['job']['submit_intent_at']),
+                                'empty_baseline'=>(array)($expected['job']['baseline_users'] ?? []) === [],
+                                'binding_prompt'=>str_starts_with((string)($expected['job']['prompt'] ?? ''),
+                                    '<rcmaker_chat_binding>' . $responseId . "</rcmaker_chat_binding>\n"),
+                            ]);
+                    } catch (\Throwable) {
+                        // Binding diagnostics are independent of page ownership and delivery.
+                    }
+                    if (self::shouldAwaitInitialRegularChatBinding($snapshot, $turn)) {
+                        // The owned page is still generating. Missing renderer/network evidence
+                        // is not a terminal result and never authorizes a resend or UUID claim.
+                        $this->scheduleTaskPoll($responseId, 0.50);
+                        return;
+                    }
                     $chat = TaskWebChat::observe($expected, $snapshotUrl,
-                        (string) ($this->taskSessions[(string) $turn['session_id']]['account_key'] ?? ''), self::modelUrl(),
-                        !empty($snapshot['initial_binding_witness']), $responseId);
+                        (string) ($this->taskSessions[$sessionId]['account_key'] ?? ''), self::modelUrl(),
+                        $initialBindingWitness, $responseId, $observedSubmission);
                     $this->chatGptTurns[$responseId]['web_chat'] = $chat;
-                    $this->taskSessions[(string) $turn['session_id']]['web_chat'] = $chat;
+                    $this->chatGptTurns[$responseId]['document_nonce'] = (string)$expected['surface']['document_nonce'];
+                    $this->taskSessions[$sessionId]['web_chat'] = $chat;
+                    $turn = $this->chatGptTurns[$responseId];
                 }
                 TaskLedger::observeSurface((string) $turn['surface_id'], (string) $turn['owner_incarnation'], (int) $turn['fencing_version'], (string) ($snapshot['url'] ?? ''));
             } catch (GatewayError $error) {
@@ -7405,6 +7445,9 @@ JS;
                     }
                 }
             }
+            if (!$activeCompact && $this->continueExpiredRegularTaskTurn(
+                $responseId, $snapshot, $roundMarkdown, $observedArtifacts !== []
+            )) return;
             if (!$activeCompact && $this->recoverRegularTaskStream($responseId, $snapshot)) return;
             if (in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true)) {
                 // Deliver an already registered native batch above before considering recovery.
@@ -7842,8 +7885,107 @@ JS;
                 $this->chatGptTurns[$responseId]['settle_text'] = null;
                 $this->chatGptTurns[$responseId]['settle_at'] = 0.0;
             }
+            if (!empty($this->chatGptTurns[$responseId]['response_deadline_expired'])
+                && ($snapshot['generation_running'] ?? null) === false) {
+                $this->taskFailTurn($responseId, 'CHATGPT_RESPONSE_TIMEOUT',
+                    'ChatGPT 网页生成超过本回合截止时间；页面已停止，但结果无法安全确认。', true);
+                return;
+            }
             $this->scheduleTaskPoll($responseId);
         }, 3.0);
+    }
+
+    /**
+     * Recover an expired saved-chat receipt round which returned to an empty idle composer
+     * without ever mounting a new assistant row. The configured deadline triggers this
+     * state audit; a visible running generation keeps waiting. Only the exact saved chat,
+     * owned document, accepted user anchor and fully delivered current tool capability may
+     * reserve one durable control-only continuation. No context or host action is replayed.
+     */
+    private function continueExpiredRegularTaskTurn(string $responseId, array $snapshot,
+        string $roundMarkdown, bool $hasArtifacts): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || empty($turn['response_deadline_expired'])
+            || ($turn['web_chat']['mode'] ?? 'temporary') !== 'regular'
+            || empty($turn['tool_capable']) || ($turn['operation_kind'] ?? 'response') !== 'response') return false;
+        try { $completion = ToolBroker::completionForResponse((string)($turn['logical_response_id'] ?? $responseId)); }
+        catch (GatewayError) { return false; }
+        if ((int)($completion['invocation_count'] ?? 0) < 1) return false;
+        if (($snapshot['generation_running'] ?? null) === true) {
+            // Stop remains the primary generation signal. A wall-clock deadline alone must
+            // not cancel a model which the owned page still proves is running.
+            $this->scheduleTaskPoll($responseId, 1.0);
+            return true;
+        }
+        if (($snapshot['generation_running'] ?? null) !== false
+            || is_array($snapshot['error'] ?? null)
+            || !ChatGptTransport::idleComposerVisible($snapshot, true)
+            || trim($roundMarkdown) !== '' || $hasArtifacts
+            || !$this->taskChatMatches($responseId, (string)($snapshot['url'] ?? ''))) return false;
+        if (!empty($turn['deadline_idle_recovery_pending'])) return true;
+        $this->chatGptTurns[$responseId]['deadline_idle_recovery_pending'] = true;
+        $logicalId = (string)($turn['logical_response_id'] ?? $responseId);
+        $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression(),
+            function ($error, $baseline) use ($responseId, $logicalId): void {
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($turn)) return;
+                $this->chatGptTurns[$responseId]['deadline_idle_recovery_pending'] = false;
+                if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
+                    || ($baseline['generation_running'] ?? null) !== false
+                    || empty($baseline['document_id'])
+                    || !$this->taskChatMatches($responseId, (string)($baseline['url'] ?? ''))) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_RESPONSE_TIMEOUT',
+                        'The saved Web chat stopped after the response deadline, but its idle editor could not be verified; no message was resent.', true);
+                    return;
+                }
+                $userIds = array_values(array_filter((array)($baseline['user_ids'] ?? []), 'is_string'));
+                $assistantIds = array_values(array_filter((array)($baseline['assistant_ids'] ?? []), 'is_string'));
+                $knownUsers = array_fill_keys((array)($turn['baseline_users'] ?? []), true);
+                $newUsers = array_values(array_filter($userIds,
+                    static fn(string $id): bool => !isset($knownUsers[$id])));
+                $userId = (string)($newUsers === [] ? ($userIds[array_key_last($userIds)] ?? '')
+                    : $newUsers[array_key_last($newUsers)]);
+                $boundAssistant = (string)($turn['bound_assistant_id'] ?? '');
+                $assistantId = $boundAssistant !== '' && in_array($boundAssistant, $assistantIds, true)
+                    ? $boundAssistant : (string)($assistantIds[array_key_last($assistantIds)] ?? '');
+                if ($userId === '' || $assistantId === '') {
+                    $this->taskFailTurn($responseId, 'CHATGPT_RESPONSE_TIMEOUT',
+                        'The saved Web chat stopped after the response deadline, but its task message anchors could not be verified; no message was resent.', true);
+                    return;
+                }
+                $failureKey = hash('sha256', json_encode([
+                    'expired_idle', $logicalId, $baseline['document_id'], $userId, $assistantId,
+                ], JSON_THROW_ON_ERROR));
+                try {
+                    $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId,
+                        (string)$turn['owner_incarnation'], (int)$turn['fencing_version'],
+                        (string)$turn['document_nonce'], $failureKey, false, true, [
+                            'action'=>'expired_idle', 'terminal'=>true,
+                            'user_id'=>$userId, 'assistant_id'=>$assistantId,
+                            'document_id'=>(string)$baseline['document_id'],
+                            'user_ids'=>$userIds, 'assistant_ids'=>$assistantIds,
+                        ]);
+                    if (!empty($reservation['waiting'])) {
+                        $this->scheduleTaskPoll($responseId, 1.0);
+                        return;
+                    }
+                    if (!empty($reservation['published'])) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_STREAM_RECOVERY_COMMITTED',
+                            'The response deadline expired after text was already published; its text and tool results were preserved without regeneration.', true);
+                        return;
+                    }
+                    if (empty($reservation['continue'])) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_RESPONSE_TIMEOUT',
+                            'The saved Web chat stopped after the response deadline, but its exact tool receipts were not ready for a safe continuation.', true);
+                        return;
+                    }
+                    $this->prepareTaskStreamContinuation($responseId, $logicalId, $baseline, $reservation);
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                }
+            });
+        return true;
     }
 
     /**
@@ -8702,6 +8844,14 @@ JS;
         if (isset($this->chatGptTurns[$responseId])) Timer::add($delay, fn() => $this->pollTaskTurn($responseId), null, false);
     }
 
+    /** Missing first-chat proof may settle while the exact owned page is still generating. */
+    private static function shouldAwaitInitialRegularChatBinding(array $snapshot, array $turn): bool
+    {
+        return ($snapshot['generation_running'] ?? null) === true
+            && empty($snapshot['initial_binding_witness'])
+            && empty($turn['initial_submission_observed']);
+    }
+
     /**
      * Recover the exact ordinary binding header from an accepted physical submission.
      * The caller still fences the task, target, account and document before using it.
@@ -8718,6 +8868,46 @@ JS;
         $id = (string)($source['id'] ?? '');
         return $id !== '' && str_starts_with((string)($source['prompt'] ?? ''), '<rcmaker_chat_binding>' . $id . "</rcmaker_chat_binding>\n")
             ? $id : '';
+    }
+
+    /** Refresh account ownership after a legitimate first-chat main-frame navigation, then re-observe the page. */
+    private function verifyInitialRegularChatAccount(string $responseId, string $sessionId, string $documentNonce): void
+    {
+        if (!isset($this->chatGptTurns[$responseId], $this->taskSessions[$sessionId])) return;
+        if (!empty($this->taskSessions[$sessionId]['initial_account_verification'])) return;
+        $this->taskSessions[$sessionId]['initial_account_verification'] = true;
+        $this->evaluateTaskSession($sessionId, WebModelPage::accountFingerprintExpression(),
+            function ($error, $account) use ($responseId, $sessionId, $documentNonce): void {
+                if (isset($this->taskSessions[$sessionId])) {
+                    unset($this->taskSessions[$sessionId]['initial_account_verification']);
+                }
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                $owner = $this->taskSessions[$sessionId] ?? null;
+                if (!is_array($turn) || !is_array($owner) || ($turn['session_id'] ?? '') !== $sessionId) return;
+                try { $ledger = TaskLedger::pollExecution((string)($turn['logical_response_id'] ?? $responseId)); }
+                catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    return;
+                }
+                if ((string)$ledger['surface']['document_nonce'] !== $documentNonce) {
+                    $this->scheduleTaskPoll($responseId, 0.25);
+                    return;
+                }
+                if ($error !== null || !is_array($account) || empty($account['verified'])
+                    || !is_string($account['account_key'] ?? null) || $account['account_key'] === '') {
+                    $this->scheduleTaskPoll($responseId, 1.0);
+                    return;
+                }
+                $previous = (string)($owner['account_key'] ?? '');
+                if ($previous !== '' && !hash_equals($previous, (string)$account['account_key'])) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_CHANGED',
+                        'The Web chat belongs to another account or workspace.', true);
+                    return;
+                }
+                $this->taskSessions[$sessionId]['account_key'] = (string)$account['account_key'];
+                $this->taskSessions[$sessionId]['account_document_nonce'] = $documentNonce;
+                $this->scheduleTaskPoll($responseId, 0.05);
+            }, 20.0, true);
     }
 
     /**
@@ -10313,10 +10503,12 @@ JS;
                 || !WebModelPage::isTaskUserMessageSubmission($params,
                     (string) ($owner['main_frame_id'] ?? ''), self::modelUrl(), $postData, $currentToken)) return;
             try {
-                ToolBroker::markSentByObservedSubmission($responseId,
+                if (ToolBroker::markSentByObservedSubmission($responseId,
                     (string) $turn['surface_id'], (string) $turn['target_id'], $sessionId,
                     (string) $turn['document_nonce'], (string) $turn['owner_incarnation'],
-                    (int) $turn['fencing_version'], $currentToken);
+                    (int) $turn['fencing_version'], $currentToken)) {
+                    $this->chatGptTurns[$responseId]['initial_submission_observed'] = true;
+                }
             } catch (\Throwable) {
                 // The DOM observer can still independently confirm the accepted turn.
             }

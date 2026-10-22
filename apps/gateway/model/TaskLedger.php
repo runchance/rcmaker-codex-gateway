@@ -1808,6 +1808,35 @@ final class TaskLedger
         });
     }
 
+    /**
+     * Retain one content-free audit of the first saved-chat UUID binding attempt.
+     * This never changes ownership, deadlines, delivery state or retry state.
+     * @param string $responseId Exact current response.
+     * @param array $observation Allow-listed boolean transport/UI facts only.
+     */
+    public static function initialChatBindingObserved(string $responseId, array $observation): void
+    {
+        Schema::transaction(static function () use ($responseId, $observation): void {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
+                || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true)
+                || $surface['status'] !== 'busy' || (string)$turn['response_id'] !== $responseId) return;
+            $db = SDB(null, 'medoo', 'sqlite');
+            $existing = $db->table('gateway_task_events')->where('response_id', $responseId)
+                ->where('surface_id', (string)$surface['id'])
+                ->where('event_type', 'initial_chat_binding_observed')->count();
+            if ($existing > 0) return;
+            $data = [];
+            foreach (['generation_running', 'initial_binding_witness', 'observed_submission',
+                'document_changed', 'account_verified', 'submit_intent', 'empty_baseline',
+                'binding_prompt'] as $key) {
+                $data[$key] = isset($observation[$key]) ? (bool)$observation[$key] : null;
+            }
+            self::eventUnlocked((string)$turn['task_id'], (string)$turn['id'], $responseId,
+                (string)$surface['id'], 'initial_chat_binding_observed', $data);
+        });
+    }
+
     public static function committed(string $responseId): void
     {
         Schema::transaction(function () use ($responseId): void {
@@ -2442,11 +2471,20 @@ final class TaskLedger
             $epoch = $db->table('gateway_task_epochs')->where('id', $job['epoch_id'])->find();
             $binding = empty($job['mcp_binding_id']) ? null
                 : $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
-            $stoppedBeforeStart = in_array($regularRecovery['action'] ?? '', ['stopped_thinking', 'rate_limit'], true)
+            $regularAction = (string)($regularRecovery['action'] ?? '');
+            $expiredIdle = $regularAction === 'expired_idle';
+            $expiredIdleState = $expiredIdle ? self::regularStreamRecoveryState($responseId) : [];
+            $expiredIdleReserved = $expiredIdle
+                && ($expiredIdleState['stage'] ?? '') === 'resume'
+                && ($expiredIdleState['failure_key'] ?? '') === $failureKey;
+            $stoppedBeforeStart = in_array($regularAction, ['stopped_thinking', 'rate_limit'], true)
                 && is_array($binding) && $binding['status'] === 'awaiting_start' && !empty($binding['sent_at']);
             if (!self::ownsCurrentGeneration($job, $turn) || $job['status'] !== 'running'
                 || $job['operation_kind'] !== 'response' || !in_array($turn['status'], ['submitted','running'], true)
-                || (int)$turn['deadline_at'] <= time() || $surface['status'] !== 'busy'
+                || ($expiredIdle
+                    ? ((int)$turn['deadline_at'] > time() && !$expiredIdleReserved)
+                    : (int)$turn['deadline_at'] <= time())
+                || $surface['status'] !== 'busy'
                 || empty($surface['target_id']) || empty($surface['session_id']) || $documentNonce === ''
                 || $surface['document_nonce'] !== $documentNonce || $surface['task_id'] !== $job['task_id']
                 || $surface['epoch_id'] !== $job['epoch_id'] || $turn['owner_incarnation'] !== $incarnation
@@ -2633,11 +2671,26 @@ final class TaskLedger
         // A later incident starts with Retry again, rather than discarding a healthy chat.
         if (($state['stage'] ?? '') === 'resume' && $hostCalls > (int) $state['host_calls']
             && !self::regularStreamRecoveryPending($job['id'])) $state = [];
+        $expiredIdle = ($facts['action'] ?? '') === 'expired_idle';
         $stoppedThinking = ($facts['action'] ?? '') === 'stopped_thinking';
         $rateLimited = ($facts['action'] ?? '') === 'rate_limit'
             && preg_match('/\A[a-f0-9]{64}\z/D', (string)($facts['rate_limit_key'] ?? '')) === 1;
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
-        if ($rateLimited) {
+        if ($expiredIdle) {
+            if (empty($facts['terminal']) || $hostCalls < 1
+                || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
+                || !in_array($facts['user_id'], $facts['user_ids'], true)
+                || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            if (($state['stage'] ?? '') === 'resume' && ($state['failure_key'] ?? '') === $failureKey) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
+            $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
+                $failureKey, $hostCalls, $idle, 'response_timeout_recovery');
+            if (empty($continued['continue'])) return $continued;
+            $stage = 'resume';
+        } elseif ($rateLimited) {
             if (empty($facts['terminal']) || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
                 || !in_array($facts['user_id'], $facts['user_ids'], true) || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
