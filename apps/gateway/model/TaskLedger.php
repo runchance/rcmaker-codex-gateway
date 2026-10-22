@@ -1809,6 +1809,49 @@ final class TaskLedger
     }
 
     /**
+     * Persist the exact empty root observed before a first saved-chat submission.
+     * Multipart staging later replaces the rolling response baseline with its own
+     * messages, so UUID binding must not depend on that mutable baseline.
+     * @param string $responseId Exact unsent response.
+     * @param array $users Pre-send user identities; must be empty.
+     * @param array $assistants Pre-send assistant identities; must be empty.
+     * @param string $incarnation Current surface owner.
+     * @param int $fence Current surface fencing version.
+     * @return void Duplicate observations are idempotent.
+     * @throws GatewayError If ownership changed or durable evidence cannot be saved.
+     */
+    public static function initialRegularChatEmptyObserved(string $responseId, array $users, array $assistants,
+        string $incarnation, int $fence): void
+    {
+        Schema::transaction(static function () use ($responseId, $users, $assistants, $incarnation, $fence): void {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if (!self::ownsCurrentGeneration($job, $turn)) {
+                throw new GatewayError('surface_fence_lost', 'Web chat ownership changed.', 409);
+            }
+            self::assertFence($surface, $incarnation, $fence);
+            if ($users !== [] || $assistants !== [] || $job['status'] !== 'running'
+                || $turn['status'] !== 'queued' || $surface['status'] !== 'ready'
+                || !empty($job['submit_intent_at']) || (int)($job['transport_stage_sent'] ?? 0) !== 0
+                || (int)($job['transport_stage_acked'] ?? 0) !== 0) {
+                return;
+            }
+            $chat = TaskWebChat::state((string)$turn['task_id']);
+            if (($chat['mode'] ?? 'temporary') !== 'regular' || !empty($chat['conversation_id'])) return;
+            $db = SDB(null, 'medoo', 'sqlite');
+            $existing = $db->table('gateway_task_events')->where('task_id', (string)$turn['task_id'])
+                ->where('turn_id', (string)$turn['id'])->where('response_id', $responseId)
+                ->where('surface_id', (string)$surface['id'])
+                ->where('event_type', 'initial_regular_chat_empty_observed')->count();
+            if ($existing > 0) return;
+            self::eventUnlocked((string)$turn['task_id'], (string)$turn['id'], $responseId,
+                (string)$surface['id'], 'initial_regular_chat_empty_observed', [
+                    'generation_id'=>(string)$turn['generation_id'],
+                    'document_nonce_sha256'=>hash('sha256', (string)$surface['document_nonce']),
+                ]);
+        });
+    }
+
+    /**
      * Retain one content-free audit of the first saved-chat UUID binding attempt.
      * This never changes ownership, deadlines, delivery state or retry state.
      * @param string $responseId Exact current response.

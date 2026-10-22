@@ -3984,6 +3984,21 @@ JS;
                 $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_NOT_READY', 'ChatGPT 编辑器不可用或页面已有生成任务。');
                 return;
             }
+            if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                && empty($turn['web_chat']['conversation_id'])) {
+                try {
+                    TaskLedger::initialRegularChatEmptyObserved(
+                        $responseId,
+                        (array)($baseline['user_ids'] ?? []),
+                        (array)($baseline['assistant_ids'] ?? []),
+                        (string)$turn['owner_incarnation'],
+                        (int)$turn['fencing_version']
+                    );
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage());
+                    return;
+                }
+            }
             $this->chatGptTurns[$responseId]['baseline_users'] = is_array($baseline['user_ids'] ?? null) ? $baseline['user_ids'] : [];
             $this->chatGptTurns[$responseId]['baseline_assistants'] = is_array($baseline['assistant_ids'] ?? null) ? $baseline['assistant_ids'] : [];
             $this->chatGptTurns[$responseId]['bound_assistant_id'] = null;

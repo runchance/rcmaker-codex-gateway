@@ -478,16 +478,31 @@ final class TaskWebChat
                 throw new GatewayError('storage_unavailable', 'The initial Web chat submission could not be verified.', 503);
             }
             $baselineUsers = json_decode((string)($submissionProof['baseline_users_json'] ?? ''), true);
+            $initialEmptyProof = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+                ->where('task_id', (string)$current['turn']['task_id'])
+                ->where('turn_id', (string)$current['turn']['id'])
+                ->where('response_id', $physicalResponseId)
+                ->where('surface_id', (string)$current['surface']['id'])
+                ->where('event_type', 'initial_regular_chat_empty_observed')->find('data_json');
+            $initialEmptyData = is_array($initialEmptyProof)
+                ? json_decode((string)($initialEmptyProof['data_json'] ?? ''), true) : null;
+            $initialPageWasEmpty = is_array($baselineUsers) && $baselineUsers === [];
+            if (!$initialPageWasEmpty && is_array($initialEmptyData)) {
+                $nonceHash = (string)($initialEmptyData['document_nonce_sha256'] ?? '');
+                $initialPageWasEmpty = ($initialEmptyData['generation_id'] ?? null) === $current['turn']['generation_id']
+                    && preg_match('/\A[a-f0-9]{64}\z/D', $nonceHash) === 1;
+            }
             $initialPrompt = '<rcmaker_chat_binding>' . $physicalResponseId . "</rcmaker_chat_binding>\n";
-            $initialSubmission = is_array($baselineUsers) && $baselineUsers === []
+            $initialSubmission = $initialPageWasEmpty
                 && str_starts_with((string)($submissionProof['prompt'] ?? ''), $initialPrompt);
             $submittedDocument = (string)($submissionProof['submitted_document_nonce'] ?? '');
             // Most first saved chats switch / -> /c/<uuid> inside the same document. Some
             // ChatGPT deployments perform a real main-frame navigation instead, and newer
             // renderers can omit the literal binding header from the visible user bubble.
             // Accept only the exact physical first submission: either its native user/reply
-            // witness, or its fenced browser POST. Empty baseline, marker prefix, task,
-            // surface, account, unique UUID and current ledger ownership remain mandatory.
+            // witness, or its fenced browser POST. The immutable pre-stage empty-page proof
+            // survives multipart's rolling baseline; marker prefix, task, surface, account,
+            // unique UUID and current ledger ownership remain mandatory.
             $physicalWitness = $initialMessageWitness || $observedSubmission;
             if (!$physicalWitness || !$initialSubmission || empty($submissionProof['submit_intent_at'])
                 || $submittedDocument === '' || empty($current['surface']['document_nonce'])) {
