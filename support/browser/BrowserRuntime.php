@@ -5525,13 +5525,14 @@ JS;
                 && $surface['owner_incarnation'] === $current['owner_incarnation']
                 && (int)$surface['fencing_version'] === (int)$current['fencing_version'];
         };
-        $deadline = min((float)$turn['deadline'], microtime(true) + 60.0);
+        $turnDeadline = (float)$turn['deadline'];
+        $deadline = min($turnDeadline, microtime(true) + 60.0);
         $read = null;
         $read = function (int $keyIndex = -1, int $attempt = 0, bool $emptySeen = false) use (
-            $responseId, $after, $searchOnly, $isCurrent, $deadline, $stageAck, &$expected, &$read): void {
+            $responseId, $after, $searchOnly, $isCurrent, $deadline, $turnDeadline, $stageAck, &$expected, &$read): void {
             if (!$isCurrent()) return;
             $this->evaluateTask($responseId, WebModelPage::connectorComposerStateExpression($keyIndex >= 0, $expected),
-                function ($error, $state) use ($responseId, $after, $searchOnly, $isCurrent, $deadline,
+                function ($error, $state) use ($responseId, $after, $searchOnly, $isCurrent, $deadline, $turnDeadline,
                     $stageAck, &$expected, &$read, $keyIndex, $attempt, $emptySeen): void {
                     if (!$isCurrent()) return;
                     if ($error === null && ($state['code'] ?? '') === 'CHATGPT_CHAT_IDENTITY_CHANGED') {
@@ -5540,7 +5541,9 @@ JS;
                         return;
                     }
                     if ($error !== null || !is_array($state) || empty($state['ok'])) {
-                        if (microtime(true) < $deadline) {
+                        $waitDeadline = self::connectorClearReadDeadline(
+                            $error, $state, $keyIndex, $attempt, $deadline, $turnDeadline);
+                        if (microtime(true) < $waitDeadline) {
                             Timer::add(0.5, fn() => $read($keyIndex, $attempt, false), null, false);
                         } else $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED',
                             '选择工具连接器前无法清空 ChatGPT 编辑器。'
@@ -5603,6 +5606,20 @@ JS;
                 }, 15.0);
         };
         $read();
+    }
+
+    /**
+     * A visible generation control is an authoritative busy signal, not an editor failure.
+     * Keep the bounded editor timeout for every other state, while an exact owned turn may
+     * wait until its existing overall deadline for ChatGPT to finish the preceding response.
+     */
+    private static function connectorClearReadDeadline(?array $error, mixed $state, int $keyIndex, int $attempt,
+        float $editorDeadline, float $turnDeadline): float
+    {
+        if ($keyIndex < 0 && $attempt === 0 && $error === null && is_array($state) && empty($state['ok'])
+            && ($state['code'] ?? '') === 'CHATGPT_EDITOR_NOT_READY'
+            && ($state['generation_running'] ?? null) === true) return $turnDeadline;
+        return $editorDeadline;
     }
 
     /** Explain a failed native cleanup using only machine codes, counts and flags; never draft/exception text. */

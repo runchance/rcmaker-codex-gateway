@@ -221,7 +221,28 @@ final class TaskWebChat
         $sourceId = (string) ($spec['previous_response_id'] ?? $spec['stopped_source_response_id'] ?? '');
         $source = $sourceId !== '' ? $db->table('gateway_response_jobs')->where('id', $sourceId)->where('task_id', $chat['task_id'])->find() : null;
         if (!is_array($source)) $source = ResponseJob::latestForTaskUnlocked($chat['task_id']);
-        $prior = is_array($source) ? json_decode((string) $source['context_json'], true, 128, JSON_THROW_ON_ERROR) : [];
+        $recoverySource = null;
+        if (!empty($spec['regular_recovery_source_response_id']) && !empty($spec['regular_recovery_source_task_id'])) {
+            $candidate = $db->table('gateway_response_jobs')
+                ->where('id', (string) $spec['regular_recovery_source_response_id'])
+                ->where('task_id', (string) $spec['regular_recovery_source_task_id'])->find(
+                    'id,task_id,operation_kind,request_hash,context_json,transport_context_json,budget_json,'
+                    . 'submit_intent_at,accepted_at,transport_stage_sent,output_started');
+            $candidateBudget = is_array($candidate)
+                ? json_decode((string) ($candidate['budget_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR) : [];
+            $candidateProof = $candidateBudget['regular_chat'] ?? null;
+            // routeConversationUnlocked transfers this exact saved-chat UUID only after
+            // proving the old and new internal tasks belong to one native conversation.
+            // Use the retired response solely as the history-diff baseline; it is never a
+            // live continuation handle and cannot revive its tool capability.
+            if (is_array($candidateProof)
+                && ($candidateProof['task_id'] ?? null) === ($spec['regular_recovery_source_task_id'] ?? null)
+                && ($candidateProof['conversation_id'] ?? null) === $chat['conversation_id']) {
+                $recoverySource = $candidate;
+            }
+        }
+        $priorSource = is_array($source) ? $source : $recoverySource;
+        $prior = is_array($priorSource) ? json_decode((string) $priorSource['context_json'], true, 128, JSON_THROW_ON_ERROR) : [];
         $checkpointResume = is_array($source) ? ContextCompaction::savedChatResumeUnlocked($spec, $source) : null;
         if ($checkpointResume !== null) {
             $messages = $checkpointResume['messages'];
@@ -243,11 +264,7 @@ final class TaskWebChat
         if ($messages === []) throw new GatewayError('empty_context_delta', 'No current request could be identified for the saved Web chat.', 400);
         // A failed pre-send suffix never reached the saved conversation. Preserve its new
         // requirements too, without replaying the historical context in the durable audit.
-        $unsentSource = $source;
-        if (!empty($spec['regular_recovery_source_response_id']) && !empty($spec['regular_recovery_source_task_id'])) {
-            $unsentSource = $db->table('gateway_response_jobs')->where('id', $spec['regular_recovery_source_response_id'])
-                ->where('task_id', $spec['regular_recovery_source_task_id'])->find();
-        }
+        $unsentSource = $recoverySource ?? $source;
         $unsentBudget = is_array($unsentSource) ? json_decode((string) $unsentSource['budget_json'], true, 128, JSON_THROW_ON_ERROR) : [];
         $unsentProof = $unsentBudget['regular_chat'] ?? [];
         if (is_array($unsentSource) && $unsentSource['operation_kind'] === 'response'

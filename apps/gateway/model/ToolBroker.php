@@ -1543,15 +1543,12 @@ final class ToolBroker
             }
             if ($nativeHostWait && !$retiredReceipt && ((string) $row['status'] === 'delivered'
                 || ($transportDeadline !== null && (string) $row['status'] === 'registered'))) {
-                // Codex owns tool execution and approval. Delivery alone cannot tell whether
-                // it is running or waiting for the human. Observe the existing turn lifetime,
-                // rather than revoking its capability at the short MCP dispatch deadline.
+                // Codex owns tool execution and approval, while the browser worker owns
+                // publication of a newly registered call. Either side can be delayed without
+                // changing the call identity or its owning turn. Keep both states within the
+                // durable turn lifetime; the short timeout only bounds one MCP RPC slice.
                 if ($liveTurn) {
                     $deadline = (float) min((int) $turn['deadline_at'], (int) $binding['expires_at']);
-                    if ((string) $row['status'] === 'registered') {
-                        // Polling the same queued call must not restart its dispatch timeout.
-                        $deadline = min($deadline, (float) $row['created_at'] + $timeoutMs / 1000);
-                    }
                 }
             }
             if ($transportDeadline !== null) {
@@ -3772,16 +3769,29 @@ final class ToolBroker
         if (!is_array($binding) || !in_array((string)$binding['status'], ['running','awaiting_start'], true)) {
             throw new GatewayError('continuation_state_invalid', '当前任务工具能力不可继续。', 409);
         }
-        $prompts = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
-            ->where('durable_turn_id', (string)$job['durable_turn_id'])->order([['rowid','DESC']])->select('prompt');
-        if (!is_array($prompts)) throw new GatewayError('storage_unavailable', '任务原始工具令牌暂不可读取。', 503);
         $tokens = [];
-        foreach ($prompts as $row) {
-            preg_match_all('/(?<![A-Za-z0-9_-])(?:turn_[A-Za-z0-9_-]{32}|request_[A-Za-z0-9_-]{24,128})(?![A-Za-z0-9_-])/', (string)($row['prompt'] ?? ''), $matches);
+        $collect = static function (string $prompt) use (&$tokens, $binding): void {
+            preg_match_all('/(?<![A-Za-z0-9_-])(?:turn_[A-Za-z0-9_-]{32}|request_[A-Za-z0-9_-]{24,128})(?![A-Za-z0-9_-])/', $prompt, $matches);
             foreach ($matches[0] as $candidate) {
                 if (hash_equals((string)$binding['token_hash'], hash('sha256', $candidate))) $tokens[$candidate] = $candidate;
             }
-            if ($tokens !== []) break;
+        };
+        // The current round normally carries the original token. Fall back across the
+        // durable turn one row at a time for upgraded ledgers whose continuation prompt
+        // omitted it. Never materialize every historical prompt: long tool turns can hold
+        // hundreds of multi-megabyte rows and previously exhausted the browser worker.
+        $collect((string)($job['prompt'] ?? ''));
+        if ($tokens === []) {
+            $statement = DB('medoo', 'sqlite')->query(
+                'SELECT prompt FROM gateway_response_jobs WHERE durable_turn_id=:turn AND id<>:response ORDER BY rowid DESC',
+                [':turn'=>(string)$job['durable_turn_id'], ':response'=>$responseId]
+            );
+            if (!$statement) throw new GatewayError('storage_unavailable', '任务原始工具令牌暂不可读取。', 503);
+            while (($row = $statement->fetch(\PDO::FETCH_ASSOC)) !== false) {
+                $collect((string)($row['prompt'] ?? ''));
+                if ($tokens !== []) break;
+            }
+            $statement->closeCursor();
         }
         $tokens = array_values($tokens);
         if (count($tokens) !== 1) throw new GatewayError('continuation_token_missing', '无法核对当前工具令牌，已停止网页续做。', 409);

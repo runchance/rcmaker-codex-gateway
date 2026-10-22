@@ -7,7 +7,7 @@ $apiProcess = [
     'type' => 'app',
     'count' => 1,
     'reusePort' => false,
-    'memory_limit' => '512M',
+    'memory_limit' => '-1',
     'package_max_length' => app\gateway\model\ResponsesProtocol::MAX_BODY_BYTES + 16384 + 4,
     // Inherit max_request from the configured framework engine.
     'bootstrap' => [app\gateway\bootstrap\HttpLimits::class, RC\Helper\Db\Medoo::class, RC\Helper\Cache\Raw::class, app\gateway\bootstrap\Initialize::class],
@@ -19,7 +19,7 @@ return [
         'count' => 1,
         'default_app' => 'console',
         'reusePort' => false,
-        'memory_limit' => '128M',
+        'memory_limit' => '-1',
         // Inherit the framework engine's configured recycling limit; polling must not
         // silently replace the operator's long-running gateway setting with 100,000.
     ],
@@ -41,30 +41,35 @@ return [
         'handler' => support\process\GatewayProbe::class,
         'count' => 1,
         'reloadable' => false,
+        'memory_limit' => '-1',
         'bootstrap' => [RC\Helper\Db\Medoo::class, RC\Helper\Cache\Raw::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_GATEWAY_MAINTENANCE' => [
         'handler' => support\process\GatewayMaintenance::class,
         'count' => 1,
         'reloadable' => false,
+        'memory_limit' => '-1',
         'bootstrap' => [RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_GATEWAY_BROWSER' => [
         'handler' => support\process\GatewayBrowser::class,
         'count' => 1,
         'reloadable' => false,
+        'memory_limit' => '-1',
         'bootstrap' => [RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_GATEWAY_TUNNEL' => [
         'handler' => support\process\GatewayTunnel::class,
         'count' => 1,
         'reloadable' => false,
+        'memory_limit' => '-1',
         'bootstrap' => [RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
     ],
     'RC_monitor' => [
         'handler' => RC\Helper\Process\FileMonitor::class,
         'count' => 1,
         'reloadable' => false,
+        'memory_limit' => '-1',
         'bootstrap' => [],
         'constructor' => [
             'monitor_dir' => [
