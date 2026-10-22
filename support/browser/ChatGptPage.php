@@ -361,14 +361,21 @@ return {ok:true,account_plan:accountPlan(),sol_available:controls.length===1,eff
 JS));
     }
 
-    /** Focus the single visible Sol effort control so CDP Enter opens its native menu. */
+    /** Focus the single visible Sol effort control and verify its current semantic node after a renderer remount. */
     public static function focusEffortControlExpression(): string
     {
         $effort = json_encode(self::EFFORT_CONTROL, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         return self::wrap(str_replace('__EFFORT__', $effort, <<<'JS'
 const composer=visibleOne(COMPOSER);const form=composer?.closest('form');if(!form)return {ok:false,code:'CHATGPT_EDITOR_FORM_MISSING'};
 const controls=[...form.querySelectorAll(__EFFORT__)].filter(visible);if(controls.length!==1)return {ok:false,code:'CHATGPT_MODEL_CONTROL_INVALID',count:controls.length};
-controls[0].focus();return {ok:document.activeElement===controls[0],expanded:controls[0].getAttribute('aria-expanded')==='true'};
+const original=controls[0];original.focus();
+// ChatGPT can synchronously replace the controlled button from its focus handler.
+// Verify the exact semantic control in the current composer instead of retaining
+// object identity with a detached pre-focus node. A lost/ambiguous focus still fails.
+const currentComposer=visibleOne(COMPOSER),currentForm=currentComposer?.closest('form');
+const currentControls=currentForm?[...currentForm.querySelectorAll(__EFFORT__)].filter(visible):[];
+const current=currentControls.length===1?currentControls[0]:null;
+return {ok:current!==null&&document.activeElement===current,expanded:current?.getAttribute('aria-expanded')==='true',remounted:current!==null&&current!==original};
 JS));
     }
 
