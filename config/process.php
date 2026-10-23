@@ -58,6 +58,13 @@ return [
         'memory_limit' => '-1',
         'bootstrap' => [RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
     ],
+    'RC_GATEWAY_FILE_CLEANUP' => [
+        'handler' => support\process\GatewayFileCleanup::class,
+        'count' => 1,
+        'reloadable' => false,
+        'memory_limit' => '-1',
+        'bootstrap' => [RC\Helper\Db\Medoo::class, app\gateway\bootstrap\Initialize::class],
+    ],
     'RC_GATEWAY_TUNNEL' => [
         'handler' => support\process\GatewayTunnel::class,
         'count' => 1,

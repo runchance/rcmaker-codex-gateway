@@ -304,8 +304,17 @@ final class AttachmentStore
         return $tokens;
     }
 
-    /** Remove old parse-stage files unless retained for native history or referenced by live/archived checkpoints. */
-    public static function cleanupOrphans(int $olderThanSeconds = 86400): int
+    /**
+     * Remove old parse-stage files only after checking every legacy and current reference source.
+     * This may scan large historical bodies and must run only in the isolated file cleanup worker.
+     * @param int $olderThanSeconds Minimum attachment age, clamped to one hour.
+     * @param string|null $afterId Maintenance cursor; null restarts a pass. Advances over retained
+     *     candidates too, so a referenced old attachment cannot starve later orphan candidates.
+     * @param int $limit Maximum candidates this pass; zero keeps the explicit full-sweep behavior.
+     * @return int Number of orphan files removed. An exhausted pass resets the cursor to null.
+     * @throws GatewayError If retained-reference state cannot be read safely.
+     */
+    public static function cleanupOrphans(int $olderThanSeconds = 86400, ?string &$afterId = null, int $limit = 0): int
     {
         Schema::initialize();
         $cutoff = time() - max(3600, $olderThanSeconds);
@@ -313,12 +322,15 @@ final class AttachmentStore
         $candidates = $db->query(
             "SELECT a.id,a.relative_path FROM gateway_attachments a "
             . "WHERE a.status='ready' AND a.retained_for_history=0 AND a.created_at<:cutoff "
-            . "AND NOT EXISTS(SELECT 1 FROM gateway_response_attachments ra WHERE ra.attachment_id=a.id)",
-            [':cutoff' => $cutoff]
+            . "AND NOT EXISTS(SELECT 1 FROM gateway_response_attachments ra WHERE ra.attachment_id=a.id) "
+            . "AND a.id>:after ORDER BY a.id" . ($limit > 0 ? ' LIMIT ' . min(100, $limit) : ''),
+            [':cutoff' => $cutoff, ':after' => $afterId ?? '']
         )->fetchAll(\PDO::FETCH_ASSOC);
+        if ($candidates === []) $afterId = null;
         $removed = 0;
         foreach ($candidates as $candidate) {
             $id = (string) ($candidate['id'] ?? '');
+            $afterId = $id;
             if (!preg_match('/\Aatt_[a-f0-9]{32}\z/D', $id)) continue;
             $needle = '%' . $id . '%';
             // A task's transcript can be removed while its native checkpoint remains usable.
@@ -345,10 +357,26 @@ final class AttachmentStore
 
             $relative = str_replace('\\', '/', (string) ($candidate['relative_path'] ?? ''));
             if ($relative === '' || str_starts_with($relative, '/') || str_contains('/' . $relative . '/', '/../')) continue;
-            $deleted = SDB(null, 'medoo', 'sqlite')->table('gateway_attachments')->where('id', $id)->delete();
-            if ($deleted === false) continue;
-            @unlink(self::root() . '/' . $relative);
-            $removed++;
+            // Another worker may bind/retain this file while a legacy body scan is running.
+            // Recheck mutable ownership under a short writer transaction, never around the scan.
+            $removedCandidate = TaskMaintenance::tryReclamation(static function () use ($id, $cutoff, $limit, $relative): bool {
+                $deleted = Schema::transaction(static function () use ($id, $cutoff, $limit): bool {
+                    if ($limit > 0 && TaskMaintenance::hasActiveWork()) return false;
+                    $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_response_attachments')
+                        ->where('attachment_id', $id)->find('attachment_id');
+                    if ($binding === false) throw new GatewayError('storage_unavailable', '附件绑定状态暂不可读取。', 503);
+                    if (is_array($binding)) return false;
+                    $result = SDB(null, 'medoo', 'sqlite')->table('gateway_attachments')->where('id', $id)
+                        ->where('status', 'ready')->where('retained_for_history', 0)->where('created_at', '<', $cutoff)->delete();
+                    return $result !== false && $result->rowCount() === 1;
+                });
+                if (!$deleted) return false;
+                // Keep the publication guard until unlink completes. A waiting publisher can
+                // then recreate the file/index together instead of losing its fresh file.
+                @unlink(self::root() . '/' . $relative);
+                return true;
+            });
+            if ($removedCandidate === true) $removed++;
         }
         return $removed;
     }

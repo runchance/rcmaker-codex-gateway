@@ -40,6 +40,22 @@ final class TaskMaintenance
         return $row !== false;
     }
 
+    /**
+     * Keep optional legacy attachment scans out of periods with live task or tool work.
+     * Includes legacy responses without a durable task, then the task retention activity
+     * definition for in-flight native work and approvals between response rounds.
+     * @return bool Whether any task currently requires the storage worker to prioritize it.
+     */
+    public static function hasActiveWork(): bool
+    {
+        $response = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+            ->where('status', 'IN', ['queued','running'])->find('id');
+        if ($response === false) throw new GatewayError('storage_unavailable', 'Response activity could not be read.', 503);
+        if (is_array($response)) return true;
+        return DB('medoo', 'sqlite')->query('SELECT 1 FROM gateway_tasks t WHERE (' . self::WORKING . ') LIMIT 1')
+            ->fetchColumn() !== false;
+    }
+
     /** @return bool True when an explicit deletion already owns this idle task's records. */
     public static function isPending(string $taskId): bool
     {
@@ -144,6 +160,39 @@ final class TaskMaintenance
         $lock = self::lock(LOCK_SH);
         try { return $operation(); }
         finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
+    /**
+     * Reclaim one proven orphan without racing attachment publication or response admission.
+     * Only final metadata rechecks and file removal belong here; history scans run beforehand.
+     * Optional cleanup cannot wait seconds for SQLite while holding the admission guard.
+     * @param callable():bool $operation Whether the guarded orphan was actually removed.
+     * @return bool|null Null when an admission/cleanup already holds the existing guard.
+     * @throws GatewayError STORAGE_BUSY before deletion when another SQLite writer owns storage.
+     */
+    public static function tryReclamation(callable $operation): ?bool
+    {
+        $lock = self::lock(LOCK_EX | LOCK_NB, false);
+        if ($lock === null) return null;
+        $db = null;
+        $previousWait = null;
+        try {
+            $db = DB('medoo', 'sqlite');
+            $statement = $db->query('PRAGMA busy_timeout');
+            $previousWait = (int)$statement->fetchColumn();
+            $statement->closeCursor();
+            $db->query('PRAGMA busy_timeout=0')->closeCursor();
+            return $operation();
+        } finally {
+            try {
+                // This is connection-local and synchronous; restore the normal durable-write
+                // budget even when optional reclamation fails before its callback can run.
+                if ($previousWait !== null) $db->query('PRAGMA busy_timeout=' . $previousWait)->closeCursor();
+            } finally {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
+        }
     }
 
     /**

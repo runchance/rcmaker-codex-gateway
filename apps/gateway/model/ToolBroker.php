@@ -1194,14 +1194,22 @@ final class ToolBroker
     public static function invocationsForResponse(string $responseId): array
     {
         Schema::initialize();
-        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
-        if (!is_array($binding) || (string) $binding['status'] !== 'running') return [];
-        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find('status');
+        $db = SDB(null, 'medoo', 'sqlite');
+        $binding = $db->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find('id,status,current_response_id');
+        if (!is_array($binding) || (string) $binding['status'] !== 'running'
+            || (string) ($binding['current_response_id'] ?? '') !== $responseId) return [];
+        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('status');
         if (!is_array($job) || !in_array((string) $job['status'], ['queued', 'running'], true)) return [];
-        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
+        $rows = $db->table('gateway_tool_invocations')
             ->where('binding_id', (string) $binding['id'])->where('response_id', $responseId)
             ->where('status', 'registered')->order([['rowid', 'ASC']])->select();
         if (!is_array($rows)) throw new GatewayError('storage_unavailable', '宿主工具批次暂不可读取。', 503);
+        if ($rows === []) return [];
+        // The immutable tool catalog is commonly hundreds of KB. Load it only when a registered
+        // call actually needs dispatch; idle page polling stays metadata-only.
+        $binding = $db->table('gateway_mcp_bindings')->where('id', (string) $binding['id'])->find();
+        if (!is_array($binding) || (string) $binding['status'] !== 'running'
+            || (string) ($binding['current_response_id'] ?? '') !== $responseId) return [];
         $invocations = [];
         foreach ($rows as $row) {
             $tool = self::catalogEntry($binding, (string) $row['wire_name']);
@@ -1657,7 +1665,8 @@ final class ToolBroker
      */
     public static function settledWaitTransportFailureForResponse(string $responseId): ?string
     {
-        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
+        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)
+            ->find('id,status,turn_id,task_id');
         if (!is_array($binding) || !in_array($binding['status'], ['running','revoked'], true)) return null;
         $db = SDB(null, 'medoo', 'sqlite');
         if ($binding['status'] === 'revoked') {
@@ -1756,7 +1765,10 @@ final class ToolBroker
             }
             if ($undelivered === []) return false;
 
-            $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+            // task_id uses the existing (task_id,id) timeline index. Without it a long-lived
+            // installation can scan every task's event history on each failed-wait poll.
+            $events = $db->table('gateway_task_events')->where('task_id', $binding['task_id'])
+                ->where('turn_id', $binding['turn_id'])
                 ->where('event_type', 'tool_result_transport_failed')->select('data_json');
             if (!is_array($events)) throw new GatewayError('storage_unavailable', '工具等待失败记录暂不可读取。', 503);
             $knownFailures = [];
@@ -2310,7 +2322,8 @@ final class ToolBroker
      */
     public static function completionForResponse(string $responseId): ?array
     {
-        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
+        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)
+            ->find('id,status,final_answer,completion_revision,activity_revision,requires_tool_call,required_tool_count,sent_at,started_at,current_response_id,turn_id,task_id');
         if (!is_array($binding)) return null;
         $contextReadPending = self::originalReadPending($binding);
         return [
@@ -2763,6 +2776,94 @@ final class ToolBroker
     }
 
     /**
+     * Prove that an unacknowledged native result was transferred by an exact steering restart.
+     *
+     * A steering restart rotates the capability inside the same binding, so the old MCP wait can
+     * remain unacknowledged even though its byte-verified receipt is already part of the successor
+     * Web request. This proof never invents a client acknowledgement. It accepts only the immediate
+     * successor in the same task, turn, binding, epoch and surface, with both broker events and the
+     * exact persisted receipt. The current recovery job must be that successor or one of its later
+     * rounds in the same fenced lineage.
+     *
+     * @param array<string,mixed> $call Completed tool invocation whose Web acknowledgement is absent.
+     * @param array<string,mixed> $currentJob Current owned response considered for Web recovery.
+     * @return bool Whether the exact receipt is already covered by a proven steering handoff.
+     */
+    public static function canonicalSteeringHandoffCoversReceiptUnlocked(array $call, array $currentJob): bool
+    {
+        if (($call['status'] ?? '') !== 'completed' || ($call['result_delivered_at'] ?? null) !== null
+            || empty($call['id']) || empty($call['response_id']) || empty($call['call_id'])
+            || empty($call['task_id']) || empty($call['turn_id']) || empty($call['binding_id'])) return false;
+        $result = is_string($call['result_json'] ?? null) ? json_decode($call['result_json'], true) : null;
+        $handoffId = is_array($result) ? (string)($result['canonical_handoff_response_id'] ?? '') : '';
+        if ($handoffId === '' || !is_string($result['output'] ?? null) || empty($call['result_hash'])
+            || !hash_equals((string)$call['result_hash'], hash('sha256', $result['output']))) return false;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', (string)$call['response_id'])
+            ->find('id,task_id,durable_turn_id,mcp_binding_id,epoch_id,surface_id,round_no,status,round_kind,operation_kind');
+        $handoff = $db->table('gateway_response_jobs')->where('id', $handoffId)
+            ->find('id,task_id,durable_turn_id,mcp_binding_id,epoch_id,surface_id,round_no,status,operation_kind,previous_response_id,transport_context_json,context_json');
+        if (!is_array($source) || !is_array($handoff)
+            || (string)$source['status'] !== 'completed' || (string)$source['round_kind'] !== 'tool_call'
+            || (string)$source['operation_kind'] !== 'response' || (string)$handoff['operation_kind'] !== 'response'
+            || !in_array((string)$handoff['status'], ['running', 'completed'], true)
+            || (string)$source['id'] !== (string)$handoff['previous_response_id']
+            || (int)$handoff['round_no'] !== (int)$source['round_no'] + 1
+            || (string)$source['task_id'] !== (string)$call['task_id']
+            || (string)$source['durable_turn_id'] !== (string)$call['turn_id']
+            || (string)$source['mcp_binding_id'] !== (string)$call['binding_id']
+            || (string)$handoff['task_id'] !== (string)$call['task_id']
+            || (string)$handoff['durable_turn_id'] !== (string)$call['turn_id']
+            || (string)$handoff['mcp_binding_id'] !== (string)$call['binding_id']
+            || (string)$handoff['epoch_id'] !== (string)$source['epoch_id']
+            || (string)$handoff['surface_id'] !== (string)$source['surface_id']
+            || (string)($currentJob['task_id'] ?? '') !== (string)$handoff['task_id']
+            || (string)($currentJob['durable_turn_id'] ?? '') !== (string)$handoff['durable_turn_id']
+            || (string)($currentJob['mcp_binding_id'] ?? '') !== (string)$handoff['mcp_binding_id']
+            || (string)($currentJob['epoch_id'] ?? '') !== (string)$handoff['epoch_id']
+            || (string)($currentJob['surface_id'] ?? '') !== (string)$handoff['surface_id']
+            || (int)($currentJob['round_no'] ?? -1) < (int)$handoff['round_no']) return false;
+
+        $events = $db->table('gateway_task_events')->where('task_id', (string)$call['task_id'])
+            ->where('turn_id', (string)$call['turn_id'])->where('response_id', $handoffId)
+            ->where('event_type', 'IN', ['tool_result_received', 'mcp_steering_restart_prepared',
+                'mcp_mailbox_context_restart_prepared'])->select('event_type,data_json');
+        if (!is_array($events)) return false;
+        $received = false;
+        $restart = false;
+        foreach ($events as $event) {
+            $data = json_decode((string)$event['data_json'], true);
+            if (!is_array($data)) continue;
+            if ($event['event_type'] === 'tool_result_received'
+                && ($data['invocation_id'] ?? '') === (string)$call['id']
+                && ($data['call_id'] ?? '') === (string)$call['call_id']
+                && !empty($data['canonical_handoff'])) $received = true;
+            if (in_array($event['event_type'], ['mcp_steering_restart_prepared',
+                    'mcp_mailbox_context_restart_prepared'], true)
+                && ($data['binding_id'] ?? '') === (string)$call['binding_id']
+                && ($data['previous_response_id'] ?? '') === (string)$source['id']) $restart = true;
+        }
+        if (!$received || !$restart) return false;
+
+        $contextJson = (string)($handoff['transport_context_json'] ?: $handoff['context_json']);
+        $context = json_decode($contextJson, true);
+        if (!is_array($context)) return false;
+        $receipts = [];
+        foreach ((array)($context['messages'] ?? []) as $message) {
+            if (!is_array($message) || !in_array($message['type'] ?? '',
+                ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)
+                || !is_string($message['call_id'] ?? null)) continue;
+            $callId = $message['call_id'];
+            if (array_key_exists($callId, $receipts)) return false;
+            if (($message['type'] ?? '') === 'tool_search_output') {
+                $receipts[$callId] = ['status'=>$message['status'] ?? 'completed', 'tools'=>$message['tools'] ?? []];
+            } elseif (array_key_exists('output', $message)) $receipts[$callId] = $message['output'];
+        }
+        return self::canonicalReceiptMatches($call, $result, $receipts);
+    }
+
+    /**
      * Prove that ChatGPT consumed an exact native result even when the old MCP acknowledgement
      * packet never reached the gateway. The immediate successor must be a completed Web round in
      * the same task/turn/page lineage, carry the byte-verified receipt, and have the broker's own
@@ -3142,7 +3243,10 @@ final class ToolBroker
         // page must inspect its archive again; its dedicated capability sets this cursor.
         $cursor = max(0, (int) ($budget['original_context_read_after_event_id'] ?? 0));
         do {
-            $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
+            // task_id uses the existing (task_id,id) timeline index. Without it a long-lived
+            // installation can scan every task's event history on each completion poll.
+            $events = $db->table('gateway_task_events')->where('task_id', $binding['task_id'])
+                ->where('turn_id', $binding['turn_id'])
                 ->where('event_type', 'original_context_read')->where('id', '>', $cursor)
                 ->order([['id','ASC']])->limit(128)->select('id,data_json');
             if (!is_array($events)) throw new GatewayError('storage_unavailable', '原文读取证明暂不可读取。', 503);

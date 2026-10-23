@@ -2601,6 +2601,16 @@ final class TaskLedger
             if ($regularRecovery !== null && self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
                 return array_replace($idle, ['waiting'=>true]);
             }
+            if (($regularRecovery['action'] ?? '') === 'refresh_observed' && is_array($binding)) {
+                // Observing the exact answer after a reload sends no message and rotates no
+                // capability. Do not wait for the MCP activity that the recovered answer may
+                // already be using; doing so can keep the recovery fence alive indefinitely.
+                $completed = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+                    ->where('status', 'completed')->count();
+                if (!is_numeric($completed)) throw new GatewayError('storage_unavailable', 'Recovery activity could not be read.', 503);
+                return self::reserveRegularStreamRecoveryUnlocked($job, $turn, $surface, $binding,
+                    $failureKey, false, (int)$completed, $regularRecovery, $idle);
+            }
             // Native regeneration must never rewrite final text already committed to Codex.
             if (!empty($job['output_started']) || (string)$job['output_text'] !== '') {
                 return $regularRecovery === null ? $idle : array_replace($idle, ['published'=>true]);
@@ -2632,8 +2642,9 @@ final class TaskLedger
                     // Canonical handoff preserved this result in a later round. Its retired
                     // Web wait remains unacknowledged, but is no longer pending delivery here.
                     $result = is_string($call['result_json']) ? json_decode($call['result_json'], true) : null;
-                    if ($call['binding_id'] !== ($binding['id'] ?? null)
-                        && !empty($result['canonical_handoff_response_id'])) continue;
+                    if (!empty($result['canonical_handoff_response_id'])
+                        && ($call['binding_id'] !== ($binding['id'] ?? null)
+                            || ToolBroker::canonicalSteeringHandoffCoversReceiptUnlocked($call, $job))) continue;
                     if ($call['binding_id'] !== ($binding['id'] ?? null)
                         && ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $job, (string)$job['task_id'])) {
                         // The old wait is conclusively closed, and this turn already carries
@@ -2728,6 +2739,10 @@ final class TaskLedger
     {
         $state = self::regularStreamRecoveryState($responseId);
         if ($state === []) return false;
+        // A fresh document that still owns the same answer has been handed back to
+        // normal polling. It must be allowed to call tools while the recovered Web
+        // generation continues; no gateway message is pending in this state.
+        if (($state['stage'] ?? '') === 'reattached') return false;
         if (($state['stage'] ?? '') !== 'resume') return true;
         $continuation = self::continuationState($responseId);
         return ($continuation['marker'] ?? '') !== ($state['marker'] ?? '') || !empty($continuation['pending']);
@@ -2745,10 +2760,11 @@ final class TaskLedger
     }
 
     /**
-     * Advance only a drained ordinary response: Retry, short resume when recovered, or
-     * exact-chat refresh and short resume before permitting a fresh-chat fallback.
-     * Explicit stopped-thinking terminals use three same-page continuations without new host progress,
-     * then the same fenced ordinary-chat replacement. Other error families keep their existing sequence.
+     * Advance only a drained ordinary response. A stopped saved chat is refreshed first so a
+     * server-side generation hidden by a stale page can be reattached without sending anything.
+     * A confirmed stopped fresh document may then use Retry or a short resume before the fenced
+     * fresh-chat fallback. Explicit stopped-thinking terminals retain their existing bounded
+     * same-page continuation contract.
      * Caller owns the writer transaction and has validated task, capability, deadline and document.
      * @param array $facts Current bound user/assistant IDs and document time origin; resume adds fresh baseline proof.
      * @return array One durable action, bounded wait, or a request for the separately fenced fresh-chat fallback.
@@ -2769,14 +2785,16 @@ final class TaskLedger
             throw new GatewayError('surface_fence_lost', 'Web recovery ownership changed.', 409);
         }
         // New, completed host work proves the preceding recovery resumed real execution.
-        // A later incident starts with Retry again, rather than discarding a healthy chat.
-        if (($state['stage'] ?? '') === 'resume' && $hostCalls > (int) $state['host_calls']
+        // A later incident starts with a fresh observation, rather than discarding a healthy chat.
+        if (in_array($state['stage'] ?? '', ['resume','reattached'], true)
+            && $hostCalls > (int) $state['host_calls']
             && !self::regularStreamRecoveryPending($job['id'])) $state = [];
         $expiredIdle = ($facts['action'] ?? '') === 'expired_idle';
         $stoppedThinking = ($facts['action'] ?? '') === 'stopped_thinking';
         $rateLimited = ($facts['action'] ?? '') === 'rate_limit'
             && preg_match('/\A[a-f0-9]{64}\z/D', (string)($facts['rate_limit_key'] ?? '')) === 1;
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
+        $refreshObserved = ($facts['action'] ?? '') === 'refresh_observed';
         if ($expiredIdle) {
             if (empty($facts['terminal']) || $hostCalls < 1
                 || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
@@ -2811,6 +2829,18 @@ final class TaskLedger
             } else {
                 $stage = $nativeControl ? 'retry' : 'refresh';
             }
+        } elseif ($refreshObserved) {
+            if (($state['stage'] ?? '') !== 'refresh' || $state['document_id'] === $facts['document_id']
+                || !hash_equals($chat['account_key'], (string)($facts['account_key'] ?? ''))
+                || $state['user_id'] !== $facts['user_id'] || $state['assistant_id'] !== $facts['assistant_id']
+                || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
+                || !in_array($state['user_id'], $facts['user_ids'], true)
+                || !in_array($state['assistant_id'], $facts['assistant_ids'], true)) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            // The same answer survived a real document reload. Hand it back to the
+            // ordinary stream collector without clicking Retry or sending Continue.
+            $stage = 'reattached';
         } elseif ($stoppedThinking) {
             if (empty($facts['terminal']) || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
                 || !in_array($facts['user_id'], $facts['user_ids'], true) || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
@@ -2821,7 +2851,7 @@ final class TaskLedger
             if (!empty($continuation['pending']) || ($state['failure_key'] ?? '') === $failureKey) {
                 return array_replace($idle, ['waiting'=>true]);
             }
-            $stoppedAttempts = (int) ($state['stopped_thinking_attempts'] ?? 0);
+            $stoppedAttempts = (int)($state['stopped_thinking_attempts'] ?? 0);
             if ($stoppedAttempts >= 3) {
                 if (empty($state['marker']) || ($continuation['marker'] ?? '') !== $state['marker']) {
                     throw new GatewayError('continuation_marker_mismatch', '网页继续消息与持久化意图不一致。', 409);
@@ -2837,8 +2867,8 @@ final class TaskLedger
             if (($state['stage'] ?? '') === 'resume'
                 && ($state['document_nonce'] ?? '') === $surface['document_nonce']
                 && ($state['document_id'] ?? '') === $facts['document_id']
-                && ($resumeAfterRetry ? empty($state['refreshed'])
-                    : hash_equals($chat['account_key'], (string) ($facts['account_key'] ?? '')))) {
+                && ($resumeAfterRetry
+                    || hash_equals($chat['account_key'], (string)($facts['account_key'] ?? '')))) {
                 return array_replace($idle, ['waiting'=>true]);
             }
             $validResume = $resumeAfterRetry
@@ -2861,7 +2891,23 @@ final class TaskLedger
         } elseif (($state['stage'] ?? '') === 'replace') {
             return array_replace($idle, ['regular_action'=>'replace', 'state'=>$state]);
         } elseif (($state['stage'] ?? '') === 'refresh') {
-            return array_replace($idle, ['regular_action'=>'refresh', 'state'=>$state]);
+            // The first caller already persisted the reload intent. Polling (and a
+            // restarted browser worker) reconciles that intent directly, so another
+            // observer must not reserve a second reload for the same document.
+            return array_replace($idle, ['waiting'=>true, 'state'=>$state]);
+        } elseif (($state['stage'] ?? '') === 'reattached') {
+            if (!is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
+                || !in_array($facts['user_id'], $facts['user_ids'], true)
+                || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
+            }
+            if ($nativeControl) $stage = 'retry';
+            else {
+                $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
+                    $failureKey, $hostCalls, $idle, 'stream_recovery');
+                if (empty($continued['continue'])) return $continued;
+                $stage = 'resume';
+            }
         } elseif (($state['stage'] ?? '') === 'retry') {
             if ($state['user_id'] !== $facts['user_id'] || $state['document_id'] !== $facts['document_id']) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
@@ -2873,25 +2919,35 @@ final class TaskLedger
             }
             $stage = 'refresh';
         } else {
-            $stage = $nativeControl ? 'retry' : 'refresh';
+            // The first observation can be a stale client-side terminal while the
+            // server is still generating. Reload the same saved chat before taking
+            // any action that could create a duplicate Web turn.
+            $stage = 'refresh';
         }
+        $wasRefreshed = !empty($state['refreshed']);
         $state = ['stage'=>$stage, 'generation_id'=>$job['generation_id'], 'surface_id'=>$surface['id'],
             'document_nonce'=>$surface['document_nonce'], 'document_id'=>$facts['document_id'],
             'conversation_id'=>$chat['conversation_id'], 'user_id'=>$facts['user_id'],
             'assistant_id'=>$facts['assistant_id'], 'failure_key'=>$failureKey, 'host_calls'=>$hostCalls,
             'intent_at'=>time()] + ($rateLimited ? ['rate_limit_attempts'=>$rateAttempts]
                 : (!empty($state['rate_limit_attempts']) ? ['rate_limit_attempts'=>$state['rate_limit_attempts']] : []))
-            + ($stoppedThinking ? ['stopped_thinking_attempts'=>$stoppedAttempts] : [])
+            + ($stoppedThinking ? ['stopped_thinking_attempts'=>$stoppedAttempts]
+                : (!empty($state['stopped_thinking_attempts']) ? ['stopped_thinking_attempts'=>$state['stopped_thinking_attempts']] : []))
+            + ($stage === 'reattached' || $wasRefreshed ? ['refreshed'=>true] : [])
             + ($stage === 'resume' ? ['marker'=>$continued['marker'],
-                'refreshed'=>$rateLimited ? !empty($state['refreshed']) : ($stoppedThinking ? false : !$resumeAfterRetry)]
+                'refreshed'=>$rateLimited ? $wasRefreshed : ($stoppedThinking ? $wasRefreshed : ($resumeAfterRetry ? $wasRefreshed : true))]
                 : ($stage === 'replace' ? ['marker'=>$state['marker']] : []));
-        if ($stage === 'resume') {
+        if (in_array($stage, ['resume','reattached'], true)) {
+            // Reattachment observes an existing answer: its pre-submit baseline must stay
+            // intact so a restarted worker can discover that same answer again. Only an
+            // actual new continuation message establishes a new pre-submit baseline.
+            $values = ['submitted_document_nonce'=>$surface['document_nonce']];
+            if ($stage === 'resume') {
+                $values['baseline_users_json'] = json_encode($facts['user_ids'], JSON_THROW_ON_ERROR);
+                $values['baseline_assistants_json'] = json_encode($facts['assistant_ids'], JSON_THROW_ON_ERROR);
+            }
             $write = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['id'])
-                ->where('generation_id', $job['generation_id'])->update([
-                    'submitted_document_nonce'=>$surface['document_nonce'],
-                    'baseline_users_json'=>json_encode($facts['user_ids'], JSON_THROW_ON_ERROR),
-                    'baseline_assistants_json'=>json_encode($facts['assistant_ids'], JSON_THROW_ON_ERROR),
-                ]);
+                ->where('generation_id', $job['generation_id'])->update($values);
             if (!$write || $write->rowCount() !== 1) throw new GatewayError('surface_fence_lost', 'Web recovery ownership changed.', 409);
         }
         self::eventUnlocked($job['task_id'], $turn['id'], $job['id'], $surface['id'], 'regular_stream_recovery_intent', $state);

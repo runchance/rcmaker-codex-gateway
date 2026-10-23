@@ -77,6 +77,8 @@ final class BrowserRuntime
     /** Bound Unix death checks independently of CDP discovery and in-flight startup deadlines. */
     private float $lastUnixExitCheck = 0.0;
     private float $lastHeartbeat = 0.0;
+    /** @var array<string,float> Rate-limit loop diagnostics so a degraded worker cannot flood disk. */
+    private array $loopFailureLoggedAt = [];
     /** Optional account-change reminders have no role in native/Web task execution. */
     private float $lastLoginIdentityCheck = 0.0;
     private float $lastChatGptInspection = 0.0;
@@ -101,7 +103,6 @@ final class BrowserRuntime
     private bool $taskDownloadsReady = false;
     /** @var array<string,array<string,mixed>> browser download guid => owned task download */
     private array $taskDownloads = [];
-    private float $lastArtifactCleanup = 0.0;
     /** @var array<string,array<string,mixed>> response_id => live turn */
     private array $chatGptTurns = [];
     /** @var array<string,array{surface_id:string,owner_incarnation:string,fencing_version:int,response_id:string,security_challenge_active:bool,security_challenge_path:?string}> */
@@ -200,9 +201,18 @@ final class BrowserRuntime
             BrowserState::recover();
             $this->recovered = true;
         }
-        if (microtime(true) - $this->lastHeartbeat >= 1.0) {
-            BrowserState::heartbeat();
-            $this->lastHeartbeat = microtime(true);
+        $heartbeatNow = microtime(true);
+        if ($heartbeatNow - $this->lastHeartbeat >= 1.0) {
+            // A transient writer conflict must not abort page/control work. Start the retry
+            // cooldown after the attempt finishes: SQLite's busy wait can itself exceed 1s.
+            $this->lastHeartbeat = $heartbeatNow;
+            try {
+                BrowserState::heartbeat();
+            } catch (\Throwable $failure) {
+                $this->recordLoopFailure('heartbeat', $failure);
+            } finally {
+                $this->lastHeartbeat = microtime(true);
+            }
         }
         if (microtime(true) - $this->lastLoginIdentityCheck >= 5.0) {
             $this->lastLoginIdentityCheck = microtime(true);
@@ -275,11 +285,6 @@ final class BrowserRuntime
             if (microtime(true) - $this->lastTaskCleanup >= $cleanupInterval) {
                 $this->cleanupRetiredTaskSurfaces($state);
                 $this->lastTaskCleanup = microtime(true);
-            }
-            if (microtime(true) - $this->lastArtifactCleanup >= 60.0) {
-                try { ArtifactStore::cleanupOrphans(3600); } catch (\Throwable) {}
-                try { AttachmentStore::cleanupOrphans(86400); } catch (\Throwable) {}
-                $this->lastArtifactCleanup = microtime(true);
             }
         }
         $inspectionInterval = ($this->commandBusy || $this->pendingStartCommand !== null || $this->chatGptTurns !== [])
@@ -921,8 +926,20 @@ final class BrowserRuntime
         $payload = json_encode(['event'=>$event, 'error'=>get_class($failure),
             'file'=>basename($failure->getFile()), 'line'=>$failure->getLine()], JSON_UNESCAPED_UNICODE);
         if (!is_string($payload)) return;
-        @file_put_contents((string) Config::get('gateway', 'browser_log_dir') . '/runtime-errors.log',
+        $directory = (string) Config::get('gateway', 'browser_log_dir');
+        // A heartbeat can fail before the first browser launch has created its log directory.
+        if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) return;
+        @file_put_contents($directory . '/runtime-errors.log',
             date('c') . ' ' . $payload . PHP_EOL, FILE_APPEND);
+    }
+
+    /** Record timer-loop failures in the exported diagnostic log, never in the user console. */
+    public function recordLoopFailure(string $event, \Throwable $failure): void
+    {
+        $now = microtime(true);
+        if ($now - ($this->loopFailureLoggedAt[$event] ?? 0.0) < 30.0) return;
+        $this->loopFailureLoggedAt[$event] = $now;
+        self::recordQuietBrowserFailure('browser_loop_' . $event, $failure);
     }
 
     /** Observe the logged-in account controls without sending a message or changing its chosen model. */
@@ -9448,9 +9465,10 @@ JS;
 
     /**
      * Reconcile one persisted refresh intent, including a lost reload acknowledgement/restart.
-     * Only a fresh document on the same chat, account and exact user/assistant anchors can
-     * reserve a short continuation. A fresh Stop button waits at the original turn deadline.
-     * @param string $responseId Physical observer. @return void No context replay occurs here.
+     * A fresh document on the same chat, account and exact user/assistant anchors is handed
+     * back to normal polling. If the server is still generating, this reattaches to that answer;
+     * if it has stopped, the next normal snapshot decides whether Retry is actually needed.
+     * @param string $responseId Physical observer. @return void No message is sent here.
      */
     private function waitRegularStreamRefresh(string $responseId): void
     {
@@ -9500,9 +9518,6 @@ JS;
                     }
                     $this->scheduleTaskPoll($responseId, 1.0); return;
                 }
-                if (($baseline['generation_running'] ?? null) !== false) {
-                    $this->scheduleTaskPoll($responseId, 1.0); return;
-                }
                 $load = $this->taskSessions[(string)$turn['session_id']]['saved_chat_load'] ?? [];
                 if ((int)($load['status'] ?? 0) === 429 && empty($baseline['editor_ready'])) {
                     // A rate-limited reload is not proof that the saved conversation vanished.
@@ -9529,7 +9544,7 @@ JS;
                     } else $this->scheduleTaskPoll($responseId, 1.0);
                     return;
                 }
-                if (empty($baseline['editor_ready'])
+                if (($baseline['generation_running'] ?? null) === null || empty($baseline['editor_ready'])
                     || !in_array($state['user_id'], (array) ($baseline['user_ids'] ?? []), true)
                     || !in_array($state['assistant_id'], (array) ($baseline['assistant_ids'] ?? []), true)) {
                     if (time() - $readySince >= 180) {
@@ -9572,16 +9587,22 @@ JS;
                             $nonce = $ledger['surface']['document_nonce'];
                             $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId, $turn['owner_incarnation'],
                                 (int) $turn['fencing_version'], $nonce, $state['failure_key'], false, false,
-                                ['action'=>'resume', 'user_id'=>$state['user_id'], 'assistant_id'=>$state['assistant_id'],
+                                ['action'=>'refresh_observed', 'user_id'=>$state['user_id'], 'assistant_id'=>$state['assistant_id'],
                                     'document_id'=>$baseline['document_id'], 'account_key'=>$account['account_key'],
                                     'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']]);
+                            // Human input or an existing MCP wait can arrive while the account
+                            // probe is in flight. Let the normal stop/steering/tool paths settle
+                            // that work instead of turning a recoverable wait into a failed turn.
                             if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 1.0); return; }
-                            if (empty($reservation['continue'])) {
+                            if (($reservation['regular_action'] ?? '') !== 'reattached') {
                                 throw new GatewayError('CHATGPT_NETWORK_RETRY_EXHAUSTED',
-                                    'The Web chat could not recover safely; the original context and exact tool results are preserved.', 503);
+                                    'The refreshed Web chat could not be reattached safely; the original context and exact tool results are preserved.', 503);
                             }
                             $this->chatGptTurns[$responseId]['document_nonce'] = $nonce;
-                            $this->prepareTaskStreamContinuation($responseId, $logicalId, $baseline, $reservation);
+                            $this->chatGptTurns[$responseId]['regular_stopped_observation'] = null;
+                            unset($this->chatGptTurns[$responseId]['regular_reload_issued'],
+                                $this->chatGptTurns[$responseId]['regular_refresh_ready_since']);
+                            $this->scheduleTaskPoll($responseId, 0.25);
                         } catch (GatewayError $failure) {
                             $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
                         }

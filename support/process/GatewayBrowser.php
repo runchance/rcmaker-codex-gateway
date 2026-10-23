@@ -34,14 +34,17 @@ final class GatewayBrowser
         $timer::add(0.1, function (): void {
             try {
                 $this->runtime->tick();
-            } catch (\Throwable) {
-                // Readiness expires in the API; no browser URL/profile data is written to logs here.
+            } catch (\Throwable $error) {
+                // Keep the worker alive and retain a bounded, exportable diagnostic. The log
+                // contains only exception type/source location, never browser or conversation data.
+                $this->runtime->recordLoopFailure('tick', $error);
             }
         });
         $timer::add(0.65, function (): void {
             try {
                 $this->runtime->capture();
-            } catch (\Throwable) {
+            } catch (\Throwable $error) {
+                $this->runtime->recordLoopFailure('capture', $error);
             }
         });
         // Only this count=1 browser worker reports startup progress. Bootstrap/API workers
