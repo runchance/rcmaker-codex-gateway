@@ -1941,7 +1941,9 @@ final class TaskLedger
      * ToolBroker rotates the capability token in the same SQLite transaction, invalidating any
      * late request from the completed browser page before a fresh prompt can be submitted.
      * Ordinary chats permit this replacement only after their persisted retry/refresh/resume
-     * sequence failed; healthy saved chats and unknown/pending host effects remain protected.
+     * sequence failed, or after the owned current page proves the conversation itself reached
+     * its native capacity terminal. The latter skips futile same-page retries but retains every
+     * ownership, receipt, active-work and human-update fence.
      *
      * @return array{retry:bool,exhausted:bool,attempt:int,old_surface_id?:string,new_surface_id?:string,generation_id?:string,binding_id?:?string}
      */
@@ -1952,19 +1954,53 @@ final class TaskLedger
         int $fence,
         int $maxRetries = 3,
         bool $missingSurface = false,
-        string $retryCause = 'missing_surface_with_complete_receipts'
+        string $retryCause = 'missing_surface_with_complete_receipts',
+        ?array $terminalProof = null
     ): array {
-        return Schema::transaction(function () use ($responseId, $prompt, $incarnation, $fence, $maxRetries, $missingSurface, $retryCause): array {
+        return Schema::transaction(function () use ($responseId, $prompt, $incarnation, $fence, $maxRetries,
+            $missingSurface, $retryCause, $terminalProof): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
             $chat = TaskWebChat::state((string) $turn['task_id']);
-            $regularRecovery = $chat['mode'] === 'regular' && $missingSurface
+            $conversationCapacity = $missingSurface && $retryCause === 'conversation_capacity_exhausted';
+            $regularExhausted = $chat['mode'] === 'regular' && $missingSurface
                 && $retryCause === 'regular_stream_recovery_exhausted';
+            $regularRecovery = $regularExhausted || ($chat['mode'] === 'regular' && $conversationCapacity);
             if ($chat['mode'] === 'regular' && !$regularRecovery) {
                 return ['retry' => false, 'exhausted' => false, 'attempt' => 0];
             }
-            if ($regularRecovery) {
+            $terminalFailureKey = null;
+            if ($conversationCapacity) {
+                $hash = static fn($value): bool => is_string($value) && preg_match('/\A[a-f0-9]{64}\z/', $value) === 1;
+                $userId = is_array($terminalProof) ? (string)($terminalProof['user_id'] ?? '') : '';
+                $assistantId = is_array($terminalProof) ? (string)($terminalProof['response_id'] ?? '') : '';
+                if (!is_array($terminalProof) || !$hash($terminalProof['descriptor_hash'] ?? null)
+                    || !$hash($terminalProof['failure_id_hash'] ?? null) || $userId === '' || $assistantId === ''
+                    || strlen($userId) > 512 || strlen($assistantId) > 512
+                    || !self::ownsCurrentGeneration($job, $turn)
+                    || (string)($terminalProof['generation_id'] ?? '') !== (string)$job['generation_id']
+                    || (string)($terminalProof['document_nonce'] ?? '') !== (string)$surface['document_nonce']
+                    || empty($surface['target_id']) || empty($surface['session_id']) || $surface['status'] !== 'busy'
+                    || (string)$surface['task_id'] !== (string)$job['task_id']
+                    || (string)$surface['epoch_id'] !== (string)$job['epoch_id']
+                    || (string)($job['submitted_document_nonce'] ?? '') !== (string)$surface['document_nonce']) {
+                    return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0];
+                }
+                if ($chat['mode'] === 'regular' && (empty($chat['conversation_id'])
+                    || !hash_equals((string)$chat['conversation_id'], (string)($terminalProof['conversation_id'] ?? '')))) {
+                    return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0];
+                }
+                $terminalFailureKey = hash('sha256', json_encode([
+                    'conversation_capacity_exhausted', (string)$job['generation_id'], (string)$surface['document_nonce'],
+                    (string)($chat['conversation_id'] ?? ''), $userId, $assistantId,
+                    (string)$terminalProof['descriptor_hash'], (string)$terminalProof['failure_id_hash'],
+                ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+                if (self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                    return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0, 'waiting'=>true];
+                }
+            }
+            if ($regularExhausted) {
                 $recovery = self::regularStreamRecoveryState($responseId);
                 $continuation = self::continuationStateUnlocked((string) $turn['id']);
                 if (($recovery['stage'] ?? '') !== 'replace' || empty($recovery['marker'])
@@ -2009,6 +2045,28 @@ final class TaskLedger
                 ? ContextRecovery::prepareUnboundReplayUnlocked($job)
                 : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface, $regularRecovery));
             if (!is_array($rotated)) {
+                if ($conversationCapacity) {
+                    // Keep the terminal page parked while already-authorized work settles. Read
+                    // this inside the same writer transaction so a completion race cannot turn a
+                    // safe next-poll replacement into a false terminal failure.
+                    $pending = $db->table('gateway_tool_invocations')->where('task_id', $job['task_id'])
+                        ->where('status', 'IN', ['registered','delivered'])->count();
+                    $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $job['task_id'])->select('id');
+                    if (!is_numeric($pending) || !is_array($bindings)) {
+                        throw new GatewayError('storage_unavailable', 'Conversation replacement tool state is unavailable.', 503);
+                    }
+                    $active = 0;
+                    foreach ($bindings as $candidate) {
+                        $count = $db->table('gateway_mcp_activities')->where('binding_id', $candidate['id'])
+                            ->where('status', 'active')->count();
+                        if (!is_numeric($count)) throw new GatewayError('storage_unavailable',
+                            'Conversation replacement activity state is unavailable.', 503);
+                        $active += (int)$count;
+                    }
+                    if ((int)$pending + $active > 0) {
+                        return ['retry'=>false, 'exhausted'=>false, 'attempt'=>(int)$attempts, 'waiting'=>true];
+                    }
+                }
                 return ['retry' => false, 'exhausted' => false, 'attempt' => (int) $attempts];
             }
             if ($regularRecovery) {
@@ -2160,7 +2218,7 @@ final class TaskLedger
                 'old_surface_id' => $oldSurfaceId,
                 'new_surface_id' => $newSurfaceId,
                 'generation_id' => $generationId,
-            ]);
+            ] + ($terminalFailureKey === null ? [] : ['terminal_failure_key'=>$terminalFailureKey]));
             return [
                 'retry' => true,
                 'exhausted' => false,

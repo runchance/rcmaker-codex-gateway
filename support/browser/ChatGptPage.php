@@ -1567,15 +1567,17 @@ const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(can
     if(currentTurn)return currentTurn.contains(candidate);
     return newUser?after(newUser.el,candidate):false;
 });
-const networkCard=networkErrorCard(newUser,answer,__REGULAR_RECOVERY__);
+const conversationReplacement=conversationReplacementCard(newUser,answer);
+const networkCard=conversationReplacement?null:networkErrorCard(newUser,answer,__REGULAR_RECOVERY__);
 const networkRetry=networkCard?.descriptor||null;
-if(networkCard)error={code:'CHATGPT_NETWORK_ERROR',message:'ChatGPT 当前回答出现网络错误，页面提供重试。'};
+if(conversationReplacement)error={code:'CHATGPT_CONVERSATION_EXHAUSTED',message:'This ChatGPT conversation has reached its terminal capacity and must continue in a new chat.'};
+else if(networkCard)error={code:'CHATGPT_NETWORK_ERROR',message:'ChatGPT 当前回答出现网络错误，页面提供重试。'};
 else if(stoppedThinkingVisible)error={code:'CHATGPT_STOPPED_THINKING',message:'ChatGPT 已停止思考，当前回答不能确认为完成。'};
 else if(/your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i.test(pageText))error={code:'CHATGPT_SESSION_EXPIRED',message:'ChatGPT 网页会话已过期。'};
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
 else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,error};
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__'],
@@ -2047,6 +2049,110 @@ const promotedAssistant=(assistants,beforeAssistants,boundId,sameGroupId)=>{
             .map(()=>entry));
     return aliases.length===1&&aliases[0].id===sameGroupId?{...aliases[0],id:boundId}:null;
 };
+// Compare a terminal callout action with ChatGPT's own sidebar New Chat action. The
+// sidebar supplies the current locale, so this is not a Chinese/English prose test.
+// Structure and ownership remain mandatory: an answer merely saying "new chat" is inert.
+const compactActionLabel=value=>String(value||'').normalize('NFKC').toLocaleLowerCase()
+    .replace(/[\p{P}\p{S}\s]+/gu,'');
+const actionWords=value=>String(value||'').normalize('NFKC').toLocaleLowerCase()
+    .match(/[\p{L}\p{N}]+/gu)||[];
+const oneEditApart=(left,right)=>{
+    if(left===right)return true;
+    if(Math.abs(left.length-right.length)>1||Math.min(left.length,right.length)<4)return false;
+    let i=0,j=0,diff=0;
+    while(i<left.length&&j<right.length){
+        if(left[i]===right[j]){i++;j++;continue;}
+        if(++diff>1)return false;
+        if(left.length>right.length)i++;else if(right.length>left.length)j++;else{i++;j++;}
+    }
+    return diff+(i<left.length||j<right.length?1:0)<=1;
+};
+const sameActionLabel=(primary,navigation)=>{
+    const left=compactActionLabel(primary),right=compactActionLabel(navigation);
+    if(!left||!right)return false;
+    if((right.length>=2&&left.includes(right))||(left.length>=2&&right.includes(left)))return true;
+    const leftWords=actionWords(primary),rightWords=actionWords(navigation);
+    return rightWords.length>0&&rightWords.every(word=>leftWords.some(candidate=>oneEditApart(candidate,word)));
+};
+const sidebarSectionAction=control=>{
+    if(!control||control.hasAttribute('aria-haspopup')||control.hasAttribute('aria-pressed')
+        ||control.hasAttribute('aria-expanded')||control.hasAttribute('data-composer-navigation-target')
+        ||control.getAttributeNames().some(name=>name.startsWith('data-app-action-sidebar-'))
+        ||String(control.innerText||'').trim()!==''||!control.querySelector('svg'))return false;
+    for(let node=control.parentElement,depth=0;node&&depth<7;node=node.parentElement,depth++){
+        const toggles=[...node.querySelectorAll('[data-app-action-sidebar-section-toggle]')];
+        if(toggles.length===1&&!toggles[0].contains(control))return true;
+    }
+    return false;
+};
+const nativeNewConversationActions=button=>{
+    if(!button)return null;
+    const label=String(button.getAttribute('aria-label')||button.innerText||button.textContent||'').replace(/\s+/g,' ').trim();
+    if(!label)return null;
+    const navigation=[...document.querySelectorAll('button[aria-label]')].filter(candidate=>candidate!==button
+        &&!candidate.closest('[role="alert"]')&&visible(candidate)&&sidebarSectionAction(candidate));
+    const matches=navigation.filter(candidate=>sameActionLabel(label,candidate.getAttribute('aria-label')));
+    return {button_label:label,matches};
+};
+const nativeNewConversationAction=button=>{
+    const action=nativeNewConversationActions(button);
+    const labels=action?[...new Set(action.matches.map(candidate=>compactActionLabel(candidate.getAttribute('aria-label'))))]:[];
+    return action&&action.matches.length>0&&labels.length===1?{button_label:action.button_label,
+        navigation_label:String(action.matches[0].getAttribute('aria-label')||'')}:null;
+};
+// A current-turn danger callout whose sole action matches ChatGPT's localized New Chat
+// control proves that this conversation cannot accept another message. It is never Retry.
+const conversationReplacementCard=(user,answer)=>{
+    const stateKey=Symbol.for('rcmaker.conversation.replacement.observation');
+    const state=window[stateKey]||(window[stateKey]={card:null,sequence:0,failureId:''});
+    if(generationStop()||(!user&&!answer)){state.card=null;return null;}
+    const anchor=user?.el||answer?.el;
+    const turnSelector='[data-turn-key],[data-content-search-turn-key],[data-turn-id],[data-testid^="conversation-turn-"]';
+    const owned=new Set([user?.el?.closest(turnSelector),answer?.el?.closest(turnSelector)].filter(Boolean));
+    const userSelector='[data-user-message-bubble],[data-message-author-role="user"],[data-conversation-role="user"],[data-content-search-unit-key$=":user"]';
+    const rendered=el=>{
+        if(!visible(el))return false;
+        for(let node=el;node;node=node.parentElement){
+            const style=getComputedStyle(node);
+            if(node.hidden||node.hasAttribute('inert')||node.getAttribute('aria-hidden')==='true'
+                ||style.display==='none'||style.visibility==='hidden'||Number(style.opacity||1)===0)return false;
+        }
+        return true;
+    };
+    const candidates=[...document.querySelectorAll('aside[role="alert"]')].filter(card=>{
+        if(!rendered(card)||card.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,'+userSelector)
+            ||!card.classList.contains('text-danger')||!card.classList.contains('border-text-danger/20'))return false;
+        const owner=card.closest(turnSelector);
+        if(owner&&!owned.has(owner)){
+            const group=card.closest('[data-turn-key]');
+            const inner=group?[...group.querySelectorAll('[data-content-search-turn-key]')]
+                .filter(node=>node.closest('[data-turn-key]')===group):[];
+            if(!group||!owned.has(group)||inner.length!==1||inner[0]!==owner)return false;
+        }
+        if(!owner&&(!card.closest('main')||!(anchor.compareDocumentPosition(card)&Node.DOCUMENT_POSITION_FOLLOWING)))return false;
+        return true;
+    }).map(card=>{
+        const buttons=[...card.querySelectorAll('button')].filter(rendered);
+        if(buttons.length!==1||buttons[0].getAttribute('type')!=='button'
+            ||card.querySelector('a[href],input,select,textarea,[contenteditable="true"]'))return null;
+        const action=nativeNewConversationAction(buttons[0]);
+        if(!action)return null;
+        const owner=card.closest(turnSelector);
+        const descriptor={user_id:user?.id||'',response_id:answer?.id||'',turn_id:String(owner?.getAttribute('data-turn-key')
+            ||owner?.getAttribute('data-content-search-turn-key')||owner?.getAttribute('data-turn-id')
+            ||owner?.getAttribute('data-testid')||''),available:true,...action};
+        descriptor.fingerprint=JSON.stringify([descriptor.user_id,descriptor.response_id,descriptor.turn_id,
+            descriptor.button_label,descriptor.navigation_label]);
+        return {card,button:buttons[0],descriptor};
+    }).filter(Boolean);
+    if(candidates.length!==1){state.card=null;return null;}
+    const observed=candidates[0];
+    if(state.card!==observed.card){
+        state.card=observed.card;state.failureId=String(Date.now())+':'+String(++state.sequence);
+    }
+    observed.descriptor.failure_id=state.failureId;
+    return observed;
+};
 // Network-error cards are native alert chrome, never prose in an assistant answer or user bubble.
 // The current stopped-generation error component is identified by its owned alert shell
 // and sole non-navigation retry action, independently of its localized timeout/error text.
@@ -2096,6 +2202,8 @@ const networkErrorCard=(user,answer,allowMessageStream=false)=>{
         const legacyLabel=/^(?:A network error occurred[.!]?\s*Please check your connection and try again[.!]?|Network error[.!]?|发生网络错误[。！]?\s*请检查(?:你的|您的)?(?:网络)?连接(?:，|,)?(?:然后)?(?:重试|再试一次)[。！]?|网络错误[。！]?(?:\s*请检查(?:你的|您的)?(?:网络)?连接(?:，|,)?(?:然后)?(?:重试|再试一次)[。！]?)?)$/i.test(label);
         const streamLabel=allowMessageStream&&/^(?:消息流中的错误|訊息串流發生錯誤|Error in message stream|Error in the message stream)(?:\s|$)/i.test(label);
         if(!nativeRetryShell&&!legacyLabel&&!streamLabel)return null;
+        // A New Chat CTA is terminal conversation replacement, never native Retry.
+        if(buttons.length===1&&(nativeNewConversationActions(buttons[0])?.matches.length||0)>0)return null;
         const button=buttons.length===1&&(nativeRetryShell||/^(?:Retry|Try again|重试|重試|再试一次|再試一次)$/i.test(
             norm(buttons[0].getAttribute('aria-label')||buttons[0].textContent)))?buttons[0]:null;
         const buttonLabel=button?norm(button.getAttribute('aria-label')||button.textContent):'';

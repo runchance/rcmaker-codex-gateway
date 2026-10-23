@@ -3831,6 +3831,7 @@ JS;
                 'response_id' => $responseId,
                 'logical_response_id' => $responseId,
                 'operation_kind' => (string) ($job['operation_kind'] ?? 'response'),
+                'generation_id' => (string) ($job['generation_id'] ?? ''),
                 'durable_turn_id' => (string) ($job['durable_turn_id'] ?? ''),
                 'prompt' => (string) $job['prompt'],
                 'attachments' => (array) ($job['attachments'] ?? []),
@@ -6844,6 +6845,7 @@ JS;
                 if ((string) $next['status'] === 'queued') ResponseJob::start($currentResponse);
                 $this->chatGptTurns[$responseId]['logical_response_id'] = $currentResponse;
                 $this->chatGptTurns[$responseId]['operation_kind'] = (string) ($next['operation_kind'] ?? 'response');
+                $this->chatGptTurns[$responseId]['generation_id'] = (string) ($next['generation_id'] ?? '');
                 $renewedTurn = TaskLedger::pollExecution($currentResponse)['turn'];
                 $this->chatGptTurns[$responseId]['deadline'] = (float)$renewedTurn['deadline_at'];
                 $this->chatGptTurns[$responseId]['emitted'] = (string) ($next['output_text'] ?? '');
@@ -7162,6 +7164,10 @@ JS;
                 }
             }
             if (is_array($snapshot['error'] ?? null)) {
+                if (($snapshot['error']['code'] ?? '') === 'CHATGPT_CONVERSATION_EXHAUSTED') {
+                    $this->recoverExhaustedConversation($responseId, $snapshot);
+                    return;
+                }
                 if (($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING') {
                     $this->recordStoppedThinkingObservation($responseId, $snapshot);
                 }
@@ -9215,11 +9221,15 @@ JS;
      * @return void
      */
     private function recoverFailedMessageStream(string $responseId, bool $waitForPending = false,
-        string $errorCode = 'CHATGPT_NETWORK_ERROR', bool $replaceRegularChat = false): void
+        string $errorCode = 'CHATGPT_NETWORK_ERROR', bool $replaceRegularChat = false,
+        ?array $terminalProof = null): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
-        if (ModelCooldown::remainingSeconds() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return; }
+        if ($errorCode !== 'CHATGPT_CONVERSATION_EXHAUSTED' && ModelCooldown::remainingSeconds() > 0) {
+            $this->scheduleTaskPoll($responseId, 5.0);
+            return;
+        }
         $logicalResponseId = (string)($turn['logical_response_id'] ?? $responseId);
         try {
             $job = ResponseJob::execution($logicalResponseId);
@@ -9230,15 +9240,20 @@ JS;
                 (int)$turn['fencing_version'],
                 self::CONNECTOR_NO_START_MAX_RETRIES,
                 true,
-                $replaceRegularChat ? 'regular_stream_recovery_exhausted' : ($errorCode === 'CHATGPT_NETWORK_ERROR'
-                    ? 'network_error_after_confirmed_receipts' : 'message_stream_error_after_confirmed_receipts')
+                $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED' ? 'conversation_capacity_exhausted'
+                    : ($replaceRegularChat ? 'regular_stream_recovery_exhausted' : ($errorCode === 'CHATGPT_NETWORK_ERROR'
+                    ? 'network_error_after_confirmed_receipts' : 'message_stream_error_after_confirmed_receipts')),
+                $terminalProof
             );
         } catch (GatewayError $error) {
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
             return;
         } catch (\Throwable) {
-            $this->taskFailTurn($responseId, 'CHATGPT_MESSAGE_STREAM_ERROR',
-                'ChatGPT 消息流断开，无法安全重建已确认的工具回执。', true);
+            $this->taskFailTurn($responseId, $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED'
+                    ? 'CHATGPT_CONVERSATION_EXHAUSTED' : 'CHATGPT_MESSAGE_STREAM_ERROR',
+                $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED'
+                    ? 'The exhausted Web conversation could not be replaced from its exact durable receipts.'
+                    : 'ChatGPT 消息流断开，无法安全重建已确认的工具回执。', true);
             return;
         }
         if (empty($retry['retry'])) {
@@ -9260,9 +9275,12 @@ JS;
                     return;
                 }
             }
-            $this->taskFailTurn($responseId, 'CHATGPT_MESSAGE_STREAM_ERROR',
-                $replaceRegularChat ? 'The Web chat could not recover safely; the original context and exact tool results are preserved.'
-                    : 'ChatGPT 消息流断开；当前工具状态或重试次数不允许自动重建。', true);
+            $message = $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED'
+                ? 'The exhausted Web conversation could not be replaced safely; the original context and exact tool results are preserved.'
+                : ($replaceRegularChat ? 'The Web chat could not recover safely; the original context and exact tool results are preserved.'
+                    : 'ChatGPT 消息流断开；当前工具状态或重试次数不允许自动重建。');
+            $this->taskFailTurn($responseId, $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED'
+                ? 'CHATGPT_CONVERSATION_EXHAUSTED' : 'CHATGPT_MESSAGE_STREAM_ERROR', $message, true);
             return;
         }
         $commandId = (int)($turn['command_id'] ?? 0);
@@ -9270,6 +9288,42 @@ JS;
         if ($commandId > 0) {
             Timer::add(0.02, fn() => $this->prepareTaskSurface($logicalResponseId, $commandId, false), null, false);
         }
+    }
+
+    /**
+     * A native current-turn capacity callout is a terminal property of this conversation.
+     * It has no useful same-page Retry action: retire the exact owned page immediately and
+     * rebuild from durable history after active tool work settles. Other failures retain their
+     * existing bounded Retry/refresh/resume sequence.
+     */
+    private function recoverExhaustedConversation(string $responseId, array $snapshot): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        $terminal = $snapshot['conversation_replacement'] ?? null;
+        if (!is_array($turn) || !is_array($terminal)
+            || ($snapshot['generation_running'] ?? null) !== false
+            || empty($terminal['available']) || empty($terminal['failure_id']) || empty($terminal['fingerprint'])
+            || empty($terminal['user_id']) || empty($terminal['response_id'])
+            || ($terminal['user_id'] ?? null) !== ($snapshot['new_user_id'] ?? null)
+            || ($terminal['response_id'] ?? null) !== ($snapshot['response_id'] ?? null)
+            || !$this->taskChatMatches($responseId, (string)($snapshot['url'] ?? ''))) {
+            $this->taskFailTurn($responseId, 'CHATGPT_CONVERSATION_EXHAUSTED',
+                'The Web conversation reached a terminal state, but its current task ownership could not be confirmed.', true);
+            return;
+        }
+        $descriptorHash = hash('sha256', (string)$terminal['fingerprint']);
+        $failureHash = hash('sha256', (string)$terminal['failure_id']);
+        $proof = [
+            'descriptor_hash'=>$descriptorHash,
+            'failure_id_hash'=>$failureHash,
+            'user_id'=>(string)$terminal['user_id'],
+            'response_id'=>(string)$terminal['response_id'],
+            'generation_id'=>(string)($turn['generation_id'] ?? ''),
+            'document_nonce'=>(string)($turn['document_nonce'] ?? ''),
+            'conversation_id'=>(string)($turn['web_chat']['conversation_id'] ?? ''),
+        ];
+        $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_CONVERSATION_EXHAUSTED',
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular', $proof);
     }
 
     /**
