@@ -1673,7 +1673,8 @@ final class ToolBroker
             ->where('status', '<>', 'completed')->count();
         if (!is_numeric($calls) || (int)$calls !== 0) return null;
         $undelivered = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
-            ->where('status', 'completed')->where('result_delivered_at', null)->select('id,result_json');
+            ->where('status', 'completed')->where('result_delivered_at', null)
+            ->select('id,task_id,turn_id,binding_id,response_id,call_id,status,delivered_at,completed_at,result_delivered_at,result_json,result_hash');
         if (!is_array($undelivered) || $undelivered === []) return null;
         $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
             ->where('event_type', 'tool_result_transport_failed')->select('data_json');
@@ -1686,7 +1687,15 @@ final class ToolBroker
             }
         }
         $codes = [];
+        $waiting = [];
         foreach ($undelivered as $call) {
+            $result = is_string($call['result_json'] ?? null) ? json_decode($call['result_json'], true) : null;
+            if (is_array($result) && (!empty($result['canonical_handoff_response_id'])
+                || self::completedReceiptCoveredByLaterRoundUnlocked($binding, $call, $result))) continue;
+            $waiting[] = $call;
+        }
+        if ($waiting === []) return null;
+        foreach ($waiting as $call) {
             if (!isset($failed[$call['id']]) || !is_string($call['result_json'])
                 || !is_array(json_decode($call['result_json'], true))) return null;
             $codes[$failed[$call['id']]] = true;
@@ -1738,8 +1747,11 @@ final class ToolBroker
             foreach ($calls as $call) {
                 if ((string)$call['status'] !== 'completed') return false;
                 if ($call['result_delivered_at'] !== null) continue;
-                if (!is_string($call['result_json']) || !is_array(json_decode($call['result_json'], true))
+                $result = is_string($call['result_json']) ? json_decode($call['result_json'], true) : null;
+                if (!is_array($result)
                     || !is_string($call['call_key']) || $call['call_key'] === '') return false;
+                if (!empty($result['canonical_handoff_response_id'])
+                    || self::completedReceiptCoveredByLaterRoundUnlocked($binding, $call, $result)) continue;
                 $undelivered[(string)$call['id']] = $call;
             }
             if ($undelivered === []) return false;
@@ -2751,6 +2763,71 @@ final class ToolBroker
     }
 
     /**
+     * Prove that ChatGPT consumed an exact native result even when the old MCP acknowledgement
+     * packet never reached the gateway. The immediate successor must be a completed Web round in
+     * the same task/turn/page lineage, carry the byte-verified receipt, and have the broker's own
+     * result-received event. No delivery timestamp or canonical handoff is invented.
+     */
+    private static function completedReceiptCoveredByLaterRoundUnlocked(array $binding, array $call,
+        ?array $result = null): bool
+    {
+        if (($call['status'] ?? '') !== 'completed' || ($call['result_delivered_at'] ?? null) !== null
+            || empty($call['id']) || empty($call['response_id']) || empty($call['call_id'])
+            || ($call['binding_id'] ?? '') !== ($binding['id'] ?? null)
+            || ($call['task_id'] ?? '') !== ($binding['task_id'] ?? null)
+            || ($call['turn_id'] ?? '') !== ($binding['turn_id'] ?? null)) return false;
+        $result ??= is_string($call['result_json'] ?? null) ? json_decode($call['result_json'], true) : null;
+        if (!is_array($result) || !is_string($result['output'] ?? null)
+            || empty($call['result_hash'])
+            || !hash_equals((string)$call['result_hash'], hash('sha256', $result['output']))) return false;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', (string)$call['response_id'])
+            ->find('id,task_id,durable_turn_id,mcp_binding_id,epoch_id,surface_id,round_no,status,round_kind,operation_kind');
+        if (!is_array($source) || (string)$source['status'] !== 'completed'
+            || (string)$source['round_kind'] !== 'tool_call' || (string)$source['operation_kind'] !== 'response'
+            || (string)$source['task_id'] !== (string)$binding['task_id']
+            || (string)$source['durable_turn_id'] !== (string)$binding['turn_id']
+            || (string)$source['mcp_binding_id'] !== (string)$binding['id']) return false;
+        $next = $db->table('gateway_response_jobs')->where('previous_response_id', (string)$source['id'])
+            ->where('task_id', (string)$source['task_id'])->where('durable_turn_id', (string)$source['durable_turn_id'])
+            ->where('mcp_binding_id', (string)$source['mcp_binding_id'])->where('status', 'completed')
+            ->where('operation_kind', 'response')->order([['rowid', 'ASC']])->limit(1)
+            ->find('id,epoch_id,surface_id,round_no,transport_context_json,context_json');
+        if (!is_array($next) || (string)$next['epoch_id'] !== (string)$source['epoch_id']
+            || (string)$next['surface_id'] !== (string)$source['surface_id']
+            || (int)$next['round_no'] !== (int)$source['round_no'] + 1) return false;
+
+        $events = $db->table('gateway_task_events')->where('task_id', (string)$source['task_id'])
+            ->where('turn_id', (string)$source['durable_turn_id'])->where('response_id', (string)$next['id'])
+            ->where('event_type', 'tool_result_received')->select('data_json');
+        if (!is_array($events)) return false;
+        $received = false;
+        foreach ($events as $event) {
+            $data = json_decode((string)$event['data_json'], true);
+            if (($data['invocation_id'] ?? '') === (string)$call['id']
+                && ($data['call_id'] ?? '') === (string)$call['call_id']) { $received = true; break; }
+        }
+        if (!$received) return false;
+
+        $contextJson = (string)($next['transport_context_json'] ?: $next['context_json']);
+        $context = json_decode($contextJson, true);
+        if (!is_array($context)) return false;
+        $receipts = [];
+        foreach ((array)($context['messages'] ?? []) as $message) {
+            if (!is_array($message) || !in_array($message['type'] ?? '',
+                ['function_call_output','custom_tool_call_output','tool_search_output'], true)
+                || !is_string($message['call_id'] ?? null)) continue;
+            $callId = $message['call_id'];
+            if (array_key_exists($callId, $receipts)) return false;
+            if (($message['type'] ?? '') === 'tool_search_output') {
+                $receipts[$callId] = ['status'=>$message['status'] ?? 'completed', 'tools'=>$message['tools'] ?? []];
+            } elseif (array_key_exists('output', $message)) $receipts[$callId] = $message['output'];
+        }
+        return self::canonicalReceiptMatches($call, $result, $receipts);
+    }
+
+    /**
      * Accept complete host receipts under the HTTP envelope; preserve hashes and bind the next round.
      * Verified question replies belong only to the selected, not-yet-returned receipt, outside its hash.
      */
@@ -3305,8 +3382,13 @@ final class ToolBroker
         if ($count === false || $count === null) throw new GatewayError('storage_unavailable', '工具调用状态暂不可读取。', 503);
         $unacknowledged = $db->table('gateway_tool_invocations')
             ->where('binding_id', $bindingId)->where('status', 'completed')->where('result_delivered_at', null)
-            ->select('call_id,result_json');
+            ->select('id,task_id,turn_id,binding_id,response_id,call_id,status,delivered_at,completed_at,result_delivered_at,result_json,result_hash');
         if (!is_array($unacknowledged)) throw new GatewayError('storage_unavailable', '工具回执状态暂不可读取。', 503);
+        $binding = null;
+        if ($unacknowledged !== []) {
+            $binding = $db->table('gateway_mcp_bindings')->where('id', $bindingId)->find();
+            if (!is_array($binding)) throw new GatewayError('mcp_capability_invalid', '工具能力绑定不存在。', 404);
+        }
         $covered = [];
         if ($unacknowledged !== []) {
             // Ordinary waits need no archive scan. Read the large context only for
@@ -3322,7 +3404,8 @@ final class ToolBroker
         $pending = 0;
         foreach ($unacknowledged as $row) {
             $result = is_string($row['result_json'] ?? null) ? json_decode($row['result_json'], true) : null;
-            if (empty($result['canonical_handoff_response_id']) && !isset($covered[$row['call_id']])) $pending++;
+            if (empty($result['canonical_handoff_response_id']) && !isset($covered[$row['call_id']])
+                && !self::completedReceiptCoveredByLaterRoundUnlocked($binding, $row, $result)) $pending++;
         }
         return (int) $count + $pending;
     }
@@ -3592,6 +3675,7 @@ final class ToolBroker
             . 'Plan the next small group of required observations before calling tools. Batch independent reads/searches/tests when supported; keep dependent steps sequential and inspect their results before choosing a mutation. '
             . 'For a known wire_name use codex_tool_inventory with query set to that name and exact=true. Reuse its returned definition within this turn; rediscover after a capability change or an unavailable-tool result, not before every call. '
             . 'Search narrowly and read relevant ranges. Choose appropriate native output limits before execution; retain errors, exit status, useful evidence and continuation handles. Do not dump entire catalogs, logs or files when only a few records are needed, and do not hide failed or pending operations. '
+            . 'Report a tool or service as unavailable, uninitialized, denied or failed only when an exact current-turn tool receipt says so. If it was not invoked, say it was not attempted; an empty or unrelated inventory search is not a runtime failure. '
             . 'When needed evidence already exists in this page or exact tool receipts, use it; query archived history only for missing facts or a required recovery check. '
             . 'These are efficiency rules, not permission to skip required checks, public progress replies, approvals or unresolved results.'
             . "\n</codex_tool_efficiency>";
