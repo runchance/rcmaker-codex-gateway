@@ -2459,6 +2459,70 @@ final class ToolBroker
     }
 
     /**
+     * Recover a saved-chat human revision after an old Connector lease expired while Codex was
+     * disconnected. Exact delivered receipts may still be accepted; calls that never acquired a
+     * native response identity are proven unexecuted and can be retired before the model reassesses
+     * the latest user intent. Live interjections and Temporary Chat retain their existing queue rules.
+     * @return list<string>|null Exact undelivered invocation IDs to retire, or null when ineligible.
+     */
+    private static function expiredRegularRestartCallsUnlocked(array $binding, array $spec, array $outputs,
+        string $previousResponseId): ?array
+    {
+        if ((int) $binding['expires_at'] >= time()
+            || (string) $binding['status'] !== 'running'
+            || $binding['sent_at'] === null || $binding['started_at'] === null
+            || !empty($spec['mailbox_context_restart'])
+            || (array) ($spec['steering_messages'] ?? []) === [] || $outputs === []
+            || (string) $binding['current_response_id'] !== $previousResponseId
+            || self::activeCountUnlocked((string) $binding['id']) !== 0) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $chat = TaskWebChat::state((string) $binding['task_id']);
+        $source = $db->table('gateway_response_jobs')->where('id', $previousResponseId)->find();
+        if (($chat['mode'] ?? '') !== 'regular' || empty($chat['conversation_id'])
+            || !is_array($source) || (string) $source['task_id'] !== (string) $binding['task_id']
+            || (string) $source['durable_turn_id'] !== (string) $binding['turn_id']
+            || (string) ($source['mcp_binding_id'] ?? '') !== (string) $binding['id']
+            || (string) $source['status'] !== 'completed' || (string) $source['round_kind'] !== 'tool_call') return null;
+        $surface = $db->table('gateway_browser_surfaces')->where('id', (string) $source['surface_id'])->find();
+        if (!is_array($surface) || (string) $surface['task_id'] !== (string) $binding['task_id']
+            || parse_url((string) ($surface['url'] ?? ''), PHP_URL_HOST) !== 'chatgpt.com'
+            || parse_url((string) ($surface['url'] ?? ''), PHP_URL_PATH) !== '/c/' . $chat['conversation_id']) return null;
+        $received = array_fill_keys(array_map(static fn(array $output): string => (string) ($output['call_id'] ?? ''), $outputs), true);
+        $rows = $db->table('gateway_tool_invocations')->where('binding_id', (string) $binding['id'])->select();
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '过期工具恢复状态暂不可读取。', 503);
+        $retire = [];
+        foreach ($rows as $row) {
+            $status = (string) $row['status'];
+            if ($status === 'unknown') return null;
+            if ($status === 'delivered'
+                && ((string) ($row['response_id'] ?? '') !== $previousResponseId
+                    || !isset($received[(string) $row['call_id']]))) return null;
+            if ($status !== 'registered') continue;
+            if ($row['response_id'] !== null || (int) $row['delivery_count'] !== 0
+                || $row['delivered_at'] !== null || $row['completed_at'] !== null
+                || $row['result_delivered_at'] !== null || $row['result_json'] !== null
+                || $row['result_hash'] !== null) return null;
+            $retire[] = (string) $row['id'];
+        }
+        return $retire;
+    }
+
+    /**
+     * Let steering keep its human revision only when the expired saved-chat recovery proof is
+     * already complete. The later broker transaction repeats every check before changing state.
+     */
+    public static function canRecoverExpiredRegularRestartUnlocked(array $source, array $spec): bool
+    {
+        $bindingId = (string) ($source['mcp_binding_id'] ?? '');
+        $previous = (string) ($spec['previous_response_id'] ?? '');
+        if ($bindingId === '' || $previous === '' || $previous !== (string) ($source['id'] ?? '')
+            || (array) ($spec['tool_outputs'] ?? []) === []) return false;
+        $binding = self::bindingByIdUnlocked($bindingId);
+        return self::expiredRegularRestartCallsUnlocked($binding, $spec,
+            (array) $spec['tool_outputs'], $previous) !== null;
+    }
+
+    /**
      * A proven native human or mailbox revision supersedes the old Web generation.
      * The caller owns the reservation transaction, so the receipt, retired calls and new
      * capability become visible together with the new response job or not at all.
@@ -2467,7 +2531,10 @@ final class ToolBroker
         string $previousResponseId, string $newResponseId): array
     {
         $mailbox = !empty($spec['mailbox_context_restart']);
-        if (!$mailbox || (string) $binding['status'] !== 'completed') self::assertLiveUnlocked($binding, $outputs !== []);
+        $expiredRegistered = self::expiredRegularRestartCallsUnlocked($binding, $spec, $outputs, $previousResponseId);
+        if ($expiredRegistered === null && (!$mailbox || (string) $binding['status'] !== 'completed')) {
+            self::assertLiveUnlocked($binding, $outputs !== []);
+        }
         if ((string) $binding['current_response_id'] !== $previousResponseId) {
             throw new GatewayError('tool_round_closed', '原网页工具回合已被后续回合取代。', 409);
         }
@@ -2502,7 +2569,8 @@ final class ToolBroker
         foreach ($rows as $row) {
             $callId = (string) $row['call_id'];
             $byCallId[$callId] = $row;
-            if ((string) $row['status'] === 'registered') {
+            if ((string) $row['status'] === 'registered'
+                && !in_array((string) $row['id'], $expiredRegistered ?? [], true)) {
                 throw new GatewayError('tool_outcome_pending', '插话正在等待已登记的工具完成。', 409);
             }
             if ($mailbox && in_array((string) $row['status'], ['registered', 'delivered'], true)) {
@@ -2528,8 +2596,24 @@ final class ToolBroker
                 }
             }
         }
-        $oldTokenHash = (string) $binding['token_hash'];
         $now = time();
+        if (is_array($expiredRegistered) && $expiredRegistered !== []) {
+            $cancelled = $db->table('gateway_tool_invocations')->where('id', 'IN', $expiredRegistered)
+                ->where('binding_id', (string) $binding['id'])->where('status', 'registered')
+                ->where('response_id', null)->where('delivery_count', 0)->where('delivered_at', null)
+                ->update(['status'=>'cancelled', 'result_json'=>json_encode([
+                    'expired_before_delivery'=>true, 'latest_user_intent_requires_reassessment'=>true,
+                ], JSON_THROW_ON_ERROR), 'updated_at'=>$now]);
+            if (!$cancelled || $cancelled->rowCount() !== count($expiredRegistered)) {
+                throw new GatewayError('tool_result_conflict', '过期且未交付的工具队列状态发生变化。', 409);
+            }
+            self::eventUnlocked((string) $binding['task_id'], (string) $binding['turn_id'], $newResponseId,
+                'expired_undelivered_tools_cancelled', [
+                    'count'=>count($expiredRegistered), 'invocation_ids'=>$expiredRegistered,
+                    'reason'=>'saved_chat_human_revision_after_capability_expiry',
+                ]);
+        }
+        $oldTokenHash = (string) $binding['token_hash'];
         foreach ($rows as $row) {
             if ((string) $row['status'] !== 'completed' || isset($batch[(string) $row['call_id']])
                 || $row['result_delivered_at'] !== null) continue;
@@ -2624,19 +2708,27 @@ final class ToolBroker
             $mailbox ? 'mcp_mailbox_context_restart_prepared' : 'mcp_steering_restart_prepared', [
                 'binding_id' => (string) $binding['id'], 'previous_response_id' => $previousResponseId,
                 'retired_token_hash' => $oldTokenHash,
-                'receipt_count' => count($outputs), 'registered_cancelled' => 0,
+                'receipt_count' => count($outputs), 'registered_cancelled' => count($expiredRegistered ?? []),
                 'old_activities_closed' => $activities->rowCount(),
             ]);
+        $controlPrompt = self::controlPrompt($newToken, $transport, $spec['checkpoint_marker'] ?? null,
+            TaskContext::enabled((array) ($spec['budget'] ?? []), $environment),
+            (string) ($spec['operation_kind'] ?? 'response'),
+            (array) ($environment['tools'] ?? []) === [] || ($spec['tool_choice'] ?? null) === 'none',
+            !empty($spec['budget']['original_context_required']),
+            array_column((array) ($environment['tools'] ?? []), 'wire_name'), $parallel,
+            self::hostShellFromContext((string) ($spec['full_context_json'] ?? $transport)),
+            (array) ($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec));
+        if (is_array($expiredRegistered) && $expiredRegistered !== []) {
+            $controlPrompt .= "\n<codex_expired_tool_recovery>\n"
+                . "The prior local Connector lease expired after Codex disconnected. Exact results already returned by Codex are preserved. "
+                . count($expiredRegistered) . " later host request(s) never reached Codex and were cancelled without execution. "
+                . "Acknowledge and reassess the latest user intent before acting. Reissue only operations that are still needed, "
+                . "after checking current state; never repeat a completed effect.\n</codex_expired_tool_recovery>";
+        }
         return [
             'binding_id' => (string) $binding['id'], 'token' => $newToken,
-            'control_prompt' => self::controlPrompt($newToken, $transport, $spec['checkpoint_marker'] ?? null,
-                TaskContext::enabled((array) ($spec['budget'] ?? []), $environment),
-                (string) ($spec['operation_kind'] ?? 'response'),
-                (array) ($environment['tools'] ?? []) === [] || ($spec['tool_choice'] ?? null) === 'none',
-                !empty($spec['budget']['original_context_required']),
-                array_column((array) ($environment['tools'] ?? []), 'wire_name'), $parallel,
-                self::hostShellFromContext((string) ($spec['full_context_json'] ?? $transport)),
-                (array) ($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
+            'control_prompt' => $controlPrompt,
             'is_continuation' => false, 'steering_restart' => !$mailbox, 'mailbox_context_restart' => $mailbox,
         ];
     }

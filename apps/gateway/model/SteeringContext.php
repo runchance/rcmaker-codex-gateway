@@ -23,6 +23,10 @@ final class SteeringContext
             ->where('status', 'IN', ['registered', 'delivered'])->select('call_id');
         if (!is_array($rows)) throw new GatewayError('storage_unavailable', '插话工具队列暂不可读取。', 503);
         if (array_diff(array_column($rows, 'call_id'), $settling) === []) return $spec;
+        // A disconnected saved-chat lease cannot drain calls that never reached Codex.
+        // Preserve this proven human revision so the broker can retire only those calls and
+        // rotate the capability atomically. Live capabilities retain the existing wait contract.
+        if (ToolBroker::canRecoverExpiredRegularRestartUnlocked($source, $spec)) return $spec;
         $updates = ['version' => 3, 'system' => [], 'messages' => $messages];
         if ($settling === []) {
             $spec['operational_context_source_response_id'] = $source['id'];
