@@ -6,9 +6,12 @@ namespace app\gateway\model;
 final class ResponsesProtocol
 {
     public const MODEL_ID = 'chatgpt-web/current';
-    // 50 MB decoded attachment budget expands under base64/JSON. Keep the HTTP envelope bounded
-    // while allowing the full Step 08 per-turn payload without copying image bytes into the prompt.
-    public const MAX_BODY_BYTES = 80000000;
+    // Codex request compression is disabled for the bundled PHP runtime because it cannot decode
+    // zstd. Keep 256 MiB of bounded headroom so long histories containing image/tool records do
+    // not hit the old 80 MB transport ceiling before Codex compacts them. This is deliberately
+    // above the reference bridge's compressed-path budget because identity bodies are much larger.
+    // The loopback envelope remains bounded; per-attachment and per-tool limits still apply below.
+    public const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
     /**
      * Answer the desktop's explicitly app-generated composer prediction locally.
