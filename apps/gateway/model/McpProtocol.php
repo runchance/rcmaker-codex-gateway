@@ -13,9 +13,13 @@ final class McpProtocol
     private const WRITE_STDIN_YIELD_RESERVE_MS = 30000;
     private const MIN_WRITE_STDIN_YIELD_RESERVE_MS = 5000;
     private const AGENT_WAIT_POLL_MS = 30000;
-    // Keep each tunnel command comfortably below its upstream response deadline.
-    // Native execution/approval remains owned by the existing durable turn.
-    public const HOST_RPC_SLICE_MS = 60000;
+    // Secure MCP Tunnel currently gives the complete command lifecycle 30 seconds,
+    // including local MCP work, response encoding and the response POST. Return an
+    // owned pending receipt before that deadline; the native operation keeps running
+    // under its durable call ID and is collected without replay by wait_result.
+    private const TUNNEL_RESPONSE_DEADLINE_MS = 30000;
+    private const RESPONSE_DELIVERY_RESERVE_MS = 10000;
+    public const HOST_RPC_SLICE_MS = self::TUNNEL_RESPONSE_DEADLINE_MS - self::RESPONSE_DELIVERY_RESERVE_MS;
     // A page of native tool descriptions can exceed functions.exec's 10k-token default.
     private const NESTED_CATALOG_MAX_OUTPUT_TOKENS = 50000;
     private const AGENT_WAIT_NAMES = [
@@ -826,6 +830,7 @@ AWK;
     {
         $timeoutMs = min(35000, (int) GatewaySettings::internal()['mcp_invoke_timeout_ms']);
         $deadline = microtime(true) + $timeoutMs / 1000;
+        if (self::$rpcDeadlineAt !== null) $deadline = min($deadline, self::$rpcDeadlineAt);
         do {
             $turn = ToolBroker::start($token);
             if (!empty($turn['sent']) && !empty($turn['started']) && (string) ($turn['status'] ?? '') === 'running') return;

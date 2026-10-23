@@ -13,7 +13,7 @@ use RC\Config;
  */
 final class TunnelRuntime
 {
-    public const VERSION = '0.0.12';
+    public const VERSION = '0.0.15';
     private const ALIAS = 'rcmaker-ai-web';
     private const PROFILE = 'rcmaker-ai-web';
     private const RELEASE_BASE = 'https://github.com/openai/tunnel-client/releases/download/v' . self::VERSION;
@@ -331,7 +331,7 @@ final class TunnelRuntime
 
     /**
      * Parse the local `tunnel-client runtimes cleanup --json` inventory.
-     * tunnel-client 0.0.12 derives runtime_state from the recorded process plus
+     * tunnel-client derives runtime_state from the recorded process plus
      * local health/readiness probes, so this stays local and does not perform an
      * optional control-plane lookup merely to refresh the console.
      * @return array{running:bool,healthy:bool,ready:bool,state:string}
