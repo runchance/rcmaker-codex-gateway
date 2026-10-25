@@ -376,7 +376,8 @@ final class ContextHistory
      * Prove an active compact retains the source history across native wire formats.
      * A freshly loaded Lite catalog moves the exact classic base instruction to a
      * prompt-only leading developer message and omits image display detail hints.
-     * Neither change may excuse missing records, changed tool arguments or image bytes.
+     * Classic serialization can restore an omitted High image default. Only these
+     * presentation changes are accepted; records, tool arguments and image bytes stay exact.
      *
      * @param array $source Durable source context before the current pending tool results.
      * @param array $requested Compiled compact context supplied by the native client.
@@ -405,7 +406,7 @@ final class ContextHistory
         if (count($records) < count($known) || ($requireComplete && count($records) !== count($known))) return false;
         foreach ($known as $index => $record) {
             $candidate = $records[$index];
-            if ($responsesLite) $record = self::sourceWithLiteImageHints($record, $candidate);
+            $record = self::sourceWithNativeImageHints($record, $candidate, $responsesLite);
             if (self::nativeToolHistoryCanonical([$record]) !== self::nativeToolHistoryCanonical([$candidate])) {
                 return false;
             }
@@ -414,10 +415,14 @@ final class ContextHistory
     }
 
     /**
-     * Align only image content-part display hints removed by Codex's Lite serializer.
+     * Align the native High image default in either wire format, plus Lite's omitted hints.
      * Attachment identity and every other field stay exact; tool arguments and text are untouched.
+     * @param array $source Original record, copied only for comparison.
+     * @param array $requested Native record at the same transcript position.
+     * @param bool $responsesLite Whether Lite may also omit explicit Low/Auto hints.
+     * @return array Comparison projection; persisted history and receipts are never changed.
      */
-    private static function sourceWithLiteImageHints(array $source, array $requested): array
+    private static function sourceWithNativeImageHints(array $source, array $requested, bool $responsesLite): array
     {
         $field = match ($source['type'] ?? '') {
             'function_call_output', 'custom_tool_call_output' => 'output',
@@ -429,10 +434,14 @@ final class ContextHistory
             if (!is_array($part) || !is_array($other)
                 || ($part['type'] ?? null) !== 'image_attachment' || ($other['type'] ?? null) !== 'image_attachment'
                 || !is_string($part['attachment_ref'] ?? null) || $part['attachment_ref'] !== ($other['attachment_ref'] ?? null)
-                || !is_string($part['filename'] ?? null) || $part['filename'] !== ($other['filename'] ?? null)
-                || !in_array($part['detail'] ?? null, ['auto', 'low', 'high'], true)
-                || array_key_exists('detail', $other)) continue;
-            unset($source[$field][$index]['detail']);
+                || !is_string($part['filename'] ?? null) || $part['filename'] !== ($other['filename'] ?? null)) continue;
+            if (!array_key_exists('detail', $part) && ($other['detail'] ?? null) === 'high') {
+                $source[$field][$index]['detail'] = 'high';
+            } elseif (!array_key_exists('detail', $other)
+                && (($part['detail'] ?? null) === 'high'
+                    || ($responsesLite && in_array($part['detail'] ?? null, ['auto', 'low'], true)))) {
+                unset($source[$field][$index]['detail']);
+            }
         }
         return $source;
     }
