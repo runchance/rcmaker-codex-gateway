@@ -507,6 +507,7 @@ final class TaskWebChat
 
     /**
      * Transfer only this task's exact saved-chat tab across epochs, fencing old observers and cleanup.
+     * Release the old surface's Stop obligation atomically; the physical page remains owned and open.
      * @param string $taskId Owning task. @param string $oldEpoch Retired source epoch.
      * @param string $surfaceId Reserved destination surface. @param string $modelUrl Configured origin.
      * @return void No transfer occurs if the disposable target cannot be proven reusable.
@@ -529,6 +530,9 @@ final class TaskWebChat
             'url' => $old['url'], 'title' => $old['title'], 'generation' => (int) $old['generation'] + 1, 'fencing_version' => $fence,
         ]);
         if (!$released || $released->rowCount() !== 1 || !$claimed || $claimed->rowCount() !== 1) throw new GatewayError('surface_fence_lost', 'Saved Web chat transfer lost ownership.', 409);
+        if (!TaskPageRetirement::releaseTransferredUnlocked($old,$surfaceId)) {
+            throw new GatewayError('surface_fence_lost','Saved Web chat retirement transfer lost ownership.',409);
+        }
     }
 
     /**

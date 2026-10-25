@@ -204,9 +204,115 @@ final class TaskPageRetirement
             if (!is_array($surface) || $surface['status'] !== 'retired') continue;
             $snapshot = json_decode((string)$row['snapshot_json'],true);
             if (!is_array($snapshot)) throw new GatewayError('storage_unavailable', 'Retired page stop evidence is invalid.', 503);
+            if (empty($surface['target_id']) && !empty($snapshot['target_id'])) {
+                $destination = $db->table('gateway_browser_surfaces')->where('task_id',$row['task_id'])
+                    ->where('target_id',$snapshot['target_id'])->where('status','ready')->find('id');
+                if ($destination === false) throw new GatewayError('storage_unavailable','Transferred page ownership could not be read.',503);
+                if (is_array($destination)) {
+                    $source = array_replace($surface,['target_id'=>$snapshot['target_id'],'fencing_version'=>$snapshot['fencing_version']]);
+                    // Normal polls stay read-only. Take a writer lock only for a fully
+                    // proved legacy handoff, then revalidate all evidence under that lock.
+                    if (is_array(self::retainedTransferProofUnlocked($source,$destination['id']))
+                        && Schema::transaction(static fn(): bool => self::releaseTransferredUnlocked($source,$destination['id']))) continue;
+                }
+            }
             $result[] = $snapshot + ['state'=>$row['state'], 'snapshot_hash'=>hash('sha256',$row['snapshot_json']), 'surface'=>$surface];
         }
         return $result;
+    }
+
+    /**
+     * Reconcile old releases before another epoch transition can obscure their exact handoff.
+     * Epoch retirement uses the same transfer proof as the browser's retirement poll.
+     * @param string|null $taskId Exact transitioning task, or the browser's bounded pending batch.
+     * @return int Obsolete obligations released; unknown or incomplete transfers remain untouched.
+     * @throws GatewayError On unavailable metadata; the caller owns the write transaction.
+     */
+    public static function reconcileTransferredUnlocked(?string $taskId = null): int
+    {
+        $db = SDB(null,'medoo','sqlite');
+        $query = $db->table('gateway_surface_retirements')->where('state','<>','closed');
+        if ($taskId !== null) $query = $query->where('task_id',$taskId);
+        $rows = $query->order([['created_at','ASC']])->limit(100)->select();
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable','Transferred page stop state could not be read.',503);
+        $released = 0;
+        foreach ($rows as $row) {
+            $surface = $db->table('gateway_browser_surfaces')->where('id',$row['surface_id'])->find(self::SURFACE_FIELDS);
+            if ($surface === false) throw new GatewayError('storage_unavailable','Transferred source page could not be read.',503);
+            if (!is_array($surface) || $surface['status'] !== 'retired' || !empty($surface['target_id'])) continue;
+            $snapshot = json_decode((string)$row['snapshot_json'],true);
+            if (!is_array($snapshot) || empty($snapshot['target_id'])) continue;
+            $destination = $db->table('gateway_browser_surfaces')->where('task_id',$row['task_id'])
+                ->where('target_id',$snapshot['target_id'])->where('status','ready')->find('id');
+            if ($destination === false) throw new GatewayError('storage_unavailable','Transferred page ownership could not be read.',503);
+            if (!is_array($destination)) continue;
+            $source = array_replace($surface,['target_id'=>$snapshot['target_id'],'fencing_version'=>$snapshot['fencing_version']]);
+            if (self::releaseTransferredUnlocked($source,$destination['id'])) $released++;
+        }
+        return $released;
+    }
+
+    /**
+     * Release an obsolete Stop obligation after an atomic transfer of the very same physical page.
+     * This is neither a Stop acknowledgement nor physical closure. The old surface must have
+     * relinquished its target and the same task's unclaimed destination must hold that exact
+     * target/document with the next generation/fence. Call within the transfer's transaction.
+     * @param array $source Original source surface before its target was cleared.
+     * @param string $destinationId New logical owner, already populated by the existing transfer.
+     * @return bool True if no obligation exists or that exact obligation was released; false for unproved transfers.
+     * @throws GatewayError On unavailable metadata or failed conditional writes; caller rolls back the transfer.
+     */
+    public static function releaseTransferredUnlocked(array $source, string $destinationId): bool
+    {
+        $row = self::retainedTransferProofUnlocked($source,$destinationId);
+        if ($row === null) return true;
+        if ($row === false) return false;
+        $db = SDB(null,'medoo','sqlite');
+        $deleted = $db->table('gateway_surface_retirements')->where('surface_id',$source['id'])
+            ->where('task_id',$source['task_id'])->where('state',$row['state'])->where('snapshot_json',$row['snapshot_json'])->delete();
+        if (!$deleted || $deleted->rowCount() !== 1) throw new GatewayError('surface_fence_lost','Transferred page stop ownership changed.',409);
+        if (!$db->table('gateway_task_events')->add(['task_id'=>$source['task_id'],'turn_id'=>null,'response_id'=>null,
+            'surface_id'=>$source['id'],'event_type'=>'retired_page_transferred',
+            'data_json'=>self::encode(['destination_surface_id'=>$destinationId,'source_epoch_id'=>$source['epoch_id'],
+                'fencing_version'=>(int)$source['fencing_version']+1]),'created_at'=>time()])) {
+            throw new GatewayError('storage_unavailable','Transferred page ownership receipt could not be saved.',503);
+        }
+        return true;
+    }
+
+    /** Read-only handoff proof: an exact obligation, null if absent, or false if ownership cannot be proved. */
+    private static function retainedTransferProofUnlocked(array $source, string $destinationId): array|false|null
+    {
+        $db = SDB(null,'medoo','sqlite');
+        $row = $db->table('gateway_surface_retirements')->where('surface_id',$source['id'])->find();
+        if ($row === false) throw new GatewayError('storage_unavailable','Transferred page stop state could not be read.',503);
+        if ($row === null) return null;
+        $snapshot = json_decode((string)$row['snapshot_json'],true);
+        if (!is_array($snapshot) || !in_array($row['state'],['pending','stopped'],true)
+            || $row['task_id'] !== ($source['task_id'] ?? null)) return false;
+        foreach (['task_id','epoch_id','target_id','url','generation','document_nonce','owner_incarnation','fencing_version'] as $key) {
+            $value = $key === 'url' ? (self::savedUrl((string)$source['url']) ?? $source['url']) : ($source[$key] ?? '');
+            if ((string)$value !== (string)($snapshot[$key] ?? '')) return false;
+        }
+        $old = $db->table('gateway_browser_surfaces')->where('id',$source['id'])->find(self::SURFACE_FIELDS);
+        $next = $db->table('gateway_browser_surfaces')->where('id',$destinationId)->find(self::SURFACE_FIELDS);
+        if ($old === false || $next === false) throw new GatewayError('storage_unavailable','Transferred page metadata could not be read.',503);
+        if (!is_array($old) || !is_array($next) || $old['id'] === $next['id'] || empty($source['target_id'])
+            || $old['status'] !== 'retired' || !empty($old['target_id']) || $next['status'] !== 'ready'
+            || $old['task_id'] !== $source['task_id'] || $next['task_id'] !== $source['task_id']
+            || $old['epoch_id'] !== $source['epoch_id'] || $next['epoch_id'] === $source['epoch_id']
+            || $next['target_id'] !== $source['target_id'] || $old['document_nonce'] !== $source['document_nonce']
+            || $next['document_nonce'] !== $source['document_nonce'] || $old['url'] !== $source['url'] || $next['url'] !== $source['url']
+            || (int)$old['generation'] !== (int)$source['generation'] || (int)$next['generation'] !== (int)$source['generation']+1
+            || (int)$old['fencing_version'] !== (int)$source['fencing_version']+1
+            || (int)$next['fencing_version'] !== (int)$source['fencing_version']+1
+            || $next['owner_incarnation'] !== 'unclaimed') return false;
+        $sourceEpoch = $db->table('gateway_task_epochs')->where('id',$source['epoch_id'])->find('task_id,status');
+        $destinationEpoch = $db->table('gateway_task_epochs')->where('id',$next['epoch_id'])->find('task_id,status');
+        if ($sourceEpoch === false || $destinationEpoch === false) throw new GatewayError('storage_unavailable','Transferred page epoch could not be read.',503);
+        if (($sourceEpoch['task_id'] ?? null) !== $source['task_id'] || ($sourceEpoch['status'] ?? null) !== 'retired'
+            || ($destinationEpoch['task_id'] ?? null) !== $source['task_id'] || ($destinationEpoch['status'] ?? null) !== 'active') return false;
+        return $row;
     }
 
     /**

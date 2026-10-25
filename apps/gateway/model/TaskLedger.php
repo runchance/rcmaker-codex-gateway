@@ -1298,7 +1298,7 @@ final class TaskLedger
     /**
      * Move only a proven completed checkpoint's physical document to its new logical epoch.
      * Clearing the retired target in the same transaction prevents cleanup from closing the
-     * retained page; incrementing its fence invalidates every old observer. No host work is replayed.
+     * retained page; release any old Stop obligation and fence every old observer. No host work is replayed.
      * @param array $spec Prepared request with an optional exact checkpoint-page proof.
      * @param string $taskId Owned task. @param string $oldEpochId Previous logical epoch.
      * @param string $surfaceId Newly reserved destination. @param int $now Transaction timestamp.
@@ -1327,6 +1327,9 @@ final class TaskLedger
         ]);
         if (!$released || $released->rowCount() !== 1 || !$claimed || $claimed->rowCount() !== 1) {
             throw new GatewayError('surface_fence_lost', '压缩后续接无法保留原页面。', 409);
+        }
+        if (!TaskPageRetirement::releaseTransferredUnlocked($old,$surfaceId)) {
+            throw new GatewayError('surface_fence_lost','Retained checkpoint retirement transfer lost ownership.',409);
         }
         self::eventUnlocked($taskId, null, null, $surfaceId, 'checkpoint_page_retained', [
             'checkpoint_id' => $proof['checkpoint_id'], 'source_surface_id' => $old['id'],
@@ -3980,9 +3983,12 @@ final class TaskLedger
         });
     }
 
+    /** Retire one logical epoch after reconciling retained predecessors, preserving real page Stop obligations. */
     private static function retireEpochUnlocked(string $taskId, string $epochId, string $reason): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
+        // Reconcile a pre-upgrade retained-page handoff before retiring its destination.
+        TaskPageRetirement::reconcileTransferredUnlocked($taskId);
         $now = time();
         $db->table('gateway_task_epochs')->where('id', $epochId)->where('status', 'active')->update(['status' => 'retired', 'retired_at' => $now]);
         $surfaces = $db->table('gateway_browser_surfaces')->where('task_id', $taskId)->where('epoch_id', $epochId)->where('status', '<>', 'retired')->select();
