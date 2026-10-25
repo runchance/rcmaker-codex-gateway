@@ -64,7 +64,14 @@ final class RetiredTaskPageStop
                     && (parse_url($snapshot['url'], PHP_URL_PATH) ?: '/') === '/'
                     && !empty($snapshot['initial_binding_marker'])
                     && WebModelPage::regularConversationId((string)($target['url'] ?? ''), $this->modelUrl) !== null;
-                if (!$this->samePage($snapshot['url'], (string)($target['url'] ?? '')) && !$initialSaved
+                // Temporary Chat also acquires /c/<uuid> after its first staged send. This
+                // permits inspection of the exact target only; DOM submission witnesses
+                // must still authorize Stop, and a different existing UUID is never adopted.
+                $initialTemporary = $snapshot['chat_mode'] === 'temporary'
+                    && (parse_url($snapshot['url'], PHP_URL_PATH) ?: '/') === '/'
+                    && WebModelPage::isTaskChatStartUrl($snapshot['url'], $this->modelUrl, 'temporary')
+                    && WebModelPage::isTaskChatUrl((string)($target['url'] ?? ''), $this->modelUrl, 'temporary');
+                if (!$this->samePage($snapshot['url'], (string)($target['url'] ?? '')) && !$initialSaved && !$initialTemporary
                     && !(($target['url'] ?? '') === 'about:blank' && !empty($snapshot['recovered_target']))) {
                     $this->retry($id); return;
                 }

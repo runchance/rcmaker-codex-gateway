@@ -570,6 +570,7 @@ JS);
     /**
      * Stop a retired physical page using its immutable identity, never the new task page's pin.
      * Hashed submission witnesses avoid persisting a live tool token in retirement diagnostics.
+     * A first temporary UUID requires its submitted witness; idle controls share the composer adapter.
      * @param array $snapshot Durable retired-page identity and original submission witnesses.
      * @param bool $click Permit Stop/its known confirmation; false is an uncertainty readback.
      * @param bool $accountVerified Fresh account verification on this observer's document.
@@ -598,8 +599,11 @@ return (async()=>{
    const hash=[...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,'0')).join('');
    if(hashes.has(hash)){witnessed=true;break;}
  }
- // A first saved submission may acquire its UUID before retirement observes the URL.
- const initialMove=regular&&expected.pathname==='/'&&/^\/c\/[0-9a-f-]{36}$/i.test(actual.pathname)&&witnessed;
+ // Both chat modes acquire a UUID after their first send. Permit only the root-to-ID
+ // transition in the same mode, with an exact submitted token/transaction witness.
+ const initialMove=expected.pathname==='/'&&witnessed
+     &&((regular&&/^\/c\/[0-9a-f-]{36}$/i.test(actual.pathname))
+         ||(temporary&&temporaryChatPage(expected.pathname,expected.search)&&actual.pathname!=='/'));
  const sameSaved=regular&&/^\/c\/[0-9a-f-]{36}\/?$/i.test(expected.pathname)
      &&actual.pathname.replace(/\/$/,'').toLowerCase()===expected.pathname.replace(/\/$/,'').toLowerCase();
  if(actual.href!==expected.href&&!initialMove&&!sameSaved)return fail();
@@ -621,7 +625,7 @@ return (async()=>{
  const action=actOnGenerationStop(e.click,e.click,'retired:'+e.surface_id);
  const form=composer?.closest('form');
  const buttons=form?[...form.querySelectorAll('button')].filter(visible):[];
- const sends=buttons.filter(button=>button.getAttribute('data-testid')==='send-button');
+ const sends=composer?composerSendButtons(composer):[];
  const voices=buttons.filter(button=>/^(?:composer-speech-button|voice-mode-button)$/.test(button.getAttribute('data-testid')||'')
      ||/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(button.getAttribute('aria-label')||''));
  // A primary square with an unrecognized localized label is not an idle witness.
