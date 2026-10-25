@@ -105,15 +105,23 @@ final class BrowserRuntime
     private array $taskDownloads = [];
     /** @var array<string,array<string,mixed>> response_id => live turn */
     private array $chatGptTurns = [];
-    /** @var array<string,array{surface_id:string,owner_incarnation:string,fencing_version:int,response_id:string,security_challenge_active:bool,security_challenge_path:?string}> */
+    /** @var array<string,array{surface_id:string,owner_incarnation:string,fencing_version:int,response_id:string,recovery_command_id?:int,security_challenge_active:bool,security_challenge_path:?string}> */
     private array $taskSessions = [];
     /** @var array<string,true> */
     private array $pendingResumes = [];
+    /** @var array<string,string> Recovery timers already scheduled for an exact response. */
+    private array $taskResumeDispatches = [];
+    /** @var array<string,float> Short retry backoff for failed recovery metadata reads. */
+    private array $taskResumeRetryAt = [];
+    /** @var array<string,string> Physical recovery attachments handed off on this CDP connection. */
+    private array $taskResumeAttachments = [];
     /** Explicit native stops use separate CDP observers; ordinary transport recovery is unchanged. */
     private ?CodexCancellation $codexCancellation = null;
     private float $lastCodexStopObservation = 0.0;
     /** @var array<string,array> Current stop intent and acknowledgement, scoped to its exact generation. */
     private array $codexUserStops = [];
+    /** Independent per-retired-page stop/close observers; never borrow an active task session. */
+    private ?RetiredTaskPageStop $retiredTaskPageStop = null;
     /** @var array<int,int> Browser command id => submitted no-side-effect Connector probe attempts. */
     private array $connectorProbeAttempts = [];
     /** Runtime fences live only for the current asynchronous connector commands. */
@@ -2921,7 +2929,7 @@ JS;
         }
     }
 
-    /** Do not submit the new instruction until the superseded Web page is physically gone. */
+    /** Release superseded observers, then require remote Stop acknowledgement before replacement. */
     private function settleSupersededTaskSurface(string $responseId, array $job, array $ledger): bool
     {
         if (\app\gateway\model\SteeringContext::isDelta($job)) {
@@ -2937,17 +2945,8 @@ JS;
             }
             return true;
         }
-        $previousId = (string) ($job['previous_response_id'] ?? '');
-        if ($previousId === '') return true;
-        try { $source = TaskLedger::execution($previousId); }
-        catch (GatewayError) { return true; }
-        $oldSurface = $source['surface'];
-        if ((string) ($oldSurface['id'] ?? '') === (string) ($ledger['surface']['id'] ?? '')
-            || (string) ($oldSurface['status'] ?? '') !== 'retired'
-            || (string) ($source['turn']['id'] ?? '') !== (string) ($ledger['turn']['id'] ?? '')) return true;
-        // Several native steers may arrive before the replacement page starts. The
-        // immediate predecessor can have no target while an older retired target is
-        // still generating; close every retired target owned by this task first.
+        // A replacement may have no previous_response_id after admission recovery.
+        // Stop every retired predecessor of this task, not only that optional parent.
         $retired = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces')
             ->where('task_id', (string) $job['task_id'])->where('status', 'retired')->select();
         if (!is_array($retired)) return false;
@@ -2961,24 +2960,14 @@ JS;
                 catch (\Throwable) {}
             }
         }
-        $targets = array_values(array_filter($retired,
-            static fn(array $row): bool => (string) ($row['target_id'] ?? '') !== ''));
-        if ($targets === []) return true;
-        $port = (int) (BrowserState::state()['debug_port'] ?? 0);
-        if ($port < 1) return false;
-        $live = $this->discoverTargetsIfAvailable($port);
-        if ($live === null) return false;
-        foreach ($targets as $surface) {
-            $targetId = (string) $surface['target_id'];
-            if (isset($live[$targetId])) {
-                $this->devtoolsRequest($port, '/json/close/' . rawurlencode($targetId));
-                $live = $this->discoverTargetsIfAvailable($port);
-                if ($live === null || isset($live[$targetId])) return false;
-            }
-            TaskLedger::targetClosed((string) $surface['id']);
-            $this->clearMonitorScreenshots((string) $surface['id']);
-        }
-        return true;
+        return $this->retiredPageStops()->settled((string)$job['task_id']);
+    }
+
+    /** Share one asynchronous retirement controller across cleanup and every replacement entry. */
+    private function retiredPageStops(): RetiredTaskPageStop
+    {
+        return $this->retiredTaskPageStop ??= new RetiredTaskPageStop($this->taskCdp, self::modelUrl(),
+            fn(string $surfaceId) => $this->clearMonitorScreenshots($surfaceId));
     }
 
     /** Maintain one browser-level CDP connection that multiplexes all automatic task surfaces. */
@@ -2986,7 +2975,7 @@ JS;
     {
         if ($this->stopping) return;
         if ($this->taskCdp->ready()) {
-            $this->ensureBrowserTimezone($state, $this->taskBrowserSocket);
+            if ($this->ensureBrowserTimezone($state, $this->taskBrowserSocket)) $this->drainPendingTaskResumes();
             return;
         }
         if ($this->taskConnecting) return;
@@ -3005,18 +2994,12 @@ JS;
                 $socket,
                 function (): void {
                     $this->taskConnecting = false;
+                    // Explicit close() does not invoke CdpClient's transport-close callback.
+                    // Any interrupted recovery attachment belongs to the new connection too.
+                    foreach ($this->taskResumeAttachments as $responseId) $this->pendingResumes[$responseId] = true;
+                    $this->taskResumeAttachments = [];
                     $this->configureTaskDownloads(function (): void {
-                        $pending = array_keys($this->pendingResumes);
-                        $this->pendingResumes = [];
-                        foreach ($pending as $responseId) {
-                            Timer::add(0.02, function () use ($responseId): void {
-                                try {
-                                    $job = ResponseJob::execution($responseId);
-                                    $commandId = (int) ($job['command_id'] ?? 0);
-                                    if ($commandId > 0) $this->prepareTaskSurface($responseId, $commandId, true);
-                                } catch (\Throwable) {}
-                            }, null, false);
-                        }
+                        $this->drainPendingTaskResumes();
                     });
                 },
                 function (array $message): void { $this->onTaskEvent($message); },
@@ -3024,6 +3007,13 @@ JS;
                     $this->taskConnecting = false;
                     if ($this->stopping) return;
                     foreach ($this->chatGptTurns as $responseId => $_turn) $this->pendingResumes[$responseId] = true;
+                    foreach ($this->taskResumeDispatches as $responseId => $_dispatch) $this->pendingResumes[$responseId] = true;
+                    foreach ($this->taskResumeAttachments as $responseId) $this->pendingResumes[$responseId] = true;
+                    foreach ($this->taskSessions as $session) {
+                        if (!empty($session['response_id'])) $this->pendingResumes[(string)$session['response_id']] = true;
+                    }
+                    $this->taskResumeDispatches = [];
+                    $this->taskResumeAttachments = [];
                     $this->chatGptTurns = [];
                     $this->taskSessions = [];
                     $this->taskDownloads = [];
@@ -3033,6 +3023,127 @@ JS;
         } catch (\Throwable) {
             $this->taskConnecting = false;
         }
+    }
+
+    /**
+     * Resume queued observers even when browser CDP connected before startup recovery ran.
+     * A delayed native receipt/compact may advance the logical round, but only within the
+     * same task, durable turn, surface, binding and physical command. This path always uses
+     * recovery mode; it never enqueues another prompt or reissues a native tool invocation.
+     * @return void Metadata failures retain the request with a short asynchronous backoff.
+     */
+    private function drainPendingTaskResumes(): void
+    {
+        if ($this->stopping || !$this->taskCdp->ready()) return;
+        foreach (array_keys($this->pendingResumes) as $responseId) {
+            if (isset($this->taskResumeDispatches[$responseId])
+                || microtime(true) < ($this->taskResumeRetryAt[$responseId] ?? 0.0)) continue;
+            $dispatch = bin2hex(random_bytes(8));
+            $this->taskResumeDispatches[$responseId] = $dispatch;
+            unset($this->pendingResumes[$responseId]);
+            Timer::add(0.02, function () use ($responseId, $dispatch): void {
+                if (($this->taskResumeDispatches[$responseId] ?? '') !== $dispatch) return;
+                $attachmentKey = null;
+                try {
+                    if ($this->stopping) return;
+                    if (!$this->taskCdp->ready()) {
+                        $this->pendingResumes[$responseId] = true;
+                        return;
+                    }
+                    $ledger = $this->currentTaskResumeLedger($responseId);
+                    if ($ledger === null) return;
+                    $job = $ledger['job'];
+                    $currentId = (string)$job['id'];
+                    $commandId = (int)($job['command_id'] ?? 0);
+                    if ($commandId < 1) return;
+                    foreach ($this->chatGptTurns as $observer) {
+                        if (($observer['surface_id'] ?? '') === ($job['surface_id'] ?? '')
+                            && (int)($observer['command_id'] ?? 0) === $commandId) return;
+                    }
+                    foreach ($this->taskSessions as $session) {
+                        if (($session['response_id'] ?? '') === $currentId) return;
+                    }
+                    $attachmentKey = (string)$job['surface_id'] . ':' . $commandId;
+                    if (isset($this->taskResumeAttachments[$attachmentKey])) return;
+                    $this->taskResumeAttachments[$attachmentKey] = $currentId;
+                    $this->prepareTaskSurface($currentId, $commandId, true);
+                    unset($this->taskResumeRetryAt[$responseId]);
+                } catch (GatewayError $error) {
+                    if ($attachmentKey !== null) unset($this->taskResumeAttachments[$attachmentKey]);
+                    if (!in_array($error->errorCode, ['response_not_found','task_ledger_missing','task_surface_missing'], true)) {
+                        $this->pendingResumes[$responseId] = true;
+                        $this->taskResumeRetryAt[$responseId] = microtime(true) + 1.0;
+                        $this->recordLoopFailure('task_resume', $error);
+                    }
+                } catch (\Throwable $error) {
+                    if ($attachmentKey !== null) unset($this->taskResumeAttachments[$attachmentKey]);
+                    $this->pendingResumes[$responseId] = true;
+                    $this->taskResumeRetryAt[$responseId] = microtime(true) + 1.0;
+                    $this->recordLoopFailure('task_resume', $error);
+                } finally {
+                    if (($this->taskResumeDispatches[$responseId] ?? '') === $dispatch) {
+                        unset($this->taskResumeDispatches[$responseId]);
+                    }
+                }
+            }, null, false);
+        }
+    }
+
+    /**
+     * Resolve an observation-only recovery to the latest round of its exact physical command.
+     * @param string $responseId Interrupted native-tool source or its current logical round.
+     * @param int $commandId Optional already-dispatched command fence.
+     * @return array|null Current ledger, or null after stop, replacement or identity changes.
+     * @throws GatewayError If durable metadata cannot be read.
+     */
+    private function currentTaskResumeLedger(string $responseId, int $commandId = 0): ?array
+    {
+        $ledger = TaskLedger::pollExecution($responseId);
+        $job = $ledger['job'];
+        if ($commandId > 0 && (int)($job['command_id'] ?? 0) !== $commandId) return null;
+        $currentId = (string)($ledger['turn']['response_id'] ?? '');
+        if ($currentId !== $responseId) {
+            if (($job['status'] ?? '') !== 'completed' || ($job['round_kind'] ?? '') !== 'tool_call'
+                || $currentId === '') return null;
+            $current = TaskLedger::pollExecution($currentId);
+            foreach (['task_id','durable_turn_id','surface_id','mcp_binding_id','command_id'] as $field) {
+                if (($current['job'][$field] ?? null) !== ($job[$field] ?? null)) return null;
+            }
+            $ledger = $current;
+            $job = $current['job'];
+        }
+        if (!in_array($ledger['turn']['status'] ?? '', ['queued','submit_intent','submitted','running'], true)
+            || in_array($ledger['turn']['error_code'] ?? '',
+                ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+            || ($ledger['turn']['generation_id'] ?? '') !== ($job['generation_id'] ?? '')
+            || ($ledger['surface']['status'] ?? '') === 'retired'
+            || (!in_array($job['status'] ?? '', ['queued','running'], true)
+                && !(($job['status'] ?? '') === 'completed' && ($job['round_kind'] ?? '') === 'tool_call'))) return null;
+        return $ledger;
+    }
+
+    /**
+     * Retry an interrupted recovery initialization after a transient ledger read failure.
+     * Only the captured CDP session is released; the page, tools and durable turn are kept.
+     * @param string $responseId Interrupted observation anchor, revalidated by the queue.
+     * @param int $commandId Original physical command. @param string $sessionId Exact session.
+     * @param array $owner Captured in-memory owner; a replacement session is never touched.
+     * @param \Throwable $failure Safe diagnostic cause, without page or request contents.
+     * @return void The queue's current-turn/stop checks decide whether a retry is still valid.
+     */
+    private function deferTaskResumeReadFailure(string $responseId, int $commandId, string $sessionId,
+        array $owner, \Throwable $failure): void
+    {
+        $current = $this->taskSessions[$sessionId] ?? null;
+        if (!is_array($current)) return;
+        foreach (['response_id','surface_id','owner_incarnation','fencing_version'] as $field) {
+            if (($current[$field] ?? null) !== ($owner[$field] ?? null)) return;
+        }
+        unset($this->taskSessions[$sessionId], $this->taskResumeAttachments[(string)$owner['surface_id'] . ':' . $commandId]);
+        $this->pendingResumes[$responseId] = true;
+        $this->taskResumeRetryAt[$responseId] = microtime(true) + 1.0;
+        $this->detachTaskSessionRaw($sessionId);
+        $this->recordLoopFailure('task_resume', $failure);
     }
 
     /** Arm timezone emulation before navigation; retry protocol failures without restarting pages or replaying tasks. */
@@ -3147,6 +3258,23 @@ JS;
         }
         $ledger = TaskLedger::execution($responseId);
         $turn = $ledger['turn'];
+        if (!$this->retiredPageStops()->settled((string)$turn['task_id'])) {
+            if (time() >= (int)$turn['deadline_at']) {
+                $this->taskFailTurn($responseId, 'CHATGPT_PREVIOUS_PAGE_STOP_UNCONFIRMED',
+                    'The previous task page has not confirmed that generation stopped. No message was sent to the replacement page.');
+                return;
+            }
+            $generation = $turn['generation_id'];
+            Timer::add(0.5, function () use ($responseId, $commandId, $recover, $generation): void {
+                try {
+                    $fresh = TaskLedger::execution($responseId);
+                    if ($fresh['turn']['response_id'] !== $responseId || $fresh['turn']['generation_id'] !== $generation
+                        || !in_array($fresh['turn']['status'], ['queued','submit_intent','submitted','running'], true)) return;
+                    $this->prepareTaskSurface($responseId, $commandId, $recover);
+                } catch (GatewayError) {}
+            }, null, false);
+            return;
+        }
         $surface = $ledger['surface'];
         $state = BrowserState::state();
         $port = (int) ($state['debug_port'] ?? 0);
@@ -3195,6 +3323,13 @@ JS;
                 }
                 $this->releaseTaskSession($responseId);
                 $recover = false;
+                // Repair can retire the old physical page without changing the logical
+                // surface. Re-check Stop before create; reopening the same saved chat
+                // remains on this path so its retained continuation is not repaired twice.
+                if (!$this->retiredPageStops()->settled((string)$turn['task_id'])) {
+                    Timer::add(0.02, fn() => $this->prepareTaskSurface($responseId, (int)$repair['command_id'], false), null, false);
+                    return;
+                }
             } catch (GatewayError $error) {
                 $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
                 return;
@@ -3233,6 +3368,16 @@ JS;
                     return;
                 }
                 try {
+                    if ($recover) {
+                        $resume = $this->currentTaskResumeLedger($responseId, $commandId);
+                        if ($resume === null) {
+                            $this->detachTaskSessionRaw($sessionId);
+                            return;
+                        }
+                        $responseId = (string)$resume['job']['id'];
+                        $resumeKey = (string)$resume['job']['surface_id'] . ':' . $commandId;
+                        if (isset($this->taskResumeAttachments[$resumeKey])) $this->taskResumeAttachments[$resumeKey] = $responseId;
+                    }
                     $ledger = TaskLedger::execution($responseId);
                     if (\app\gateway\model\SteeringContext::isDelta(ResponseJob::execution($responseId))
                         && ($ledger['turn']['response_id'] !== $responseId
@@ -3247,6 +3392,7 @@ JS;
                         'owner_incarnation' => (string) $ownership['owner_incarnation'],
                         'fencing_version' => (int) $ownership['fencing_version'],
                         'response_id' => $responseId,
+                        'recovery_command_id' => $recover ? $commandId : 0,
                         'web_chat' => TaskWebChat::state((string) $ledger['turn']['task_id']),
                         'main_frame_id' => null,
                         'security_challenge_active' => false,
@@ -3271,8 +3417,31 @@ JS;
                         if (($currentOwner[$key] ?? null) !== ($pageOwner[$key] ?? null)) return;
                     }
                     if (!$this->taskCdp->ready()) return;
-                    try { $currentLedger = TaskLedger::pollExecution($responseId); }
-                    catch (GatewayError) { return; }
+                    try {
+                        $currentLedger = $recover
+                            ? $this->currentTaskResumeLedger($responseId, $commandId)
+                            : TaskLedger::pollExecution($responseId);
+                        if ($currentLedger === null) {
+                            unset($this->taskSessions[$sessionId]);
+                            $this->detachTaskSessionRaw($sessionId);
+                            return;
+                        }
+                        if ($recover && (string)$currentLedger['job']['id'] !== $responseId) {
+                            $responseId = (string)$currentLedger['job']['id'];
+                            $pageGeneration = (string)$currentLedger['job']['generation_id'];
+                            $this->taskSessions[$sessionId]['response_id'] = $responseId;
+                            $resumeKey = (string)$currentLedger['job']['surface_id'] . ':' . $commandId;
+                            if (isset($this->taskResumeAttachments[$resumeKey])) $this->taskResumeAttachments[$resumeKey] = $responseId;
+                        }
+                    }
+                    catch (\Throwable $failure) {
+                        if ($recover) {
+                            $this->deferTaskResumeReadFailure($responseId, $commandId, $sessionId, $pageOwner, $failure);
+                            return;
+                        }
+                        if ($failure instanceof GatewayError) return;
+                        throw $failure;
+                    }
                     if ((string) $currentLedger['turn']['generation_id'] !== $pageGeneration
                         || (string) $currentLedger['surface']['owner_incarnation'] !== (string) $pageOwner['owner_incarnation']
                         || (int) $currentLedger['surface']['fencing_version'] !== (int) $pageOwner['fencing_version']
@@ -3457,8 +3626,21 @@ JS;
         $session = $this->taskSessions[$sessionId] ?? null;
         if (!is_array($session)) return false;
         try {
-            TaskLedger::browserIdentityObserved((string)$session['response_id'], $verified, $code, $attempt,
-                (string)$session['owner_incarnation'], (int)$session['fencing_version']);
+            $audit = function () use ($session, $verified, $code, $attempt): bool {
+                $responseId = (string)$session['response_id'];
+                if ((int)($session['recovery_command_id'] ?? 0) > 0) {
+                    $ledger = $this->currentTaskResumeLedger($responseId, (int)$session['recovery_command_id']);
+                    if ($ledger === null || ($ledger['surface']['id'] ?? '') !== $session['surface_id']) return false;
+                    $responseId = (string)$ledger['job']['id'];
+                }
+                TaskLedger::browserIdentityObserved($responseId, $verified, $code, $attempt,
+                    (string)$session['owner_incarnation'], (int)$session['fencing_version']);
+                return true;
+            };
+            // Resolve and audit under the same short ledger transaction. Do not mutate
+            // the captured session owner while its identity callbacks are still running.
+            if ((int)($session['recovery_command_id'] ?? 0) > 0) return Schema::transaction($audit);
+            return $audit();
         } catch (\Throwable $error) {
             $this->taskSessions[$sessionId]['browser_identity_audit_error'] = $error instanceof GatewayError
                 ? $error->errorCode : get_class($error);
@@ -3654,15 +3836,7 @@ JS;
                 || $ledger['turn']['status'] !== 'queued') return;
             $this->prepareTaskSurface($responseId, (int)$repair['command_id'], false);
         };
-        if (empty($repair['target_id'])) $resume();
-        else $this->taskCdp->send('Target.closeTarget', ['targetId' => $repair['target_id']], null,
-            function ($error, $result) use ($responseId, $resume): void {
-                if ($error !== null || empty($result['success'])) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_REPAIR_CLOSE_FAILED', '原任务页未能关闭，停止恢复。');
-                    return;
-                }
-                $resume();
-            }, 3.0);
+        $resume(); // prepareTaskSurface waits for the shared durable Stop/close gate.
         return true;
     }
 
@@ -3818,6 +3992,22 @@ JS;
             return;
         }
         try {
+            if ($recover) {
+                $resume = $this->currentTaskResumeLedger($responseId, $commandId);
+                $owner = $this->taskSessions[$sessionId] ?? null;
+                if ($resume === null || !is_array($owner)
+                    || ($resume['surface']['id'] ?? '') !== ($owner['surface_id'] ?? '')
+                    || ($resume['surface']['owner_incarnation'] ?? '') !== ($owner['owner_incarnation'] ?? '')
+                    || (int)($resume['surface']['fencing_version'] ?? 0) !== (int)($owner['fencing_version'] ?? -1)) {
+                    unset($this->taskSessions[$sessionId]);
+                    $this->detachTaskSessionRaw($sessionId);
+                    return;
+                }
+                $responseId = (string)$resume['job']['id'];
+                $this->taskSessions[$sessionId]['response_id'] = $responseId;
+                $resumeKey = (string)$resume['job']['surface_id'] . ':' . $commandId;
+                if (isset($this->taskResumeAttachments[$resumeKey])) $this->taskResumeAttachments[$resumeKey] = $responseId;
+            }
             $job = ResponseJob::execution($responseId);
             $toolCapable = !empty($job['mcp_binding_id']);
             $toolSettings = $toolCapable ? GatewaySettings::internal() : [];
@@ -9247,11 +9437,13 @@ JS;
      * drain at the original deadline before any failed-stream recovery.
      * @param string $errorCode Observed native stream error, used only for the recovery audit cause.
      * @param bool $replaceRegularChat Only a persisted exhausted ordinary recovery may replace its saved binding.
+     * @param array|null $terminalProof Current owned native terminal identity for capacity replacement.
+     * @param array|null $preparedRegularContext Internal plan prepared before the final browser observation.
      * @return void
      */
     private function recoverFailedMessageStream(string $responseId, bool $waitForPending = false,
         string $errorCode = 'CHATGPT_NETWORK_ERROR', bool $replaceRegularChat = false,
-        ?array $terminalProof = null): void
+        ?array $terminalProof = null, ?array $preparedRegularContext = null): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
@@ -9272,7 +9464,8 @@ JS;
                 $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED' ? 'conversation_capacity_exhausted'
                     : ($replaceRegularChat ? 'regular_stream_recovery_exhausted' : ($errorCode === 'CHATGPT_NETWORK_ERROR'
                     ? 'network_error_after_confirmed_receipts' : 'message_stream_error_after_confirmed_receipts')),
-                $terminalProof
+                $terminalProof,
+                $preparedRegularContext
             );
         } catch (GatewayError $error) {
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
@@ -9321,9 +9514,12 @@ JS;
 
     /**
      * A native current-turn capacity callout is a terminal property of this conversation.
-     * It has no useful same-page Retry action: retire the exact owned page immediately and
-     * rebuild from durable history after active tool work settles. Other failures retain their
-     * existing bounded Retry/refresh/resume sequence.
+     * It has no useful same-page Retry action. Ordinary history planning can outlast a
+     * transient renderer state, so read the same owned callout again after that work and
+     * replace only if the page is still stopped. Other failures retain their existing flow.
+     * @param string $responseId Physical browser observer whose logical response may advance with tools.
+     * @param array $snapshot Current native terminal observed on the owned task page.
+     * @return void The existing recovery transaction remains the only page/token rotation authority.
      */
     private function recoverExhaustedConversation(string $responseId, array $snapshot): void
     {
@@ -9351,8 +9547,92 @@ JS;
             'document_nonce'=>(string)($turn['document_nonce'] ?? ''),
             'conversation_id'=>(string)($turn['web_chat']['conversation_id'] ?? ''),
         ];
-        $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_CONVERSATION_EXHAUSTED',
-            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular', $proof);
+        if (($turn['web_chat']['mode'] ?? 'temporary') !== 'regular') {
+            $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_CONVERSATION_EXHAUSTED', false, $proof);
+            return;
+        }
+        if (!empty($turn['capacity_planning_pending'])) return;
+        $logicalId = (string)($turn['logical_response_id'] ?? $responseId);
+        $planningKey = hash('sha256', $logicalId . '|' . $descriptorHash . '|' . $failureHash
+            . '|' . (string)($turn['generation_id'] ?? '') . '|' . (string)($turn['document_nonce'] ?? ''));
+        $this->chatGptTurns[$responseId]['capacity_planning_pending'] = $planningKey;
+        $started = microtime(true);
+        $this->recordTaskTransportObservation($responseId, 'capacity_candidate', [
+            'generation_running'=>false, 'conversation_replacement_available'=>true,
+            'request_fingerprint'=>$descriptorHash, 'response_fingerprint'=>$failureHash,
+        ]);
+        try {
+            $prepared = ToolBroker::prepareRegularRetryContext($logicalId);
+        } catch (GatewayError $error) {
+            unset($this->chatGptTurns[$responseId]['capacity_planning_pending']);
+            if ($error->errorCode === 'STORAGE_BUSY') $this->scheduleTaskPoll($responseId, 0.5);
+            else $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage(), true);
+            return;
+        } catch (\Throwable) {
+            unset($this->chatGptTurns[$responseId]['capacity_planning_pending']);
+            $this->taskFailTurn($responseId, 'CHATGPT_CONVERSATION_EXHAUSTED',
+                'The exhausted Web conversation could not be prepared from its exact durable receipts.', true);
+            return;
+        }
+        $expression = WebModelPage::responseExpression((array)($turn['baseline_users'] ?? []),
+            (array)($turn['baseline_assistants'] ?? []), (string)($turn['continuation_marker'] ?? ''),
+            (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), $responseId, true);
+        $this->evaluateTaskSession((string)($turn['session_id'] ?? ''), $expression,
+            function ($error, $fresh) use ($responseId, $logicalId, $turn, $terminal,
+                $proof, $prepared, $planningKey, $started): void {
+                $current = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($current) || ($current['capacity_planning_pending'] ?? null) !== $planningKey) return;
+                unset($this->chatGptTurns[$responseId]['capacity_planning_pending']);
+                foreach (['session_id','surface_id','owner_incarnation','fencing_version','document_nonce','generation_id'] as $key) {
+                    if (($current[$key] ?? null) !== ($turn[$key] ?? null)) {
+                        $this->scheduleTaskPoll($responseId, 0.5);
+                        return;
+                    }
+                }
+                if (($current['logical_response_id'] ?? $responseId) !== $logicalId) {
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                try { $ledger = TaskLedger::pollExecution($logicalId); }
+                catch (GatewayError) { $this->scheduleTaskPoll($responseId, 0.5); return; }
+                if (($ledger['turn']['response_id'] ?? '') !== $logicalId
+                    || ($ledger['turn']['generation_id'] ?? '') !== ($turn['generation_id'] ?? '')
+                    || !empty($ledger['turn']['error_code'])
+                    || ($ledger['surface']['id'] ?? '') !== ($turn['surface_id'] ?? '')
+                    || ($ledger['surface']['document_nonce'] ?? '') !== ($turn['document_nonce'] ?? '')
+                    || ($ledger['surface']['owner_incarnation'] ?? '') !== ($turn['owner_incarnation'] ?? '')
+                    || (int)($ledger['surface']['fencing_version'] ?? -1) !== (int)($turn['fencing_version'] ?? -2)) {
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                $replacement = is_array($fresh) ? ($fresh['conversation_replacement'] ?? null) : null;
+                $same = $error === null && is_array($fresh) && is_array($replacement)
+                    && ($fresh['generation_running'] ?? null) === false
+                    && empty($fresh['stop_confirmation_pending'])
+                    && $this->taskChatMatches($responseId, (string)($fresh['url'] ?? ''))
+                    && !empty($replacement['available']);
+                foreach (['user_id','response_id','fingerprint','failure_id'] as $key) {
+                    $same = $same && ($replacement[$key] ?? null) === ($terminal[$key] ?? null);
+                }
+                $same = $same && ($fresh['new_user_id'] ?? null) === $terminal['user_id']
+                    && ($fresh['response_id'] ?? null) === $terminal['response_id'];
+                $facts = ['same_terminal'=>$same,
+                    'conversation_replacement_available'=>is_array($replacement) && !empty($replacement['available']),
+                    'elapsed_ms'=>(int)round((microtime(true)-$started)*1000),
+                    'request_fingerprint'=>$proof['descriptor_hash'], 'response_fingerprint'=>$proof['failure_id_hash']];
+                foreach (['generation_running','send_button_visible','send_button_disabled','completion_action_visible'] as $key) {
+                    if (is_bool($fresh[$key] ?? null)) $facts[$key] = $fresh[$key];
+                }
+                $this->recordTaskTransportObservation($responseId, $same ? 'capacity_revalidated' : 'capacity_deferred', $facts);
+                if (!$same) {
+                    // A resumed generation, replaced callout or failed read is not a new
+                    // replacement authorization. Keep this page and let normal polling settle it.
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_CONVERSATION_EXHAUSTED',
+                    true, $proof, $prepared ?? []);
+            }, 15.0);
     }
 
     /**
@@ -10246,13 +10526,7 @@ JS;
                 if ($repair !== null) {
                     $this->releaseTaskSession($responseId);
                     $resume = function () use ($responseId, $repair): void { $this->prepareTaskSurface($responseId,(int)$repair['command_id'],false); };
-                    if (!empty($repair['target_id'])) {
-                        $this->taskCdp->send('Target.closeTarget',['targetId'=>$repair['target_id']],null,
-                            function($closeError) use($responseId,$resume): void {
-                                if($closeError!==null){$this->taskFailTurn($responseId,'CHATGPT_REPAIR_CLOSE_FAILED','原任务页未能关闭，停止恢复。');return;}
-                                $resume();
-                            },3.0);
-                    } else $resume();
+                    $resume(); // The common preparation gate stops the retired page first.
                     return;
                 }
             } catch (GatewayError $repairError) { $code=$repairError->errorCode; $message=$repairError->getMessage(); }
@@ -10401,6 +10675,7 @@ JS;
 
     private function onTaskEvent(array $message): void
     {
+        $this->retiredTaskPageStop?->onEvent($message);
         $method = (string) ($message['method'] ?? '');
         $params = is_array($message['params'] ?? null) ? $message['params'] : [];
         if ($method === 'Browser.downloadWillBegin') { $this->onTaskDownloadWillBegin($params); return; }
@@ -10645,8 +10920,7 @@ JS;
     }
 
     /**
-     * Close only retired task targets and acknowledge closure from a complete physical inventory.
-     * Failed requests or untrustworthy inventories preserve ownership for the next cleanup tick.
+     * Stop retired task generations before physical cleanup; lost replies keep their durable gate.
      * @param array $state Existing private browser state with its owned debug port.
      */
     private function cleanupRetiredTaskSurfaces(array $state): void
@@ -10657,17 +10931,7 @@ JS;
             $live = $this->discoverPhysicalPageIdsIfAvailable($port);
             if ($live === null) return;
             TaskLedger::reconcilePhysicalTargets(array_keys($live));
-            $retired = TaskLedger::retiredTargets();
-            if ($retired === []) return;
-            foreach ($retired as $targetId => $surfaceId) {
-                if (isset($live[$targetId])) {
-                    $this->devtoolsRequest($port, '/json/close/' . rawurlencode($targetId));
-                    $after = $this->discoverPhysicalPageIdsIfAvailable($port);
-                    if ($after === null || isset($after[$targetId])) continue;
-                }
-                TaskLedger::targetClosed($surfaceId);
-                $this->clearMonitorScreenshots($surfaceId);
-            }
+            $this->retiredPageStops()->tick();
         } catch (\Throwable) {}
     }
 

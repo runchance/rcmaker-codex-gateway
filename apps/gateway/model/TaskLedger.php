@@ -1947,6 +1947,8 @@ final class TaskLedger
      * Large regular-page history is planned before the writer transaction, then revalidated
      * against the current response/capability before any page or token is changed.
      *
+     * @param array|null $preparedRegularContext Internal precomputed plan; an empty array
+     *     records no settled proof. Null preserves planning for existing callers.
      * @return array{retry:bool,exhausted:bool,attempt:int,old_surface_id?:string,new_surface_id?:string,generation_id?:string,binding_id?:?string}
      */
     public static function prepareConnectorNoStartRetry(
@@ -1957,9 +1959,12 @@ final class TaskLedger
         int $maxRetries = 3,
         bool $missingSurface = false,
         string $retryCause = 'missing_surface_with_complete_receipts',
-        ?array $terminalProof = null
+        ?array $terminalProof = null,
+        ?array $preparedRegularContext = null
     ): array {
-        $preparedRegularContext = $missingSurface && $maxRetries > 0
+        // A browser capacity recovery reads the current page after this expensive plan.
+        // Revalidate its source under the writer lock without repeating planning afterward.
+        $preparedRegularContext ??= $missingSurface && $maxRetries > 0
             && in_array($retryCause, ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)
             ? ToolBroker::prepareRegularRetryContext($responseId) : null;
         return Schema::transaction(function () use ($responseId, $prompt, $incarnation, $fence, $maxRetries,
@@ -2074,6 +2079,9 @@ final class TaskLedger
                 }
                 return ['retry' => false, 'exhausted' => false, 'attempt' => (int) $attempts];
             }
+            // The source arrays still describe the original page/token. Rotation may have
+            // rewritten the response row, so capture those pre-rotation values explicitly.
+            TaskPageRetirement::captureUnlocked($surface, $job, $chat);
             if ($regularRecovery) {
                 // A network recovery is the explicit exception to saved-chat reuse. Keep the
                 // account pin, retire the old surface below, and bind only a witnessed new chat.
@@ -3023,6 +3031,7 @@ final class TaskLedger
         if (!in_array($state, ['stream_failed','recovery_visible','recovery_cleared','response_http',
             'empty_candidate','empty_cleared','empty_settlement','empty_stream_recovery','stopped_thinking',
             'stream_metrics','background_failed','background_finished',
+            'capacity_candidate','capacity_revalidated','capacity_deferred',
             'attachment_wait','attachment_ready','attachment_timeout'], true)) return false;
         $uploadObservation = in_array($state, ['attachment_wait','attachment_ready','attachment_timeout'], true);
         $facts = ['state'=>$state];
@@ -3030,7 +3039,8 @@ final class TaskLedger
             'completion_action_visible','content_present','transport_recovery_visible','transport_failed',
             'transport_settled','ui_receipts_settled','request_finished','fence_drained',
             'source_receipt_present','has_artifacts','stopped_thinking_visible','network_retry_available','connection_reused',
-            'upload_pending','upload_error','duplicate','from_service_worker','from_disk_cache'] as $key) {
+            'upload_pending','upload_error','duplicate','from_service_worker','from_disk_cache',
+            'conversation_replacement_available','same_terminal'] as $key) {
             if (is_bool($metadata[$key] ?? null)) $facts[$key] = $metadata[$key];
         }
         if (is_int($metadata['elapsed_ms'] ?? null)) $facts['elapsed_ms'] = max(0, min(86400000, $metadata['elapsed_ms']));
@@ -3175,6 +3185,12 @@ final class TaskLedger
 
     public static function targetClosed(string $surfaceId): void
     {
+        $retirement = SDB(null, 'medoo', 'sqlite')->table('gateway_surface_retirements')
+            ->where('surface_id', $surfaceId)->find('state');
+        // Tracked pages close only through TaskPageRetirement::closed(), which records
+        // the confirmed stop and clears this target in the same transaction.
+        if (is_array($retirement) && $retirement['state'] !== 'closed') return;
+        if ($retirement === false) throw new GatewayError('storage_unavailable', 'Retired page stop state could not be read.', 503);
         $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces')->where('id', $surfaceId)->where('status', 'retired')->update([
             'target_id' => null, 'session_id' => null, 'updated_at' => time(),
         ]);
@@ -3258,6 +3274,7 @@ final class TaskLedger
         $surfaces = $db->table('gateway_browser_surfaces')->where('task_id', $taskId)->where('status', '<>', 'retired')->select();
         $targets = [];
         foreach (is_array($surfaces) ? $surfaces : [] as $surface) {
+            TaskPageRetirement::captureUnlocked($surface);
             if (!empty($surface['target_id'])) $targets[] = (string) $surface['target_id'];
             $db->table('gateway_browser_surfaces')->where('id', $surface['id'])->update([
                 'status' => 'retired', 'session_id' => null, 'retired_at' => $now, 'updated_at' => $now,
@@ -3943,6 +3960,7 @@ final class TaskLedger
         $db->table('gateway_task_epochs')->where('id', $epochId)->where('status', 'active')->update(['status' => 'retired', 'retired_at' => $now]);
         $surfaces = $db->table('gateway_browser_surfaces')->where('task_id', $taskId)->where('epoch_id', $epochId)->where('status', '<>', 'retired')->select();
         foreach (is_array($surfaces) ? $surfaces : [] as $surface) {
+            if ($reason !== 'checkpoint_page_retained') TaskPageRetirement::captureUnlocked($surface);
             $db->table('gateway_browser_surfaces')->where('id', $surface['id'])->update([
                 'status' => 'retired', 'session_id' => null, 'retired_at' => $now, 'updated_at' => $now,
             ]);

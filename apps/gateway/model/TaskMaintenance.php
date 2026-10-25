@@ -302,9 +302,13 @@ final class TaskMaintenance
         $hasTarget = false;
         foreach ($surfaces ?: [] as $surface) if (!empty($surface['target_id'])) $hasTarget = true;
         $browser = $db->table('gateway_browser_state')->where('id', 1)->find();
-        if ($hasTarget && ($browser['status'] ?? '') !== 'stopped') {
+        if (!in_array($item['status'], ['waiting_surface','deleting_rows'], true)) TaskLedger::cancelTaskUnlocked($taskId);
+        // Closing Chrome does not stop a saved-chat generation on the server. Preserve
+        // the retirement obligation and its ownership until the browser confirms Stop.
+        $unclosed = $db->table('gateway_surface_retirements')->where('task_id', $taskId)->where('state','<>','closed')->count();
+        if (!is_numeric($unclosed)) throw new GatewayError('storage_unavailable', 'Retired page cleanup state could not be read.', 503);
+        if (($hasTarget && ($browser['status'] ?? '') !== 'stopped') || (int)$unclosed > 0) {
             if ($item['status'] !== 'waiting_surface') {
-                TaskLedger::cancelTaskUnlocked($taskId);
                 $db->table('gateway_task_cleanup_items')->where('cleanup_id', $cleanupId)->where('task_id', $taskId)
                     ->update(['status'=>'waiting_surface']);
                 $db->table('gateway_task_cleanup')->where('id', $cleanupId)->update(['status'=>'deleting','updated_at'=>time()]);
@@ -312,7 +316,6 @@ final class TaskMaintenance
             return false;
         }
         if ($item['status'] !== 'deleting_rows') {
-            TaskLedger::cancelTaskUnlocked($taskId);
             ContextCompaction::archiveTaskProofsUnlocked($taskId);
         }
         $sql = DB('medoo', 'sqlite');

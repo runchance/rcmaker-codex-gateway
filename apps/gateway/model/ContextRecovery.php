@@ -439,7 +439,8 @@ final class ContextRecovery
      * Rebuild at most once, on a fresh page; never repeat a stage in its contaminated chat.
      * @param string $responseId Durable Responses job to inspect under the ledger transaction.
      * @param string $code Observed transport error, not model-authored recovery instructions.
-     * @return array{target_id:?string,command_id:int}|null Old target to close and command to resume, or no safe repair.
+     * @return array{target_id:?string,command_id:int}|null Old target retained for Stop verification
+     *     and command to resume through the common retirement gate, or no safe repair.
      * @throws GatewayError If cooldown, context validation, storage or ownership prevents recovery.
      */
     public static function repairUnsent(string $responseId, string $code): ?array
@@ -622,6 +623,9 @@ final class ContextRecovery
                 \support\browser\ChatGptTransport::plan($prompt, $budget, $budget,
                     ['sol_available'=>true], null, AttachmentStore::tokenReserve($attachments));
             }
+            // Preserve the old physical page before this logical surface is reused. A
+            // queued repair keeps its original epoch/checkpoint/capability identities.
+            $retiredSurfaceId = TaskPageRetirement::preserveReplacedSurfaceUnlocked($surface, $responseId, $chat);
             $fence = (int) $surface['fencing_version'] + 1;
             $surfaceUpdated = $db->table('gateway_browser_surfaces')->where('id', $surface['id'])->where('fencing_version', $surface['fencing_version'])->update([
                 'target_id'=>null,'session_id'=>null,'status'=>'reserved','url'=>'','title'=>'',
@@ -644,7 +648,8 @@ final class ContextRecovery
             if (!$db->table('gateway_task_events')->add(['task_id'=>$job['task_id'],'turn_id'=>$turn['id'],'response_id'=>$responseId,
                 'surface_id'=>$surface['id'],'event_type'=>'unsent_surface_rebuilt',
                 'data_json'=>json_encode(['cause'=>$code,'generation'=>(int)$surface['generation']+1,'context_hash'=>hash('sha256',ContextHistory::canonical($context)),
-                    'discarded_transaction'=>$job['transport_transaction_id'],'final_commit_sent'=>false]),'created_at'=>time()])) {
+                    'discarded_transaction'=>$job['transport_transaction_id'],'final_commit_sent'=>false,
+                    'retired_surface_id'=>$retiredSurfaceId]),'created_at'=>time()])) {
                 throw new GatewayError('storage_unavailable','页面恢复证据无法保存。',503);
             }
             return ['target_id'=>$surface['target_id'],'command_id'=>$job['command_id']];

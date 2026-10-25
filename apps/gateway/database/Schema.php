@@ -528,6 +528,11 @@ final class Schema
                 'CREATE TABLE gateway_task_error_attempts (request_key TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES gateway_tasks(id) ON DELETE CASCADE, error_code TEXT NOT NULL, created_at INTEGER NOT NULL)',
                 'CREATE INDEX gateway_task_error_attempts_task ON gateway_task_error_attempts(task_id)',
             ],
+            65 => [
+                // Empty on upgrade: capture only pages retired by new code or still-owned legacy targets.
+                "CREATE TABLE gateway_surface_retirements (surface_id TEXT PRIMARY KEY REFERENCES gateway_browser_surfaces(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES gateway_tasks(id) ON DELETE CASCADE, state TEXT NOT NULL CHECK(state IN ('pending','stopped','closed')), snapshot_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+                'CREATE INDEX gateway_surface_retirements_pending ON gateway_surface_retirements(task_id,state,updated_at)',
+            ],
         ];
     }
 

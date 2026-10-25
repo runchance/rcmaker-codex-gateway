@@ -568,6 +568,75 @@ JS);
     }
 
     /**
+     * Stop a retired physical page using its immutable identity, never the new task page's pin.
+     * Hashed submission witnesses avoid persisting a live tool token in retirement diagnostics.
+     * @param array $snapshot Durable retired-page identity and original submission witnesses.
+     * @param bool $click Permit Stop/its known confirmation; false is an uncertainty readback.
+     * @param bool $accountVerified Fresh account verification on this observer's document.
+     * @return string Async CDP expression; unknown ownership or dialogs never count as idle.
+     */
+    public static function retiredStopExpression(array $snapshot, bool $click, bool $accountVerified): string
+    {
+        $expected = array_intersect_key($snapshot, array_flip(['surface_id','url','chat_mode','baseline_users',
+            'accepted_initial','initial_binding_marker','turn_token_hashes','transaction_hashes','empty_page']));
+        $expected += ['click'=>$click, 'account_verified'=>$accountVerified];
+        return self::wrap('const retiredStop=' . json_encode($expected, JSON_THROW_ON_ERROR) . ";\n" . <<<'JS'
+return (async()=>{
+ const e=retiredStop,composer=visibleOne(COMPOSER),rows=userTurns(),latest=rows.at(-1);
+ const fail=()=>({owned:false,generation_running:true,editor_ready:false,stopped:false});
+ let expected,actual;try{expected=new URL(e.url);actual=new URL(location.href);}catch(_){return fail();}
+ if(actual.origin!==expected.origin)return fail();
+ const regular=e.chat_mode==='regular'&&!actual.searchParams.has('temporary-chat');
+ const temporary=e.chat_mode==='temporary'&&temporaryChatPage(actual.pathname,actual.search);
+ const text=[latest?.innerText,latest?.textContent].map(value=>String(value||'')).join('\n');
+ const candidates=[...new Set([...(text.match(/\b(?:turn|request)_[A-Za-z0-9_-]{16,}\b/g)||[]),
+     ...(text.match(/\bctx_[a-f0-9]{16,}\b/gi)||[])])];
+ const hashes=new Set([...(e.turn_token_hashes||[]),...(e.transaction_hashes||[])]);
+ let witnessed=!!e.initial_binding_marker&&text.includes(e.initial_binding_marker);
+ for(const candidate of candidates){
+   const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(candidate));
+   const hash=[...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,'0')).join('');
+   if(hashes.has(hash)){witnessed=true;break;}
+ }
+ // A first saved submission may acquire its UUID before retirement observes the URL.
+ const initialMove=regular&&expected.pathname==='/'&&/^\/c\/[0-9a-f-]{36}$/i.test(actual.pathname)&&witnessed;
+ const sameSaved=regular&&/^\/c\/[0-9a-f-]{36}\/?$/i.test(expected.pathname)
+     &&actual.pathname.replace(/\/$/,'').toLowerCase()===expected.pathname.replace(/\/$/,'').toLowerCase();
+ if(actual.href!==expected.href&&!initialMove&&!sameSaved)return fail();
+ const saved=regular&&/^\/c\/[0-9a-f-]{36}$/i.test(actual.pathname)&&e.account_verified;
+ const ids=rows.map((row,index)=>turnId(row,index,'user'));
+ const users=e.baseline_users||[],fresh=ids.filter(id=>!users.includes(id));
+ const initial=e.accepted_initial&&users.length===0&&ids.length===1;
+ const baseline=users.length>0&&ids.some(id=>users.includes(id));
+ if((initial||baseline)&&fresh.length===1&&fresh[0]===ids.at(-1)
+     &&/^group:user:[0-9a-f-]{36}$/i.test(fresh[0]))witnessed=true;
+ const empty=e.empty_page&&rows.length===0&&assistantTurns().length===0;
+ if((!regular&&!temporary)||(!saved&&!witnessed&&!empty))return fail();
+ // Hashing yields to the page. A same-document navigation or composer/message remount
+ // must invalidate the witness before Stop queries the current DOM, not after its click.
+ const currentLatest=userTurns().at(-1);
+ if(location.href!==actual.href||visibleOne(COMPOSER)!==composer
+     ||currentLatest!==latest||(latest&&!latest.isConnected)||(composer&&!composer.isConnected)
+     ||[currentLatest?.innerText,currentLatest?.textContent].map(value=>String(value||'')).join('\n')!==text)return fail();
+ const action=actOnGenerationStop(e.click,e.click,'retired:'+e.surface_id);
+ const form=composer?.closest('form');
+ const buttons=form?[...form.querySelectorAll('button')].filter(visible):[];
+ const sends=buttons.filter(button=>button.getAttribute('data-testid')==='send-button');
+ const voices=buttons.filter(button=>/^(?:composer-speech-button|voice-mode-button)$/.test(button.getAttribute('data-testid')||'')
+     ||/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(button.getAttribute('aria-label')||''));
+ // A primary square with an unrecognized localized label is not an idle witness.
+ // Require an explicit Send/voice identity; unknown controls keep the task parked.
+ const idleControl=sends.length===1||voices.length===1;
+ // Require a usable composer in addition to no Stop. An error/loading screen without
+ // controls cannot certify that a remote generation ended.
+ const ready=idleControl&&!!composer&&!composer.disabled&&!composer.readOnly
+     &&composer.getAttribute('aria-disabled')!=='true'&&composer.getAttribute('contenteditable')!=='false';
+ return {owned:true,generation_running:!!action.running,editor_ready:ready,...action};
+})()
+JS);
+    }
+
+    /**
      * Stop/read only a manually interrupted task's verified document and user-message witness.
      * @param string $url Persisted target URL. @param array $tokens Current task/part transport identities, never logged.
      * @param array $users Exact pre-send user identities, also fencing truncated long-message witnesses.
