@@ -1414,12 +1414,13 @@ final class TaskLedger
      * keeps the ordinary ready state and must pass the existing recovery checks separately.
      * @param string $surfaceId Durable surface. @param string $targetId Observed Chrome target.
      * @param string $sessionId New CDP session. @param string $url Observed page URL.
-     * @return array New owner, fence, generation and unchanged retained document nonce.
+     * @param array|null $compactObserver Missing-target proof for an unsent saved-chat checkpoint observer only.
+     * @return array New owner, fence, generation and current document nonce (preserved for the same target).
      * @throws GatewayError If ownership or the exact retained turn cannot be transferred.
      */
-    public static function claimSurface(string $surfaceId, string $targetId, string $sessionId, string $url): array
+    public static function claimSurface(string $surfaceId, string $targetId, string $sessionId, string $url, ?array $compactObserver = null): array
     {
-        return Schema::transaction(function () use ($surfaceId, $targetId, $sessionId, $url): array {
+        return Schema::transaction(function () use ($surfaceId, $targetId, $sessionId, $url, $compactObserver): array {
             $db = SDB(null, 'medoo', 'sqlite');
             $surface = $db->table('gateway_browser_surfaces')->where('id', $surfaceId)->find();
             if (!is_array($surface) || (string) $surface['status'] === 'retired') {
@@ -1431,6 +1432,21 @@ final class TaskLedger
             $nonce = ((string) ($surface['target_id'] ?? '') === $targetId && (string) ($surface['document_nonce'] ?? '') !== '')
                 ? (string) $surface['document_nonce'] : bin2hex(random_bytes(12));
             $retainedTurn = null;
+            $observerChat = null;
+            if ($compactObserver !== null) {
+                $ledger = self::execution((string)$compactObserver['response_id']);
+                $observerChat = TaskWebChat::compactObserverChat($ledger);
+                if ($observerChat === null || $surfaceId !== $ledger['surface']['id']
+                    || $surface['owner_incarnation'] !== ($compactObserver['owner_incarnation'] ?? '')
+                    || (int)$surface['fencing_version'] !== (int)($compactObserver['fencing_version'] ?? -1)
+                    || $surface['document_nonce'] !== ($compactObserver['document_nonce'] ?? '')
+                    || $ledger['job']['generation_id'] !== ($compactObserver['generation_id'] ?? '')
+                    || $observerChat['conversation_id'] !== ($compactObserver['conversation_id'] ?? '')
+                    || $observerChat['account_key'] !== ($compactObserver['account_key'] ?? '') || $url !== 'about:blank') {
+                    throw new GatewayError('surface_fence_lost', 'Saved checkpoint reopening lost ownership.', 409);
+                }
+                $retainedTurn = $ledger['turn'];
+            }
             if ($surface['status'] === 'busy' && (string) ($surface['target_id'] ?? '') === $targetId) {
                 $candidate = $db->table('gateway_task_turns')->where('surface_id', $surfaceId)
                     ->where('status', 'IN', ['submit_intent', 'submitted', 'running'])->find();
@@ -1442,7 +1458,10 @@ final class TaskLedger
                     && $candidate['task_id'] === $surface['task_id'] && $candidate['epoch_id'] === $surface['epoch_id']
                     && $candidate['owner_incarnation'] === $surface['owner_incarnation']
                     && (int) $candidate['fencing_version'] === (int) $surface['fencing_version']
-                    && ($job['submitted_document_nonce'] ?? null) === $nonce) $retainedTurn = $candidate;
+                    && (($job['submitted_document_nonce'] ?? null) === $nonce
+                        || TaskWebChat::compactObserverReopenState(['job'=>$job,'turn'=>$candidate,'surface'=>$surface]) !== null)) {
+                    $retainedTurn = $candidate;
+                }
             }
             $updated = $db->table('gateway_browser_surfaces')->where('id', $surfaceId)->where('fencing_version', (int) $surface['fencing_version'])->update([
                 'target_id' => $targetId,
@@ -1470,6 +1489,12 @@ final class TaskLedger
             self::eventUnlocked((string) $surface['task_id'], null, null, $surfaceId, 'surface_attached', [
                 'generation' => $generation, 'fencing_version' => $fence,
             ]);
+            if ($observerChat !== null) self::eventUnlocked($surface['task_id'], $retainedTurn['id'],
+                $compactObserver['response_id'], $surfaceId, 'regular_compact_observer_reopened', [
+                    'generation_id'=>$compactObserver['generation_id'], 'target_id'=>$targetId,
+                    'source_response_id'=>$observerChat['source_response_id'],
+                    'conversation_id'=>$observerChat['conversation_id'], 'account_key'=>$observerChat['account_key'],
+                ]);
             return ['owner_incarnation' => $incarnation, 'fencing_version' => $fence, 'generation' => $generation, 'document_nonce' => $nonce];
         });
     }

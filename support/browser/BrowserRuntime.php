@@ -3295,7 +3295,17 @@ JS;
             $this->attachTaskSurface($responseId, $commandId, $targetId, (string) ($targets[$targetId]['url'] ?? ''), $recover);
             return;
         }
-        if ((string) ($turn['status'] ?? '') !== 'queued') {
+        $compactObserver = null;
+        if ($recover && (string) ($turn['status'] ?? '') !== 'queued') {
+            $chat = TaskWebChat::compactObserverChat($ledger);
+            if ($chat !== null) $compactObserver = [
+                'response_id'=>$responseId, 'generation_id'=>$ledger['job']['generation_id'],
+                'owner_incarnation'=>$surface['owner_incarnation'], 'fencing_version'=>$surface['fencing_version'],
+                'document_nonce'=>$surface['document_nonce'], 'conversation_id'=>$chat['conversation_id'],
+                'account_key'=>$chat['account_key'],
+            ];
+        }
+        if ((string) ($turn['status'] ?? '') !== 'queued' && $compactObserver === null) {
             try {
                 $job = ResponseJob::execution($responseId);
                 $retry = TaskLedger::prepareConnectorNoStartRetry($responseId, (string)$job['prompt'],
@@ -3312,7 +3322,7 @@ JS;
             $this->taskFailTurn($responseId, 'RECOVERY_OUTCOME_UNKNOWN', '原任务页面已经丢失，上一提交结果无法确认；不会自动重发。', true);
             return;
         }
-        if ($targetId !== '' || !empty($ledger['job']['continuation_source_response_id'])) {
+        if ($compactObserver === null && ($targetId !== '' || !empty($ledger['job']['continuation_source_response_id']))) {
             // A saved target id is not evidence that the physical page still exists. A fresh page
             // must receive canonical history, never the suffix prepared for the previous page.
             try {
@@ -3341,22 +3351,25 @@ JS;
         // then let prepareTaskTemporarySurface perform the one intentional navigation.
         $this->taskCdp->send('Target.createTarget', NativeBrowserWindow::backgroundPageParameters(
             ['url' => 'about:blank'], BrowserState::state()), null,
-            function ($error, $result) use ($responseId, $commandId, $recover): void {
+            function ($error, $result) use ($responseId, $commandId, $recover, $compactObserver): void {
                 $targetId = (string) ($result['targetId'] ?? '');
                 if ($error !== null || $targetId === '') {
                     $detail = is_array($error) ? ' [CDP ' . (int) ($error['code'] ?? 0) . ']' : '';
                     $this->taskFailTurn($responseId, 'CHATGPT_SURFACE_CREATE_FAILED', '无法为任务创建独立 ChatGPT 页面。' . $detail);
                     return;
                 }
-                $this->attachTaskSurface($responseId, $commandId, $targetId, 'about:blank', $recover);
+                // The claim transaction checks the captured old fence again. A late create
+                // callback cannot attach or navigate after cancellation or another owner.
+                $this->attachTaskSurface($responseId, $commandId, $targetId, 'about:blank', $recover, $compactObserver);
             }, 15.0);
     }
 
     /** Attach the owned task page; Page.enable uses the preparation budget without renewing its turn deadline. */
-    private function attachTaskSurface(string $responseId, int $commandId, string $targetId, string $url, bool $recover): void
+    private function attachTaskSurface(string $responseId, int $commandId, string $targetId, string $url, bool $recover,
+        ?array $compactObserver = null): void
     {
         $this->taskCdp->send('Target.attachToTarget', ['targetId' => $targetId, 'flatten' => true], null,
-            function ($error, $result) use ($responseId, $commandId, $targetId, $url, $recover): void {
+            function ($error, $result) use ($responseId, $commandId, $targetId, $url, $recover, $compactObserver): void {
                 $sessionId = (string) ($result['sessionId'] ?? '');
                 if ((TaskLedger::execution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
                     if ($sessionId !== '') $this->detachTaskSessionRaw($sessionId);
@@ -3386,7 +3399,7 @@ JS;
                         $this->finishCommand($commandId, ['status' => 'superseded']);
                         return;
                     }
-                    $ownership = TaskLedger::claimSurface((string) $ledger['surface']['id'], $targetId, $sessionId, $url);
+                    $ownership = TaskLedger::claimSurface((string) $ledger['surface']['id'], $targetId, $sessionId, $url, $compactObserver);
                     $this->taskSessions[$sessionId] = [
                         'surface_id' => (string) $ledger['surface']['id'],
                         'owner_incarnation' => (string) $ownership['owner_incarnation'],
@@ -3400,6 +3413,8 @@ JS;
                     ];
                 } catch (GatewayError $ledgerError) {
                     $this->detachTaskSessionRaw($sessionId);
+                    if ($compactObserver !== null && in_array($ledgerError->errorCode,
+                        ['surface_fence_lost','response_superseded','task_surface_missing','task_ledger_missing'], true)) return;
                     $this->taskFailTurn($responseId, $ledgerError->errorCode, $ledgerError->getMessage(), $recover);
                     return;
                 }
@@ -3659,10 +3674,18 @@ JS;
             $this->prepareSteeringSurface($responseId, $commandId, $sessionId, microtime(true) + 30.0);
             return;
         }
-        $surface = TaskLedger::execution($responseId)['surface'];
+        $prepared = TaskLedger::execution($responseId);
+        $surface = $prepared['surface'];
+        $reopenedObserver = $recover && TaskWebChat::compactObserverReopenState($prepared) !== null;
         $retainedDocument = $this->taskChatMatches($responseId, (string)($surface['url'] ?? ''));
         $this->evaluateTaskSession($sessionId, WebModelPage::capabilityExpression(),
-            function ($error, $capability) use ($responseId, $commandId, $sessionId, $recover, $retainedDocument): void {
+            function ($error, $capability) use ($responseId, $commandId, $sessionId, $recover, $retainedDocument, $reopenedObserver, $surface): void {
+                if ($reopenedObserver) {
+                    $current = $this->currentTaskResumeLedger($responseId, $commandId);
+                    if ($current === null || $current['job']['id'] !== $responseId
+                        || $current['surface']['owner_incarnation'] !== $surface['owner_incarnation']
+                        || (int)$current['surface']['fencing_version'] !== (int)$surface['fencing_version']) return;
+                }
                 if ($error === null && is_array($capability)) {
                     if (!empty($capability['login_required'])) {
                         $this->taskFailTurn($responseId, 'authentication_required', 'ChatGPT 网页需要重新登录。', $recover);
@@ -3679,6 +3702,13 @@ JS;
                     return;
                 }
                 if ($recover) {
+                    $ledger = TaskLedger::execution($responseId);
+                    $chat = TaskWebChat::compactObserverReopenState($ledger);
+                    if ($chat !== null && $error === null && ($capability['url'] ?? '') === 'about:blank'
+                        && ($ledger['surface']['url'] ?? '') === 'about:blank') {
+                        $this->navigateCompactObserver($responseId, $commandId, $sessionId, $ledger, $chat);
+                        return;
+                    }
                     $this->taskFailTurn(
                         $responseId,
                         'RECOVERY_OUTCOME_UNKNOWN',
@@ -3697,6 +3727,34 @@ JS;
                         $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, false, microtime(true) + 60.0);
                     }, 60.0);
             }, 3.0);
+    }
+
+    /** Navigate only an inert replacement observer to its already bound saved chat; never send a prompt. */
+    private function navigateCompactObserver(string $responseId, int $commandId, string $sessionId,
+        array $ledger, array $chat): void
+    {
+        $owner = $this->taskSessions[$sessionId] ?? [];
+        $surface = $ledger['surface'];
+        if (($owner['response_id'] ?? '') !== $responseId || $surface['session_id'] !== $sessionId
+            || ($owner['owner_incarnation'] ?? '') !== $surface['owner_incarnation']
+            || (int)($owner['fencing_version'] ?? -1) !== (int)$surface['fencing_version']) return;
+        $url = self::taskModelUrl('regular', $chat['conversation_id']);
+        $this->taskCdp->send('Page.navigate', ['url'=>$url], $sessionId,
+            function ($error) use ($responseId, $commandId, $sessionId, $owner, $surface): void {
+                $current = $this->currentTaskResumeLedger($responseId, $commandId);
+                $session = $this->taskSessions[$sessionId] ?? [];
+                if ($current === null || ($current['job']['id'] ?? '') !== $responseId
+                    || ($session['owner_incarnation'] ?? '') !== $owner['owner_incarnation']
+                    || ($current['surface']['target_id'] ?? '') !== $surface['target_id']
+                    || ($current['surface']['owner_incarnation'] ?? '') !== $surface['owner_incarnation']
+                    || (int)($current['surface']['fencing_version'] ?? -1) !== (int)$surface['fencing_version']) return;
+                if ($error !== null) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_SURFACE_NOT_READY',
+                        'The saved checkpoint source could not be reopened; no message was sent.', true);
+                    return;
+                }
+                $this->waitTaskSurfaceReady($responseId, $commandId, $sessionId, true, microtime(true) + 60.0);
+            }, 60.0);
     }
 
     /**
@@ -4007,6 +4065,9 @@ JS;
                 $this->taskSessions[$sessionId]['response_id'] = $responseId;
                 $resumeKey = (string)$resume['job']['surface_id'] . ':' . $commandId;
                 if (isset($this->taskResumeAttachments[$resumeKey])) $this->taskResumeAttachments[$resumeKey] = $responseId;
+                TaskWebChat::adoptCompactObserverDocument($responseId,
+                    $this->taskSessions[$sessionId] + ['session_id'=>$sessionId],
+                    (string)$resume['surface']['document_nonce'], self::modelUrl());
             }
             $job = ResponseJob::execution($responseId);
             $toolCapable = !empty($job['mcp_binding_id']);

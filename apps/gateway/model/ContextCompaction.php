@@ -1568,7 +1568,18 @@ final class ContextCompaction
                     && self::hasMissingTargetCleanupUnlocked($binding, $job, $surface, true)) $retiredSource = true;
             }
         }
+        $bindingsById = array_column($bindings, null, 'id');
         foreach ($calls as $call) {
+            // Admission cancels registered, unassigned calls when compaction takes over.
+            // They never reached Codex, so there is no host receipt to wait for or replay.
+            // Keep delivery evidence authoritative even if a cancellation flag exists.
+            if ($call['status'] === 'cancelled' && ($call['task_id'] ?? null) === $taskId
+                && ($bindingsById[$call['binding_id']]['task_id'] ?? null) === $taskId
+                && ($bindingsById[$call['binding_id']]['turn_id'] ?? null) === $call['turn_id']
+                && $call['response_id'] === null && (int) $call['delivery_count'] === 0
+                && $call['delivered_at'] === null && $call['completed_at'] === null
+                && $call['result_hash'] === null && $call['result_delivered_at'] === null
+                && json_decode((string) ($call['result_json'] ?? ''), true) === ['compaction_interrupted' => true]) continue;
             // Missing delivery is transport uncertainty, not host uncertainty. This
             // exception requires a revoked capability, proven missing page, and the
             // full byte-verified receipt proof below; stored delivery ACKs stay intact.
@@ -1757,14 +1768,20 @@ final class ContextCompaction
         if (!is_array($data) || ($data['reason'] ?? '') !== 'surface_target_missing'
             || !array_key_exists('registered_cancelled', $data) || (int) $data['registered_cancelled'] !== 0
             || !array_key_exists('delivered_unknown', $data) || (int) $data['delivered_unknown'] !== 0
-            || (int) $revocation['created_at'] !== (int) $binding['revoked_at']) return false;
+            || (int) $binding['revoked_at'] < (int) $failure['created_at']
+            || (int) $binding['revoked_at'] > (int) $revocation['created_at']) return false;
         $retirements = $db->table('gateway_task_events')->where('task_id', (string) $job['task_id'])
             ->where('surface_id', (string) $surface['id'])->where('event_type', 'surface_retired')
             ->where('id', '>', (int) $revocation['id'])->select();
         if (!is_array($retirements) || count($retirements) !== 1) return false;
         $retirement = $retirements[0];
+        // These unique, owner-scoped events establish the causal order. Their writers
+        // read time() separately: durable page-stop capture can cross a second (or more)
+        // between marking a surface retired and recording its event in the transaction.
+        // Require the row timestamp to fall within that operation, not equal its last second.
         return (json_decode((string) $retirement['data_json'], true)['reason'] ?? '') === 'physical_target_missing'
-            && (int) $retirement['created_at'] === (int) $surface['retired_at'];
+            && (int) $surface['retired_at'] >= (int) $binding['revoked_at']
+            && (int) $surface['retired_at'] <= (int) $retirement['created_at'];
     }
     /**
      * Restore only user IDs which an earlier compiler omitted from persisted history.

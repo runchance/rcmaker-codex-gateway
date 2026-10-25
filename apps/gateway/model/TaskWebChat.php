@@ -348,6 +348,131 @@ final class TaskWebChat
     }
 
     /**
+     * Prove that an unsent checkpoint still observes its exact completed tool source in a saved chat.
+     * This permits only reattachment, never a new message, capability or tool execution.
+     * @param array $ledger Fresh job/turn/surface rows; callers mutating ownership hold Schema's transaction.
+     * @return array|null Pinned chat identity and source response, or no eligible observer.
+     */
+    public static function compactObserverChat(array $ledger): ?array
+    {
+        ['job'=>$job, 'turn'=>$turn, 'surface'=>$surface] = $ledger;
+        if (!in_array($job['operation_kind'] ?? '', ['compact_v1','compact_v2'], true)
+            || !in_array($job['status'] ?? '', ['queued','running'], true)
+            || empty($job['previous_response_id']) || empty($job['mcp_binding_id']) || empty($job['command_id'])
+            || $job['submit_intent_at'] !== null || $job['accepted_at'] !== null
+            || (int)$job['transport_stage_sent'] !== 0 || (int)$job['output_started'] !== 0 || $job['output_text'] !== ''
+            || $turn['response_id'] !== $job['id'] || $turn['generation_id'] !== $job['generation_id']
+            || !in_array($turn['status'], ['submitted','running'], true) || (int)$turn['deadline_at'] <= time()
+            || in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+            || !in_array($surface['status'], ['ready','busy','attaching','reserved'], true)) return null;
+        foreach (['task_id','epoch_id','surface_id'] as $key) {
+            if ($turn[$key] !== $job[$key]) return null;
+        }
+        if ($surface['id'] !== $job['surface_id'] || $surface['task_id'] !== $job['task_id']
+            || $surface['epoch_id'] !== $job['epoch_id']) return null;
+        $chat = self::state((string)$job['task_id']);
+        if ($chat['mode'] !== 'regular' || empty($chat['conversation_id']) || empty($chat['account_key'])) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', $job['previous_response_id'])->find();
+        if (!is_array($source) || $source['status'] !== 'completed' || $source['round_kind'] !== 'tool_call'
+            || $source['operation_kind'] !== 'response' || empty($source['submitted_document_nonce'])) return null;
+        foreach (['task_id','durable_turn_id','epoch_id','surface_id','mcp_binding_id','command_id'] as $key) {
+            if ($source[$key] !== $job[$key]) return null;
+        }
+        $task = $db->table('gateway_tasks')->where('id', $job['task_id'])->find('status,current_epoch_id');
+        $epoch = $db->table('gateway_task_epochs')->where('id', $job['epoch_id'])->find('status,task_id');
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find('status,task_id,turn_id,current_response_id');
+        if (!is_array($task) || $task['status'] !== 'active' || $task['current_epoch_id'] !== $job['epoch_id']
+            || !is_array($epoch) || $epoch['status'] !== 'active' || $epoch['task_id'] !== $job['task_id']
+            || !is_array($binding) || !in_array($binding['status'], ['awaiting_start','running','completed'], true)
+            || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $turn['id']
+            || $binding['current_response_id'] !== $job['id']) return null;
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $job['compact_id'])->find();
+        if (!is_array($checkpoint) || $checkpoint['state'] !== 'generating'
+            || $checkpoint['response_id'] !== $job['id'] || $checkpoint['source_response_id'] !== $source['id']
+            || $checkpoint['task_id'] !== $job['task_id'] || $checkpoint['source_epoch_id'] !== $job['epoch_id']) return null;
+        foreach (['gateway_compaction_handoffs'=>'compact_response_id', 'gateway_web_messages'=>'response_id'] as $table=>$key) {
+            $query = $db->table($table)->where($key, $job['id']);
+            if ($table === 'gateway_web_messages') $query->where('direction', 'outbound');
+            $count = $query->count();
+            if (!is_numeric($count) || (int)$count !== 0) return null;
+        }
+        return $chat + ['source_response_id'=>$source['id'], 'source_document_nonce'=>$source['submitted_document_nonce']];
+    }
+
+    /**
+     * Read the persisted authorization to navigate only this checkpoint's replacement tab to its saved chat.
+     * @param array $ledger Fresh execution rows. @return array|null Exact pinned chat or no matching reopen.
+     */
+    public static function compactObserverReopenState(array $ledger): ?array
+    {
+        $chat = self::compactObserverChat($ledger);
+        if ($chat === null) return null;
+        $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('response_id', $ledger['job']['id'])->where('event_type', 'regular_compact_observer_reopened')
+            ->order([['id','DESC']])->limit(1)->find('data_json');
+        $proof = is_array($event) ? json_decode((string)$event['data_json'], true) : null;
+        if (!is_array($proof) || ($proof['generation_id'] ?? '') !== $ledger['job']['generation_id']
+            || ($proof['target_id'] ?? '') !== $ledger['surface']['target_id']
+            || ($proof['source_response_id'] ?? '') !== $chat['source_response_id']
+            || ($proof['conversation_id'] ?? '') !== $chat['conversation_id']
+            || ($proof['account_key'] ?? '') !== $chat['account_key']) return null;
+        return $chat;
+    }
+
+    /**
+     * Rebind only the observer document after its exact saved chat and account have been verified.
+     * @param string $responseId Unsent checkpoint. @param array $owner Current CDP session identity.
+     * @param string $nonce Verified document nonce. @param string $modelUrl Configured ChatGPT origin.
+     * @return bool Whether this was a saved observer reopen.
+     * @throws GatewayError If verification became stale; original results and capabilities remain untouched.
+     */
+    public static function adoptCompactObserverDocument(string $responseId, array $owner, string $nonce, string $modelUrl): bool
+    {
+        return Schema::transaction(static function () use ($responseId, $owner, $nonce, $modelUrl): bool {
+            $ledger = TaskLedger::execution($responseId);
+            $chat = self::compactObserverReopenState($ledger);
+            if ($chat === null) return false;
+            $surface = $ledger['surface'];
+            if ($surface['document_nonce'] !== $nonce || ($owner['account_document_nonce'] ?? '') !== $nonce
+                || ($owner['account_key'] ?? '') !== $chat['account_key']
+                || ($owner['surface_id'] ?? '') !== $surface['id'] || ($owner['session_id'] ?? '') !== $surface['session_id']
+                || ($owner['owner_incarnation'] ?? '') !== $surface['owner_incarnation']
+                || (int)($owner['fencing_version'] ?? -1) !== (int)$surface['fencing_version']
+                || !WebModelPage::isTaskChatUrl((string)$surface['url'], $modelUrl,
+                    'regular', $chat['conversation_id'])) {
+                throw new GatewayError('surface_fence_lost', 'Saved checkpoint observation changed before reattachment.', 409);
+            }
+            $job = $ledger['job'];
+            $db = SDB(null, 'medoo', 'sqlite');
+            $write = $db->table('gateway_response_jobs')->where('id', $responseId)->where('generation_id', $job['generation_id'])
+                ->update(['submitted_document_nonce'=>$nonce]);
+            // The source remains the same remote answer. Its document fence, like the
+            // compact observer's, follows this verified reopen; execution receipts do not.
+            $sourceWrite = $db->table('gateway_response_jobs')->where('id', $chat['source_response_id'])
+                ->where('task_id', $job['task_id'])->where('durable_turn_id', $job['durable_turn_id'])
+                ->where('surface_id', $job['surface_id'])->where('mcp_binding_id', $job['mcp_binding_id'])
+                ->where('submitted_document_nonce', $chat['source_document_nonce'])
+                ->where('status', 'completed')->where('round_kind', 'tool_call')->update(['submitted_document_nonce'=>$nonce]);
+            $surfaceWrite = $db->table('gateway_browser_surfaces')->where('id', $surface['id'])
+                ->where('fencing_version', $surface['fencing_version'])->update(['status'=>'busy']);
+            if (!$write || $write->rowCount() !== 1 || !$sourceWrite || $sourceWrite->rowCount() !== 1
+                || !$surfaceWrite || $surfaceWrite->rowCount() !== 1) {
+                throw new GatewayError('surface_fence_lost', 'Saved checkpoint observation could not be reattached.', 409);
+            }
+            if ($chat['source_document_nonce'] !== $nonce && !$db->table('gateway_task_events')->add([
+                'task_id'=>$job['task_id'], 'turn_id'=>$job['durable_turn_id'], 'response_id'=>$responseId,
+                'surface_id'=>$surface['id'], 'event_type'=>'regular_compact_observer_document_adopted',
+                'created_at'=>time(), 'data_json'=>ContextHistory::canonical([
+                    'source_response_id'=>$chat['source_response_id'], 'generation_id'=>$job['generation_id'],
+                    'previous_document_nonce'=>$chat['source_document_nonce'], 'document_nonce'=>$nonce,
+                ]),
+            ])) throw new GatewayError('storage_unavailable', 'Saved checkpoint observation could not be recorded.', 503);
+            return true;
+        });
+    }
+
+    /**
      * Fence a missing target while preserving the exact unsent message and capability.
      * Caller owns the write transaction and has already proved this request was never submitted.
      * @param array $job Queued unsent job.
