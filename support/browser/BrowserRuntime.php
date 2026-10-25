@@ -3822,7 +3822,13 @@ JS;
             $toolCapable = !empty($job['mcp_binding_id']);
             $toolSettings = $toolCapable ? GatewaySettings::internal() : [];
             $connectorName = $toolCapable ? ToolBroker::connectorNameForJob($job) : '';
-            ResponseJob::start($responseId);
+            $started = ResponseJob::start($responseId);
+            $startedBudget = json_decode((string)($started['budget_json'] ?? '{}'), true);
+            // An older failed replacement can acquire its working view at start.
+            // Adopt that exact prompt/token/attachment set before caching the browser turn.
+            if (isset($startedBudget['imported_history_selection']) && !isset($job['budget']['imported_history_selection'])) {
+                $job = ResponseJob::execution($responseId);
+            }
             $ledger = TaskLedger::execution($responseId);
             $continuationState = TaskLedger::continuationState($responseId);
             $surface = $ledger['surface'];
@@ -8229,7 +8235,13 @@ JS;
                 return false;
             }
         }
-        $this->recordEmptyResponseObservation($responseId, 'empty_settlement', $snapshot, $evidence, $health['candidate'], $now);
+        if (($previousHealth['signature'] ?? null) !== $health['candidate']['signature']
+            || ($previousHealth['settlement_error_code'] ?? null) !== $health['error_code']) {
+            $this->recordEmptyResponseObservation($responseId, 'empty_settlement', $snapshot, $evidence, $health['candidate'], $now);
+        }
+        // Keep polling the recovery fence while it drains, but log this stable terminal
+        // transition only once. A changed/cleared candidate starts a new observation.
+        $this->chatGptTurns[$responseId]['empty_response_health']['settlement_error_code'] = $health['error_code'];
         if ($activeCompact) {
             // Settle only this source's tool channel through its existing atomic fence.
             // The native compact stays running until a separate real summary receipt;

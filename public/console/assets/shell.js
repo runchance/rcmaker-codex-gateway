@@ -63,7 +63,7 @@ layui.use(['admin', 'layer'], function () {
 
     /** Codex configuration proves only the last setup step, independently of gateway readiness. */
     function installed(codex) {
-        return Boolean(codex && (codex.configured === true || ['configured', 'restart_required', 'client_connected', 'verified'].includes(codex.state)));
+        return Gateway.codexConfigured(codex);
     }
 
     /** Open one mandatory wizard. Opening it never changes tasks, accounts or configuration. */

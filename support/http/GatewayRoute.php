@@ -75,21 +75,7 @@ final class GatewayRoute
      */
     public static function decodedBody(Request $request): string
     {
-        $raw = (string) $request->rawBody();
-        if (strlen($raw) > ResponsesProtocol::MAX_BODY_BYTES) {
-            throw new GatewayError('request_body_too_large', 'HTTP 请求正文超过网关字节上限。', 413);
-        }
-        $encoding = strtolower(trim((string) $request->header('content-encoding', '')));
-        if ($encoding !== '' && $encoding !== 'identity') {
-            if ($encoding === 'gzip') $decoded = @gzdecode($raw, ResponsesProtocol::MAX_BODY_BYTES + 1);
-            elseif ($encoding === 'zstd' && function_exists('zstd_uncompress')) $decoded = zstd_uncompress($raw);
-            else throw new GatewayError('unsupported_content_encoding', '当前 PHP 运行时不支持 ' . $encoding . ' 请求压缩，请通过接入配置关闭客户端请求压缩。', 415);
-            if (!is_string($decoded)) throw new GatewayError('invalid_compressed_body', '压缩请求损坏。', 400);
-            if (strlen($decoded) > ResponsesProtocol::MAX_BODY_BYTES) {
-                throw new GatewayError('request_body_too_large', '解压后的 HTTP 请求正文超过网关字节上限。', 413);
-            }
-            $raw = $decoded;
-        }
-        return $raw;
+        return RequestCompression::decode((string) $request->rawBody(),
+            (string) $request->header('content-encoding', ''), ResponsesProtocol::MAX_BODY_BYTES);
     }
 }

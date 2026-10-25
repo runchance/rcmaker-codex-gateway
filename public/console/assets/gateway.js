@@ -7,6 +7,13 @@
     let lastInteractionAt = 0;
     let pointerHeld = false;
 
+    /** New servers distinguish effective routing from legacy marker detection; older servers retain their contract. */
+    function codexConfigured(status) {
+        if (!status || status.route_ready === false) return false;
+        return status.route_ready === true || status.configured === true
+            || ['configured', 'restart_required', 'client_connected', 'verified'].includes(status.state);
+    }
+
     /** Pear keeps inactive documents alive; document.hidden alone cannot identify the active tab. */
     function isPageActive() {
         if (document.hidden) return false;
@@ -441,6 +448,6 @@
         throw new Error(I18n.t('设置已应用，浏览器重新初始化仍在进行。请稍后刷新查看，不会重复重启。'));
     }
 
-    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics, browserTimezones, waitBrowserRestart,
+    window.Gateway = {bootstrap, request, binary, describe, consumers, prerequisiteState, prerequisites, ensureReady, openOverview, openNetwork, openBrowser, openSettings, openTasks, openDiagnostics, browserTimezones, waitBrowserRestart, codexConfigured,
         isPageActive, automaticRefreshAllowed, onPageActivate, notifyStateChange};
 })();

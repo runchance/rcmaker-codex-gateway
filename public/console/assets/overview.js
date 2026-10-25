@@ -26,7 +26,7 @@
     function setupState(state, codex) {
         const tunnel = state?.settings?.tunnel || {};
         const connector = state?.settings?.connector || {};
-        const installed = Boolean(codex && (codex.configured === true || ['configured', 'restart_required', 'client_connected', 'verified'].includes(codex.state)));
+        const installed = Gateway.codexConfigured(codex);
         const completed = {
             network: Boolean(state?.networkTested), runtime: Boolean(state?.runtimeReady),
             account: Boolean(state?.accountReady && state?.modelReady && !state?.browser?.profile_reset_required),
@@ -92,7 +92,7 @@
         const connector = state?.settings?.connector || {};
         if (busy || !state?.modelReady || !state?.accountReady || state.toolsReady
             || !(state.settings.tunnel?.configured && state.settings.tunnel?.status === 'ready')
-            || !(codexStatus?.configured === true || ['configured', 'restart_required', 'client_connected', 'verified'].includes(codexStatus?.state))
+            || !Gateway.codexConfigured(codexStatus)
             || connector.verified || connector.reconnecting || connector.recheck_queued || connector.probe_pending
             || connector.last_error || connector.status === 'error' || autoConnectorAttempt
             || (Gateway.isPageActive && !Gateway.isPageActive())) return;
@@ -172,8 +172,9 @@
         const states = {not_installed: I18n.t('尚未接入 Codex。'), configured: I18n.t('已检测到 Codex 接入配置。'), writing: I18n.t('配置正在保存。'), restart_required: I18n.t('配置已保存。请完全退出 Codex 后再打开。'),
             client_connected: I18n.t('Codex 已读取模型目录。选择一个 Web 模型完成一次对话后，即可确认接入成功。'),
             verified: I18n.t('Codex 已使用 Web 模型完成真实调用，接入成功。'), removed: I18n.t('接入已移除，请完全退出 Codex 后再打开。'), config_conflict: I18n.t('接入配置已变化，点击“预览接入配置”即可重新接入，也可恢复 Codex 官方路由。')};
-        progress('codex-progress', states[codexStatus.state] || I18n.t('正在检查接入状态…'));
-        byId('codex-restart-notice').hidden = !['restart_required','removed'].includes(codexStatus.state);
+        const routeChanged = codexStatus.configured && codexStatus.route_ready === false;
+        progress('codex-progress', states[routeChanged ? 'config_conflict' : codexStatus.state] || I18n.t('正在检查接入状态…'), routeChanged ? 'warning' : '');
+        byId('codex-restart-notice').hidden = routeChanged || !['restart_required','removed'].includes(codexStatus.state);
         renderCodexDetails();
     }
     /** Prominent installation guidance; acknowledging the dialog never claims that Codex was restarted. */
@@ -303,10 +304,10 @@
             renderToolsGuide(state);
         }
         const clientReady = !profileResetRequired && state.ready && codexStatus
-            && (codexStatus.configured === true || ['configured','restart_required','client_connected','verified'].includes(codexStatus.state));
+            && Gateway.codexConfigured(codexStatus);
         badge('overall-status', profileResetRequired ? I18n.t('浏览器资料清理未完成') : (clientReady ? I18n.t('Codex 已接入') : (state.ready ? I18n.t('网关已就绪 · 待确认 Codex 接入') : I18n.t('尚未准备完成'))), clientReady ? 'good' : 'pending');
         byId('ready-banner').hidden = true;
-        byId('ready-detail').textContent = profileResetRequired ? I18n.t('资料清理未完成，请继续清理。') : (state.ready && codexStatus?.state === 'restart_required' ? I18n.t('请重启 Codex，让接入配置生效。') : (clientReady ? I18n.t('可以从 Codex 开始任务。') : (state.ready ? I18n.t('完成 Codex 接入') : I18n.t('按提示完成缺少的设置。'))));
+        byId('ready-detail').textContent = profileResetRequired ? I18n.t('资料清理未完成，请继续清理。') : (clientReady && codexStatus?.state === 'restart_required' ? I18n.t('请重启 Codex，让接入配置生效。') : (clientReady ? I18n.t('可以从 Codex 开始任务。') : (state.ready ? I18n.t('完成 Codex 接入') : I18n.t('按提示完成缺少的设置。'))));
         const next = byId('next-action');
         if (!state.networkTested) { next.textContent = I18n.t('设置网络'); next.dataset.action = 'network'; }
         else if (!state.runtimeReady) { next.textContent = I18n.t('准备运行组件'); next.dataset.action = 'runtime'; }

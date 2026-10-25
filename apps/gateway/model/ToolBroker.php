@@ -307,11 +307,16 @@ final class ToolBroker
             throw new GatewayError('context_budget_preview_invalid', '上下文预算预览令牌无效。', 500);
         }
         $environment = json_decode((string)($spec['tool_environment_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
-        return ['prompt'=>self::controlPrompt($turnToken, $contextJson, $spec['checkpoint_marker'] ?? null,
+        $prompt = self::controlPrompt($turnToken, $contextJson, $spec['checkpoint_marker'] ?? null,
             TaskContext::enabled((array)($spec['budget'] ?? []), $environment), 'response', $contextOnly, $archive,
             array_column((array)($environment['tools'] ?? []), 'wire_name'), !empty($spec['parallel_tool_calls']),
             self::hostShellFromContext((string)($spec['full_context_json'] ?? $contextJson)),
-            (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)), 'turn_token'=>$turnToken];
+            (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec));
+        // A regular recovery's notice and initial binding witness consume the same
+        // physical envelope as its selected history; include them before admission.
+        $prompt = (string)($spec['recovery_preview_prefix'] ?? '') . $prompt
+            . (string)($spec['recovery_preview_suffix'] ?? '');
+        return ['prompt'=>$prompt, 'turn_token'=>$turnToken];
     }
 
     /**
@@ -593,17 +598,338 @@ final class ToolBroker
     }
 
     /**
+     * Compile a regular replacement page's bounded history before acquiring the SQLite writer lock.
+     * This is read-only planning: the committing retry rechecks its source and all receipt fences.
+     * @param string $responseId Exact running response considered for regular-page replacement.
+     * @return array|null Immutable source fingerprint and prepared working view, or no settled proof.
+     * @throws GatewayError If required instructions/receipts cannot fit or storage is unavailable.
+     */
+    public static function prepareRegularRetryContext(string $responseId): ?array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
+        if (!is_array($job) || $job['status'] !== 'running' || $job['operation_kind'] !== 'response'
+            || empty($job['mcp_binding_id']) || TaskWebChat::state((string)$job['task_id'])['mode'] !== 'regular') return null;
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
+        if (!is_array($binding) || $binding['current_response_id'] !== $responseId
+            || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $job['durable_turn_id']
+            || !in_array($binding['status'], ['awaiting_start','running'], true)
+            || self::activeCountUnlocked((string)$binding['id']) !== 0
+            || !self::hasCompleteReceiptHistory($binding, $job, $callIds)) return null;
+        return ['source_hash'=>self::retryContextFingerprint($job, $binding),
+            'spec'=>self::retryContextSpec($job, $binding, true, true, $callIds)];
+    }
+
+    /**
+     * Plan a full native request after a legacy regular-page replacement failed before submission.
+     * Reads only: history selection and physical budget planning never hold the SQLite writer lock.
+     * @param array $spec Incoming native request; routing and receipt ownership remain authoritative.
+     * @param string $responseId Proposed response ID, used only to count the initial page marker.
+     * @return array|null Exact source proof and selected working context, or null outside this recovery.
+     * @throws GatewayError If required instructions/receipts cannot fit or evidence is unavailable.
+     */
+    public static function prepareFailedRegularAdmission(array $spec, string $responseId): ?array
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response' || !empty($spec['input_is_delta'])) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $baseTaskId = 'task_' . substr((string)$spec['task_key'], 0, 24);
+        $link = $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->find();
+        $taskId = is_array($link) ? (string)$link['current_task_id'] : $baseTaskId;
+        $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+        $owner = is_array($link) ? $link['current_owner_key'] : ($spec['browser_owner_key'] ?? null);
+        if (!is_array($task) || $task['owner_key'] !== $owner
+            || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
+            || $task['thread_id'] !== ($spec['thread_id'] ?? null)
+            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')) return null;
+        $source = self::failedRegularAdmissionSource($taskId);
+        if ($source === null) return null;
+        if (!empty($spec['previous_response_id']) && $spec['previous_response_id'] !== $source['job']['id']) return null;
+        $spec = ContextHistory::demoteHistoricalToolOutputsUnlocked($spec);
+        if (!empty($spec['tool_outputs'])) return null;
+        if (is_array($link)) {
+            $spec['task_key'] = (string)$link['current_task_key'];
+            $spec['browser_owner_key'] = (string)$link['current_owner_key'];
+            $spec['browser_lease_key'] = hash('sha256', $spec['browser_lease_key'] . '|task|' . $spec['task_key']);
+        }
+        // Full input may also contain pending native environment records. Use the same
+        // read-only normalization as admission, then compare its exact output under the lock.
+        $spec = ContextHistory::prepareUnlocked($spec);
+        if (!self::failedRegularAdmissionRequest($spec)) return null;
+        $route = ModelCatalog::resolveForOperation($spec['model'], $spec['reasoning_effort'] ?? null, 'response');
+        $outputControl = (array)($spec['budget']['output_control'] ?? []);
+        $spec['budget'] = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
+        if ($outputControl !== []) $spec['budget']['output_control'] = $outputControl;
+        $spec['budget'] = ContextRecovery::applyObservedMessageLimitUnlocked($spec, $spec['budget']);
+        $receiptSource = $source['job'];
+        $receiptSource['transport_context_json'] = $spec['full_context_json'] ?? $spec['context_json'];
+        if (!self::hasCompleteReceiptHistory($source['binding'], $receiptSource, $callIds)) return null;
+        $requestHash = self::failedRegularAdmissionRequestHash($spec);
+        $spec['recovery_preview_prefix'] = '<rcmaker_chat_binding>'.$responseId."</rcmaker_chat_binding>\n";
+        $selected = ContextWindow::selectImportedHistory($spec, false, null, false, $callIds);
+        if (!isset($selected['imported_budget_context_json'])) return null;
+        return ['task_id'=>$taskId, 'base_task_id'=>$baseTaskId, 'link'=>$link,
+            'source_hash'=>$source['hash'], 'request_hash'=>$requestHash, 'spec'=>$selected];
+    }
+
+    /**
+     * Adopt a read-only plan only after normal routing/history/budget checks reached the same state.
+     * @param array $spec Current normalized request inside ResponseJob's admission transaction.
+     * @param array|null $prepared Plan returned by prepareFailedRegularAdmission; never client supplied.
+     * @return array Request with only transport/selection fields changed; normal admission still runs.
+     * @throws GatewayError On unavailable ownership or receipt evidence.
+     */
+    public static function applyFailedRegularAdmissionUnlocked(array $spec, ?array $prepared): array
+    {
+        if ($prepared === null || !self::failedRegularAdmissionRequest($spec)
+            || 'task_' . substr((string)$spec['task_key'], 0, 24) !== $prepared['task_id']
+            || !hash_equals($prepared['request_hash'], self::failedRegularAdmissionRequestHash($spec))) return $spec;
+        $link = SDB(null, 'medoo', 'sqlite')->table('gateway_task_conversations')
+            ->where('base_task_id', $prepared['base_task_id'])->find();
+        if (ContextHistory::canonical($link) !== ContextHistory::canonical($prepared['link'])) return $spec;
+        $source = self::failedRegularAdmissionSource($prepared['task_id']);
+        if ($source === null || !hash_equals($prepared['source_hash'], $source['hash'])) return $spec;
+        $receiptSource = $source['job'];
+        $receiptSource['transport_context_json'] = $spec['full_context_json'] ?? $spec['context_json'];
+        if (!self::hasCompleteReceiptHistory($source['binding'], $receiptSource)) return $spec;
+        foreach (['budget','context_json','transport_context_json','full_context_json','imported_budget_context_json',
+            'imported_prompt_turn_token','prompt','continuation_source_response_id'] as $field) {
+            if (array_key_exists($field, $prepared['spec'])) $spec[$field] = $prepared['spec'][$field];
+        }
+        // This exact failed parent supplied history, not authority to revive its capability.
+        // The new human request receives a new turn/binding through the existing reservation.
+        if (($spec['previous_response_id'] ?? null) === $source['job']['id']) $spec['previous_response_id'] = null;
+        $spec['browser_lease_key'] = hash('sha256', (string)$spec['browser_lease_key']
+            . '|imported-history|' . hash('sha256', $spec['context_json']));
+        return $spec;
+    }
+
+    /** Only an explicit full human followup without a live receipt/steering/compaction owner qualifies. */
+    private static function failedRegularAdmissionRequest(array $spec): bool
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response'
+            || !empty($spec['input_is_delta']) || !empty($spec['tool_outputs'])
+            || !empty($spec['steering_restart']) || !empty($spec['steering_messages'])
+            || !empty($spec['stopped_source_response_id']) || !empty($spec['operational_context_source_response_id'])
+            || !empty($spec['mailbox_context_restart']) || !empty($spec['rolling_source_response_id'])
+            || !empty($spec['verified_compaction_source']) || !empty($spec['web_chat_mode_change'])
+            || !empty($spec['budget']['regular_chat'])) return false;
+        $context = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $last = $context['messages'][array_key_last($context['messages'] ?? [])] ?? [];
+        return ($last['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($last)
+            && empty($context['continuation']);
+    }
+
+    /** Bind the plan to the exact new instructions, tools, owner and current account budget. */
+    private static function failedRegularAdmissionRequestHash(array $spec): string
+    {
+        return hash('sha256', ContextHistory::canonical([
+            'source'=>hash('sha256', (string)($spec['full_context_json'] ?? $spec['context_json'])),
+            'request'=>array_intersect_key($spec, array_flip(['task_key','browser_owner_key','client_id','thread_id',
+                'branch_id','turn_id','request_hash','previous_response_id','model','reasoning_effort','tool_environment_hash',
+                'parallel_tool_calls','tool_choice','checkpoint_marker','budget'])),
+        ]));
+    }
+
+    /** Read the exact failed, unsent replacement and reject live work, manual stops or a rebound chat. */
+    private static function failedRegularAdmissionSource(string $taskId): ?array
+    {
+        $chat = TaskWebChat::state($taskId);
+        if ($chat['mode'] !== 'regular' || !empty($chat['conversation_id'])) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $previous = $db->table('gateway_response_jobs')->where('task_id', $taskId)
+            ->order([['rowid','DESC']])->limit(1)
+            ->find('id,status,error_json,submit_intent_at,accepted_at,transport_stage_sent,output_started');
+        $error = is_array($previous) ? json_decode((string)($previous['error_json'] ?? ''), true) : null;
+        if (!is_array($previous) || $previous['status'] !== 'failed'
+            || ($error['error']['code'] ?? '') !== 'CHATGPT_CONTEXT_TOO_LARGE'
+            || $previous['submit_intent_at'] !== null || $previous['accepted_at'] !== null
+            || (int)$previous['transport_stage_sent'] !== 0 || (int)$previous['output_started'] !== 0) return null;
+        $event = $db->table('gateway_task_events')->where('task_id', $taskId)->where('response_id', $previous['id'])
+            ->where('event_type', 'connector_no_start_retry_prepared')->order([['id','DESC']])->limit(1)->find();
+        $cause = is_array($event) ? json_decode((string)$event['data_json'], true) : null;
+        if (!in_array($cause['cause'] ?? '', ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)) return null;
+        $job = $db->table('gateway_response_jobs')->where('id', $previous['id'])->find();
+        $binding = is_array($job) ? $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find() : null;
+        $turn = is_array($job) ? $db->table('gateway_task_turns')->where('id', $job['durable_turn_id'])->find() : null;
+        if (!is_array($binding) || !is_array($turn) || $job['operation_kind'] !== 'response'
+            || $binding['task_id'] !== $taskId || $binding['turn_id'] !== $job['durable_turn_id']
+            || $binding['current_response_id'] !== $job['id'] || $turn['task_id'] !== $taskId
+            || $turn['status'] === 'cancelled' || str_starts_with((string)($turn['error_code'] ?? ''), 'CODEX_USER_STOP')
+            || self::activeCountUnlocked((string)$binding['id']) !== 0) return null;
+        $live = $db->table('gateway_response_jobs')->where('task_id', $taskId)->where('status', 'IN', ['queued','running'])->count();
+        $pending = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
+            ->where('status', 'IN', ['registered','delivered','unknown'])->count();
+        if (!is_numeric($live) || !is_numeric($pending)) throw new GatewayError('storage_unavailable',
+            'Regular-chat recovery evidence is unavailable.', 503);
+        if ((int)$live !== 0 || (int)$pending !== 0) return null;
+        return ['job'=>$job, 'binding'=>$binding, 'hash'=>hash('sha256', ContextHistory::canonical([
+            'response'=>self::retryContextFingerprint($job, $binding), 'error'=>$previous['error_json'],
+            'event'=>$event, 'chat'=>$chat, 'turn'=>array_intersect_key($turn,
+                array_flip(['id','task_id','response_id','status','error_code','generation_id'])),
+        ]))];
+    }
+
+    /**
+     * Bound a new explicit continuation after an older release failed before sending a replacement page.
+     * Plan outside the writer lock; preserve the old failed response and repair only this new unsent job.
+     * @param array $job Exact just-started response row supplied by ResponseJob::start.
+     * @return bool Whether this new job received a receipt-proven working view.
+     * @throws GatewayError If current instructions/receipts cannot fit or storage is unavailable.
+     */
+    public static function prepareFailedRegularReplacementHistory(array $job): bool
+    {
+        if ($job['status'] !== 'running' || $job['operation_kind'] !== 'response' || $job['round_kind'] !== 'text'
+            || empty($job['mcp_binding_id'])
+            || $job['submit_intent_at'] !== null || $job['accepted_at'] !== null
+            || (int)$job['output_started'] !== 0 || (string)$job['output_text'] !== ''
+            || !empty($job['transport_transaction_id']) || (int)$job['transport_parts_total'] !== 0) return false;
+        $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
+        if (!empty($budget['regular_chat']) || isset($budget['imported_history_selection'])) return false;
+        $chat = TaskWebChat::state((string)$job['task_id']);
+        if ($chat['mode'] !== 'regular' || !empty($chat['conversation_id'])) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $previous = $db->table('gateway_response_jobs')->where('task_id', $job['task_id'])
+            ->where('id', '<>', $job['id'])->order([['rowid','DESC']])->limit(1)
+            ->find('id,status,error_json,submit_intent_at,accepted_at,transport_stage_sent,output_started');
+        $error = is_array($previous) ? json_decode((string)($previous['error_json'] ?? ''), true) : null;
+        if (!is_array($previous) || $previous['status'] !== 'failed'
+            || ($error['error']['code'] ?? '') !== 'CHATGPT_CONTEXT_TOO_LARGE'
+            || $previous['submit_intent_at'] !== null || $previous['accepted_at'] !== null
+            || (int)$previous['transport_stage_sent'] !== 0 || (int)$previous['output_started'] !== 0) return false;
+        $event = $db->table('gateway_task_events')->where('task_id', $job['task_id'])
+            ->where('response_id', $previous['id'])->where('event_type', 'connector_no_start_retry_prepared')
+            ->order([['id','DESC']])->limit(1)->find('data_json');
+        $cause = is_array($event) ? json_decode((string)$event['data_json'], true) : null;
+        if (!in_array($cause['cause'] ?? '', ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)) return false;
+        $previous = $db->table('gateway_response_jobs')->where('id', $previous['id'])->find();
+        if (!is_array($previous)) return false;
+        $oldBinding = $db->table('gateway_mcp_bindings')->where('id', $previous['mcp_binding_id'])->find();
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
+        if (!is_array($oldBinding) || !is_array($binding) || $oldBinding['task_id'] !== $job['task_id']
+            || $oldBinding['turn_id'] !== $previous['durable_turn_id'] || $binding['turn_id'] !== $job['durable_turn_id']
+            || $oldBinding['current_response_id'] !== $previous['id'] || $binding['task_id'] !== $job['task_id']
+            || $binding['current_response_id'] !== $job['id'] || $binding['sent_at'] !== null || $binding['started_at'] !== null
+            || self::invocationCountUnlocked((string)$binding['id']) !== 0
+            || self::activeCountUnlocked((string)$binding['id']) !== 0
+            || self::activeCountUnlocked((string)$oldBinding['id']) !== 0) return false;
+        $receiptSource = $previous;
+        $receiptSource['transport_context_json'] = $job['context_json'];
+        if (!self::hasCompleteReceiptHistory($oldBinding, $receiptSource, $callIds)) return false;
+        $prepared = ['source_hash'=>self::retryContextFingerprint($job, $binding),
+            'spec'=>self::retryContextSpec($job, $binding, true, true, $callIds)];
+        if (!isset($prepared['spec']['imported_budget_context_json'])) return false;
+        $oldHash = self::retryContextFingerprint($previous, $oldBinding);
+        $attachments = AttachmentStore::selectForContext([], $prepared['spec']['transport_context_json']);
+        return Schema::transaction(static function () use ($job, $previous, $oldHash, $prepared, $attachments): bool {
+            $db = SDB(null, 'medoo', 'sqlite');
+            $current = $db->table('gateway_response_jobs')->where('id', $job['id'])->find();
+            $prior = $db->table('gateway_response_jobs')->where('id', $previous['id'])->find();
+            $old = is_array($prior) ? $db->table('gateway_mcp_bindings')->where('id', $prior['mcp_binding_id'])->find() : null;
+            $turn = $db->table('gateway_task_turns')->where('id', $job['durable_turn_id'])->find();
+            $chat = TaskWebChat::state((string)$job['task_id']);
+            if (!is_array($current) || !is_array($prior) || !is_array($old) || !is_array($turn)
+                || $chat['mode'] !== 'regular' || !empty($chat['conversation_id'])
+                || $turn['status'] !== 'queued' || $turn['response_id'] !== $job['id']
+                || in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+                || !hash_equals($oldHash, self::retryContextFingerprint($prior, $old))
+                || self::activeCountUnlocked((string)$old['id']) !== 0) return false;
+            $receiptSource = $prior;
+            $receiptSource['transport_context_json'] = $current['context_json'];
+            if (!self::hasCompleteReceiptHistory($old, $receiptSource)) return false;
+            $rotated = self::rotateNoStartRetryUnlocked($job['id'], (string)$job['prompt'], true, true, $prepared);
+            if (!is_array($rotated)) return false;
+            $prompt = TaskWebChat::withInitialBindingMarker($rotated['prompt'], $job['id'], $job['task_id']);
+            $updated = $db->table('gateway_response_jobs')->where('id', $job['id'])->where('status', 'running')
+                ->update(['prompt'=>$prompt] + $rotated['job_fields']);
+            if (!$updated || $updated->rowCount() !== 1) throw new GatewayError('storage_unavailable',
+                'The unsent regular-chat working context could not be saved.', 503);
+            AttachmentStore::replaceResponseBindingsUnlocked($job['id'], $attachments);
+            self::eventUnlocked($job['task_id'], $job['durable_turn_id'], $job['id'],
+                'regular_replacement_history_selected', ['source_response_id'=>$prior['id'],
+                    'selected_messages'=>count($prepared['spec']['budget']['imported_history_selection']['selected_message_indices']),
+                    'input_tokens'=>$rotated['job_fields']['input_tokens']]);
+            return true;
+        });
+    }
+
+    /** Fingerprint only the exact response, source, budget and capability used by read-only planning. */
+    private static function retryContextFingerprint(array $job, array $binding): string
+    {
+        return hash('sha256', ContextHistory::canonical([
+            'job'=>array_intersect_key($job, array_flip(['id','task_id','durable_turn_id','status','operation_kind',
+                'epoch_id','surface_id','generation_id','mcp_binding_id','budget_json','tool_environment_hash',
+                'checkpoint_marker','browser_lease_key','model','reasoning_effort','request_hash','output_started',
+                'submit_intent_at','accepted_at','submitted_document_nonce','transport_transaction_id',
+                'transport_parts_total','transport_stage_sent','transport_stage_acked'])),
+            'context'=>hash('sha256', (string)$job['context_json']),
+            'transport'=>hash('sha256', (string)($job['transport_context_json'] ?? '')),
+            'output'=>hash('sha256', (string)($job['output_text'] ?? '')),
+            'binding'=>array_intersect_key($binding, array_flip(['id','current_response_id','task_id','turn_id',
+                'token_hash','status','activity_revision','sent_at','started_at','tool_environment_hash','parallel_tool_calls'])),
+        ]));
+    }
+
+    /**
+     * Build one fresh-page transport, preserving complete canonical history outside its working view.
+     * @param list<string>|null $settledCalls Exact delivered receipt IDs; only regular recovery may select history.
+     * @return array Prepared context and pinned budget; no database state is changed.
+     */
+    private static function retryContextSpec(array $job, array $binding, bool $newOrdinaryChat,
+        bool $missingSurface, ?array $settledCalls = null): array
+    {
+        $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
+        if ($newOrdinaryChat) unset($budget['regular_chat'], $budget['steering_delta'], $budget['postcompact_page']);
+        $transport = (string)($newOrdinaryChat ? $job['context_json'] : ($job['transport_context_json'] ?? $job['context_json']));
+        $context = json_decode($transport, true, 128, JSON_THROW_ON_ERROR);
+        if (!empty($context['continuation'])) $context = json_decode((string)$job['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        unset($context['continuation']);
+        $transport = ContextHistory::canonical($context);
+        if ($newOrdinaryChat && $missingSurface && $settledCalls !== null) $budget['recovery_receipt_staging'] = true;
+        $environment = json_decode($binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
+        $spec = [
+            'budget'=>$budget, 'context_json'=>$transport, 'transport_context_json'=>$transport,
+            'full_context_json'=>$job['context_json'], 'tool_environment_json'=>$binding['tool_environment_json'],
+            'tool_environment_hash'=>$binding['tool_environment_hash'], 'browser_lease_key'=>$job['browser_lease_key'],
+            'operation_kind'=>$job['operation_kind'], 'tools'=>$environment['tools'] ?? [], 'tool_outputs'=>[],
+            'model'=>$job['model'], 'reasoning_effort'=>$job['reasoning_effort'],
+            'checkpoint_marker'=>$job['checkpoint_marker'] ?? null,
+            'parallel_tool_calls'=>!empty($binding['parallel_tool_calls']),
+        ];
+        if ($newOrdinaryChat && $missingSurface && $job['operation_kind'] === 'response' && $settledCalls !== null) {
+            $spec['recovery_preview_prefix'] = '<rcmaker_chat_binding>'.$job['id']."</rcmaker_chat_binding>\n";
+            $spec['recovery_preview_suffix'] = self::recoveryResumeNotice();
+            $spec = ContextWindow::selectImportedHistory($spec, false, null, false, $settledCalls);
+        }
+        $logical = (string)($spec['imported_budget_context_json'] ?? $transport);
+        $attachments = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $logical, false));
+        $spec = ContextWindow::prepare($spec, $attachments);
+        if ($missingSurface) $spec['budget']['recovery_receipt_staging'] = true;
+        if (isset($spec['imported_budget_context_json'])) {
+            $spec['recovery_input_tokens'] = ContextBudget::inputTokens((string)$spec['imported_budget_context_json'], $spec['budget'],
+                AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], (string)$spec['imported_budget_context_json'], false), $spec['budget']));
+        }
+        return $spec;
+    }
+
+    /** Exact existing recovery contract, shared by physical admission and the final fresh-page prompt. */
+    private static function recoveryResumeNotice(): string
+    {
+        return "\nThe prior page could not continue with the Connector. Resume exactly the same user turn, including any plan-only or no-edit boundary. Recovery does not authorize a deferred phase. The durable original history preserves every confirmed host call and its exact result. When execution is authorized, continue only remaining work; do not repeat completed effects. Inspect current files/state and consult archived receipts before any further authorized mutation.\n";
+    }
+
+    /**
      * Rotate the one-shot turn token after a browser response definitively completed without a
      * host invocation. For a proven missing page, confirmed delivered receipts may instead resume
      * from their exact durable history. Active MCP work or unknown/undelivered host effects block
      * both paths. The caller must already own Schema::transaction().
      *
      * @param bool $missingSurface True only after an authoritative browser snapshot proves loss.
-     * @param bool $newOrdinaryChat Explicit staged recovery must rebuild the entire logical history.
+     * @param bool $newOrdinaryChat Rebuild a regular page from its full archive and receipt-proven working view.
+     * @param array|null $preparedRegularContext Read-only plan revalidated inside this writer transaction.
      * @return array{binding_id:string,prompt:string,job_fields:array}|null
      */
     public static function rotateNoStartRetryUnlocked(string $responseId, string $prompt, bool $missingSurface = false,
-        bool $newOrdinaryChat = false): ?array
+        bool $newOrdinaryChat = false, ?array $preparedRegularContext = null): ?array
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $binding = $db->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
@@ -620,38 +946,18 @@ final class ToolBroker
         $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
         if (!is_array($job)) throw new GatewayError('response_not_found', '任务恢复源记录不存在。', 404);
         $environment = json_decode($binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
-        $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
-        if ($newOrdinaryChat) unset($budget['regular_chat'], $budget['steering_delta'], $budget['postcompact_page']);
-        $transport = (string)($newOrdinaryChat ? $job['context_json'] : ($job['transport_context_json'] ?? $job['context_json']));
-        $context = json_decode($transport, true, 128, JSON_THROW_ON_ERROR);
-        if (!empty($context['continuation'])) {
-            // Legacy records may have persisted only an exact-prefix suffix. A fresh page
-            // cannot consume it; rebuild the complete durable source and bound it if needed.
-            $transport = (string)$job['context_json'];
+        if ($missingSurface && !self::hasCompleteReceiptHistory($binding, $job)) return null;
+        if ($newOrdinaryChat && $missingSurface && $job['operation_kind'] === 'response') {
+            if (!is_array($preparedRegularContext)
+                || !hash_equals(self::retryContextFingerprint($job, $binding), (string)($preparedRegularContext['source_hash'] ?? ''))) return null;
+            $retrySpec = $preparedRegularContext['spec'];
+            if (isset($retrySpec['imported_budget_context_json']) && empty(GatewaySettings::internal()['mcp_enabled'])) return null;
+        } else {
+            $retrySpec = self::retryContextSpec($job, $binding, $newOrdinaryChat, $missingSurface);
         }
-        $context = json_decode($transport, true, 128, JSON_THROW_ON_ERROR);
-        unset($context['continuation']);
-        $transport = ContextHistory::canonical($context);
-        // Preserve the full logical reserve; ContextWindow separately measures this new page's
-        // selected uploads and inline fallbacks without rewriting historical tool receipts.
-        $retryAttachmentTokens = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $transport, false));
-        $retrySpec = ContextWindow::prepare([
-            'budget'=>$budget, 'context_json'=>$transport, 'transport_context_json'=>$transport,
-            'full_context_json'=>$job['context_json'], 'tool_environment_json'=>$binding['tool_environment_json'],
-            'tool_environment_hash'=>$binding['tool_environment_hash'], 'browser_lease_key'=>$job['browser_lease_key'],
-            'operation_kind'=>$job['operation_kind'], 'tools'=>$environment['tools'] ?? [], 'tool_outputs'=>[],
-        ], $retryAttachmentTokens);
         $budget = $retrySpec['budget'];
         $transport = (string)$retrySpec['transport_context_json'];
-        if ($missingSurface) {
-            if (!self::hasCompleteReceiptHistory($binding, $job)) return null;
-            // A recovered turn may contain hundreds of settled receipts after its
-            // latest user message. They are immutable context, not new actions:
-            // allow staging them by their original indices instead of forcing all
-            // of them into the one executable commit. Persist this recovery-only
-            // policy so reconnects rebuild exactly the same multipart envelopes.
-            $budget['recovery_receipt_staging'] = true;
-        }
+        $newToken = $retrySpec['imported_prompt_turn_token'] ?? $newToken;
         // Every retry retires the original page. Never carry its delta-only control prompt.
         $newPrompt = self::controlPrompt($newToken, $transport, $job['checkpoint_marker'] ?? null,
             TaskContext::enabled($budget, $environment), (string)$job['operation_kind'], empty($environment['tools']),
@@ -661,7 +967,7 @@ final class ToolBroker
         $newPrompt = WebContract::withSteeringNotice($newPrompt,
             $job['operation_kind'] === 'response' && WebContract::hasSteeringNotice((string)$job['prompt']),
             WebContract::steeringScope((string)$job['prompt']));
-        if ($missingSurface) $newPrompt .= "\nThe prior page could not continue with the Connector. Resume exactly the same user turn, including any plan-only or no-edit boundary. Recovery does not authorize a deferred phase. The durable original history preserves every confirmed host call and its exact result. When execution is authorized, continue only remaining work; do not repeat completed effects. Inspect current files/state and consult archived receipts before any further authorized mutation.\n";
+        if ($missingSurface) $newPrompt .= self::recoveryResumeNotice();
         if (!$missingSurface && !str_contains($newPrompt, '<codex_tool_execution_retry>')) {
             $newPrompt .= "\n<codex_tool_execution_retry>\n"
                 . ($archivePending && empty($binding['requires_tool_call'])
@@ -695,8 +1001,11 @@ final class ToolBroker
             'mcp_no_start_retry_token_rotated',
             ['binding_id' => (string) $binding['id']]
         );
-        return ['binding_id' => (string) $binding['id'], 'prompt' => $newPrompt,
-            'job_fields'=>['transport_context_json'=>$transport, 'budget_json'=>json_encode($budget, JSON_THROW_ON_ERROR)]];
+        $fields = ['transport_context_json'=>$transport, 'budget_json'=>json_encode($budget, JSON_THROW_ON_ERROR)];
+        if (isset($retrySpec['imported_budget_context_json'])) {
+            $fields['input_tokens'] = (int)$retrySpec['recovery_input_tokens'];
+        }
+        return ['binding_id' => (string) $binding['id'], 'prompt' => $newPrompt, 'job_fields'=>$fields];
     }
 
     /**
@@ -848,9 +1157,13 @@ final class ToolBroker
         return false;
     }
 
-    /** Missing-page continuation requires exact delivered receipts; pending/unknown effects never replay. */
-    private static function hasCompleteReceiptHistory(array $binding, array $job): bool
+    /**
+     * Missing-page continuation requires exact delivered receipts; pending/unknown effects never replay.
+     * @param list<string>|null $settledCallIds Optional output of the completed receipts verified on success.
+     */
+    private static function hasCompleteReceiptHistory(array $binding, array $job, ?array &$settledCallIds = null): bool
     {
+        $settledCallIds = [];
         $calls = SDB(null,'medoo','sqlite')->table('gateway_tool_invocations')->where('binding_id', $binding['id'])->select();
         if (!is_array($calls)) throw new GatewayError('storage_unavailable', '工具执行回执暂不可读取。', 503);
         if ($calls === []) return true;
@@ -882,6 +1195,7 @@ final class ToolBroker
                     || ContextHistory::canonical($projected)
                     !== ContextHistory::canonical($receipts[$call['call_id']])) return false;
             }
+            $settledCallIds[] = (string)$call['call_id'];
         }
         return true;
     }
@@ -1899,6 +2213,50 @@ final class ToolBroker
             return true;
         }
         return false;
+    }
+
+    /**
+     * Recognize a completed historical receipt whose old MCP acknowledgement was lost.
+     * Only an ordinary chat's different, committed turn may use the completed-successor
+     * proof, and the current context/checkpoint must still cover its exact result.
+     * This read-only check neither acknowledges delivery nor revives the old capability.
+     * @param array $call Persisted invocation with its original result and delivery fields.
+     * @param array $job Current recovery round, inside the caller's ownership transaction.
+     * @return bool Whether this historical receipt is conclusively settled for recovery.
+     * @throws GatewayError If storage is unavailable or current receipt coverage differs.
+     */
+    public static function completedHistoricalReceiptForRecoveryUnlocked(array $call, array $job): bool
+    {
+        $taskId = (string)($job['task_id'] ?? '');
+        if ($taskId === '' || ($call['task_id'] ?? '') !== $taskId
+            || ($call['status'] ?? '') !== 'completed' || ($call['result_delivered_at'] ?? null) !== null
+            || empty($call['binding_id']) || empty($call['turn_id']) || empty($call['response_id'])
+            || $call['binding_id'] === ($job['mcp_binding_id'] ?? null)
+            || $call['turn_id'] === ($job['durable_turn_id'] ?? null)
+            || (TaskWebChat::state($taskId)['mode'] ?? 'temporary') !== 'regular') return false;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $call['binding_id'])->find();
+        $turn = $db->table('gateway_task_turns')->where('id', $call['turn_id'])->find();
+        if (!is_array($binding) || !is_array($turn) || $binding['status'] !== 'completed'
+            || $binding['task_id'] !== $taskId || $binding['turn_id'] !== $call['turn_id']
+            || $turn['task_id'] !== $taskId || $turn['status'] !== 'committed'
+            || $turn['response_id'] !== $binding['current_response_id']) return false;
+        $owner = $db->table('gateway_response_jobs')->where('id', $binding['current_response_id'])
+            ->find('task_id,durable_turn_id,mcp_binding_id,status');
+        if (!is_array($owner) || $owner['status'] !== 'completed' || $owner['task_id'] !== $taskId
+            || $owner['durable_turn_id'] !== $call['turn_id'] || $owner['mcp_binding_id'] !== $binding['id']) return false;
+        $pending = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('status', '<>', 'completed')->count();
+        $liveJobs = $db->table('gateway_response_jobs')->where('mcp_binding_id', $binding['id'])
+            ->where('status', 'IN', ['queued', 'running'])->count();
+        if (!is_numeric($pending) || !is_numeric($liveJobs)) {
+            throw new GatewayError('storage_unavailable', 'Historical tool receipt state is temporarily unavailable.', 503);
+        }
+        if ((int)$pending !== 0 || (int)$liveJobs !== 0 || self::activeCountUnlocked($binding['id']) !== 0
+            || !self::completedReceiptCoveredByLaterRoundUnlocked($binding, $call)) return false;
+        ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($job, $call, $taskId);
+        return true;
     }
 
     /**

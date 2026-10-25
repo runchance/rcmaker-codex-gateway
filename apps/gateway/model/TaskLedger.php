@@ -1944,6 +1944,8 @@ final class TaskLedger
      * sequence failed, or after the owned current page proves the conversation itself reached
      * its native capacity terminal. The latter skips futile same-page retries but retains every
      * ownership, receipt, active-work and human-update fence.
+     * Large regular-page history is planned before the writer transaction, then revalidated
+     * against the current response/capability before any page or token is changed.
      *
      * @return array{retry:bool,exhausted:bool,attempt:int,old_surface_id?:string,new_surface_id?:string,generation_id?:string,binding_id?:?string}
      */
@@ -1957,8 +1959,11 @@ final class TaskLedger
         string $retryCause = 'missing_surface_with_complete_receipts',
         ?array $terminalProof = null
     ): array {
+        $preparedRegularContext = $missingSurface && $maxRetries > 0
+            && in_array($retryCause, ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)
+            ? ToolBroker::prepareRegularRetryContext($responseId) : null;
         return Schema::transaction(function () use ($responseId, $prompt, $incarnation, $fence, $maxRetries,
-            $missingSurface, $retryCause, $terminalProof): array {
+            $missingSurface, $retryCause, $terminalProof, $preparedRegularContext): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
@@ -2043,7 +2048,7 @@ final class TaskLedger
                 ? ToolBroker::prepareReadOnlyCompactionReplayUnlocked($job, true)
                 : ($missingSurface && empty($job['mcp_binding_id'])
                 ? ContextRecovery::prepareUnboundReplayUnlocked($job)
-                : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface, $regularRecovery));
+                : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface, $regularRecovery, $preparedRegularContext));
             if (!is_array($rotated)) {
                 if ($conversationCapacity) {
                     // Keep the terminal page parked while already-authorized work settles. Read
@@ -2646,9 +2651,10 @@ final class TaskLedger
                         && ($call['binding_id'] !== ($binding['id'] ?? null)
                             || ToolBroker::canonicalSteeringHandoffCoversReceiptUnlocked($call, $job))) continue;
                     if ($call['binding_id'] !== ($binding['id'] ?? null)
-                        && ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $job, (string)$job['task_id'])) {
-                        // The old wait is conclusively closed, and this turn already carries
-                        // its exact result. It is not in-flight work on the current page.
+                        && (ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $job, (string)$job['task_id'])
+                            || ToolBroker::completedHistoricalReceiptForRecoveryUnlocked($call, $job))) {
+                        // An old failed wait or a committed successor proves the exact result
+                        // is covered here. Its missing MCP ACK is not current in-flight work.
                         continue;
                     }
                     $allReceiptsDelivered = false;

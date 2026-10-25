@@ -174,17 +174,19 @@ final class ContextWindow
     }
 
     /**
-     * Admit an oversized first readable import by retaining a complete recent suffix and all
+     * Admit an oversized first import or proven regular-page recovery with a complete recent suffix and all
      * current instructions. The original archive remains immutable; later requests reuse the
      * same selection only after proving its complete initial prefix, never dropping new work.
      * @param array $spec Prepared request with its pinned model budget and complete readable history.
      * @param bool $noGatewayHistory Caller proved this task has no local history or live epoch.
      * @param ?array $prior Owned local response carrying the persisted selection and original archive.
      * @param bool $verifiedInertRecovery ContextRecovery proved no executable commit/tool effects before this new import.
+     * @param list<string>|null $verifiedRecoveryCalls Caller proved these completed receipts were delivered before replacing a regular page.
      * @return array Request with selected transport and imported_budget_context_json for logical usage.
      * @throws GatewayError If the current request/instructions or their atomic tool block cannot fit.
      */
-    public static function selectImportedHistory(array $spec, bool $noGatewayHistory, ?array $prior = null, bool $verifiedInertRecovery = false): array
+    public static function selectImportedHistory(array $spec, bool $noGatewayHistory, ?array $prior = null,
+        bool $verifiedInertRecovery = false, ?array $verifiedRecoveryCalls = null): array
     {
         $budget = (array) ($spec['budget'] ?? []);
         if ((int) ($budget['version'] ?? 0) < 5 || ($spec['operation_kind'] ?? 'response') !== 'response'
@@ -214,9 +216,10 @@ final class ContextWindow
             && ($verifiedInertRecovery || (($recoverySource['status'] ?? null) === 'failed'
                 && ($priorError['error']['code'] ?? null) === 'CHATGPT_MESSAGE_TOO_LARGE'));
         $inertReimport = $verifiedInertRecovery && $reader && !$receiptOrSteering;
-        if ($sizeRecovery || $inertReimport) {
-            // A proven inert failure has no executable Web context to preserve. Recompute its
-            // working view from the current native history, including changed session instructions.
+        $settledRecovery = $verifiedRecoveryCalls !== null && $reader && !$receiptOrSteering;
+        if ($sizeRecovery || $inertReimport || $settledRecovery) {
+            // A fresh page cannot inherit the old page's retained context. Recompute its
+            // working view only after inert-send or exact settled-receipt proof from the caller.
             // Keep every human requirement and whole call/result blocks in source or its exact archive.
             $selection = null;
             unset($spec['budget']['imported_history_selection'], $spec['budget']['context_min_parts']);
@@ -253,8 +256,8 @@ final class ContextWindow
             return $spec;
         }
 
-        if ((!$noGatewayHistory && !$sizeRecovery && !$inertReimport) || $receiptOrSteering || !empty($spec['input_is_delta'])
-            || (!$sizeRecovery && !$inertReimport && (!empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
+        if ((!$noGatewayHistory && !$sizeRecovery && !$inertReimport && !$settledRecovery) || $receiptOrSteering || !empty($spec['input_is_delta'])
+            || (!$sizeRecovery && !$inertReimport && !$settledRecovery && (!empty($spec['previous_response_id']) || !empty($spec['continuation_source_response_id'])
                 || isset($context['continuation']))) || !empty($spec['verified_compaction_source'])) return $spec;
         $reserve = (int) $budget['contract_reserve_tokens'] + (int) $budget['output_reserve_tokens'];
         $capacity = min((int)$budget['context_tokens'], (int)($budget['browser_context_tokens'] ?? $budget['context_tokens'])) - $reserve;
@@ -275,9 +278,25 @@ final class ContextWindow
             }
         }
         $protected = self::importProtectedIndices($messages);
-        if ($sizeRecovery || $inertReimport) {
+        if ($sizeRecovery || $inertReimport || $settledRecovery) {
             foreach ($messages as $index => $message) {
                 if (($message['role'] ?? null) === 'user') $protected[$index] = true;
+            }
+        }
+        if ($settledRecovery) {
+            // Current binding receipts stay in the physical working view, together with their
+            // complete atomic call blocks. Older epochs remain in the same task's exact archive.
+            $requiredCalls = array_fill_keys($verifiedRecoveryCalls, false);
+            foreach ($messages as $index => $message) {
+                $callId = $message['call_id'] ?? null;
+                if (!is_string($callId) || !array_key_exists($callId, $requiredCalls)) continue;
+                if (!in_array($message['type'] ?? '', ['function_call','function_call_output',
+                    'custom_tool_call','custom_tool_call_output','tool_search_call','tool_search_output'], true)) continue;
+                $protected[$index] = true;
+                $requiredCalls[$callId] = true;
+            }
+            if (in_array(false, $requiredCalls, true)) {
+                throw new GatewayError('recovery_conflict', 'Confirmed recovery receipts are absent from the original task history.', 409);
             }
         }
         if ($protected === []) return $spec;

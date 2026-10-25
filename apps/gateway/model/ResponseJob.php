@@ -116,8 +116,11 @@ final class ResponseJob
         $itemId = 'msg_' . bin2hex(random_bytes(12));
         $created = time();
         $roundInfo = null;
+        // Legacy page replacement can fail before creating a usable transport. Plan its
+        // next explicit request before taking the writer lock or validating the full archive.
+        $replacementHistory = ToolBroker::prepareFailedRegularAdmission($spec, $responseId);
         $reservedId = Schema::transaction(function () use ($spec, $idempotencyKey, $responseId, $itemId,
-            $created, $requestIdentity, $budget, &$roundInfo): string {
+            $created, $requestIdentity, $budget, $replacementHistory, &$roundInfo): string {
             $db = SDB(null, 'medoo', 'sqlite');
             $joined = TaskLedger::joinedOperationalContextResponse($spec, $idempotencyKey);
             if ($joined !== null) return $joined;
@@ -205,6 +208,7 @@ final class ResponseJob
             $spec = TaskWebChat::prepareModeChangeUnlocked($spec);
             if (empty($spec['web_chat_mode_change'])) $spec = LunaCheckpoint::applyUnlocked($spec);
             $spec = TaskWebChat::prepareContinuationUnlocked($spec);
+            $spec = ToolBroker::applyFailedRegularAdmissionUnlocked($spec, $replacementHistory);
             if (($spec['operation_kind'] ?? 'response') === 'response' && empty($spec['budget']['regular_chat'])) {
                 // A foreign/forked conversation can be larger than this model's window before
                 // it has any local epoch. Select its recent history before the admission check;
@@ -654,12 +658,16 @@ final class ResponseJob
         return $events;
     }
 
-    /** Mark browser execution begun and publish response.created/in_progress exactly once. */
+    /** Mark execution begun once; prepare legacy failed-replacement history outside the writer lock. */
     public static function start(string $responseId): array
     {
-        return Schema::transaction(function () use ($responseId): array {
+        $startedRow = null;
+        $result = Schema::transaction(function () use ($responseId, &$startedRow): array {
             $job = self::row($responseId);
-            if ($job['status'] !== 'queued') return self::decode($job);
+            if ($job['status'] !== 'queued') {
+                if ($job['status'] === 'running') $startedRow = $job;
+                return self::decode($job);
+            }
             $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->where('status', 'queued')->update([
                 'status' => 'running', 'started_at' => time(),
             ]);
@@ -671,8 +679,11 @@ final class ResponseJob
                 'sequence_next' => (int) $job['sequence_next'],
             ]);
             if (!$sequence || $sequence->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Responses 初始事件无法提交。', 503);
+            $startedRow = $job;
             return self::decode($job);
         });
+        if (is_array($startedRow) && ToolBroker::prepareFailedRegularReplacementHistory($startedRow)) return self::get($responseId);
+        return $result;
     }
 
     /**

@@ -4,6 +4,7 @@ namespace app\gateway\model;
 
 use RC\Config;
 use app\gateway\database\Schema;
+use support\http\RequestCompression;
 
 /** Recoverable, compare-before-write Codex configuration integration; never manages Codex processes. */
 final class CodexIntegration
@@ -82,7 +83,12 @@ final class CodexIntegration
         });
     }
 
-    /** Detect configuration by its route marker pair; suffix identity is not an installation requirement. */
+    /**
+     * Detect legacy markers separately from effective routing; never rewrite external edits on a read.
+     * @param string|null $path Optional isolated client config path; defaults to the configured Codex home.
+     * @return array Status with independent configured (markers) and route_ready (effective route) evidence.
+     * @throws GatewayError If the document or durable installation journal cannot be read safely.
+     */
     public static function status(?string $path = null): array
     {
         Schema::initialize(); $path = self::canonicalPath($path ?? self::configPath());
@@ -90,15 +96,45 @@ final class CodexIntegration
         $row = self::recoverInterruptedWrite(self::record($path, $current), $current);
         $document = new CodexConfigDocument($current);
         $configured = $document->hasIntegrationMarkers();
+        $routeReady = $configured && self::routesToGateway($document);
         $status = $configured ? 'configured' : 'not_installed';
         if ($configured && is_array($row) && in_array($row['state'], ['restart_required', 'client_connected', 'verified'], true)) {
             $status = (string) $row['state'];
         }
         $canRestore = is_array($row) && !in_array($row['state'], ['removed', 'writing'], true) && self::isInstalled($row, $current);
         return ['id' => $row['id'] ?? null, 'state' => $status, 'path' => $path,
-            'configured' => $configured, 'can_restore' => $canRestore,
-            'expected_hash' => hash('sha256', $current), 'catalog_seen_at' => $configured ? ($row['catalog_seen_at'] ?? null) : null,
-            'response_seen_at' => $configured ? ($row['response_seen_at'] ?? null) : null, 'models' => self::publicModels(), 'account' => ModelCatalog::account()];
+            'configured' => $configured, 'route_ready' => $routeReady, 'can_restore' => $canRestore,
+            'expected_hash' => hash('sha256', $current), 'catalog_seen_at' => $routeReady ? ($row['catalog_seen_at'] ?? null) : null,
+            'response_seen_at' => $routeReady ? ($row['response_seen_at'] ?? null) : null, 'models' => self::publicModels(), 'account' => ModelCatalog::account()];
+    }
+
+    /**
+     * Check the current effective route without requiring a local journal for legacy installations.
+     * @param CodexConfigDocument $document Current client configuration, already parsed losslessly.
+     * @return bool Whether the built-in provider reaches this gateway with its supported wire settings.
+     */
+    private static function routesToGateway(CodexConfigDocument $document): bool
+    {
+        $url = self::scalarString(self::values($document, ['openai_base_url']));
+        $base = rtrim((string) Config::get('gateway', 'api_origin'), '/') . '/v1';
+        if ($url === null || !preg_match('~\A' . preg_quote($base, '~') . '(?:/rcm_[a-f0-9]{24})?/?\z~D', $url)) return false;
+        $providers = self::values($document, ['model_provider']);
+        if ($providers !== [] && self::scalarString($providers) !== 'openai') return false;
+        return $document->assignments(['model_catalog_json']) === [] && $document->assignments(['profile']) === []
+            && self::compressionCompatible($document);
+    }
+
+    /**
+     * Decode one TOML string scalar; duplicate, malformed and non-string values are not ready.
+     * @param list<string> $values Normalized assignment values. @return string|null Decoded scalar or null.
+     */
+    private static function scalarString(array $values): ?string
+    {
+        if (count($values) !== 1) return null;
+        $value = $values[0];
+        if (strlen($value) >= 2 && $value[0] === "'" && str_ends_with($value, "'")) return substr($value, 1, -1);
+        $decoded = json_decode($value, true);
+        return is_string($decoded) ? $decoded : null;
     }
 
     /** Record actual client contact for its configured route; mere config write is never verified. */
@@ -201,7 +237,8 @@ final class CodexIntegration
         $path = self::canonicalPath($path ?? self::configPath());
         $before = self::readConfig($path);
         $existing = self::recoverInterruptedWrite(self::record($path, $before), $before);
-        if (is_array($existing) && !in_array($existing['state'], ['removed', 'writing'], true) && self::isInstalled($existing, $before)) {
+        if (is_array($existing) && !in_array($existing['state'], ['removed', 'writing'], true) && self::isInstalled($existing, $before)
+            && self::values(new CodexConfigDocument($before), self::COMPRESSION_KEY) === [self::compressionValue()]) {
             return ['id' => $existing['id'], 'path' => $path, 'expected_hash' => hash('sha256', $before),
                 'changes' => self::block($existing['id']), 'already_installed' => true, 'replaced_keys' => [],
                 'backup_path' => self::backupPath($path, $existing['before_text']), 'after_text' => $before];
@@ -215,7 +252,8 @@ final class CodexIntegration
         $clean = new CodexConfigDocument($document->without($paths));
         $scope = $clean->hasTable(['features']) ? ['features'] : [];
         $key = $scope ? 'enable_request_compression' : 'features.enable_request_compression';
-        $compression = '# RCMAKER COMPRESSION BEGIN ' . $id . "\n" . $key . " = false\n# RCMAKER COMPRESSION END " . $id . "\n";
+        $compression = '# RCMAKER COMPRESSION BEGIN ' . $id . "\n" . $key . ' = ' . self::compressionValue()
+            . "\n# RCMAKER COMPRESSION END " . $id . "\n";
         $after = self::block($id) . $clean->insert($compression, $scope);
         $replaced = [];
         foreach ($paths as $keyPath) if ($document->assignments($keyPath) !== []) $replaced[] = implode('.', $keyPath);
@@ -224,7 +262,7 @@ final class CodexIntegration
             'replaced_keys' => $replaced, 'backup_path' => self::backupPath($path, $before), 'after_text' => $after];
     }
 
-    /** Check the actual root route and compression, not merely a historic SQLite record. */
+    /** Check owned route/compression against the journal; runtime compatibility is a separate readiness decision. */
     private static function isInstalled(array $row, string $current): bool
     {
         $document = new CodexConfigDocument($current);
@@ -234,7 +272,22 @@ final class CodexIntegration
         if ($document->assignments(['model_catalog_json']) || $document->assignments(['profile'])) return false;
         $providers = self::values($document, ['model_provider']);
         if ($providers !== [] && $providers !== ['"openai"'] && $providers !== ["'openai'"]) return false;
-        return self::values($document, self::COMPRESSION_KEY) === ['false'];
+        $compression = self::values($document, self::COMPRESSION_KEY);
+        return in_array($compression, [['false'], ['true']], true)
+            && $compression === self::values(new CodexConfigDocument((string) $row['after_text']), self::COMPRESSION_KEY);
+    }
+
+    /** Generate the request-compression flag only from a successful self-test in the running PHP. */
+    private static function compressionValue(): string
+    {
+        return RequestCompression::zstdAvailable() ? 'true' : 'false';
+    }
+
+    /** Retain uncompressed legacy clients; compressed configuration requires this runtime's decoder. */
+    private static function compressionCompatible(CodexConfigDocument $document): bool
+    {
+        $values = self::values($document, self::COMPRESSION_KEY);
+        return $values === ['false'] || ($values === ['true'] && RequestCompression::zstdAvailable());
     }
 
     /** Return normalized scalar representations for the small set of managed routing keys. */

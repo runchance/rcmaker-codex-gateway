@@ -6,11 +6,9 @@ namespace app\gateway\model;
 final class ResponsesProtocol
 {
     public const MODEL_ID = 'chatgpt-web/current';
-    // Codex request compression is disabled for the bundled PHP runtime because it cannot decode
-    // zstd. Keep 256 MiB of bounded headroom so long histories containing image/tool records do
-    // not hit the old 80 MB transport ceiling before Codex compacts them. This is deliberately
-    // above the reference bridge's compressed-path budget because identity bodies are much larger.
-    // The loopback envelope remains bounded; per-attachment and per-tool limits still apply below.
+    // Request compression is negotiated from the running PHP decoder. This limit applies to
+    // both wire and decoded bytes, including legacy uncompressed clients with long image/tool
+    // histories. Per-attachment and per-tool limits still apply below.
     public const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
     /**

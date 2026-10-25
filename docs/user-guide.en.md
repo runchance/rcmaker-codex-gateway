@@ -313,7 +313,11 @@ Saving backs up and replaces model routing while preserving unrelated MCP, proje
 
 > **Wait for Ready in RCMAKER's startup window, then fully quit Codex, including background processes, and reopen it. Keep RCMAKER running. Closing a chat tab or opening a new chat is not a restart.**
 
-**Configuration detection:** both actual `# RCMAKER BEGIN` and `# RCMAKER END` comments mean the configuration is integrated. Identifier suffixes need not match the current journal or URL. Examples inside strings and compression-only markers do not count. Detection does not rewrite configuration.
+**Configuration detection:** actual `# RCMAKER BEGIN` and `# RCMAKER END` comments identify an existing integration, including older identifier suffixes. Setup also checks that the current route reaches this RCMAKER instance and has compatible settings. If other software changed the route, preview and save the integration again to replace it automatically. Existing configuration is backed up, unrelated settings are preserved, and status checks never rewrite the file.
+
+**Request compression:** saving the integration enables Codex's zstd request compression only when the running PHP passes its decoder self-test. A runtime without that support keeps compression disabled. After upgrading PHP, preview and save the integration to enable compression, then fully restart Codex when your current tasks have finished. Old uncompressed clients remain supported. Compressed and decoded bodies both retain the 256 MiB limit; corrupt or incomplete compressed data is rejected before a task is created.
+
+Codex decides whether to compress each request according to its authentication and transport mode; enabling the setting does not force every request to be compressed.
 
 This check covers only the final Codex step. An unfinished earlier step keeps the setup overlay open, even when Codex configuration is already present.
 
@@ -470,9 +474,13 @@ New requests use saved changes. Already-started work retains its budget and wait
 
 If an ordinary task failed during history staging before its final task message was submitted, an explicit continuation first checks that no host tool ran and no other round is active. It can then reselect a bounded history view under the current account/model budget, including updated Codex session instructions. The full source remains queryable, and every human requirement and system/developer instruction is retained verbatim. Bound ordinary chats keep their existing incremental path. Current requirements that exceed the budget still require compaction.
 
+When an ordinary Web chat reaches its conversation limit, its replacement page uses a working history that fits the existing message and context budgets. Every human and privileged instruction, plus the current binding's verified completed calls and exact receipts, stays intact; omitted older records remain available through the same task's original-context reader. This also covers an explicit continuation after an older release failed before sending the replacement message: verified history selection happens before request admission, even when the full archive exceeds the current account budget. Pending or unknown tool results, an unavailable reader, and requirements that cannot fit are never silently discarded. History selection runs outside the database writer transaction, and ownership is checked again before committing it. Temporary Chat and normal same-page continuations retain their existing behavior.
+
 While waiting for a native tool result, a normal tool-round transition does not end the wait. Before reporting that the wait scope changed, the gateway rechecks the exact call and current turn in one short transaction. An already saved result remains usable without executing the tool again or claiming that the Web page has received it. Actual cancellation, invalid ownership and unknown results retain their existing safeguards.
 
 If an older turn's result-wait connection failed conclusively, its unacknowledged result does not keep a later stopped page waiting forever when the current context or a verified checkpoint covers the exact receipt. The gateway verifies that the old turn is terminal and has no pending tools or active MCP requests, then applies the current turn's normal recovery checks. It preserves the old delivery record; current pending work still blocks recovery.
+
+Saved ordinary chats also check historical results consumed by an exact completed successor Web round when the old MCP acknowledgement never reached the gateway. The old turn must have completed, its tools and connections must have settled, and the exact receipt must remain covered by the current context or a verified checkpoint. The current empty stopped answer can then use the existing same-page continuation rules without inventing a delivery timestamp or replaying tools. Temporary Chat and unsettled current work keep their existing behavior.
 
 Instructions to pause tools and submit only a summary apply to that compaction operation. The next ordinary request labels the summary as handoff data and asks the model to continue the original human task's remaining steps while preserving completed results and exact tool receipts. Genuine user pauses, cancellations and approval requirements remain in force.
 
