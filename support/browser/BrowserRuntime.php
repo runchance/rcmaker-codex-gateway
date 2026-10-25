@@ -6753,30 +6753,91 @@ JS;
                 });
             return;
         }
+        $owner = $this->modelReadbackOwner($responseId);
+        if ($owner === null) return;
+        $deadline = min(microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS,
+            (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF));
+        $this->verifyFinalEffortFocus($responseId, $mode, $after, $deadline, $owner);
+    }
+
+    /** Capture the current task/document/staging phase or isolated probe without borrowing another task's state. */
+    private function modelReadbackOwner(string $responseId): ?array
+    {
+        if (!$this->modelSelectionActive($responseId)) return null;
+        if (str_starts_with($responseId, 'connector_model_')) return $this->connectorModelSelections[$responseId];
+        return array_intersect_key($this->chatGptTurns[$responseId], array_flip([
+            'surface_id','target_id','session_id','document_nonce','owner_incarnation','fencing_version',
+            'logical_response_id','transport_transaction_id','transport_stage_sent','transport_stage_acked',
+        ]));
+    }
+
+    /**
+     * Verify reversible focus after composing a large stage, within the existing model-preparation budget.
+     * A lost focus reply or renderer remount may be read back; Enter is sent only once after proven focus.
+     * The exact model readback, draft, attachments and previously acknowledged stages remain unchanged.
+     */
+    private function verifyFinalEffortFocus(string $responseId, array $mode, callable $after, float $deadline,
+        array $owner, string $lastDetail = ''): void
+    {
+        if ($this->modelReadbackOwner($responseId) !== $owner) return;
+        if (microtime(true) >= $deadline) {
+            $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
+                'ChatGPT reasoning control could not be verified before sending.' . $lastDetail);
+            return;
+        }
         $this->evaluateModelSelection($responseId, WebModelPage::focusEffortControlExpression(),
-            function ($error, $focused) use ($responseId, $mode, $after): void {
-                if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
-                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN', '发送前无法复核 ChatGPT 推理档位。');
+            function ($error, $focused) use ($responseId, $mode, $after, $deadline, $owner): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                if (microtime(true) >= $deadline) {
+                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
+                        'ChatGPT reasoning control could not be verified before sending. [focus=PREPARATION_DEADLINE]');
                     return;
                 }
-                $read = fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, microtime(true) + 4.0);
+                if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
+                    $reason = $error !== null
+                        ? (($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT' ? 'CDP_TIMEOUT' : 'CDP_ERROR')
+                        : (is_array($focused) && in_array($focused['code'] ?? '',
+                            ['CHATGPT_EDITOR_FORM_MISSING','CHATGPT_MODEL_CONTROL_INVALID'], true)
+                            ? $focused['code'] : 'FOCUS_NOT_CONFIRMED');
+                    $detail = ' [focus=' . $reason . ', cdp=' . (int)($error['code'] ?? 0)
+                        . ', controls=' . (int)($focused['count'] ?? -1) . ']';
+                    $retryable = ($error === null || ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT')
+                        && (int)($focused['count'] ?? 0) <= 1;
+                    if ($retryable && microtime(true) < $deadline) {
+                        Timer::add(0.15, fn() => $this->verifyFinalEffortFocus(
+                            $responseId, $mode, $after, $deadline, $owner, $detail), null, false);
+                        return;
+                    }
+                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
+                        'ChatGPT reasoning control could not be verified before sending.' . $detail);
+                    return;
+                }
+                $safeAfter = function () use ($responseId, $owner, $after): void {
+                    if ($this->modelReadbackOwner($responseId) === $owner) $after();
+                };
+                $read = fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $safeAfter,
+                    min($deadline, microtime(true) + 4.0), $owner);
                 if (!empty($focused['expanded'])) { $read(); return; }
-                $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $read): void {
+                $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $read, $owner): void {
+                    if ($this->modelReadbackOwner($responseId) !== $owner) return;
                     if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                         $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN', '发送前无法打开 ChatGPT 推理档位菜单。');
                         return;
                     }
                     $read();
                 });
-            });
+            }, min(10.0, max(0.1, $deadline - microtime(true))));
     }
 
     /** Wait for readback to settle within the original bound; restriction is distinct from identity drift. */
-    private function verifyTaskFinalEffortSlider(string $responseId, array $mode, callable $after, float $deadline): void
+    private function verifyTaskFinalEffortSlider(string $responseId, array $mode, callable $after, float $deadline,
+        ?array $owner = null): void
     {
+        $owner ??= $this->modelReadbackOwner($responseId);
+        if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
         $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
-            function ($error, $slider) use ($responseId, $mode, $after, $deadline): void {
-                if (!$this->modelSelectionActive($responseId)) return;
+            function ($error, $slider) use ($responseId, $mode, $after, $deadline, $owner): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
                 if ($error === null && is_array($slider) && !empty($slider['ok'])) {
                     $familyMatches = !is_string($mode['family'] ?? null)
                         || ChatGptTransport::familyChecked($slider, $mode['family']);
@@ -6798,7 +6859,7 @@ JS;
                     // Slider position and its live description can hydrate separately.
                     // Only read again: no key replay, model downgrade, send or deadline extension.
                     if (microtime(true) < $deadline) {
-                        Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline), null, false);
+                        Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline, $owner), null, false);
                         return;
                     }
                     $this->dispatchModelSelectionKey($responseId, 'Escape', static function (): void {});
@@ -6809,7 +6870,7 @@ JS;
                     return;
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline), null, false);
+                    Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline, $owner), null, false);
                     return;
                 }
                 $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN', '发送前无法读取 ChatGPT 推理档位。');
