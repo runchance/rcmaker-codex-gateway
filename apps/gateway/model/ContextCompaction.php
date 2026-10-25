@@ -2020,6 +2020,8 @@ final class ContextCompaction
         // Unknown and unfinished effects still block compaction. A conclusively closed
         // wait transport may retain a known native receipt without an old-page delivery;
         // prove that exact receipt is in this compact or its verified checkpoint instead.
+        // A committed ordinary turn may also prove consumption through its exact completed
+        // successor, as on the active-source and stopped-stream recovery paths.
         $pendingCall = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
             ->where('status', 'IN', ['registered', 'delivered', 'unknown'])->find();
         $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
@@ -2032,7 +2034,9 @@ final class ContextCompaction
         }
         if (!is_array($activeSource)) {
             foreach ($undelivered as $call) {
-                if (!ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)) {
+                if (!ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)
+                    && !ToolBroker::completedHistoricalReceiptForRecoveryUnlocked($call,
+                        array_replace($spec, ['task_id'=>$taskId]))) {
                     throw new GatewayError('compaction_source_unavailable', '工具执行或回执尚未确认，不能压缩当前任务。', 409);
                 }
             }

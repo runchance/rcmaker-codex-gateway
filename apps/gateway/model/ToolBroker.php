@@ -196,6 +196,10 @@ final class ToolBroker
                 throw new GatewayError('compaction_source_unavailable', '其他工具能力尚未结束，不能压缩当前任务。', 409);
             }
         }
+        // Compact admission has not created its own turn/binding yet. Use the verified
+        // source identity, but check historical receipts against this request's context.
+        $receiptContext = array_replace($spec, ['task_id'=>$taskId,
+            'mcp_binding_id'=>$binding['id'], 'durable_turn_id'=>$source['durable_turn_id']]);
         $hasWaitingSourceResult = false;
         foreach (array_merge($pending, $undelivered) as $call) {
             if ((string) $call['status'] === 'completed') {
@@ -207,6 +211,7 @@ final class ToolBroker
                 && isset($ids[(string) $call['call_id']]);
             if (!$current && self::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)) continue;
             if (!$current && self::activeFailedWaitReceiptCoveredUnlocked($call, $spec, $source)) continue;
+            if (!$current && self::completedHistoricalReceiptForRecoveryUnlocked($call, $receiptContext)) continue;
             if ($current && ((string) $call['status'] === 'delivered'
                 || ((string) $call['status'] === 'completed' && $call['result_delivered_at'] === null))) {
                 $hasWaitingSourceResult = true;
@@ -2217,11 +2222,12 @@ final class ToolBroker
 
     /**
      * Recognize a completed historical receipt whose old MCP acknowledgement was lost.
-     * Only an ordinary chat's different, committed turn may use the completed-successor
-     * proof, and the current context/checkpoint must still cover its exact result.
+     * Only an ordinary chat's committed turn, distinct from any current source turn, may
+     * use the completed-successor proof. Recovery and compact admission must both retain
+     * the exact result in their current context/checkpoint.
      * This read-only check neither acknowledges delivery nor revives the old capability.
      * @param array $call Persisted invocation with its original result and delivery fields.
-     * @param array $job Current recovery round, inside the caller's ownership transaction.
+     * @param array $job Current recovery round or compact context with verified task/source identity.
      * @return bool Whether this historical receipt is conclusively settled for recovery.
      * @throws GatewayError If storage is unavailable or current receipt coverage differs.
      */
