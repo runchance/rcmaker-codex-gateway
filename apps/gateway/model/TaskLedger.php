@@ -457,7 +457,8 @@ final class TaskLedger
             $spec['rolling_source_response_id'] = null;
             $hasToolOutputs = false;
         }
-        $sourceWaitingSuperseded = is_array($task) && ContextCompaction::supersedeSourceWaitingUnlocked($taskId, $spec);
+        $expandedReceiptIds = [];
+        $sourceWaitingSuperseded = is_array($task) && ContextCompaction::supersedeSourceWaitingUnlocked($taskId, $spec, $expandedReceiptIds);
         if ($sourceWaitingSuperseded) {
             // Exact completed receipts now belong to a fresh read-only history import.
             $spec['tools'] = [];
@@ -606,7 +607,8 @@ final class TaskLedger
                     // capability. The saved chat holds that source even though no final
                     // assistant answer or successful checkpoint was ever produced.
                     $spec['regular_compaction_recovery'] = ['source_response_id' => $sourceJob['id'],
-                        'context_sha256' => hash('sha256', (string) $spec['full_context_json'])];
+                        'context_sha256' => hash('sha256', (string) $spec['full_context_json']),
+                        'expanded_receipt_ids'=>$expandedReceiptIds];
                 }
             }
         }

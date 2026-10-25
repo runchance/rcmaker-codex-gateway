@@ -12,6 +12,67 @@ final class ContextCompaction
     private const PREFIX = 'rcmx1:';
 
     /**
+     * Describe the actual rejected native request without logging any conversation text or tokens.
+     * Run only after admission rolled back; this never reserves or releases a checkpoint.
+     * @param array $spec Parsed request retained by the Responses controller.
+     * @return array Bounded structural facts for the existing diagnostic export log.
+     */
+    public static function conflictDiagnostics(array $spec): array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $taskId = 'task_' . substr((string) ($spec['task_key'] ?? ''), 0, 24);
+        $link = $db->table('gateway_task_conversations')->where('base_task_id', $taskId)->find();
+        if (is_array($link)) $taskId = (string) $link['current_task_id'];
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
+            ->where('state', 'generating')->order([['rowid','DESC']])->limit(1)->find();
+        $facts = ['diagnostic_version'=>1, 'task_id'=>$taskId, 'checkpoint_found'=>is_array($checkpoint)];
+        if (!is_array($checkpoint)) return $facts;
+        $job = $db->table('gateway_response_jobs')->where('id', $checkpoint['response_id'])->find();
+        if (!is_array($job)) return $facts;
+        $before = json_decode((string) $job['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        $after = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $records = (array) ($after['messages'] ?? []);
+        $known = (array) ($before['messages'] ?? []);
+        $base = $before['system'][0] ?? null;
+        $offset = !empty($spec['native_responses_lite']) && is_string($base) && $base !== ''
+            && ($records[0]['role'] ?? '') === 'developer' && ($records[0]['content'] ?? null) === $base
+            && ContextHistory::canonical($known[0] ?? null) !== ContextHistory::canonical($records[0] ?? null) ? 1 : 0;
+        $matched = self::sourceWithRecoveredNativeUserIds($before, $records, $offset);
+        $facts += ['response_id'=>$job['id'], 'source_status'=>$job['status'],
+            'source_model'=>$job['model'], 'model_same'=>$job['model'] === ($spec['model'] ?? null),
+            'effort_same'=>$job['reasoning_effort'] === ($spec['reasoning_effort'] ?? null),
+            'epoch_same'=>$job['compaction_epoch'] === ($spec['compaction_epoch'] ?? 'base'),
+            'source_records'=>count($known), 'request_records'=>count($records),
+            'source_system_count'=>count((array) ($before['system'] ?? [])),
+            'request_system_count'=>count((array) ($after['system'] ?? [])),
+            'native_lite'=>!empty($spec['native_responses_lite']), 'user_identity_valid'=>$matched !== null,
+            'source_prefix_matches'=>self::hasCompleteSourcePrefix($before, $after, !empty($spec['native_responses_lite']))];
+        $known = $matched['messages'] ?? $known;
+        $differences = [];
+        foreach ($known as $index=>$record) {
+            $candidate = $records[$index + $offset] ?? [];
+            if (ContextHistory::matchesCompactionSource(['messages'=>[$record]], ['messages'=>[$candidate]],
+                !empty($spec['native_responses_lite']), true)) continue;
+            $fields = [];
+            foreach (['type','role','content','output','call_id','id','name','arguments','input','phase','summary','origin'] as $key) {
+                if (ContextHistory::canonical($record[$key] ?? null) === ContextHistory::canonical($candidate[$key] ?? null)) continue;
+                $old = $record[$key] ?? null; $new = $candidate[$key] ?? null;
+                $fields[$key] = ['source_type'=>get_debug_type($old), 'request_type'=>get_debug_type($new),
+                    'source_bytes'=>strlen(ContextHistory::canonical($old)), 'request_bytes'=>strlen(ContextHistory::canonical($new))];
+                if ($key === 'output') $fields[$key] += [
+                    'source_context_truncated'=>$old === 'Output exceeded the available model context and was truncated',
+                    'request_context_truncated'=>$new === 'Output exceeded the available model context and was truncated'];
+            }
+            $differences[] = ['index'=>$index, 'fields'=>$fields];
+            if (count($differences) === 4) break;
+        }
+        $facts['first_differences'] = $differences;
+        $facts['suffix_kinds'] = array_slice(array_map(static fn(array $record): string =>
+            (string) ($record['role'] ?? $record['type'] ?? ''), array_slice($records, count($known) + $offset)), 0, 8);
+        return $facts;
+    }
+
+    /**
      * Turn native v1/v2 compaction into a read-only checkpoint. An active v2 tool batch first
      * resumes its exact source response and fences later host calls. An exact replay of a proven
      * unsent failure or a terminal read-only archive failure without an accepted summary receives
@@ -1404,11 +1465,13 @@ final class ContextCompaction
      * Completed receipts are immutable; the old capability is revoked without cancelling host work.
      * @param string $taskId Current routed task identity.
      * @param array $spec New read-only native compact request, with full readable history.
+     * @param array|null $expandedReceiptIds Receives restored native result IDs for the summary transport.
      * @return bool Whether the old source-waiting slot and task were atomically retired.
      * @throws GatewayError If receipt proof or durable retirement cannot be recorded.
      */
-    public static function supersedeSourceWaitingUnlocked(string $taskId, array $spec): bool
+    public static function supersedeSourceWaitingUnlocked(string $taskId, array $spec, ?array &$expandedReceiptIds = null): bool
     {
+        $expandedReceiptIds = [];
         $state = self::sourceWaitingStateUnlocked($taskId, $spec);
         if ($state === null) return false;
         $checkpoint = $state['checkpoint'];
@@ -1417,6 +1480,7 @@ final class ContextCompaction
         $turn = $state['turn'];
         $surface = $state['surface'];
         $calls = $state['calls'];
+        $expandedReceiptIds = array_column($state['expandedReceipts'], 'call_id');
         $db = SDB(null, 'medoo', 'sqlite');
         $updated = $db->table('gateway_context_checkpoints')->where('id', (string) $checkpoint['id'])
             ->where('response_id', (string) $job['id'])->where('state', 'generating')->update(['state'=>'abandoned']);
@@ -1432,7 +1496,8 @@ final class ContextCompaction
             'data_json'=>json_encode(['checkpoint_id'=>$checkpoint['id'], 'source_response_id'=>$source['id'],
                 'delivered_tool_calls'=>count(array_filter($calls, static fn(array $call): bool => $call['result_delivered_at'] !== null)),
                 'completed_tool_calls'=>count($calls),
-                'native_base_task_id'=>$spec['readonly_source_base_task_id'] ?? null], JSON_THROW_ON_ERROR), 'created_at'=>time(),
+                'native_base_task_id'=>$spec['readonly_source_base_task_id'] ?? null,
+                'expanded_native_receipts'=>$state['expandedReceipts']], JSON_THROW_ON_ERROR), 'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', '源摘要等待替换证据无法保存。', 503);
         return true;
     }
@@ -1615,11 +1680,65 @@ final class ContextCompaction
             && ($sourceBinding['sent_at'] !== null || $sourceBinding['started_at'] !== null))) return null;
         $before = json_decode((string) $job['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $after = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $expandedReceipts = [];
+        $comparison = $after;
+        if (!$running && $retiredSource && $job['model'] === ($spec['model'] ?? null)
+            && $job['reasoning_effort'] === ($spec['reasoning_effort'] ?? null)
+            && ($job['integration_id'] ?? null) === ($spec['integration_id'] ?? null)) {
+            $comparison = self::compareExpandedNativeReceipts($before, $after, $calls, $job, $source, $expandedReceipts);
+        }
         if ($running && !$missingReplay) {
             if (!self::hasNewHumanAfterExactSource($before, $after)) return null;
-        } elseif (!self::hasCompleteSourcePrefix($before, $after, !empty($spec['native_responses_lite']))) return null;
-        self::assertRetiredSourceReceiptsUnlocked($spec, $job, $taskId);
-        return compact('task', 'checkpoint', 'job', 'source', 'turn', 'epoch', 'surface', 'calls');
+        } elseif (!self::hasCompleteSourcePrefix($before, $comparison, !empty($spec['native_responses_lite']))) return null;
+        $receiptSpec = $spec;
+        if ($expandedReceipts !== []) $receiptSpec['context_json'] = $receiptSpec['full_context_json'] = ContextHistory::canonical($comparison);
+        self::assertRetiredSourceReceiptsUnlocked($receiptSpec, $job, $taskId);
+        return compact('task', 'checkpoint', 'job', 'source', 'turn', 'epoch', 'surface', 'calls', 'expandedReceipts');
+    }
+
+    /**
+     * Compare a closed source whose authenticated native retry restores a previously truncated result.
+     * Only the original source batch's completed, delivered scalar placeholder can expand.
+     * This comparison copy never replaces stored history, acknowledges delivery or revives a tool.
+     * @param array $before Original failed compact history. @param array $after Current native history.
+     * @param array $calls Task-scoped calls already proved settled by sourceWaitingStateUnlocked.
+     * @param array $job Unsent failed compact. @param array $source Its exact completed tool-call response.
+     * @param array $expanded Receives call IDs and hashes for immutable audit evidence, never result text.
+     * @return array Comparison-only current history with those placeholders aligned to the old receipt.
+     */
+    private static function compareExpandedNativeReceipts(array $before, array $after, array $calls,
+        array $job, array $source, array &$expanded): array
+    {
+        $marker = 'Output exceeded the available model context and was truncated';
+        $byId = array_column($calls, null, 'call_id');
+        $records = (array) ($after['messages'] ?? []);
+        $positions = [];
+        foreach ($records as $index=>$record) {
+            if (isset($record['call_id']) && array_key_exists('output', $record)) $positions[$record['call_id']][] = $index;
+        }
+        foreach ((array) ($before['messages'] ?? []) as $record) {
+            if (!in_array($record['type'] ?? '', ['function_call_output','custom_tool_call_output'], true)
+                || ($record['output'] ?? null) !== $marker) continue;
+            $callId = (string) ($record['call_id'] ?? '');
+            $call = $byId[$callId] ?? null;
+            $indexes = $positions[$callId] ?? [];
+            if (!is_array($call) || count($indexes) !== 1 || $call['status'] !== 'completed'
+                || $call['task_id'] !== $job['task_id'] || $call['turn_id'] !== $job['durable_turn_id']
+                || $call['binding_id'] !== $job['mcp_binding_id'] || $call['response_id'] !== $source['id']
+                || (int)$call['delivery_count'] < 1 || $call['delivered_at'] === null || $call['completed_at'] === null
+                || !hash_equals((string)$call['result_hash'], hash('sha256', $marker))) continue;
+            $persisted = json_decode((string)$call['result_json'], true);
+            if (($persisted['output'] ?? null) !== $marker || !empty($persisted['output_is_content_parts'])) continue;
+            $index = $indexes[0]; $candidate = $records[$index]; $output = $candidate['output'] ?? null;
+            if (!is_string($output) || strlen($output) <= strlen($marker)) continue;
+            $candidate['output'] = $marker;
+            if (ContextHistory::nativeToolHistoryCanonical([$candidate]) !== ContextHistory::nativeToolHistoryCanonical([$record])) continue;
+            $after['messages'][$index]['output'] = $marker;
+            $expanded[] = ['call_id'=>$callId, 'invocation_id'=>$call['id'],
+                'previous_sha256'=>$call['result_hash'], 'restored_sha256'=>hash('sha256', $output),
+                'restored_bytes'=>strlen($output)];
+        }
+        return $after;
     }
 
     /**
@@ -2134,6 +2253,14 @@ final class ContextCompaction
                 }
             }
             $spec['prompt'] = self::prompt(ContextHistory::canonical($requested), true);
+            if ($recoveredSourceId !== null && !empty($recovery['expanded_receipt_ids'])) {
+                $restoredIds = array_fill_keys($recovery['expanded_receipt_ids'], true);
+                $restored = array_values(array_filter((array)$requested['messages'], static fn(array $record): bool =>
+                    isset($restoredIds[$record['call_id'] ?? '']) && array_key_exists('output', $record)));
+                $spec['prompt'] .= "\nThe native host restored these completed results after its earlier context truncation. "
+                    . "Use them in the checkpoint; they are historical results, not new tool requests. Do not repeat their execution.\n"
+                    . '<restored_native_results>' . ContextHistory::canonical($restored) . '</restored_native_results>';
+            }
             $spec['verified_compaction_source'] = true;
             $spec['continuation_source_response_id'] = $recoveredSourceId ?? $last['id'];
             $spec['budget']['regular_chat'] = ['task_id' => $taskId, 'conversation_id' => $regularChat['conversation_id'],

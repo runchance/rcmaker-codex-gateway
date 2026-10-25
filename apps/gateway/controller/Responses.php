@@ -119,6 +119,14 @@ final class Responses
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
             $this->logFreeModelSelectionFailure($error, $phase, $spec ?? [], is_array($body ?? null) ? $body : []);
+            if ($error->errorCode === 'compaction_conflict' && isset($spec)) {
+                try {
+                    $this->logUnexpectedCreateFailure($error, $phase . ':compaction_conflict',
+                        ContextCompaction::conflictDiagnostics($spec));
+                } catch (\Throwable) {
+                    // Diagnostics cannot replace or relax the original admission failure.
+                }
+            }
             // Codex replaces these details with its generic context-window message.
             // Admission failures precede job creation, so keep structural evidence
             // in the existing diagnostic sink without logging any request content.
