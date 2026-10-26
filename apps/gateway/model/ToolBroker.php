@@ -3313,6 +3313,68 @@ final class ToolBroker
     }
 
     /**
+     * Reconcile an old receipt-only RPC after a completed successor proves its exact result was consumed.
+     * Caller owns the recovery writer transaction and has fenced the stopped page/current capability.
+     * Physical delivery ACKs and host results stay unchanged; unrelated or newer RPCs stay active.
+     * @param array $job Current owned native response, with its exact recovery context.
+     * @param array $binding Current live binding already validated by the caller.
+     * @param array $calls Persisted task invocations read in this same transaction.
+     * @return array<string,true> Completed call IDs covered by both the successor and current context.
+     * @throws GatewayError On unavailable activity storage or an atomic retirement conflict.
+     */
+    public static function retireConsumedReceiptWaitsForRecoveryUnlocked(array $job, array $binding, array $calls): array
+    {
+        if (($job['status'] ?? '') !== 'running' || ($job['operation_kind'] ?? '') !== 'response'
+            || ($binding['status'] ?? '') !== 'running' || ($binding['current_response_id'] ?? '') !== ($job['id'] ?? null)
+            || ($binding['id'] ?? '') !== ($job['mcp_binding_id'] ?? null)
+            || ($binding['task_id'] ?? '') !== ($job['task_id'] ?? null)
+            || ($binding['turn_id'] ?? '') !== ($job['durable_turn_id'] ?? null)) return [];
+        $covered = [];
+        foreach ($calls as $call) {
+            if (($call['binding_id'] ?? '') !== $binding['id']) continue;
+            if (($call['status'] ?? '') !== 'completed') return [];
+            if (($call['result_delivered_at'] ?? null) === null && !empty($call['completed_at'])
+                && self::completedReceiptCoveredByLaterRoundUnlocked($binding, $call)) $covered[$call['id']] = $call;
+        }
+        if ($covered === []) return [];
+        try {
+            ContextCompaction::assertClosedWaitReceiptsCoverageUnlocked($job, array_values($covered), (string)$job['task_id']);
+        } catch (GatewayError $error) {
+            if ($error->errorCode !== 'compaction_context_incomplete') throw $error;
+            return [];
+        }
+        $db = SDB(null, 'medoo', 'sqlite');
+        $activities = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+            ->where('status', 'active')->select('id,created_at,updated_at');
+        if (!is_array($activities)) throw new GatewayError('storage_unavailable', 'Consumed receipt wait state is temporarily unavailable.', 503);
+        $retired = [];
+        $cutoff = time() - (int)ceil(McpProtocol::HOST_RPC_SLICE_MS / 1000);
+        foreach ($covered as $call) {
+            $prefix = 'activity_receipt_' . hash('sha256', (string)$call['call_key']) . '_';
+            foreach ($activities as $activity) {
+                if (str_starts_with((string)$activity['id'], $prefix)
+                    // Keep fresh readers, including ones created in the result's same timestamp second.
+                    // Age alone is never a proof: the completed successor and exact context were checked above.
+                    && (int)$activity['created_at'] <= $cutoff && (int)$activity['updated_at'] <= $cutoff
+                    && (int)$activity['created_at'] <= (int)$call['completed_at']
+                    && (int)$activity['updated_at'] <= (int)$call['completed_at']) $retired[$activity['id']] = true;
+            }
+        }
+        if ($retired !== []) {
+            $updated = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                ->where('status', 'active')->where('id', 'IN', array_keys($retired))
+                ->update(['status'=>'completed', 'updated_at'=>time()]);
+            if (!$updated || $updated->rowCount() !== count($retired)) {
+                throw new GatewayError('storage_unavailable', 'Consumed receipt waits changed during recovery.', 503);
+            }
+            self::bumpRevisionUnlocked((string)$binding['id']);
+            self::eventUnlocked((string)$job['task_id'], (string)$job['durable_turn_id'], (string)$job['id'],
+                'consumed_receipt_wait_retired', ['receipt_count'=>count($covered), 'activity_count'=>count($retired)]);
+        }
+        return array_fill_keys(array_keys($covered), true);
+    }
+
+    /**
      * Accept complete host receipts under the HTTP envelope; preserve hashes and bind the next round.
      * Verified question replies belong only to the selected, not-yet-returned receipt, outside its hash.
      */

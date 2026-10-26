@@ -2663,6 +2663,13 @@ final class TaskLedger
             if (!is_array($calls) || !is_array($bindings)) {
                 throw new GatewayError('storage_unavailable', '网页重试的工具状态暂不可读取。', 503);
             }
+            $consumedReceipts = is_array($binding)
+                ? ToolBroker::retireConsumedReceiptWaitsForRecoveryUnlocked($job, $binding, $calls) : [];
+            if ($consumedReceipts !== []) {
+                $revision = $db->table('gateway_mcp_bindings')->where('id', $binding['id'])->find('activity_revision');
+                if (!is_array($revision)) throw new GatewayError('storage_unavailable', 'Recovery activity revision is temporarily unavailable.', 503);
+                $binding['activity_revision'] = (int)$revision['activity_revision'];
+            }
             $waiting = false;
             $hasCompletedWork = false;
             $currentCompletedCalls = 0;
@@ -2682,6 +2689,7 @@ final class TaskLedger
                 if ($call['status'] === 'completed') $hasCompletedWork = true;
                 if ($call['status'] === 'completed' && $call['binding_id'] === ($binding['id'] ?? null)) $currentCompletedCalls++;
                 if ($call['status'] === 'completed' && ($call['result_delivered_at'] === null || $call['result_json'] === null)) {
+                    if (isset($consumedReceipts[$call['id']])) continue;
                     // Canonical handoff preserved this result in a later round. Its retired
                     // Web wait remains unacknowledged, but is no longer pending delivery here.
                     $result = is_string($call['result_json']) ? json_decode($call['result_json'], true) : null;
