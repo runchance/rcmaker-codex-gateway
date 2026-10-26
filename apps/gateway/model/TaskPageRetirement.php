@@ -473,6 +473,81 @@ final class TaskPageRetirement
         });
     }
 
+    /**
+     * Close an absent temporary page whose exact native task already completed before retirement.
+     * Caller must have a successful inventory with neither its target nor the same chat URL present.
+     * This records absence after completion, never a fabricated browser Stop acknowledgement.
+     * @param array $snapshot Immutable pending retirement plus the current ownership witness.
+     * @return bool False for live, uncertain, unacknowledged, reassigned or non-temporary work.
+     * @throws GatewayError On unavailable or unpersistable retirement evidence.
+     */
+    public static function closeMissingCompletedPage(array $snapshot): bool
+    {
+        if (($snapshot['chat_mode'] ?? '') !== 'temporary' || empty($snapshot['source_response_id'])
+            || preg_match('~\Ahttps://chatgpt\.com/c/[a-f0-9-]{16,}(?:[/?#].*)?\z~i', (string)($snapshot['url'] ?? '')) !== 1) return false;
+        return Schema::transaction(static function () use ($snapshot): bool {
+            if (!self::owns($snapshot)) return false;
+            $db = SDB(null,'medoo','sqlite');
+            $retirement = $db->table('gateway_surface_retirements')->where('surface_id',$snapshot['surface_id'])->find('state,created_at');
+            if (!is_array($retirement) || $retirement['state'] !== 'pending') return false;
+            $sourceSurface = $snapshot['origin_surface_id'] ?? $snapshot['surface_id'];
+            $source = $db->table('gateway_response_jobs')->where('id',$snapshot['source_response_id'])
+                ->find('task_id,surface_id,durable_turn_id,mcp_binding_id,submit_intent_at');
+            $final = $db->table('gateway_response_jobs')->where('surface_id',$sourceSurface)
+                ->order([['rowid','DESC']])->limit(1)->find('id,task_id,status,operation_kind,round_kind,terminal_type,durable_turn_id,mcp_binding_id,output_text,finished_at');
+            if (!is_array($source) || !is_array($final) || $source['task_id'] !== $snapshot['task_id']
+                || $source['surface_id'] !== $sourceSurface || empty($source['submit_intent_at'])
+                || $final['task_id'] !== $snapshot['task_id'] || $final['status'] !== 'completed'
+                || $final['operation_kind'] !== 'response' || $final['round_kind'] !== 'text'
+                || $final['terminal_type'] !== 'response.completed' || $final['output_text'] === ''
+                || empty($final['finished_at']) || (int)$final['finished_at'] > (int)$retirement['created_at']
+                || $source['durable_turn_id'] !== $final['durable_turn_id']
+                || $source['mcp_binding_id'] !== $final['mcp_binding_id']) return false;
+            $turns = $db->table('gateway_task_turns')->where('surface_id',$sourceSurface)->select('id,task_id,status,response_id');
+            if (!is_array($turns) || $turns === []) return false;
+            $finalTurn = null;
+            foreach ($turns as $turn) {
+                if ($turn['task_id'] !== $snapshot['task_id'] || $turn['status'] !== 'committed') return false;
+                if ($turn['id'] === $final['durable_turn_id']) $finalTurn = $turn;
+            }
+            if (!is_array($finalTurn) || $finalTurn['response_id'] !== $final['id']) return false;
+            $bindings = $db->table('gateway_mcp_bindings')->where('turn_id','IN',array_column($turns,'id'))
+                ->select('id,task_id,status,token_hash,current_response_id,final_answer');
+            if (!is_array($bindings) || $bindings === []) return false;
+            $finalBinding = null;
+            foreach ($bindings as $binding) {
+                if ($binding['task_id'] !== $snapshot['task_id'] || $binding['status'] !== 'completed') return false;
+                if ($binding['id'] === $final['mcp_binding_id']) $finalBinding = $binding;
+            }
+            if (!is_array($finalBinding) || $finalBinding['current_response_id'] !== $final['id']
+                || $finalBinding['final_answer'] !== $final['output_text']
+                || !in_array($finalBinding['token_hash'],$snapshot['turn_token_hashes'] ?? [],true)) return false;
+            $bindingIds = array_column($bindings,'id');
+            $counts = [
+                $db->table('gateway_response_jobs')->where('surface_id',$sourceSurface)->where('status','IN',['queued','running'])->count(),
+                $db->table('gateway_tool_invocations')->where('binding_id','IN',$bindingIds)->where('status','<>','completed')->count(),
+                $db->table('gateway_tool_invocations')->where('binding_id','IN',$bindingIds)->where('result_delivered_at',null)->count(),
+                $db->table('gateway_tool_invocations')->where('binding_id','IN',$bindingIds)->where('result_json',null)->count(),
+                $db->table('gateway_mcp_activities')->where('binding_id','IN',$bindingIds)->where('status','active')->count(),
+            ];
+            foreach ($counts as $count) {
+                if (!is_numeric($count)) throw new GatewayError('storage_unavailable','Completed page state could not be read.',503);
+                if ((int)$count !== 0) return false;
+            }
+            $changed = $db->table('gateway_surface_retirements')->where('surface_id',$snapshot['surface_id'])
+                ->where('state','pending')->where('snapshot_json',self::encode(self::persistedSnapshot($snapshot)))
+                ->update(['state'=>'closed','updated_at'=>time()]);
+            if (!$changed || $changed->rowCount() !== 1) return false;
+            TaskLedger::targetClosed($snapshot['surface_id']);
+            if (!$db->table('gateway_task_events')->add(['task_id'=>$snapshot['task_id'],'turn_id'=>$finalTurn['id'],
+                'response_id'=>$final['id'],'surface_id'=>$snapshot['surface_id'],'event_type'=>'retired_completed_page_absent',
+                'data_json'=>self::encode(['reason'=>'committed_task_and_confirmed_absence']),'created_at'=>time()])) {
+                throw new GatewayError('storage_unavailable','Completed page absence could not be saved.',503);
+            }
+            return true;
+        });
+    }
+
     /** Keep ephemeral caller fields out of the immutable JSON used for compare-and-swap. */
     private static function persistedSnapshot(array $snapshot): array
     {

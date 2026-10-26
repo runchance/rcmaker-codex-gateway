@@ -38,7 +38,10 @@ final class RetiredTaskPageStop
                 if (!is_array($result['targetInfos'] ?? null)) { $this->retry($id); return; }
                 $snapshot = $this->observers[$id]['snapshot'];
                 $target = null;
+                $sameChatVisible = false;
                 foreach ($result['targetInfos'] as $candidate) {
+                    if (($candidate['type'] ?? '') === 'page'
+                        && $this->sameConversation($snapshot['url'], (string)($candidate['url'] ?? ''))) $sameChatVisible = true;
                     if (($candidate['targetId'] ?? '') === $snapshot['target_id'] && ($candidate['type'] ?? '') === 'page') {
                         $target = $candidate; break;
                     }
@@ -49,6 +52,8 @@ final class RetiredTaskPageStop
                     } elseif (!empty($snapshot['empty_page'])) {
                         if (TaskPageRetirement::confirmStopped($snapshot)) $this->finishClosed($id, $snapshot);
                     } elseif (TaskPageRetirement::closeMissingInertStage($snapshot)) {
+                        $this->finishClosed($id, $snapshot, true);
+                    } elseif (!$sameChatVisible && TaskPageRetirement::closeMissingCompletedPage($snapshot)) {
                         $this->finishClosed($id, $snapshot, true);
                     } else $this->recover($id);
                     return;
@@ -241,6 +246,14 @@ final class RetiredTaskPageStop
     }
 
     /** Exact saved-page identity, with temporary flags kept significant. */
+    /** Inventory must not declare a chat absent merely because its temporary/query flag changed. */
+    private function sameConversation(string $expected, string $actual): bool
+    {
+        $expectedId = WebModelPage::regularConversationId((string)preg_replace('~[?#].*\z~s','',$expected), $this->modelUrl);
+        return $expectedId !== null && $expectedId === WebModelPage::regularConversationId(
+            (string)preg_replace('~[?#].*\z~s','',$actual), $this->modelUrl);
+    }
+
     private function samePage(string $expected, string $actual): bool
     {
         $a = parse_url($expected); $b = parse_url($actual);
