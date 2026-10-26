@@ -83,7 +83,9 @@ final class ContextRecovery
     }
 
     /**
-     * Allow a new full native request to reselect an inert ordinary-chat staging import.
+     * Allow a new full native request to reselect an inert, never-committed history import.
+     * Both chat modes can fail during staging or before its first physical part. A persisted
+     * import selection is required in the latter case; arbitrary failed tasks stay excluded.
      * The caller owns admission's transaction; this never retries the old browser message.
      * @param array $spec Current routed request, with its own model and native tool environment.
      * @param array|null $prior Latest response read for that exact durable task.
@@ -93,16 +95,18 @@ final class ContextRecovery
     public static function canReimportFailedStagingUnlocked(array $spec, ?array $prior): bool
     {
         if (!is_array($prior) || ($spec['operation_kind'] ?? 'response') !== 'response'
-            || !empty($spec['tool_outputs']) || !empty($spec['steering_restart'])
+            || !empty($spec['input_is_delta']) || !empty($spec['tool_outputs']) || !empty($spec['steering_restart'])
             || !empty($spec['steering_messages']) || !empty($spec['budget']['regular_chat'])
             || ($prior['operation_kind'] ?? '') !== 'response' || ($prior['status'] ?? '') !== 'failed'
             || ($prior['task_id'] ?? '') !== 'task_' . substr((string) ($spec['task_key'] ?? ''), 0, 24)
             || ($prior['model'] ?? '') !== ($spec['model'] ?? '')
-            || ($prior['reasoning_effort'] ?? null) !== ($spec['reasoning_effort'] ?? null)
-            || (int) ($prior['transport_parts_total'] ?? 0) < 2
-            || (int) ($prior['transport_stage_sent'] ?? 0) < 1) return false;
+            || ($prior['reasoning_effort'] ?? null) !== ($spec['reasoning_effort'] ?? null)) return false;
+        $staged = (int) ($prior['transport_parts_total'] ?? 0) >= 2
+            && (int) ($prior['transport_stage_sent'] ?? 0) >= 1;
+        $priorBudget = json_decode((string) ($prior['budget_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
+        if (!$staged && !is_array($priorBudget['imported_history_selection'] ?? null)) return false;
         $chat = TaskWebChat::state((string) $prior['task_id']);
-        return $chat['mode'] === 'regular' && empty($chat['conversation_id'])
+        return in_array($chat['mode'], ['regular','temporary'], true) && empty($chat['conversation_id'])
             && self::canRetryFailedBeforeCommitUnlocked((string) $prior['id']);
     }
 

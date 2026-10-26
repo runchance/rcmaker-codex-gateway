@@ -116,8 +116,8 @@ final class ResponseJob
         $itemId = 'msg_' . bin2hex(random_bytes(12));
         $created = time();
         $roundInfo = null;
-        // Legacy page replacement can fail before creating a usable transport. Plan its
-        // next explicit request before taking the writer lock or validating the full archive.
+        // An inert import or legacy page replacement can fail before a usable submission.
+        // Plan the next explicit request before taking the writer lock or validating its archive.
         $replacementHistory = ToolBroker::prepareFailedRegularAdmission($spec, $responseId);
         $reservedId = Schema::transaction(function () use ($spec, $idempotencyKey, $responseId, $itemId,
             $created, $requestIdentity, $budget, $replacementHistory, &$roundInfo): string {
@@ -209,7 +209,10 @@ final class ResponseJob
             if (empty($spec['web_chat_mode_change'])) $spec = LunaCheckpoint::applyUnlocked($spec);
             $spec = TaskWebChat::prepareContinuationUnlocked($spec);
             $spec = ToolBroker::applyFailedRegularAdmissionUnlocked($spec, $replacementHistory);
-            if (($spec['operation_kind'] ?? 'response') === 'response' && empty($spec['budget']['regular_chat'])) {
+            if (($spec['operation_kind'] ?? 'response') === 'response' && empty($spec['budget']['regular_chat'])
+                && !isset($spec['imported_budget_context_json'])) {
+                // A revalidated preplanned import already includes the current requirements.
+                // Restoring its older selection here could discard an earlier human instruction.
                 // A foreign/forked conversation can be larger than this model's window before
                 // it has any local epoch. Select its recent history before the admission check;
                 // later rounds must inherit the same selection instead of importing it again.

@@ -626,7 +626,7 @@ final class ToolBroker
     }
 
     /**
-     * Plan a full native request after a legacy regular-page replacement failed before submission.
+     * Plan a full native request after an inert import or legacy regular-page replacement failed.
      * Reads only: history selection and physical budget planning never hold the SQLite writer lock.
      * @param array $spec Incoming native request; routing and receipt ownership remain authoritative.
      * @param string $responseId Proposed response ID, used only to count the initial page marker.
@@ -646,9 +646,6 @@ final class ToolBroker
             || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
             || $task['thread_id'] !== ($spec['thread_id'] ?? null)
             || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')) return null;
-        $source = self::failedRegularAdmissionSource($taskId);
-        if ($source === null) return null;
-        if (!empty($spec['previous_response_id']) && $spec['previous_response_id'] !== $source['job']['id']) return null;
         $spec = ContextHistory::demoteHistoricalToolOutputsUnlocked($spec);
         if (!empty($spec['tool_outputs'])) return null;
         if (is_array($link)) {
@@ -656,6 +653,9 @@ final class ToolBroker
             $spec['browser_owner_key'] = (string)$link['current_owner_key'];
             $spec['browser_lease_key'] = hash('sha256', $spec['browser_lease_key'] . '|task|' . $spec['task_key']);
         }
+        $source = self::failedRegularAdmissionSource($taskId, $spec);
+        if ($source === null) return null;
+        if (!empty($spec['previous_response_id']) && $spec['previous_response_id'] !== $source['job']['id']) return null;
         // Full input may also contain pending native environment records. Use the same
         // read-only normalization as admission, then compare its exact output under the lock.
         $spec = ContextHistory::prepareUnlocked($spec);
@@ -669,8 +669,12 @@ final class ToolBroker
         $receiptSource['transport_context_json'] = $spec['full_context_json'] ?? $spec['context_json'];
         if (!self::hasCompleteReceiptHistory($source['binding'], $receiptSource, $callIds)) return null;
         $requestHash = self::failedRegularAdmissionRequestHash($spec);
-        $spec['recovery_preview_prefix'] = '<rcmaker_chat_binding>'.$responseId."</rcmaker_chat_binding>\n";
-        $selected = ContextWindow::selectImportedHistory($spec, false, null, false, $callIds);
+        if (TaskWebChat::state($taskId)['mode'] === 'regular') {
+            $spec['recovery_preview_prefix'] = '<rcmaker_chat_binding>'.$responseId."</rcmaker_chat_binding>\n";
+        }
+        $inertImport = !empty($source['inert_import']);
+        $selected = ContextWindow::selectImportedHistory($spec, false, $inertImport ? $source['job'] : null,
+            $inertImport, $inertImport ? null : $callIds);
         if (!isset($selected['imported_budget_context_json'])) return null;
         return ['task_id'=>$taskId, 'base_task_id'=>$baseTaskId, 'link'=>$link,
             'source_hash'=>$source['hash'], 'request_hash'=>$requestHash, 'spec'=>$selected];
@@ -691,7 +695,7 @@ final class ToolBroker
         $link = SDB(null, 'medoo', 'sqlite')->table('gateway_task_conversations')
             ->where('base_task_id', $prepared['base_task_id'])->find();
         if (ContextHistory::canonical($link) !== ContextHistory::canonical($prepared['link'])) return $spec;
-        $source = self::failedRegularAdmissionSource($prepared['task_id']);
+        $source = self::failedRegularAdmissionSource($prepared['task_id'], $spec);
         if ($source === null || !hash_equals($prepared['source_hash'], $source['hash'])) return $spec;
         $receiptSource = $source['job'];
         $receiptSource['transport_context_json'] = $spec['full_context_json'] ?? $spec['context_json'];
@@ -735,12 +739,28 @@ final class ToolBroker
         ]));
     }
 
-    /** Read the exact failed, unsent replacement and reject live work, manual stops or a rebound chat. */
-    private static function failedRegularAdmissionSource(string $taskId): ?array
+    /** Read the exact inert import or failed unsent replacement, rejecting live work and changed owners. */
+    private static function failedRegularAdmissionSource(string $taskId, ?array $spec = null): ?array
     {
         $chat = TaskWebChat::state($taskId);
-        if ($chat['mode'] !== 'regular' || !empty($chat['conversation_id'])) return null;
         $db = SDB(null, 'medoo', 'sqlite');
+        if ($spec !== null) {
+            $inert = ResponseJob::latestForTaskUnlocked($taskId);
+            if (is_array($inert) && ContextRecovery::canReimportFailedStagingUnlocked($spec, $inert)) {
+                $binding = empty($inert['mcp_binding_id']) ? null
+                    : $db->table('gateway_mcp_bindings')->where('id', $inert['mcp_binding_id'])->find();
+                $turn = $db->table('gateway_task_turns')->where('id', $inert['durable_turn_id'])->find();
+                if (is_array($binding) && is_array($turn) && $binding['task_id'] === $taskId
+                    && $binding['turn_id'] === $inert['durable_turn_id'] && $binding['current_response_id'] === $inert['id']) {
+                    return ['job'=>$inert, 'binding'=>$binding, 'inert_import'=>true,
+                        'hash'=>hash('sha256', ContextHistory::canonical([
+                            'response'=>self::retryContextFingerprint($inert, $binding),
+                            'error'=>$inert['error_json'], 'chat'=>$chat, 'turn'=>$turn,
+                        ]))];
+                }
+            }
+        }
+        if ($chat['mode'] !== 'regular' || !empty($chat['conversation_id'])) return null;
         $previous = $db->table('gateway_response_jobs')->where('task_id', $taskId)
             ->order([['rowid','DESC']])->limit(1)
             ->find('id,status,error_json,submit_intent_at,accepted_at,transport_stage_sent,output_started');
