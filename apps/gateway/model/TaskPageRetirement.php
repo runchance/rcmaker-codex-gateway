@@ -552,6 +552,69 @@ final class TaskPageRetirement
         });
     }
 
+    /**
+     * Reconcile a missing temporary checkpoint document before any resumed message was sent.
+     * Caller must successfully inventory both the original target and every page for its chat ID.
+     * The consumed summary and all source receipts must be settled; this does not fabricate Stop.
+     * @return bool Whether this exact pending obligation was closed from confirmed absence.
+     * @throws GatewayError On unavailable or unpersistable retirement evidence.
+     */
+    public static function closeMissingPendingCheckpointPage(array $snapshot): bool
+    {
+        if (($snapshot['chat_mode'] ?? '') !== 'temporary' || !self::owns($snapshot)
+            || self::missingCheckpointPageProofUnlocked($snapshot) === null) return false;
+        // Ineligible polling stays read-only; eligible evidence is rechecked under the writer fence.
+        return Schema::transaction(static function () use ($snapshot): bool {
+            if (!self::owns($snapshot)) return false;
+            $source = self::missingCheckpointPageProofUnlocked($snapshot);
+            if ($source === null) return false;
+            $db = SDB(null,'medoo','sqlite');
+            $changed = $db->table('gateway_surface_retirements')->where('surface_id',$snapshot['surface_id'])
+                ->where('state','pending')->where('snapshot_json',self::encode(self::persistedSnapshot($snapshot)))
+                ->update(['state'=>'closed','updated_at'=>time()]);
+            if (!$changed || $changed->rowCount() !== 1) return false;
+            TaskLedger::targetClosed($snapshot['surface_id']);
+            if (!$db->table('gateway_task_events')->add(['task_id'=>$snapshot['task_id'],'turn_id'=>$source['durable_turn_id'],
+                'response_id'=>$source['id'],'surface_id'=>$snapshot['surface_id'],'event_type'=>'retired_checkpoint_page_absent',
+                'data_json'=>self::encode(['reason'=>'consumed_checkpoint_without_resume_submission']),'created_at'=>time()])) {
+                throw new GatewayError('storage_unavailable','Checkpoint page absence could not be saved.',503);
+            }
+            return true;
+        });
+    }
+
+    /** Read-only evidence, rechecked inside the closure transaction; never loads archived contexts. */
+    private static function missingCheckpointPageProofUnlocked(array $snapshot): ?array
+    {
+        $db = SDB(null,'medoo','sqlite');
+        $surface = $db->table('gateway_browser_surfaces')->where('id',$snapshot['surface_id'])->find(self::SURFACE_FIELDS);
+        if (!is_array($surface) || self::checkpointControlHashes($snapshot,$surface) === []) return null;
+        $retirement = $db->table('gateway_surface_retirements')->where('surface_id',$snapshot['surface_id'])->find('state,created_at');
+        $source = $db->table('gateway_response_jobs')->where('id',$snapshot['source_response_id'])
+            ->find('id,status,durable_turn_id,budget_json,created_at,transport_stage_sent,output_started,output_text');
+        if (!is_array($retirement) || $retirement['state'] !== 'pending' || !is_array($source) || $source['status'] !== 'failed'
+            || (int)$source['created_at'] > (int)$retirement['created_at'] || (int)$source['transport_stage_sent'] !== 0
+            || (int)$source['output_started'] !== 0 || $source['output_text'] !== '') return null;
+        $proof = json_decode($source['budget_json'],true)['postcompact_page'];
+        $bindings = $db->table('gateway_response_jobs')->where('surface_id','IN',[$surface['id'],$proof['source_surface_id']])
+            ->where('mcp_binding_id','<>',null)->select('mcp_binding_id');
+        if (!is_array($bindings)) throw new GatewayError('storage_unavailable','Checkpoint source capabilities could not be read.',503);
+        $counts = [$db->table('gateway_response_jobs')->where('surface_id',$proof['source_surface_id'])
+            ->where('status','IN',['queued','running'])->count()];
+        $bindingIds = array_values(array_unique(array_column($bindings,'mcp_binding_id')));
+        if ($bindingIds !== []) {
+            $counts[] = $db->table('gateway_tool_invocations')->where('binding_id','IN',$bindingIds)->where('status','<>','completed')->count();
+            $counts[] = $db->table('gateway_tool_invocations')->where('binding_id','IN',$bindingIds)->where('result_delivered_at',null)->count();
+            $counts[] = $db->table('gateway_tool_invocations')->where('binding_id','IN',$bindingIds)->where('result_json',null)->count();
+            $counts[] = $db->table('gateway_mcp_activities')->where('binding_id','IN',$bindingIds)->where('status','active')->count();
+        }
+        foreach ($counts as $count) {
+            if (!is_numeric($count)) throw new GatewayError('storage_unavailable','Checkpoint source work could not be read.',503);
+            if ((int)$count !== 0) return null;
+        }
+        return $source;
+    }
+
     /** Keep ephemeral caller fields out of the immutable JSON used for compare-and-swap. */
     private static function persistedSnapshot(array $snapshot): array
     {
