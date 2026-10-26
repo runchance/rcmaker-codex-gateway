@@ -3217,8 +3217,8 @@ final class TaskLedger
     {
         $retirement = SDB(null, 'medoo', 'sqlite')->table('gateway_surface_retirements')
             ->where('surface_id', $surfaceId)->find('state');
-        // Tracked pages close only through TaskPageRetirement::closed(), which records
-        // the confirmed stop and clears this target in the same transaction.
+        // Tracked pages clear only after a durable retirement closure receipt, from
+        // confirmed Stop or an absent staging page proved never executable.
         if (is_array($retirement) && $retirement['state'] !== 'closed') return;
         if ($retirement === false) throw new GatewayError('storage_unavailable', 'Retired page stop state could not be read.', 503);
         $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces')->where('id', $surfaceId)->where('status', 'retired')->update([

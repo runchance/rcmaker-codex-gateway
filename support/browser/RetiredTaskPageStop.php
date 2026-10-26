@@ -48,6 +48,8 @@ final class RetiredTaskPageStop
                         $this->finishClosed($id, $snapshot);
                     } elseif (!empty($snapshot['empty_page'])) {
                         if (TaskPageRetirement::confirmStopped($snapshot)) $this->finishClosed($id, $snapshot);
+                    } elseif (TaskPageRetirement::closeMissingInertStage($snapshot)) {
+                        $this->finishClosed($id, $snapshot, true);
                     } else $this->recover($id);
                     return;
                 }
@@ -219,10 +221,10 @@ final class RetiredTaskPageStop
         $this->observers[$id]['next_at'] = microtime(true) + $delay;
     }
 
-    /** Publish confirmed closure before clearing the old page's disposable monitor frames. */
-    private function finishClosed(string $id, array $snapshot): void
+    /** Publish confirmed physical closure, including an already-recorded absent inert-stage proof. */
+    private function finishClosed(string $id, array $snapshot, bool $recorded = false): void
     {
-        if (!TaskPageRetirement::closed($snapshot)) return;
+        if (!$recorded && !TaskPageRetirement::closed($snapshot)) return;
         $this->release($id);
         if ($this->onClosed !== null) {
             try { ($this->onClosed)((string)($snapshot['origin_surface_id'] ?? $id)); }
