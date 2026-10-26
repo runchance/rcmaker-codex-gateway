@@ -90,9 +90,13 @@ final class SteeringContext
             $submitted = $db->table('gateway_response_jobs')->where('surface_id', $surface['id'])
                 ->where('submit_intent_at', '<>', null)->count();
             if (!is_numeric($submitted)) throw new GatewayError('storage_unavailable', '插话原页提交记录暂不可读取。', 503);
-            // There is no remote history to resend before this page's first submission.
-            // Supersede the unsent request using the existing first-send reservation path.
-            if ((int) $submitted === 0) return $spec;
+            if ((int) $submitted === 0) {
+                if (ContextCompaction::retainedResumePage($source, $surface)) {
+                    return self::preparePendingCheckpointUpdateUnlocked($spec, $source, $surface);
+                }
+                // Only a genuinely new document has no remote history before first submission.
+                return $spec;
+            }
         }
         if (!is_array($source) || !is_array($surface) || !is_array($epoch) || !is_array($task)
             || $source['task_id'] !== $taskId || $source['operation_kind'] !== 'response'
@@ -161,6 +165,51 @@ final class SteeringContext
         $spec['compaction_epoch'] = $epoch['compaction_epoch'];
         $spec['browser_lease_key'] = $surface['lease_key'];
         $spec['prompt'] = ContextHistory::plainPrompt($delta);
+        return $spec;
+    }
+
+    /**
+     * Coalesce human updates before a proven checkpoint resume's first Web submission.
+     * The new logical surface already owns the old document; zero new submissions is not an empty chat.
+     * Caller has verified task/model/epoch and the existing retained checkpoint-page proof.
+     * @return array Same-page checkpoint transport, retaining every unsent human requirement.
+     * @throws GatewayError On changed history or any already accepted host/MCP work.
+     */
+    private static function preparePendingCheckpointUpdateUnlocked(array $spec, array $source, array $surface): array
+    {
+        $db = SDB(null,'medoo','sqlite');
+        if (!empty($source['mcp_binding_id'])) {
+            $binding = $db->table('gateway_mcp_bindings')->where('id',$source['mcp_binding_id'])->find('status,sent_at,started_at');
+            $calls = $db->table('gateway_tool_invocations')->where('binding_id',$source['mcp_binding_id'])->count();
+            $activities = $db->table('gateway_mcp_activities')->where('binding_id',$source['mcp_binding_id'])->count();
+            if (!is_numeric($calls) || !is_numeric($activities)) throw new GatewayError('storage_unavailable','Pending checkpoint tools could not be read.',503);
+            if (!is_array($binding) || $binding['status'] !== 'awaiting_start' || $binding['sent_at'] !== null
+                || $binding['started_at'] !== null || (int)$calls !== 0 || (int)$activities !== 0) {
+                throw new GatewayError('tool_outcome_pending','The pending checkpoint resume already has accepted tool activity.',409);
+            }
+        }
+        $known = json_decode($source['context_json'],true,128,JSON_THROW_ON_ERROR);
+        $full = json_decode($spec['full_context_json'],true,128,JSON_THROW_ON_ERROR);
+        $physical = json_decode($source['transport_context_json'],true,128,JSON_THROW_ON_ERROR);
+        if (!is_array($physical) || !is_array($physical['messages'] ?? null)
+            || ContextHistory::canonical(array_slice($full['messages'],0,count($known['messages']))) !== ContextHistory::canonical($known['messages'])
+            || ContextHistory::canonical(array_slice($full['system'],0,count($known['system']))) !== ContextHistory::canonical($known['system'])) {
+            throw new GatewayError('steering_history_mismatch','The pending checkpoint history changed; no Web message was sent.',409);
+        }
+        $physical['messages'] = array_merge($physical['messages'],array_slice($full['messages'],count($known['messages'])));
+        $physical['system'] = array_merge($physical['system'],array_slice($full['system'],count($known['system'])));
+        $physical['continuation']['current_tool_environment_sha256'] = $spec['tool_environment_hash'];
+        $budget = json_decode($source['budget_json'],true,128,JSON_THROW_ON_ERROR);
+        $spec['budget']['postcompact_page'] = array_replace($budget['postcompact_page'],['request_hash'=>$spec['request_hash']]);
+        // Use the existing same-page reservation flag, but keep the checkpoint proof as the
+        // persisted transport type. The worker resumes the checkpoint rather than stopping an unsent message.
+        $spec['steering_delta'] = true;
+        $spec['postcompact_user_input'] = true;
+        $spec['context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($physical);
+        $spec['continuation_source_response_id'] = $source['continuation_source_response_id'];
+        $spec['compaction_epoch'] = $source['compaction_epoch'];
+        $spec['browser_lease_key'] = $surface['lease_key'];
+        $spec['prompt'] = ContextHistory::plainPrompt($physical);
         return $spec;
     }
 

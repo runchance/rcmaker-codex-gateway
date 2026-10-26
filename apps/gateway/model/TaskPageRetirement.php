@@ -216,6 +216,8 @@ final class TaskPageRetirement
                         && Schema::transaction(static fn(): bool => self::releaseTransferredUnlocked($source,$destination['id']))) continue;
                 }
             }
+            $checkpointHashes = self::checkpointControlHashes($snapshot, $surface);
+            if ($checkpointHashes !== []) $snapshot['checkpoint_control_hashes'] = $checkpointHashes;
             $result[] = $snapshot + ['state'=>$row['state'], 'snapshot_hash'=>hash('sha256',$row['snapshot_json']), 'surface'=>$surface];
         }
         return $result;
@@ -334,6 +336,8 @@ final class TaskPageRetirement
             $actual = $key === 'url' ? (self::savedUrl((string)$surface['url']) ?? (string)$surface['url']) : (string)($surface[$key] ?? '');
             if ((string)$actual !== (string)($snapshot[$key] ?? '')) return false;
         }
+        if (isset($snapshot['checkpoint_control_hashes'])
+            && $snapshot['checkpoint_control_hashes'] !== self::checkpointControlHashes($snapshot,$surface)) return false;
         return !self::transferredUnlocked($surface,self::savedUrl((string)$snapshot['url']));
     }
 
@@ -551,8 +555,65 @@ final class TaskPageRetirement
     /** Keep ephemeral caller fields out of the immutable JSON used for compare-and-swap. */
     private static function persistedSnapshot(array $snapshot): array
     {
-        unset($snapshot['state'],$snapshot['snapshot_hash'],$snapshot['surface']);
+        unset($snapshot['state'],$snapshot['snapshot_hash'],$snapshot['surface'],$snapshot['checkpoint_control_hashes']);
         return $snapshot;
+    }
+
+    /**
+     * Derive a read-only summary-message witness for an unsent retained checkpoint lease.
+     * Old snapshots pin a new host token that never reached the page. Use only the consumed
+     * handoff's exact hash, verified against its committed checkpoint and original document.
+     * No snapshot, token, receipt, Stop state or task ownership is changed by this upgrade path.
+     * @return list<string> Verified control hashes, or empty for any unproved ancestry/activity.
+     */
+    private static function checkpointControlHashes(array $snapshot, array $surface): array
+    {
+        if (($snapshot['chat_mode'] ?? '') !== 'temporary' || empty($snapshot['source_response_id'])
+            || $surface['status'] !== 'retired') return [];
+        $db = SDB(null,'medoo','sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id',$snapshot['source_response_id'])->find(
+            'id,task_id,surface_id,epoch_id,operation_kind,request_hash,budget_json,compaction_epoch,continuation_source_response_id,submit_intent_at,accepted_at,mcp_binding_id');
+        if (!is_array($source) || $source['task_id'] !== $snapshot['task_id']
+            || $source['operation_kind'] !== 'response'
+            || $source['surface_id'] !== $surface['id'] || $source['epoch_id'] !== $surface['epoch_id']
+            || $source['submit_intent_at'] !== null || $source['accepted_at'] !== null) return [];
+        $proof = json_decode((string)$source['budget_json'],true)['postcompact_page'] ?? null;
+        if (!is_array($proof) || array_diff(['source_response_id','source_surface_id','source_epoch_id','checkpoint_id','fencing_version'],array_keys($proof)) !== []
+            || ($proof['request_hash'] ?? '') !== $source['request_hash']
+            || ($proof['source_response_id'] ?? '') !== $source['continuation_source_response_id']
+            || ($proof['target_id'] ?? '') !== $surface['target_id']
+            || ($proof['document_nonce'] ?? '') !== $surface['document_nonce']
+            || (int)$surface['fencing_version'] <= (int)($proof['fencing_version'] ?? 0)) return [];
+        $compact = $db->table('gateway_response_jobs')->where('id',$proof['source_response_id'])->find(
+            'id,task_id,surface_id,epoch_id,status,operation_kind,submitted_document_nonce,compact_id');
+        $origin = $db->table('gateway_browser_surfaces')->where('id',$proof['source_surface_id'])->find('task_id,epoch_id,status,target_id,document_nonce');
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id',$proof['checkpoint_id'])->find();
+        $handoff = $db->table('gateway_compaction_handoffs')->where('compact_response_id',$proof['source_response_id'])
+            ->find('checkpoint_id,task_id,state,token_hash,accepted_at,consumed_at');
+        if (!is_array($compact) || $compact['task_id'] !== $snapshot['task_id'] || $compact['status'] !== 'completed'
+            || $compact['operation_kind'] !== 'compact_v2' || $compact['surface_id'] !== $proof['source_surface_id']
+            || $compact['epoch_id'] !== $proof['source_epoch_id'] || $compact['compact_id'] !== $proof['checkpoint_id']
+            || $compact['submitted_document_nonce'] !== $surface['document_nonce']
+            || !is_array($origin) || $origin['status'] !== 'retired' || $origin['target_id'] !== null
+            || $origin['task_id'] !== $snapshot['task_id'] || $origin['epoch_id'] !== $proof['source_epoch_id']
+            || $origin['document_nonce'] !== $surface['document_nonce']
+            || !is_array($checkpoint) || $checkpoint['response_id'] !== $compact['id'] || $checkpoint['task_id'] !== $snapshot['task_id']
+            || !ContextCompaction::matchesCommittedEpoch($checkpoint,$source['compaction_epoch'])
+            || !is_array($handoff) || $handoff['state'] !== 'consumed' || empty($handoff['accepted_at']) || empty($handoff['consumed_at'])
+            || $handoff['task_id'] !== $snapshot['task_id'] || $handoff['checkpoint_id'] !== $checkpoint['id']
+            || preg_match('/\A[a-f0-9]{64}\z/D',(string)$handoff['token_hash']) !== 1) return [];
+        $submitted = $db->table('gateway_response_jobs')->where('surface_id',$surface['id'])->where('submit_intent_at','<>',null)->count();
+        if (!is_numeric($submitted)) throw new GatewayError('storage_unavailable','Checkpoint page submissions could not be read.',503);
+        if ((int)$submitted !== 0) return [];
+        if (!empty($source['mcp_binding_id'])) {
+            $binding = $db->table('gateway_mcp_bindings')->where('id',$source['mcp_binding_id'])->find('status,sent_at,started_at');
+            $calls = $db->table('gateway_tool_invocations')->where('binding_id',$source['mcp_binding_id'])->count();
+            $active = $db->table('gateway_mcp_activities')->where('binding_id',$source['mcp_binding_id'])->where('status','active')->count();
+            if (!is_numeric($calls) || !is_numeric($active)) throw new GatewayError('storage_unavailable','Checkpoint page tools could not be read.',503);
+            if (!is_array($binding) || !in_array($binding['status'],['awaiting_start','revoked'],true)
+                || $binding['sent_at'] !== null || $binding['started_at'] !== null || (int)$calls !== 0 || (int)$active !== 0) return [];
+        }
+        return [(string)$handoff['token_hash']];
     }
 
     /** Serialize only controlled retirement metadata, never context or plaintext capability tokens. */

@@ -579,7 +579,7 @@ JS);
     public static function retiredStopExpression(array $snapshot, bool $click, bool $accountVerified): string
     {
         $expected = array_intersect_key($snapshot, array_flip(['surface_id','url','chat_mode','baseline_users',
-            'accepted_initial','initial_binding_marker','turn_token_hashes','transaction_hashes','empty_page']));
+            'accepted_initial','initial_binding_marker','turn_token_hashes','transaction_hashes','checkpoint_control_hashes','empty_page']));
         $expected += ['click'=>$click, 'account_verified'=>$accountVerified];
         return self::wrap('const retiredStop=' . json_encode($expected, JSON_THROW_ON_ERROR) . ";\n" . <<<'JS'
 return (async()=>{
@@ -591,8 +591,9 @@ return (async()=>{
  const temporary=e.chat_mode==='temporary'&&temporaryChatPage(actual.pathname,actual.search);
  const text=[latest?.innerText,latest?.textContent].map(value=>String(value||'')).join('\n');
  const candidates=[...new Set([...(text.match(/\b(?:turn|request)_[A-Za-z0-9_-]{16,}\b/g)||[]),
+     ...(text.match(/\bcontrol_[a-f0-9]{64}\b/g)||[]),
      ...(text.match(/\bctx_[a-f0-9]{16,}\b/gi)||[])])];
- const hashes=new Set([...(e.turn_token_hashes||[]),...(e.transaction_hashes||[])]);
+ const hashes=new Set([...(e.turn_token_hashes||[]),...(e.transaction_hashes||[]),...(e.checkpoint_control_hashes||[])]);
  let witnessed=!!e.initial_binding_marker&&text.includes(e.initial_binding_marker);
  for(const candidate of candidates){
    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(candidate));
