@@ -19,6 +19,7 @@ RCMAKER Codex Gateway 连接本机 Codex 与 ChatGPT 网页模型。你在 Codex
 | 看得见的执行过程 | 查看最多五个任务页面、任务时间线，复制或下载完整发送原文 |
 | 按账号识别模型 | 检测可用网页模型与档位，通过 **RC (Web)** 后缀区分网关模型 |
 | 本机可视化控制台 | 管理登录、网络、上下文设置、界面语言与本机用量记录 |
+| zstd 请求压缩（v1.6.0 起支持） | [Releases](https://github.com/runchance/rcmaker-codex-gateway/releases) 发布的二进制包内置支持；源码部署视 PHP 的 zstd 扩展及解码自检结果而定 |
 | 二进制或源码部署 | 直接运行独立程序，或使用 PHP 源码；持久数据保存在程序外部 |
 
 ![RCMAKER 启动控制台：逐项检查运行条件](docs/images/user-guide/zh-CN/rcmaker-console.png)

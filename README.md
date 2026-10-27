@@ -19,6 +19,7 @@ Built with the [RCMAKER PHP framework](https://github.com/runchance/rcmaker).
 | Visible task activity | Watch up to five task pages, inspect timelines, and copy or download the full sent messages |
 | Account-aware model selection | Detect available Web models and modes; identify gateway entries by their **RC (Web)** suffix |
 | A local control panel | Configure sign-in, network access, context settings, language and local usage tracking |
+| zstd request compression (v1.6.0+) | Binary packages from [Releases](https://github.com/runchance/rcmaker-codex-gateway/releases) include support; source deployments depend on PHP's zstd extension and the decoder self-test |
 | Standalone or source deployment | Use a packaged executable, or run the PHP source; keep persistent data outside the binary |
 
 ![RCMAKER startup console showing readiness checks](docs/images/user-guide/en/rcmaker-console.png)
