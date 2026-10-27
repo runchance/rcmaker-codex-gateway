@@ -1381,7 +1381,7 @@ final class ContextCompaction
 
     /**
      * Retire only a failed active-source checkpoint whose one-shot handoff was never accepted.
-     * Recover failed submitted handoffs or proved unsent model-selection failures only after the incoming history
+     * Recover failed submitted handoffs or proved unsent model/Connector preparation failures only after the incoming history
      * proves the delivered host results. The caller owns the task-routing transaction and
      * carries that readable history into a fresh task; old Web work and host calls are not replayed.
      * @param string $taskId Task owning the failed checkpoint selected by the conversation routing transaction.
@@ -1436,9 +1436,15 @@ final class ContextCompaction
                 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'CHATGPT_MODEL_UNAVAILABLE', 'CHATGPT_PRO_QUOTA_EXHAUSTED'], true)
             && $handoff['submit_intent_at'] === null
             && $job['submit_intent_at'] === null && $job['accepted_at'] === null;
-        if (!$unsentModelFailure && ($task['status'] !== 'needs_attention' || $handoff['state'] !== 'submit_intent'
+        // Older checkpoint menu timeouts marked the outcome unknown despite never submitting
+        // the message. Prove the prepared state and all send audits before releasing that slot.
+        $unsentConnectorFailure = $failureCode === 'CHATGPT_CONNECTOR_UNAVAILABLE'
+            && $handoff['state'] === 'prepared' && $handoff['submit_intent_at'] === null
+            && $job['submit_intent_at'] === null && $job['accepted_at'] === null;
+        $unsentPreparationFailure = $unsentModelFailure || $unsentConnectorFailure;
+        if (!$unsentPreparationFailure && ($task['status'] !== 'needs_attention' || $handoff['state'] !== 'submit_intent'
             || !in_array($failureCode, ['compaction_handoff_missing', 'compaction_handoff_page_unavailable'], true))) return false;
-        if ($unsentModelFailure) {
+        if ($unsentPreparationFailure) {
             $outbound = $db->table('gateway_web_messages')->where('response_id', (string) $job['id'])
                 ->where('direction', 'outbound')->count();
             if (!is_numeric($outbound) || (int) $outbound !== 0) return false;
@@ -1447,11 +1453,14 @@ final class ContextCompaction
         $epoch = $db->table('gateway_task_epochs')->where('id', (string) $job['epoch_id'])->find();
         $surface = $db->table('gateway_browser_surfaces')->where('id', (string) $job['surface_id'])->find();
         if (!is_array($turn) || !is_array($epoch) || !is_array($surface)
-            || $turn['status'] !== ($unsentModelFailure ? 'failed' : 'needs_attention') || $turn['error_code'] !== $failureCode
+            || $turn['status'] !== ($unsentPreparationFailure && $task['status'] === 'active' ? 'failed' : 'needs_attention')
+            || $turn['error_code'] !== $failureCode
             || (string) $turn['response_id'] !== (string) $job['id']
-            || !in_array($epoch['status'], $unsentModelFailure ? ['active', 'retired'] : ['needs_attention'], true)
-            || !in_array($surface['status'], $unsentModelFailure ? ['ready', 'retired'] : ['needs_attention', 'retired'], true)
-            || ($unsentModelFailure && $epoch['status'] === 'retired' && $surface['status'] !== 'retired')
+            || !in_array($epoch['status'], $unsentPreparationFailure
+                ? ($task['status'] === 'active' ? ['active', 'retired'] : ['needs_attention', 'retired']) : ['needs_attention'], true)
+            || !in_array($surface['status'], $unsentPreparationFailure && $task['status'] === 'active'
+                ? ['ready', 'retired'] : ['needs_attention', 'retired'], true)
+            || ($unsentPreparationFailure && $epoch['status'] === 'retired' && $surface['status'] !== 'retired')
             || (string) $task['current_epoch_id'] !== (string) $epoch['id']) return false;
         $activeJobs = $db->table('gateway_response_jobs')->where('task_id', $taskId)
             ->where('status', 'IN', ['queued', 'running'])->count();
@@ -1484,7 +1493,7 @@ final class ContextCompaction
         if (!$updated || $updated->rowCount() !== 1) {
             throw new GatewayError('compaction_conflict', '失败摘要检查点恢复所有权发生变化。', 409);
         }
-        if ($surface['status'] === 'needs_attention' || ($unsentModelFailure && $surface['status'] === 'ready')) {
+        if ($surface['status'] === 'needs_attention' || ($unsentPreparationFailure && $surface['status'] === 'ready')) {
             $retired = $db->table('gateway_browser_surfaces')->where('id', (string) $surface['id'])
                 ->where('status', $surface['status'])->update([
                     'status' => 'retired', 'session_id' => null,

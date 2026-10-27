@@ -46,6 +46,8 @@ final class BrowserRuntime
     private const IDLE_CAPABILITY_REFRESH_SECONDS = BrowserState::IDLE_CAPABILITY_REFRESH_SECONDS;
     /** Fresh Temporary Chat pages can expose the composer before the model picker hydrates. */
     private const TASK_MODEL_CONTROL_READY_SECONDS = 30.0;
+    /** App catalog loading and native selection rendering are asynchronous, within the turn deadline. */
+    private const TASK_CONNECTOR_READY_SECONDS = 60.0;
     /** First-profile recovery requires a continuous absence of initialization progress. */
     private const COLD_PROFILE_IDLE_RETRY_SECONDS = 45.0;
 
@@ -5778,7 +5780,8 @@ JS;
                                                 return;
                                             }
                                             // Keep a valid query in place while the asynchronous catalog loads.
-                                            $deadline = min((float)$this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0);
+                                            $deadline = min((float)$this->chatGptTurns[$responseId]['deadline'],
+                                                microtime(true) + self::TASK_CONNECTOR_READY_SECONDS);
                                             $this->waitTaskConnectorMenu($responseId, $connectorName, 3, $deadline, $documentNonce, $isCurrent);
                                         }, 15.0);
                                 }, 30.0, $connectorName, $isCurrent);
@@ -5798,7 +5801,15 @@ JS;
                             function ($insertError) use ($responseId, $connectorName, $attempt, $documentNonce): void {
                                 // A lost CDP acknowledgement may still have opened the menu.
                                 // Read the current menu before deciding to clear/retry the draft.
-                                $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, microtime(true) + 2.5, $documentNonce);
+                                $turn = $this->chatGptTurns[$responseId] ?? null;
+                                if (!is_array($turn) || ($turn['document_nonce'] ?? '') !== $documentNonce) return;
+                                // A retained checkpoint needs the App catalog again. Keep its query
+                                // while network results/rendering settle, as saved-chat preparation does.
+                                $checkpoint = ($turn['compaction_phase'] ?? null) === 'preparing';
+                                $deadline = min((float)$turn['deadline'],
+                                    microtime(true) + ($checkpoint ? self::TASK_CONNECTOR_READY_SECONDS : 2.5));
+                                $this->waitTaskConnectorMenu($responseId, $connectorName, $checkpoint ? 3 : $attempt,
+                                    $deadline, $documentNonce);
                             }, 5.0, $connectorName);
                     });
             });
@@ -6337,7 +6348,12 @@ JS;
                     $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $connectorName, $isCurrent): void {
                         if ($isCurrent !== null && !$isCurrent()) return;
                         // Enter may have selected the item even if its acknowledgement was lost.
-                        $this->waitTaskConnectorSelected($responseId, $connectorName, microtime(true) + ($isCurrent === null ? 3.0 : 30.0), $isCurrent);
+                        $turn = $this->chatGptTurns[$responseId] ?? null;
+                        if (!is_array($turn)) return;
+                        $checkpoint = ($turn['compaction_phase'] ?? null) === 'preparing';
+                        $deadline = min((float)$turn['deadline'],
+                            microtime(true) + ($checkpoint ? self::TASK_CONNECTOR_READY_SECONDS : ($isCurrent === null ? 3.0 : 30.0)));
+                        $this->waitTaskConnectorSelected($responseId, $connectorName, $deadline, $isCurrent);
                     });
                     return;
                 }
