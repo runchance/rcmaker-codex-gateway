@@ -6,6 +6,7 @@ window.GatewayTranslations = {
     "Codex 请求压缩": "Codex request compression",
     "当前 PHP 支持 zstd，Codex 请求压缩使用默认开启设置。": "This PHP runtime supports zstd. Codex request compression uses its enabled-by-default setting.",
     "检测到旧的请求压缩设置，可重新接入 Codex 以应用默认压缩。": "An older request compression override was detected. Reconnect Codex to use compression by default.",
+    "请保存工作并完全退出 Codex（包括后台进程），再重新打开，使请求压缩设置生效；只关闭聊天标签不会生效。": "Save your work, fully quit Codex (including background processes), and reopen it to apply the request compression settings. Closing a chat tab is not enough.",
     "从旧版本升级后，请保存工作并完全退出 Codex（包括后台进程），再重新打开；只关闭聊天标签不会生效。": "After upgrading from an older version, save your work, fully quit Codex (including background processes), and reopen it. Closing a chat tab is not enough.",
     "自动选择连接器的“始终允许”": "Automatically select Always allow for the connector",
     "仅为当前连接器保存 ChatGPT 支持的后续操作授权；Codex 的权限审批保持不变。": "Saves permission for supported future ChatGPT actions by this connector only. Codex approval rules still apply.",

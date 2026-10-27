@@ -160,6 +160,13 @@
             pending.textContent = I18n.t('正在自动刷新可用模型…'); container.append(pending);
         }
         renderModelChoices(container, codexStatus.models);
+        if (codexStatus.configured && codexStatus.request_compression?.zstd_available) {
+            const compression = document.createElement('p'); compression.className = 'model-compatibility-note';
+            compression.textContent = I18n.t(codexStatus.request_compression.uses_default
+                ? '当前 PHP 支持 zstd，Codex 请求压缩使用默认开启设置。'
+                : '检测到旧的请求压缩设置，可重新接入 Codex 以应用默认压缩。');
+            container.append(compression);
+        }
         if (codexStatus.models.some(model => Array.isArray(model.efforts) && model.efforts.includes('max'))) {
             const hint = document.createElement('p'); hint.className = 'model-compatibility-note';
             hint.textContent = I18n.t('网页 Pro 对应 Codex 的 Ultra 档；选择 Ultra 即可使用网页 Pro，无需开启 Max。');
@@ -178,10 +185,10 @@
         const compression = codexStatus.request_compression;
         const compressionNotice = byId('codex-compression-notice'), compressionDetail = byId('codex-compression-detail');
         if (compressionNotice && compressionDetail) {
-            compressionNotice.hidden = !codexStatus.configured || !compression?.zstd_available;
-            compressionDetail.textContent = I18n.t(compression?.uses_default
-                ? '当前 PHP 支持 zstd，Codex 请求压缩使用默认开启设置。'
-                : '检测到旧的请求压缩设置，可重新接入 Codex 以应用默认压缩。');
+            // Client contact clears the existing restart state; capability alone is not a pending action.
+            compressionNotice.hidden = routeChanged || !codexStatus.configured || !compression?.zstd_available
+                || !compression.uses_default || codexStatus.state !== 'restart_required';
+            compressionDetail.textContent = I18n.t('当前 PHP 支持 zstd，Codex 请求压缩使用默认开启设置。');
         }
         renderCodexDetails();
     }

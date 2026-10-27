@@ -315,7 +315,7 @@ php index.php start
 
 **配置接入标志：**`# RCMAKER BEGIN` 和 `# RCMAKER END` 两条实际注释用于识别已有接入，兼容旧版本的标识后缀。初始化还会检查当前路由是否指向本次运行的 RCMAKER，以及相关设置是否兼容。如果其他软件改过路由，重新预览并保存接入即可自动替换；原配置会备份，无关设置保留，状态检查不会重写文件。
 
-**请求压缩：**当前 PHP 通过 zstd 解码自检时，新接入配置不再写入 `features.enable_request_compression`，使用 Codex [默认开启压缩的行为](https://learn.chatgpt.com/docs/config-file/config-reference)。升级后，独立维护进程会自动移除现有网关配置中的旧压缩覆盖项，保留 API 路由、其他设置及准确备份。控制台会提示：请保存工作，完全退出 Codex（包括后台进程）后重新打开。没有 zstd 能力的运行时仍显式写入 `false`。旧客户端仍可发送未压缩请求。压缩正文和解压后正文均保留 256 MiB 上限；损坏或不完整的压缩数据会在创建任务前被拒绝。
+**请求压缩：**当前 PHP 通过 zstd 解码自检时，新接入配置不再写入 `features.enable_request_compression`，使用 Codex [默认开启压缩的行为](https://learn.chatgpt.com/docs/config-file/config-reference)。升级后，独立维护进程会自动移除现有网关配置中的旧压缩覆盖项，保留 API 路由、其他设置及准确备份。控制台仅在接入状态为待重启时显示压缩重启提醒：请保存工作，完全退出 Codex（包括后台进程）后重新打开。检测到客户端重新接入后，提醒自动收起；压缩状态仍可在 Codex 接入详情中查看。没有 zstd 能力的运行时仍显式写入 `false`。旧客户端仍可发送未压缩请求。压缩正文和解压后正文均保留 256 MiB 上限；损坏或不完整的压缩数据会在创建任务前被拒绝。
 
 Codex 会根据认证和传输模式决定是否实际压缩某次请求；开启设置不代表每个请求都会压缩。
 

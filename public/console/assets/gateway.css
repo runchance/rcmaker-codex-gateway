@@ -43,9 +43,11 @@ p { line-height: 1.65; }
 .context-policy-summary dd { font-size: 13px; }
 .context-budget-table th:not(:first-child), .context-budget-table td:not(:first-child) { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .context-budget-table td:first-child { min-width: 150px; overflow-wrap: anywhere; line-height: 1.6; }
-.codex-restart-notice { border: 2px solid #d89429; padding: 20px 24px; }
-.codex-restart-notice h2 { margin-bottom: 8px; font-size: 20px; }
-.codex-restart-notice p { margin: 8px 0 12px; }
+.codex-restart-notice { border: 1px solid #d89429; }
+.codex-restart-notice, #codex-compression-notice { padding: 14px 16px; font-size: 13px; line-height: 1.6; white-space: normal; }
+.codex-restart-notice h2, #codex-compression-notice h2 { margin: 0 0 6px; font-size: 15px; line-height: 1.5; }
+.codex-restart-notice p, #codex-compression-notice p { margin: 6px 0 0; }
+.codex-restart-notice > .layui-btn { margin-top: 10px; }
 .codex-restart-dialog, .task-delete-confirm { padding: 20px 24px; line-height: 1.8; }
 .task-storage-bar { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 12px 16px; margin: 12px 0 20px; background: #fff; border: 1px solid var(--gateway-line); border-radius: 8px; color: var(--gateway-muted); }
 .task-storage-bar [role="status"] { color: var(--gateway-accent); }
