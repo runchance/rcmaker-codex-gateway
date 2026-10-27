@@ -404,6 +404,8 @@ Send may remain briefly disabled after text entry. Ordinary and attachment messa
 
 A delayed Web acknowledgement alone does not block compaction when the tool result is complete and a later round in the same task has verifiably consumed that exact result. The accepted summary handoff retains this evidence so the same old acknowledgement cannot block subsequent compactions. The gateway does not forge delivery acknowledgements or repeat tools. Running tools, unknown outcomes and inconsistent receipts still require confirmation.
 
+This also applies across completed turns in both Temporary Chat and saved chats. The old turn and capability must be complete, with no active work, an exact completed-successor receipt and coverage in the current history or a verified checkpoint. A missing Web acknowledgement alone is not unfinished tool execution.
+
 If compaction is still rejected, export the diagnostic logs. They record the admission phase, exact code location, tool-state counts, bounded task/turn identifiers and checkpoint state to distinguish active tools, delayed acknowledgements and summary conflicts. Conversation text, tool results and capability tokens are excluded. Failed diagnostic reads still preserve the original guard location without changing the task or resending messages.
 
 If focusing the reasoning slider returns an uncertain result, the gateway reads the current control and value on the same owned page before changing effort. Temporary control remounts and lost focus acknowledgements can recover within the preparation budget; disabled or ambiguous controls still prevent submission. Focus retries do not resend messages or repeat relative arrow keys.

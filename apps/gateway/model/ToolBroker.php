@@ -2243,8 +2243,8 @@ final class ToolBroker
 
     /**
      * Recognize a completed historical receipt whose old MCP acknowledgement was lost.
-     * Only an ordinary chat's committed turn, distinct from any current source turn, may
-     * use the completed-successor proof. Recovery and compact admission must both retain
+     * Read-only compaction in either chat mode may use a distinct committed turn's
+     * completed-successor proof. Other recovery retains its ordinary-chat scope. Both retain
      * the exact result in their current context/checkpoint.
      * This read-only check neither acknowledges delivery nor revives the old capability.
      * @param array $call Persisted invocation with its original result and delivery fields.
@@ -2260,7 +2260,8 @@ final class ToolBroker
             || empty($call['binding_id']) || empty($call['turn_id']) || empty($call['response_id'])
             || $call['binding_id'] === ($job['mcp_binding_id'] ?? null)
             || $call['turn_id'] === ($job['durable_turn_id'] ?? null)
-            || (TaskWebChat::state($taskId)['mode'] ?? 'temporary') !== 'regular') return false;
+            || (!in_array($job['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+                && (TaskWebChat::state($taskId)['mode'] ?? 'temporary') !== 'regular')) return false;
 
         $db = SDB(null, 'medoo', 'sqlite');
         $binding = $db->table('gateway_mcp_bindings')->where('id', $call['binding_id'])->find();
