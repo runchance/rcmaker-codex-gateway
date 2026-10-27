@@ -1433,7 +1433,7 @@ final class ContextCompaction
         $failureCode = (string)($error['error']['code'] ?? '');
         $unsentModelFailure = $task['status'] === 'active' && $handoff['state'] === 'prepared'
             && in_array($failureCode, ['CHATGPT_MODEL_SELECTION_DRIFT', 'CHATGPT_MODEL_SELECTION_UNPROVEN',
-                'CHATGPT_MODEL_UNAVAILABLE', 'CHATGPT_PRO_QUOTA_EXHAUSTED'], true)
+                'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'CHATGPT_MODEL_UNAVAILABLE', 'CHATGPT_PRO_QUOTA_EXHAUSTED'], true)
             && $handoff['submit_intent_at'] === null
             && $job['submit_intent_at'] === null && $job['accepted_at'] === null;
         if (!$unsentModelFailure && ($task['status'] !== 'needs_attention' || $handoff['state'] !== 'submit_intent'

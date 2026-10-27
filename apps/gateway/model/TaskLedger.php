@@ -602,10 +602,10 @@ final class TaskLedger
             if (is_array($sourceJob)) {
                 $spec['regular_recovery_source_response_id'] = $sourceJob['id'];
                 $spec['regular_recovery_source_task_id'] = $taskId;
-                if ($sourceWaitingSuperseded && $newCheckpoint) {
+                if (($sourceWaitingSuperseded || $failedHandoffRecovered) && $newCheckpoint) {
                     // The same transaction proved every source receipt and revoked its
-                    // capability. The saved chat holds that source even though no final
-                    // assistant answer or successful checkpoint was ever produced.
+                    // capability, or verified the stopped source of a failed handoff.
+                    // The saved chat still holds that source without a successful checkpoint.
                     $spec['regular_compaction_recovery'] = ['source_response_id' => $sourceJob['id'],
                         'context_sha256' => hash('sha256', (string) $spec['full_context_json']),
                         'expanded_receipt_ids'=>$expandedReceiptIds];
