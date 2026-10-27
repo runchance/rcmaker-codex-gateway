@@ -414,7 +414,7 @@ const family_options=[...(picker?.querySelectorAll('[role="menuitemradio"]')||[]
     const label=modelFamilyLabel(el),raw=String(el.textContent||'').replace(/\s+/g,' ').trim();
     return {label:label.slice(0,120),notice:raw.startsWith(label)?raw.slice(label.length).trim().slice(0,240):'',checked:el.getAttribute('aria-checked'),disabled:el.getAttribute('aria-disabled')==='true'};
 });
-const owner=slider.closest('[role="menuitem"]');
+const owner=modelEffortSliderOwner(containers[0]);
 const described=el=>String(el?.getAttribute('aria-describedby')||'').split(/\s+/).filter(Boolean).map(id=>String(document.getElementById(id)?.textContent||'').replace(/\s+/g,' ').trim().slice(0,500)).filter(Boolean);
 const descriptions=[...new Set([...described(owner),...described(slider)])];
 const proRows=[...(picker?.querySelectorAll('[role="menuitemradio"]')||[])].filter(el=>{
@@ -428,7 +428,7 @@ const pro_supported=max-min+1>=5||family_options.filter(option=>/^Pro(?:$|[\s,ï¼
 const quota_labels=pro?[...new Set([String(pro.innerText||pro.textContent||'').replace(/\s+/g,' ').trim().slice(0,500),...described(pro)])].filter(Boolean):[];
 const ticks=[...containers[0].querySelectorAll('[data-selected]')];
 const effort_locks=ticks.length===max-min+1?ticks.map(el=>el.getAttribute('data-locked')==='true'?true:el.getAttribute('data-locked')==='false'?false:null):[];
-return {ok:true,open:true,account_plan:accountPlan(),min,max,value,option_count:max-min+1,extra_high_available:max-min+1>=4,pro_available:max-min+1>=5,pro_supported,family_options,descriptions,
+return {ok:true,open:true,owner_focused:document.activeElement===owner,account_plan:accountPlan(),min,max,value,option_count:max-min+1,extra_high_available:max-min+1>=4,pro_available:max-min+1>=5,pro_supported,family_options,descriptions,
     value_text:String(slider.getAttribute('aria-valuetext')||'').trim().slice(0,500),selected_disabled:slider.getAttribute('aria-disabled')==='true'||owner?.getAttribute('aria-disabled')==='true',
     pro_disabled:pro?.getAttribute('aria-disabled')==='true',pro_detail:quota_labels.join(' | '),quota_labels,effort_locks};
 JS));
@@ -478,7 +478,7 @@ JS));
         $container = json_encode(self::EFFORT_SLIDER_CONTAINER, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         return self::wrap(str_replace('__CONTAINER__', $container, <<<'JS'
 const containers=modelEffortContainers(__CONTAINER__);if(containers.length!==1)return {ok:false,code:'CHATGPT_EFFORT_SLIDER_MISSING'};
-const owner=containers[0].closest('[role="menuitem"]')||containers[0].querySelector('[role="menuitem"]')||containers[0];
+const owner=modelEffortSliderOwner(containers[0]);
 if(!(owner instanceof HTMLElement))return {ok:false,code:'CHATGPT_EFFORT_OWNER_MISSING'};
 if(!owner.hasAttribute('tabindex'))owner.setAttribute('tabindex','-1');owner.focus();return {ok:document.activeElement===owner,code:document.activeElement===owner?null:'CHATGPT_EFFORT_FOCUS_FAILED'};
 JS));
@@ -1910,6 +1910,8 @@ const modelEffortContainers=selector=>{
         return a.length===1&&b.length===1&&a[0]===b[0];
     }));
 };
+// Focus and readback must resolve the same keyboard owner after a wrapper remount.
+const modelEffortSliderOwner=container=>container.querySelector('[role="slider"]')?.closest('[role="menuitem"]')||container.closest('[role="menuitem"]')||container;
 const modelPickerMenu=()=>{
     const composer=visibleOne(COMPOSER),form=composer?.closest('form');
     const controls=[...(form?.querySelectorAll(MODEL_CONTROL)||[])].filter(modelRendered);

@@ -4903,8 +4903,9 @@ JS;
             });
     }
 
-    /** Move only to an explicitly available requested effort; never downgrade a blocked Pro request. */
-    private function moveTaskEffort(string $responseId, array $mode, array $slider, callable $after, bool $recover): void
+    /** Move only to an available effort; focusConfirmed requires a fresh, focused slider readback. */
+    private function moveTaskEffort(string $responseId, array $mode, array $slider, callable $after, bool $recover,
+        bool $focusConfirmed = false): void
     {
         if (is_string($mode['family'] ?? null) && !ChatGptTransport::familyChecked($slider, $mode['family'])) {
             $this->failModelSelection($responseId, 'CHATGPT_MODEL_FAMILY_DRIFT', 'ChatGPT 模型家族在切换档位时发生变化，未发送任务。', $recover);
@@ -4921,25 +4922,72 @@ JS;
             $this->closeTaskEffortMenu($responseId, $after, $recover);
             return;
         }
-        $this->evaluateModelSelection($responseId, WebModelPage::focusEffortSliderOwnerExpression(),
-            function ($error, $focused) use ($responseId, $mode, $slider, $after, $recover, $target, $current): void {
-                if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
-                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位滑块无法获得焦点。', $recover);
+        $move = function () use ($responseId, $mode, $after, $recover, $target, $current): void {
+            $key = $target > $current ? 'ArrowRight' : 'ArrowLeft';
+            $this->dispatchModelSelectionKey($responseId, $key, function ($keyError) use ($responseId, $mode, $after, $recover, $current, $key): void {
+                if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
+                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位无法切换。', $recover);
                     return;
                 }
-                $key = $target > $current ? 'ArrowRight' : 'ArrowLeft';
-                $this->dispatchModelSelectionKey($responseId, $key, function ($keyError) use ($responseId, $mode, $after, $recover, $current, $key): void {
-                    if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
-                        $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位无法切换。', $recover);
-                        return;
-                    }
-                    // Observe the exact effect of the relative key, including quota-driven range changes.
-                    $expected = $current + ($key === 'ArrowRight' ? 1 : -1);
-                    Timer::add(0.08, fn() => $this->observeTaskEffortMove($responseId, $mode, $current, $expected,
-                        $after, $recover, microtime(true) + 4.0), null, false);
-                });
+                // Observe the exact effect of the relative key, including quota-driven range changes.
+                $expected = $current + ($key === 'ArrowRight' ? 1 : -1);
+                Timer::add(0.08, fn() => $this->observeTaskEffortMove($responseId, $mode, $current, $expected,
+                    $after, $recover, microtime(true) + 4.0), null, false);
+            });
+        };
+        if ($focusConfirmed) { $move(); return; }
+        $this->evaluateModelSelection($responseId, WebModelPage::focusEffortSliderOwnerExpression(),
+            function ($error, $focused) use ($responseId, $mode, $after, $recover, $move): void {
+                if ($error === null && is_array($focused) && !empty($focused['ok'])) { $move(); return; }
+                // A lost CDP reply or a remounted Radix owner is not evidence that focus failed.
+                // Read the current owner and value before authorizing any relative key.
+                $deadline = min(microtime(true) + 15.0,
+                    (float)($this->chatGptTurns[$responseId]['deadline'] ?? INF));
+                $this->observeTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
             });
     }
+
+    /** Reconcile uncertain slider focus on the same owned page; retries never emit a model key or message. */
+    private function observeTaskEffortFocus(string $responseId, array $mode, callable $after, bool $recover,
+        float $deadline): void
+    {
+        if (!$this->modelSelectionActive($responseId)) return;
+        $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
+            function ($error, $slider) use ($responseId, $mode, $after, $recover, $deadline): void {
+                if (!$this->modelSelectionActive($responseId)) return;
+                if (microtime(true) >= $deadline) {
+                    $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+                    return;
+                }
+                if ($error === null && is_array($slider) && !empty($slider['ok'])
+                    && !empty($slider['owner_focused']) && empty($slider['selected_disabled'])) {
+                    $this->moveTaskEffort($responseId, $mode, $slider, $after, $recover, true);
+                    return;
+                }
+                $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+            });
+    }
+
+    /** Refocus only the unique slider owner within one preparation deadline; stale tasks cannot dispatch keys. */
+    private function retryTaskEffortFocus(string $responseId, array $mode, callable $after, bool $recover,
+        float $deadline): void
+    {
+        if (!$this->modelSelectionActive($responseId)) return;
+        if (microtime(true) >= $deadline) {
+            $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位滑块无法获得焦点。', $recover);
+            return;
+        }
+        Timer::add(0.15, function () use ($responseId, $mode, $after, $recover, $deadline): void {
+            if (!$this->modelSelectionActive($responseId)) return;
+            if (microtime(true) >= $deadline) {
+                $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+                return;
+            }
+            $this->evaluateModelSelection($responseId, WebModelPage::focusEffortSliderOwnerExpression(),
+                fn() => $this->observeTaskEffortFocus($responseId, $mode, $after, $recover, $deadline));
+        }, null, false);
+    }
+
     /** Read back one relative key's exact effect, allowing delayed rendering but never blind replay. */
     private function observeTaskEffortMove(string $responseId, array $mode, int $before, int $expected, callable $after, bool $recover, float $deadline): void
     {
