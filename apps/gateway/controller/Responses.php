@@ -119,13 +119,17 @@ final class Responses
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
             $this->logFreeModelSelectionFailure($error, $phase, $spec ?? [], is_array($body ?? null) ? $body : []);
-            if ($error->errorCode === 'compaction_conflict' && isset($spec)) {
+            if (in_array($error->errorCode, ['compaction_conflict', 'compaction_source_unavailable',
+                'compaction_busy', 'compaction_context_incomplete'], true) && isset($spec)) {
                 try {
-                    $this->logUnexpectedCreateFailure($error, $phase . ':compaction_conflict',
-                        ContextCompaction::conflictDiagnostics($spec));
+                    $facts = $error->errorCode === 'compaction_conflict'
+                        ? ContextCompaction::conflictDiagnostics($spec) : ContextCompaction::admissionDiagnostics($spec);
                 } catch (\Throwable) {
-                    // Diagnostics cannot replace or relax the original admission failure.
+                    $facts = ['diagnostics_unavailable'=>true];
                 }
+                // Even unavailable storage must leave the original guard's source and phase.
+                // Diagnostic reads run after rollback and never replace the actual HTTP error.
+                $this->logUnexpectedCreateFailure($error, $phase . ':' . $error->errorCode, $facts);
             }
             // Codex replaces these details with its generic context-window message.
             // Admission failures precede job creation, so keep structural evidence

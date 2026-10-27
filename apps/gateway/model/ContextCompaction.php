@@ -12,6 +12,56 @@ final class ContextCompaction
     private const PREFIX = 'rcmx1:';
 
     /**
+     * Describe an admission fence after its reservation transaction has rolled back.
+     * Read only bounded, indexed task metadata; never copy prompts, tool output or capability tokens.
+     * Counts distinguish genuinely pending host work from completed results awaiting a Web ACK.
+     * @param array $spec Parsed compact request with the original conversation key.
+     * @return array Structural evidence suitable for the existing diagnostic export log.
+     * @throws GatewayError If the diagnostic metadata cannot be read.
+     */
+    public static function admissionDiagnostics(array $spec): array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $taskId = 'task_' . substr((string) ($spec['task_key'] ?? ''), 0, 24);
+        $link = $db->table('gateway_task_conversations')->where('base_task_id', $taskId)->find('current_task_id');
+        if (is_array($link)) $taskId = (string) $link['current_task_id'];
+        $counts = [];
+        foreach (['registered', 'delivered', 'unknown'] as $status) {
+            $counts[$status] = $db->table('gateway_tool_invocations')->where('task_id', $taskId)->where('status', $status)->count();
+        }
+        $counts['completed_without_web_ack'] = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
+            ->where('status', 'completed')->where('result_delivered_at', null)->count();
+        foreach ($counts as $count) if (!is_numeric($count)) {
+            throw new GatewayError('storage_unavailable', 'Compaction diagnostic metadata is temporarily unavailable.', 503);
+        }
+        $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)
+            ->where('status', 'IN', ['awaiting_start', 'running'])->order([['rowid', 'DESC']])->limit(4)
+            ->select('id,turn_id,current_response_id,status');
+        $turns = $db->table('gateway_task_turns')->where('task_id', $taskId)
+            ->where('status', 'IN', ['queued', 'submit_intent', 'submitted', 'running', 'needs_attention'])
+            ->order([['rowid', 'DESC']])->limit(4)->select('id,response_id,status');
+        $calls = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
+            ->where('status', 'IN', ['registered', 'delivered', 'unknown'])
+            ->order([['rowid', 'ASC']])->limit(4)->select('id,binding_id,response_id,status,created_at,completed_at');
+        $receipts = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
+            ->where('status', 'completed')->where('result_delivered_at', null)
+            ->order([['rowid', 'ASC']])->limit(4)->select('id,binding_id,response_id,status,created_at,completed_at');
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
+            ->order([['rowid', 'DESC']])->limit(1)->find('id,response_id,state,created_at,committed_at');
+        if (!is_array($bindings) || !is_array($turns) || !is_array($calls) || !is_array($receipts)) {
+            throw new GatewayError('storage_unavailable', 'Compaction diagnostic metadata is temporarily unavailable.', 503);
+        }
+        return ['diagnostic_version'=>2, 'task_id'=>$taskId,
+            'operation_kind'=>(string)($spec['operation_kind'] ?? ''),
+            'request_tool_results'=>count((array)($spec['tool_outputs'] ?? [])),
+            'context_bytes'=>strlen((string)($spec['full_context_json'] ?? $spec['context_json'] ?? '')),
+            'call_counts'=>array_map('intval', $counts), 'sample_limit'=>4,
+            'pending_call_sample'=>$calls, 'unacknowledged_receipt_sample'=>$receipts,
+            'active_binding_sample'=>$bindings, 'active_turn_sample'=>$turns,
+            'latest_checkpoint'=>is_array($checkpoint) ? $checkpoint : null];
+    }
+
+    /**
      * Describe the actual rejected native request without logging any conversation text or tokens.
      * Run only after admission rolled back; this never reserves or releases a checkpoint.
      * @param array $spec Parsed request retained by the Responses controller.
