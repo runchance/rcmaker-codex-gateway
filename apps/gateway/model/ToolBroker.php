@@ -211,6 +211,7 @@ final class ToolBroker
                 && isset($ids[(string) $call['call_id']]);
             if (!$current && self::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)) continue;
             if (!$current && self::activeFailedWaitReceiptCoveredUnlocked($call, $spec, $source)) continue;
+            if (!$current && self::activeConsumedReceiptForCompactionUnlocked($call, $spec, $source, $binding)) continue;
             if (!$current && self::completedHistoricalReceiptForRecoveryUnlocked($call, $receiptContext)) continue;
             if ($current && ((string) $call['status'] === 'delivered'
                 || ((string) $call['status'] === 'completed' && $call['result_delivered_at'] === null))) {
@@ -2286,6 +2287,32 @@ final class ToolBroker
     }
 
     /**
+     * Accept an older consumed result while its successful MCP delivery ACK is still in flight.
+     * The active-source caller owns the reservation transaction and already verified the binding.
+     * Reuse the completed-successor proof, then require the exact receipt in this compact context.
+     * This does not change execution, ACK timestamps, RPC activity or failed-wait handoff behavior.
+     * @param array $call Persisted invocation outside the current native receipt batch.
+     * @param array $spec Incoming compact with its complete readable context.
+     * @param array $source Verified current tool-call response on the owned task page.
+     * @param array $binding Verified live capability of that source response.
+     * @return bool Whether an earlier result is proven consumed and safe for compact admission.
+     * @throws GatewayError If current receipt coverage is inconsistent or storage is unavailable.
+     */
+    private static function activeConsumedReceiptForCompactionUnlocked(array $call, array $spec,
+        array $source, array $binding): bool
+    {
+        if (($call['response_id'] ?? '') === $source['id']
+            || !self::completedReceiptCoveredByLaterRoundUnlocked($binding, $call)) return false;
+        $older = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $call['response_id'])
+            ->find('epoch_id,surface_id,round_no');
+        if (!is_array($older) || $older['epoch_id'] !== $source['epoch_id']
+            || $older['surface_id'] !== $source['surface_id']
+            || (int)$older['round_no'] >= (int)$source['round_no']) return false;
+        ContextCompaction::assertClosedWaitReceiptCoverageUnlocked($spec, $call, (string)$source['task_id']);
+        return true;
+    }
+
+    /**
      * Prove an older failed wait or an atomically sealed current source wait in the same turn.
      * The active-source caller already verified the current capability, page and native batch.
      * Exact native output and a typed closed wait are required; nothing is acknowledged here.
@@ -2325,10 +2352,13 @@ final class ToolBroker
     }
 
     /**
-     * Collect exact failed-wait results for the one-shot retained checkpoint message.
+     * Collect exact unacknowledged results for the one-shot retained checkpoint message.
      * These are already executed native results, not new tool requests or old RPC delivery.
+     * Include proven consumed receipts with an in-flight ACK as well as closed-wait receipts.
+     * Their exact content must enter the accepted checkpoint so later compact cycles cannot
+     * rediscover a stale ACK as unfinished work. This never marks a healthy wait as failed.
      * @param array $job Active compact job owning its current binding and checkpoint.
-     * @return list<array> Native receipt records that the old Web wait did not receive.
+     * @return list<array> Exact unacknowledged native receipts covered by this retained checkpoint.
      * @throws GatewayError On unreadable or inconsistent source receipt evidence.
      */
     public static function retainedCompactionFailedWaitReceiptsUnlocked(array $job): array
@@ -2349,7 +2379,8 @@ final class ToolBroker
         foreach ($rows as $call) {
             $result = json_decode((string)$call['result_json'], true);
             if (!empty($result['canonical_handoff_response_id'])
-                || !self::activeFailedWaitReceiptCoveredUnlocked($call, $job, $source)) continue;
+                || (!self::activeFailedWaitReceiptCoveredUnlocked($call, $job, $source)
+                    && !self::activeConsumedReceiptForCompactionUnlocked($call, $job, $source, $binding))) continue;
             $tool = self::catalogEntry($binding, (string)$call['wire_name']);
             $receipts[] = ['type'=>!empty($tool['tool_search']) ? 'tool_search_output'
                 : ($call['input_text'] !== null ? 'custom_tool_call_output' : 'function_call_output'),

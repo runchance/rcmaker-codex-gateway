@@ -1294,9 +1294,9 @@ final class ContextCompaction
         });
     }
 
-    /** Compose the control-only checkpoint prompt, including any verified failed-wait receipts. */
+    /** Compose the control-only checkpoint prompt, including verified unacknowledged receipts. */
     private static function retainedHandoffPrompt(string $controlToken, string $handoffId,
-        string $connectorName, array $failedWaitReceipts = []): string
+        string $connectorName, array $unacknowledgedReceipts = []): string
     {
         $call = json_encode(['turn_token' => $controlToken,
             'wire_name' => 'codex.control.compaction_handoff',
@@ -1309,9 +1309,9 @@ final class ContextCompaction
             . "- What remains to be done (clear next steps)\n"
             . "- Any critical data, examples, or references needed to continue\n\n"
             . "Be concise, structured, and focused on helping the next LLM seamlessly continue the work.\n"
-            . ($failedWaitReceipts === [] ? '' : "The following native results were already executed and verified, but their earlier Web wait failed. "
+            . ($unacknowledgedReceipts === [] ? '' : "The following native results were already executed and verified, but their earlier Web delivery was not acknowledged. "
                 . "Treat them as exact task evidence, include their relevant facts in the checkpoint, and do not repeat these calls.\n"
-                . "<codex_compaction_receipts>\n" . ContextHistory::canonical($failedWaitReceipts)
+                . "<codex_compaction_receipts>\n" . ContextHistory::canonical($unacknowledgedReceipts)
                 . "\n</codex_compaction_receipts>\n")
             . 'Submit the summary to the pending Codex task through the attached ' . $connectorName
             . " App using codex_tool_call with the binding below.\n"
