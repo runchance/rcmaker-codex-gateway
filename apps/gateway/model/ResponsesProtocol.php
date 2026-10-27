@@ -50,7 +50,14 @@ final class ResponsesProtocol
             || !is_array($schema['properties'] ?? null)
             || array_keys($schema['properties'] ?? []) !== ['suggestion']
             || !is_array($schema['properties']['suggestion'])
-            || ($schema['properties']['suggestion']['anyOf'] ?? null) !== [['type'=>'string'], ['type'=>'null']]) return null;
+            // Codex emits either nullable-string spelling. Match only equivalent unconstrained
+            // shapes so a contract that forbids null still follows normal model handling.
+            || !in_array($schema['properties']['suggestion'], [
+                ['anyOf'=>[['type'=>'string'], ['type'=>'null']]],
+                ['anyOf'=>[['type'=>'null'], ['type'=>'string']]],
+                ['type'=>['string','null']],
+                ['type'=>['null','string']],
+            ], true)) return null;
         $key = substr(hash('sha256', $raw), 0, 24);
         $responseId = 'resp_' . $key;
         $itemId = 'msg_' . $key;
