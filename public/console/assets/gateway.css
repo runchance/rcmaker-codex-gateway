@@ -346,7 +346,8 @@ p { line-height: 1.65; }
 .gateway-shell.pear-mini .layui-side #side { padding-top: 18px; }
 .gateway-shell.pear-mini .layui-side .layui-nav-item { margin: 3px 6px; width: calc(100% - 12px); }
 .gateway-shell.pear-mini .layui-side .layui-nav-tree { width: 60px !important; }
-.gateway-shell.pear-mini .layui-side .layui-nav-item > a { padding: 0; }
+.gateway-shell.pear-mini .layui-side .layui-nav-item > a { display: flex; align-items: center; justify-content: center; padding: 0; }
+.gateway-shell.pear-mini .layui-side .layui-nav-item > a > i { flex: 0 0 20px; width: 20px; height: 20px; margin: 0; line-height: 20px; text-align: center; }
 .gateway-shell #content > .layui-tab { margin: 0; }
 .gateway-shell #content .layui-tab-title { border-bottom-color: var(--gateway-line); background: #fff; }
 .gateway-shell #content .layui-tab-title > li { color: var(--gateway-muted); font-size: 13px; }
