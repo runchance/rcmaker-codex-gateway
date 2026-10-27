@@ -11,6 +11,7 @@ final class CodexIntegration
 {
     private const ROUTE_KEYS = [['openai_base_url'], ['model_provider'], ['model_catalog_json'], ['profile']];
     private const COMPRESSION_KEY = ['features', 'enable_request_compression'];
+    private const COMPRESSION_UPGRADE = 'compression_default_from:';
     /** Resolve the configured client home, separately from the private gateway runtime. */
     public static function configPath(): string
     {
@@ -105,7 +106,68 @@ final class CodexIntegration
         return ['id' => $row['id'] ?? null, 'state' => $status, 'path' => $path,
             'configured' => $configured, 'route_ready' => $routeReady, 'can_restore' => $canRestore,
             'expected_hash' => hash('sha256', $current), 'catalog_seen_at' => $routeReady ? ($row['catalog_seen_at'] ?? null) : null,
-            'response_seen_at' => $routeReady ? ($row['response_seen_at'] ?? null) : null, 'models' => self::publicModels(), 'account' => ModelCatalog::account()];
+            'response_seen_at' => $routeReady ? ($row['response_seen_at'] ?? null) : null,
+            'request_compression' => ['zstd_available'=>RequestCompression::zstdAvailable(),
+                'uses_default'=>$document->assignments(['features']) === [] && self::values($document,self::COMPRESSION_KEY) === []],
+            'models' => self::publicModels(), 'account' => ModelCatalog::account()];
+    }
+
+    /**
+     * Upgrade only an existing gateway route to Codex's default-on compression after decoder self-test.
+     * Called by the independent maintenance worker, never by status/preview or a model request.
+     * Keep the active route/ID, exact backup, unrelated settings and journal restoration ownership.
+     * @return array{changed:bool,restart_required:bool} No change for native, missing, complex or unsupported configs.
+     * @throws GatewayError On a concurrent edit, unavailable journal or failed atomic replacement.
+     */
+    public static function upgradeCompressionDefaults(?string $path = null): array
+    {
+        if (!RequestCompression::zstdAvailable()) return ['changed'=>false,'restart_required'=>false];
+        $path = self::canonicalPath($path ?? self::configPath());
+        if (!is_file($path)) return ['changed'=>false,'restart_required'=>false];
+        $preview = new CodexConfigDocument(self::readConfig($path));
+        if (!$preview->hasIntegrationMarkers() || !self::routesToGateway($preview)) return ['changed'=>false,'restart_required'=>false];
+        return self::locked($path, static function () use ($path): array {
+            $before = self::readConfig($path);
+            $row = self::record($path,$before);
+            // A compression-only publication has a separate before-file hash: before_text
+            // remains the user's recoverable native route, not a second gateway installation.
+            if (is_array($row) && $row['state'] === 'writing' && str_starts_with((string)$row['last_error'],self::COMPRESSION_UPGRADE)) {
+                $expected = substr($row['last_error'],strlen(self::COMPRESSION_UPGRADE));
+                if (hash_equals($expected,hash('sha256',$before))) {
+                    self::backup($path,$before);
+                    self::assertVersion(self::readConfig($path),$expected);
+                    self::atomicWrite($path,$row['after_text']);
+                } elseif (!hash_equals($row['after_hash'],hash('sha256',$before))) {
+                    throw new GatewayError('codex_config_conflict','Codex 配置在升级期间发生变化，未自动覆盖。',409);
+                }
+                SDB(null,'medoo','sqlite')->table('gateway_codex_integrations')->where('id',$row['id'])
+                    ->update(['state'=>'restart_required','last_error'=>null,'catalog_seen_at'=>null,'response_seen_at'=>null]);
+                return ['changed'=>true,'restart_required'=>true];
+            }
+            $row = self::recoverInterruptedWrite($row,$before);
+            $document = new CodexConfigDocument($before);
+            if (!$document->hasIntegrationMarkers() || !self::routesToGateway($document)
+                || self::values($document,self::COMPRESSION_KEY) === []) return ['changed'=>false,'restart_required'=>false];
+            if (is_array($row) && $row['state'] === 'writing') throw new GatewayError('codex_config_conflict','Codex 接入安装尚未确认，未自动覆盖。',409);
+            $after = $document->withoutCompressionOverride();
+            $owned = is_array($row) && $row['state'] !== 'removed' && self::isInstalled($row,$before);
+            $restored = $owned ? self::restorePrevious($row,$before) : null;
+            self::backup($path,$before);
+            if ($owned) {
+                Schema::transaction(static function () use ($row,$before,$after,$restored): void {
+                    $changed = SDB(null,'medoo','sqlite')->table('gateway_codex_integrations')->where('id',$row['id'])
+                        ->where('after_hash',$row['after_hash'])->update(['before_text'=>$restored,'before_hash'=>hash('sha256',$restored),
+                            'after_text'=>$after,'after_hash'=>hash('sha256',$after),'state'=>'writing',
+                            'last_error'=>self::COMPRESSION_UPGRADE.hash('sha256',$before)]);
+                    if (!$changed || $changed->rowCount() !== 1) throw new GatewayError('codex_config_conflict','Codex 接入记录已变化，未自动覆盖。',409);
+                });
+            }
+            self::assertVersion(self::readConfig($path),hash('sha256',$before));
+            self::atomicWrite($path,$after);
+            if ($owned) SDB(null,'medoo','sqlite')->table('gateway_codex_integrations')->where('id',$row['id'])
+                ->update(['state'=>'restart_required','last_error'=>null,'catalog_seen_at'=>null,'response_seen_at'=>null]);
+            return ['changed'=>true,'restart_required'=>true];
+        });
     }
 
     /**
@@ -145,7 +207,8 @@ final class CodexIntegration
         Schema::transaction(static function () use ($id, $field): void {
             $db = SDB(null, 'medoo', 'sqlite');
             $row = $db->table('gateway_codex_integrations')->where('id', $id)->find();
-            if (!is_array($row) || $row['state'] === 'removed') return;
+            // An old client's contact cannot prove that an in-flight config image was published.
+            if (!is_array($row) || in_array($row['state'],['removed','writing'],true)) return;
             $row[$field] = time();
             $state = !empty($row['catalog_seen_at']) && !empty($row['response_seen_at']) ? 'verified' : 'client_connected';
             $db->table('gateway_codex_integrations')->where('id', $id)->update([$field => $row[$field], 'state' => $state]);
@@ -238,7 +301,7 @@ final class CodexIntegration
         $before = self::readConfig($path);
         $existing = self::recoverInterruptedWrite(self::record($path, $before), $before);
         if (is_array($existing) && !in_array($existing['state'], ['removed', 'writing'], true) && self::isInstalled($existing, $before)
-            && self::values(new CodexConfigDocument($before), self::COMPRESSION_KEY) === [self::compressionValue()]) {
+            && self::values(new CodexConfigDocument($before), self::COMPRESSION_KEY) === self::compressionValues()) {
             return ['id' => $existing['id'], 'path' => $path, 'expected_hash' => hash('sha256', $before),
                 'changes' => self::block($existing['id']), 'already_installed' => true, 'replaced_keys' => [],
                 'backup_path' => self::backupPath($path, $existing['before_text']), 'after_text' => $before];
@@ -252,7 +315,7 @@ final class CodexIntegration
         $clean = new CodexConfigDocument($document->without($paths));
         $scope = $clean->hasTable(['features']) ? ['features'] : [];
         $key = $scope ? 'enable_request_compression' : 'features.enable_request_compression';
-        $compression = '# RCMAKER COMPRESSION BEGIN ' . $id . "\n" . $key . ' = ' . self::compressionValue()
+        $compression = RequestCompression::zstdAvailable() ? '' : '# RCMAKER COMPRESSION BEGIN ' . $id . "\n" . $key . ' = false'
             . "\n# RCMAKER COMPRESSION END " . $id . "\n";
         $after = self::block($id) . $clean->insert($compression, $scope);
         $replaced = [];
@@ -273,21 +336,22 @@ final class CodexIntegration
         $providers = self::values($document, ['model_provider']);
         if ($providers !== [] && $providers !== ['"openai"'] && $providers !== ["'openai'"]) return false;
         $compression = self::values($document, self::COMPRESSION_KEY);
-        return in_array($compression, [['false'], ['true']], true)
+        return in_array($compression, [[], ['false'], ['true']], true)
             && $compression === self::values(new CodexConfigDocument((string) $row['after_text']), self::COMPRESSION_KEY);
     }
 
-    /** Generate the request-compression flag only from a successful self-test in the running PHP. */
-    private static function compressionValue(): string
+    /** Omit the override only after the running PHP self-test; Codex enables compression by default. */
+    private static function compressionValues(): array
     {
-        return RequestCompression::zstdAvailable() ? 'true' : 'false';
+        return RequestCompression::zstdAvailable() ? [] : ['false'];
     }
 
     /** Retain uncompressed legacy clients; compressed configuration requires this runtime's decoder. */
     private static function compressionCompatible(CodexConfigDocument $document): bool
     {
         $values = self::values($document, self::COMPRESSION_KEY);
-        return $values === ['false'] || ($values === ['true'] && RequestCompression::zstdAvailable());
+        if ($document->assignments(['features']) !== []) return false;
+        return $values === ['false'] || (in_array($values,[[],['true']],true) && RequestCompression::zstdAvailable());
     }
 
     /** Return normalized scalar representations for the small set of managed routing keys. */

@@ -105,6 +105,18 @@ final class CodexConfigDocument
         return $result;
     }
 
+    /** Remove the managed compression override/markers while retaining the route and every other byte. */
+    public function withoutCompressionOverride(): string
+    {
+        $result = '';
+        foreach ($this->statements as $s) {
+            if ($s['kind'] === 'assignment' && $s['path'] === ['features','enable_request_compression']) continue;
+            if ($s['kind'] === 'comment' && preg_match('/^# RCMAKER COMPRESSION (?:BEGIN|END)(?:[ \t]+.*)?$/',trim($s['text']))) continue;
+            $result .= $s['text'];
+        }
+        return $result;
+    }
+
     /** Insert already reviewed statements at the start of their root/table scope. */
     public function insert(string $text, array $scope = []): string
     {

@@ -175,6 +175,14 @@
         const routeChanged = codexStatus.configured && codexStatus.route_ready === false;
         progress('codex-progress', states[routeChanged ? 'config_conflict' : codexStatus.state] || I18n.t('正在检查接入状态…'), routeChanged ? 'warning' : '');
         byId('codex-restart-notice').hidden = routeChanged || !['restart_required','removed'].includes(codexStatus.state);
+        const compression = codexStatus.request_compression;
+        const compressionNotice = byId('codex-compression-notice'), compressionDetail = byId('codex-compression-detail');
+        if (compressionNotice && compressionDetail) {
+            compressionNotice.hidden = !codexStatus.configured || !compression?.zstd_available;
+            compressionDetail.textContent = I18n.t(compression?.uses_default
+                ? '当前 PHP 支持 zstd，Codex 请求压缩使用默认开启设置。'
+                : '检测到旧的请求压缩设置，可重新接入 Codex 以应用默认压缩。');
+        }
         renderCodexDetails();
     }
     /** Prominent installation guidance; acknowledging the dialog never claims that Codex was restarted. */

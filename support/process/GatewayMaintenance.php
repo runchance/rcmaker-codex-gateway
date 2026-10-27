@@ -4,14 +4,26 @@ namespace support\process;
 
 use app\gateway\database\Schema;
 use app\gateway\model\TaskMaintenance;
+use app\gateway\model\CodexIntegration;
+use app\gateway\model\GatewayError;
 
 /** Independent storage worker for cleanup batches and nonblocking WAL checkpoints. */
 final class GatewayMaintenance
 {
+    private bool $compressionChecked = false;
     /** @param string $type Framework runtime. @param mixed $worker Owning worker. @param string $timer Framework timer class. */
     public function __construct($type, $worker, $timer)
     {
-        $timer::add(1, static function (): void {
+        $timer::add(1, function (): void {
+            if (!$this->compressionChecked) {
+                try {
+                    CodexIntegration::upgradeCompressionDefaults();
+                    $this->compressionChecked = true;
+                } catch (GatewayError $error) {
+                    // Retry only transient locks/storage. A conflicting user config stays intact.
+                    $this->compressionChecked = !in_array($error->errorCode,['codex_config_busy','storage_busy','storage_unavailable'],true);
+                } catch (\Throwable) { /* Startup storage may still be initializing; retry in this isolated worker. */ }
+            }
             try {
                 // No writer transaction or cleanup admission lock surrounds this work.
                 // PASSIVE skips contended pages; never switch to FULL/RESTART/TRUNCATE.
