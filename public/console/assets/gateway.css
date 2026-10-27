@@ -530,6 +530,10 @@ p { line-height: 1.65; }
 .setup-service-card > .muted { margin: 10px 0 16px; font-size: 12px; overflow-wrap: anywhere; }
 .setup-service-card .actions { margin-top: auto; }
 .setup-overview-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.compression-indicator { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 30px; padding: 4px 10px; border: 1px solid #c2e5d5; color: #166b54; background: #e9f6f0; font-family: inherit; font-size: 12px; cursor: pointer; }
+.compression-indicator > .layui-icon { font-size: 14px; }
+.compression-indicator:hover { border-color: #78b8a1; }
+.compression-indicator.is-pending { border-color: #f0deb7; color: #795820; background: #fff6e4; }
 
 @media (max-width: 1100px) {
     .gateway-page { padding: 24px; }

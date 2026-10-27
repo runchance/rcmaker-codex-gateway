@@ -174,6 +174,24 @@
         }
         byId('codex-remove').disabled = codexStatus.can_restore === false || ['not_installed','removed','config_conflict'].includes(codexStatus.state);
     }
+    /** Show a compact configuration indicator; this does not claim that every client request is compressed. */
+    function renderCompressionIndicator() {
+        const indicator = byId('codex-compression-indicator'), label = byId('codex-compression-label');
+        if (!indicator || !label) return;
+        const compression = codexStatus?.request_compression;
+        const enabled = codexStatus?.configured && codexStatus.route_ready === true
+            && compression?.zstd_available === true && compression.uses_default === true
+            && ['configured', 'restart_required', 'client_connected', 'verified'].includes(codexStatus.state);
+        indicator.hidden = !enabled;
+        if (!enabled) return;
+        const pending = codexStatus.state === 'restart_required';
+        indicator.classList.toggle('is-pending', pending);
+        label.textContent = I18n.t(pending ? 'zstd 待重启' : 'zstd 已启用');
+        indicator.title = I18n.t(pending
+            ? '压缩配置已更新，请完全退出并重新打开 Codex 使其生效。'
+            : '网关支持 zstd，Codex 已使用默认压缩设置。客户端会按需压缩请求。');
+        indicator.setAttribute('aria-label', label.textContent + '. ' + indicator.title);
+    }
     function renderCodexStatus() {
         if (!codexStatus) return;
         const states = {not_installed: I18n.t('尚未接入 Codex。'), configured: I18n.t('已检测到 Codex 接入配置。'), writing: I18n.t('配置正在保存。'), restart_required: I18n.t('配置已保存。请完全退出 Codex 后再打开。'),
@@ -191,6 +209,7 @@
             compressionDetail.textContent = I18n.t('当前 PHP 支持 zstd，Codex 请求压缩使用默认开启设置。');
         }
         renderCodexDetails();
+        renderCompressionIndicator();
     }
     /** Prominent installation guidance; acknowledging the dialog never claims that Codex was restarted. */
     function showCodexRestart() {
@@ -877,8 +896,11 @@
         if (snapshot && activeLayer === 'account' && !busy && snapshot.accountReady && !snapshot.modelReady && snapshot.modelError) {
             progress('account-progress', I18n.error(snapshot.modelError, snapshot.modelErrorCode), 'warning');
         }
-        if (codexStatus) renderCodexDetails();
+        if (codexStatus) { renderCodexDetails(); renderCompressionIndicator(); }
         if (usageSnapshot) renderUsage(usageSnapshot);
+    });
+    byId('codex-compression-indicator')?.addEventListener('click', function () {
+        if (!this.hidden && this.title) layui.layer.tips(this.title, this, {tips: [3, '#172b42'], time: 5000});
     });
     byId('use-direct').addEventListener('click', () => prepareNetworkLayer('direct'));
     byId('open-network').addEventListener('click', () => prepareNetworkLayer());
