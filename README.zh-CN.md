@@ -26,6 +26,10 @@ RCMAKER Codex Gateway 连接本机 Codex 与 ChatGPT 网页模型。你在 Codex
 
 *启动时逐项显示检查进度，准备就绪后提示启动或重启 Codex。*
 
+![RCMAKER 中文用户控制台](docs/images/user-guide/zh-CN/console-overview.png)
+
+*用户控制台展示连接状态、可用模型和本机用量估算，图中为演示数据。*
+
 ## 安装前准备
 
 在运行网关的电脑上安装 Codex，准备具有所需网页模型和自定义 MCP 插件权限的 ChatGPT 账号，以及可使用 Secure MCP Tunnel 的权限。控制台会引导创建 Tunnel 和普通运行 API Key；账号与工作区权限请核对 [OpenAI Tunnel 官方说明](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。

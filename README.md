@@ -26,6 +26,10 @@ Built with the [RCMAKER PHP framework](https://github.com/runchance/rcmaker).
 
 *Startup checks show what is ready and what still needs your attention.*
 
+![RCMAKER user console in English](docs/images/user-guide/en/console-overview.png)
+
+*The local user console shows connection status, available models and usage estimates. Example data.*
+
 ## Before you install
 
 You need Codex on the computer where the gateway will run, a ChatGPT account with access to the required Web models and custom MCP plugins, and permission to use a Secure MCP Tunnel. The setup wizard guides you through the Tunnel and its ordinary runtime API key. Account/workspace access follows [OpenAI's Tunnel requirements](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
