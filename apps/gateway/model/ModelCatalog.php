@@ -504,6 +504,26 @@ final class ModelCatalog
     }
 
     /**
+     * Project an already augmented catalog into an explicit OpenAI-style discovery response.
+     * The original catalog, opaque model IDs and Codex injection metadata remain unchanged.
+     * @param array $catalog Genuine authenticated catalog after augment().
+     * @return array{object:string,data:list<array>} Visible models only; no private templates or hidden aliases.
+     */
+    public static function openAiCatalog(array $catalog): array
+    {
+        $models = [];
+        foreach ((array) ($catalog['models'] ?? []) as $row) {
+            if (!is_array($row) || ($row['visibility'] ?? '') !== 'list') continue;
+            $id = $row['slug'] ?? null;
+            if (!is_string($id) || $id === '' || isset($models[$id])) continue;
+            $models[$id] = ['id'=>$id, 'object'=>'model', 'created'=>0,
+                'owned_by'=>str_starts_with($id, 'chatgpt-web/') ? 'chatgpt-web' : 'codex',
+                'metadata'=>['display_name'=>(string) ($row['display_name'] ?? $id)]];
+        }
+        return ['object'=>'list', 'data'=>array_values($models)];
+    }
+
+    /**
      * Fixed catalog profiles use their actual effort budget; old unified rows retain the minimum window.
      * Thinking profile efforts share their real budget. The hidden unified identity still admits saved
      * Low/Max inputs, so its metadata must remain conservative instead of adopting Thinking's window.

@@ -27,17 +27,26 @@ final class NativeTransport
      * It must reject incomplete output: a known HTTP response is delivered even when the
      * upstream resets after its terminal SSE event, which is a normal native backend close.
      * Response endpoints select HTTP/1.1 before sending to avoid observed HTTP/2 stream resets.
+     * @param bool $openAiCatalog Explicit models-only adapter; default Codex catalogs and all Responses stay unchanged.
      * @throws GatewayError Before any response bytes if transport setup is invalid.
      */
     public static function start(TcpConnection $connection, string $endpoint, string $method, string $query,
-        array $headers, string $body, ?callable $onCatalog = null, ?callable $onResponse = null): void
+        array $headers, string $body, ?callable $onCatalog = null, ?callable $onResponse = null,
+        bool $openAiCatalog = false): void
     {
         if (!in_array($endpoint, self::ENDPOINTS, true)) throw new GatewayError('native_route_unsupported', '原生路径不受支持。', 404);
         if (trim((string) ($headers['authorization'] ?? '')) === '') throw new GatewayError('native_auth_required', '此原生路径需要 Codex 自身登录凭据。', 401);
+        if ($openAiCatalog && $endpoint !== 'models') {
+            throw new GatewayError('native_route_unsupported', 'Catalog formatting is available only for models.', 400);
+        }
         parse_str($query, $params);
+        if ($openAiCatalog) unset($params['format']);
         if ($endpoint === 'models' && empty($params['client_version'])
             && preg_match('~^(?:codex_cli_rs|codex-tui|codex_vscode|codex_atlas|codex_chatgpt_desktop|Codex [A-Za-z0-9._ -]+)/([0-9]+\.[0-9]+\.[0-9]+)~', $headers['user-agent'] ?? '', $match)) {
             $params['client_version'] = $match[1];
+        }
+        if ($openAiCatalog && empty($params['client_version'])) {
+            $params['client_version'] = self::catalogClientVersion();
         }
         $url = 'https://chatgpt.com/backend-api/codex/' . $endpoint . ($params ? '?' . http_build_query($params) : '');
         $client = curl();
@@ -133,7 +142,7 @@ final class NativeTransport
             throw new GatewayError('native_transport_unavailable', '原生连接无法初始化。', 503);
         }
         $timer = null;
-        $timer = Timer::add(0.02, static function () use ($client, $multi, $connection, $endpoint, $onCatalog, $onResponse,
+        $timer = Timer::add(0.02, static function () use ($client, $multi, $connection, $endpoint, $onCatalog, $onResponse, $openAiCatalog,
             &$timer, &$started, &$stream, &$buffer, &$status, &$responseHeaders, &$terminated, &$lineBuffer,
             &$paused, &$pauseCount, &$resumeCount, &$queuePeak, &$terminalType, &$abortReason, &$bytes, $requestBytes): void {
             $finished = !self::open($connection); $error = 0;
@@ -186,7 +195,8 @@ final class NativeTransport
                     if (!is_array($catalog)) throw new GatewayError('native_catalog_invalid', '原生目录不是 JSON 对象。', 502);
                     $augmented = ModelCatalog::augment($catalog);
                     if ($onCatalog !== null) $onCatalog($catalog);
-                    $buffer = json_encode($augmented, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+                    $buffer = json_encode($openAiCatalog ? ModelCatalog::openAiCatalog($augmented) : $augmented,
+                        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
                 }
                 $connection->close(new Response($status, self::headers($responseHeaders, $responseHeaders['content-type'] ?? 'application/json'), $buffer));
             } catch (\Throwable $failure) {
@@ -198,6 +208,29 @@ final class NativeTransport
                             : ($endpoint === 'models' ? 'Codex 原生目录无法解析。' : 'Codex 原生响应无法解析。')]])));
             }
         });
+    }
+
+    /**
+     * Read only the installed client's catalog version for explicit third-party discovery.
+     * Never reads auth.json, spawns Codex, guesses a version, or affects default native requests.
+     * @return string Valid cached Codex client version.
+     * @throws GatewayError When no bounded, parseable client catalog is available.
+     */
+    private static function catalogClientVersion(): string
+    {
+        $home = rtrim((string) \RC\Config::get('gateway', 'codex_home'), '/\\');
+        $path = $home . '/models_cache.json';
+        $limit = 4194304;
+        $size = $home !== '' && is_file($path) ? @filesize($path) : false;
+        $raw = is_int($size) && $size > 0 && $size <= $limit
+            ? @file_get_contents($path, false, null, 0, $limit + 1) : false;
+        $cache = is_string($raw) && strlen($raw) <= $limit ? json_decode($raw, true, 32) : null;
+        $version = is_array($cache) ? ($cache['client_version'] ?? null) : null;
+        if (!is_string($version) || preg_match('/\A[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?\z/D', $version) !== 1) {
+            throw new GatewayError('native_client_version_required',
+                'Provide client_version or start Codex once to populate its local model catalog.', 400);
+        }
+        return $version;
     }
 
     /**

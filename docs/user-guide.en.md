@@ -329,6 +329,12 @@ After a full Codex restart, model names ending in **RC (Web)** should appear. A 
 
 <a id="first-task"></a>
 
+### 5.4 Third-party model discovery
+
+The normal authenticated `GET /v1/<integration>/models` response remains Codex's `models/slug` catalog, including the existing Web injection metadata. Clients that require OpenAI-style `data/id` discovery must explicitly request `GET /v1/<integration>/models?format=openai`. This lists the visible native and Web IDs without renaming them or exposing hidden compatibility aliases. It does not mark Codex as restarted or connected.
+
+The native catalog still requires the caller's Codex subscription credentials, rather than an OpenAI API key. On this explicit discovery path, a missing `client_version` is read from the configured Codex home's bounded `models_cache.json`; it is never guessed. Start Codex once or provide the version if that cache is missing. This adapter is for discovery and does not turn Codex's native backend into the general OpenAI API. Third-party platforms must retain opaque `chatgpt-web/...` IDs and use a compatible executor, such as their existing Codex CLI integration. The normal Codex catalog, response forwarding, tool contracts and model injection remain unchanged.
+
 ## 6. Run and check your first task
 
 Open the intended project in Codex and choose a detected **RC (Web)** model. Thinking entries offer the available effort choices; Web Pro uses a separate **Pro · RC (Web)** entry when available. Family names follow the current detection result.

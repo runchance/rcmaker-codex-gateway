@@ -331,6 +331,12 @@ php index.php start
 
 <a id="first-task"></a>
 
+### 5.4 第三方平台读取模型目录
+
+带认证的普通 `GET /v1/<integration>/models` 继续返回 Codex 的 `models/slug` 目录和原有 Web 注入字段。需要 OpenAI 风格 `data/id` 的平台须显式请求 `GET /v1/<integration>/models?format=openai`，获得实际可见的原生和 Web 模型，不改名、不显示隐藏兼容别名，也不会将这次目录读取记作 Codex 已重启或连接。
+
+原生目录仍使用调用方自身的 Codex 订阅登录凭据，不能用 OpenAI API Key 替代。仅此显式兼容请求缺少 `client_version` 时，网关会从配置的 Codex 目录内有界读取 `models_cache.json` 的版本，不猜测固定版本；缓存缺失时先启动一次 Codex 或显式提供版本。目录兼容不代表把 Codex 原生后端变成通用 OpenAI API；第三方平台须保留 `chatgpt-web/...` 完整模型ID，并使用匹配的执行器，例如其已有 Codex CLI 接入。原有 Codex 目录、响应转发、工具契约与模型注入保持不变。
+
 ## 6. 发起并核对首次任务
 
 在 Codex 打开要处理的项目，选择检测通过的 **RC (Web)** 模型。Thinking 条目提供可用推理档位；Pro 可用时选独立的 **Pro · RC (Web)** 条目。具体家族名称以当前检测结果为准。

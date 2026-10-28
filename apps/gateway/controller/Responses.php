@@ -22,11 +22,18 @@ use support\http\GatewayRoute;
 /** Loopback Responses-compatible text entry points backed by the owned ChatGPT browser. */
 final class Responses
 {
+    /**
+     * Return the Codex catalog by default; format=openai opts into a third-party list.
+     * @param Request $request Current loopback request; credentials stay request-local.
+     * @return mixed Framework JSON response or asynchronous native catalog response.
+     */
     public function models(Request $request)
     {
         try {
             Schema::initialize();
-            if ((string) $request->header('authorization', '') !== '') return $this->forward($request, 'models');
+            if ((string) $request->header('authorization', '') !== '') {
+                return $this->forward($request, 'models', null, $request->get('format') === 'openai');
+            }
             $browser = BrowserState::state();
             $page = ResponseJob::pageSnapshot($browser);
             if ($browser['status'] !== 'ready' || (int) $browser['worker_heartbeat'] < time() - 5 || !$page['fresh']) {
@@ -253,8 +260,8 @@ final class Responses
         } catch (GatewayError $error) { return $this->error($request, $error); }
     }
 
-    /** Snapshot only endpoint-safe headers; never retain the Request in asynchronous callbacks. */
-    private function forward(Request $request, string $endpoint, ?string $decodedBody = null)
+    /** Snapshot endpoint-safe headers; only explicit third-party catalogs use the OpenAI list adapter. */
+    private function forward(Request $request, string $endpoint, ?string $decodedBody = null, bool $openAiCatalog = false)
     {
         $connection = $request->RCresponse?->getConnection();
         if (!$connection instanceof TcpConnection) throw new GatewayError('transport_unavailable', '原生转发需要异步连接。', 503);
@@ -269,12 +276,12 @@ final class Responses
         }
         $integration = $this->integrationId($request);
         NativeTransport::start($connection, $endpoint, (string) $request->method(), (string) $request->queryString(), $headers,
-            $wireBody, static function (array $catalog) use ($integration): void {
+            $wireBody, static function (array $catalog) use ($integration, $openAiCatalog): void {
                 SDB(null, 'medoo', 'sqlite')->table('gateway_model_catalog')->where('id', 1)->update([
                     'native_catalog_json' => json_encode($catalog, JSON_THROW_ON_ERROR), 'native_verified_at' => time(),
                 ]);
-                CodexIntegration::clientSeen($integration, 'catalog');
-            });
+                if (!$openAiCatalog) CodexIntegration::clientSeen($integration, 'catalog');
+            }, null, $openAiCatalog);
         return new DeferredResponse($request);
     }
 
