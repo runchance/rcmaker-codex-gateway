@@ -4474,6 +4474,7 @@ JS;
             microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS, null);
     }
 
+    /** Observe owned controls, then allow the initial picker its bounded readiness stage. */
     private function probeTaskModelControls(string $responseId, bool $recover, float $deadline, ?float $absenceSince): void
     {
         if (!$this->modelSelectionActive($responseId)) return;
@@ -4499,7 +4500,11 @@ JS;
                     return;
                 }
                 if ($count === 1 && !empty($state['sol_available'])) {
-                    $this->openTaskEffortMenu($responseId, $recover, microtime(true) + 4.0);
+                    // The button can hydrate before its asynchronous picker. Give the menu
+                    // its existing readiness budget, bounded by the owning task's deadline.
+                    $menuDeadline = min(microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS,
+                        (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF));
+                    $this->openTaskEffortMenu($responseId, $recover, $menuDeadline);
                     return;
                 }
                 $since = $absenceSince ?? microtime(true);
@@ -4541,9 +4546,10 @@ JS;
                     // Focusing is reversible; retry within the existing menu deadline.
                     $this->evaluateModelSelection($responseId, WebModelPage::dismissOptionalSetupDialogExpression(),
                         function ($dismissError, $dismissed) use ($responseId, $recover, $deadline, $reopenAttempts): void {
-                            if ($dismissError === null && !empty($dismissed['ok']) && !empty($dismissed['dismissed'])) {
+                            if ($dismissError === null && !empty($dismissed['ok']) && !empty($dismissed['dismissed'])
+                                && microtime(true) < $deadline) {
                                 Timer::add(0.15, fn() => $this->openTaskEffortMenu($responseId, $recover,
-                                    max($deadline, microtime(true) + 4.0), $reopenAttempts), null, false);
+                                    $deadline, $reopenAttempts), null, false);
                                 return;
                             }
                             if (microtime(true) < $deadline) {
