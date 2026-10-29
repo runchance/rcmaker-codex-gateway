@@ -135,6 +135,7 @@
         return node;
     }
     function taskName(task) {
+        if (task.is_subagent && task.agent_path) return task.agent_path.split('/').pop();
         return task.conversation_title || task.latest_user || I18n.t('任务');
     }
 
@@ -169,7 +170,7 @@
             const title = document.createElement('strong');
             title.className = 'task-conversation-title';
             title.dataset.userContent = 'true';
-            title.textContent = task.conversation_title || task.latest_user || taskName(task);
+            title.textContent = task.is_subagent ? taskName(task) : (task.conversation_title || task.latest_user || taskName(task));
             if (task.latest_user && task.latest_user !== task.conversation_title) {
                 const latest = document.createElement('div');
                 latest.className = 'task-latest-user muted';
@@ -181,6 +182,7 @@
             }
             const identityMeta = document.createElement('div');
             identityMeta.className = 'task-identity-meta';
+            if (task.is_subagent) identityMeta.append(badge('子智能体', 'active'));
             identityMeta.append(badge(task.conversation_kind === 'continued' ? I18n.t('继续对话')
                 : (task.conversation_kind === 'new' ? I18n.t('新对话') : I18n.t('对话状态未知')), task.conversation_kind));
             const thread = document.createElement('span');
@@ -563,6 +565,7 @@
         summary.className = 'state-grid task-summary';
         [
             [I18n.t('客户端'), task.client_id], ['Thread', task.thread_id || I18n.t('未提供')],
+            ...(task.is_subagent ? [[I18n.t('父线程'), task.parent_thread_id], [I18n.t('子智能体'), task.agent_path]] : []),
             [I18n.t('网页对话模式'), I18n.t(task.web_chat_mode === 'regular' ? '普通对话（保存到 ChatGPT 历史）' : '临时对话（默认）')],
             [I18n.t('网页对话标识'), task.web_conversation_id || '—'],
             [I18n.t('当前阶段'), task.current_epoch_id ? (I18n.t('阶段 ') + (task.epoch_no || '—')) : I18n.t('尚未建立')],

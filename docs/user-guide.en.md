@@ -492,6 +492,14 @@ New requests use saved changes. Already-started work retains its budget and wait
 
 </details>
 
+### Web subagents
+
+In **Settings → Web subagents**, choose the model and reasoning level for native Codex Web subagents. The default follows the requested model family without Pro, at Extra High. This preference does not enable delegation or change the root task or an ordinary fork. Already-issued tools and their exact results settle under their original model before a new generation adopts changed settings.
+
+Each subagent uses its own Temporary Chat, without automatic fallback to a saved chat. Its first submission carries the context supplied by Codex; `fork_turns=none` supplies the assignment, while `all` may include inherited history. Repeated dispatches reuse the child's owned page when possible. Subagents appear in Task Center with a parent-thread identifier, but do not occupy Browser Workspace tabs.
+
+After the tracked Web parent finishes, settled child pages are retired through the normal Stop/confirm/close path; task history and receipts remain available. Running tools, undelivered receipts and unknown outcomes prevent premature cleanup. Child errors retain their own task diagnostics without revoking parent or sibling tool capabilities. Shared browser capacity, account limits and connector availability still apply. A Temporary Chat without the connector reports an error instead of switching chat mode.
+
 ### Context parts, compaction and Pro
 
 **Multipart delivery** sends longer history in batches. **Compaction** creates a summary for subsequent work. Both can add waiting time without implying failure. History includes instructions, skills and tool results, not just the few messages you typed.

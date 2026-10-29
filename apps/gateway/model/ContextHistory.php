@@ -720,6 +720,7 @@ final class ContextHistory
                 // A temporary catalog refresh or subscription upgrade cannot discard that receipt.
                 $spec = ResponsesProtocol::inheritReasoningConfiguration($spec, $prior);
                 $configuration = $spec['budget']['reasoning_configuration'] ?? null;
+                $subagent = $spec['budget']['native_subagent'] ?? null;
                 $spec['budget'] = json_decode((string) $prior['budget_json'], true, 32, JSON_THROW_ON_ERROR);
                 if ($configuration === null && !empty($spec['budget']['deferred_model_selection'])
                     && empty($spec['reasoning_configuration_reset'])) {
@@ -727,6 +728,7 @@ final class ContextHistory
                 }
                 unset($spec['budget']['reasoning_configuration']);
                 if ($configuration !== null) $spec['budget']['reasoning_configuration'] = $configuration;
+                if ($subagent !== null) $spec['budget']['native_subagent'] = $subagent;
                 if (in_array($spec['operation_kind'] ?? 'response', ['compact_v1', 'compact_v2'], true)) {
                     // The separate summary operation pins the current administrative wait;
                     // every other limit remains the source turn's exact snapshot.

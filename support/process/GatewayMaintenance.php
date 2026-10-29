@@ -4,10 +4,11 @@ namespace support\process;
 
 use app\gateway\database\Schema;
 use app\gateway\model\TaskMaintenance;
+use app\gateway\model\TaskLedger;
 use app\gateway\model\CodexIntegration;
 use app\gateway\model\GatewayError;
 
-/** Independent storage worker for cleanup batches and nonblocking WAL checkpoints. */
+/** Independent storage worker for cleanup batches, settled child pages and nonblocking WAL checkpoints. */
 final class GatewayMaintenance
 {
     private bool $compressionChecked = false;
@@ -30,6 +31,14 @@ final class GatewayMaintenance
                 Schema::checkpointWal();
             } catch (\Throwable) {
                 // Keep durable WAL records for the next tick or worker restart.
+            }
+        });
+        $timer::add(5, static function (): void {
+            try {
+                Schema::initialize();
+                TaskLedger::retireFinishedSubagentPages();
+            } catch (\Throwable) {
+                // Ownership and receipt checks are retried here; never fail a parent response.
             }
         });
         $timer::add(300, static function (): void {

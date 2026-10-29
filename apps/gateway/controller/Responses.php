@@ -13,6 +13,7 @@ use app\gateway\model\ResponseJob;
 use app\gateway\model\ResponsesProtocol;
 use app\gateway\model\ModelCatalog;
 use app\gateway\model\CodexIntegration;
+use app\gateway\model\CodexSubagent;
 use app\gateway\model\ContextCompaction;
 use app\gateway\model\ContextPortability;
 use app\gateway\model\GatewaySettings;
@@ -126,6 +127,7 @@ final class Responses
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
             $this->logFreeModelSelectionFailure($error, $phase, $spec ?? [], is_array($body ?? null) ? $body : []);
+            $this->logSubagentAdmissionFailure($error, $phase, $spec ?? []);
             if (in_array($error->errorCode, ['compaction_conflict', 'compaction_source_unavailable',
                 'compaction_busy', 'compaction_context_incomplete'], true) && isset($spec)) {
                 try {
@@ -153,7 +155,23 @@ final class Responses
         }
     }
 
-    /** Record only structural failure evidence; optional facts are prefiltered model-selection metadata. */
+    /**
+     * Record rejected child requests even before a task row exists, without changing the HTTP result.
+     * @param GatewayError $error Original gateway rejection. @param string $phase Owning admission phase.
+     * @param array $spec Parsed native identity only; no request body, tool arguments or tokens are logged.
+     * @return void Uses the existing diagnostic export sink; logging never affects a parent task.
+     */
+    private function logSubagentAdmissionFailure(GatewayError $error, string $phase, array $spec): void
+    {
+        try {
+            $scope = CodexSubagent::scope($spec['thread_id'] ?? null);
+            if ($scope !== null) $this->logUnexpectedCreateFailure($error, $phase . ':' . $error->errorCode, $scope);
+        } catch (\Throwable) {
+            // Missing native metadata/storage does not replace the original rejection.
+        }
+    }
+
+    /** Record only structural failure evidence; optional facts are prefiltered model-selection or native identity metadata. */
     private function logUnexpectedCreateFailure(\Throwable $error, string $phase, array $facts = []): string
     {
         try {
@@ -245,6 +263,7 @@ final class Responses
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
             $this->logFreeModelSelectionFailure($error, 'compact', $spec ?? [], is_array($body ?? null) ? $body : []);
+            $this->logSubagentAdmissionFailure($error, 'compact', $spec ?? []);
             return $this->error($request, $error);
         }
         catch (\Throwable) { return $request->json(ResponsesProtocol::error('上下文压缩请求无效。', 'invalid_compaction'))->withStatus(400); }

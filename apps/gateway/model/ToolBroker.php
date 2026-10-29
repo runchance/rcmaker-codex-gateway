@@ -671,9 +671,11 @@ final class ToolBroker
         $route = ModelCatalog::resolveForOperation($spec['model'], $spec['reasoning_effort'] ?? null, 'response');
         $outputControl = (array)($spec['budget']['output_control'] ?? []);
         $configuration = $spec['budget']['reasoning_configuration'] ?? null;
+        $subagent = $spec['budget']['native_subagent'] ?? null;
         $spec['budget'] = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
         if ($outputControl !== []) $spec['budget']['output_control'] = $outputControl;
         if ($configuration !== null) $spec['budget']['reasoning_configuration'] = $configuration;
+        if ($subagent !== null) $spec['budget']['native_subagent'] = $subagent;
         $spec['budget'] = ContextRecovery::applyObservedMessageLimitUnlocked($spec, $spec['budget']);
         $receiptSource = $source['job'];
         $receiptSource['transport_context_json'] = $spec['full_context_json'] ?? $spec['context_json'];

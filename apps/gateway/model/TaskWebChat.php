@@ -9,7 +9,8 @@ use support\browser\WebModelPage;
 final class TaskWebChat
 {
     /**
-     * Pin a new task's preference, or move the same conversation's binding across an admitted recovery.
+     * Pin a new task's preference (verified native children always use Temporary Chat),
+     * or move the same root conversation's binding across an admitted recovery.
      * @param string $taskId Newly created durable task ID.
      * @param string|null $sourceTaskId Retired/reconciled source selected by TaskLedger's existing recovery guards.
      * @param bool $freshConversation Start a new chat of the source mode after verified repeated-failure retirement.
@@ -22,6 +23,9 @@ final class TaskWebChat
         $settings = $db->table('gateway_settings')->where('id', 1)->find('web_chat_mode');
         if (!is_array($settings)) throw new GatewayError('storage_unavailable', 'Web chat preference could not be saved.', 503);
         $values = ['task_id' => $taskId, 'mode' => (string) $settings['web_chat_mode'], 'updated_at' => time()];
+        $taskIdentity = $db->table('gateway_tasks')->where('id', $taskId)->find('thread_id');
+        $temporaryChild = is_array($taskIdentity) && CodexSubagent::scope($taskIdentity['thread_id'] ?? null) !== null;
+        if ($temporaryChild) $values['mode'] = 'temporary';
         $source = $sourceTaskId === null ? null : self::state($sourceTaskId);
         if (is_array($source) && ($freshConversation || ($source['mode'] === 'regular' && !empty($source['conversation_id'])))) {
             $oldTask = $db->table('gateway_tasks')->where('id', $sourceTaskId)->find('client_id,thread_id,branch_id');
@@ -30,8 +34,8 @@ final class TaskWebChat
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
             }
         }
-        if ($freshConversation && is_array($source)) $values['mode'] = $source['mode'];
-        if (!$freshConversation && is_array($source) && $source['mode'] === 'regular' && !empty($source['conversation_id'])) {
+        if (!$temporaryChild && $freshConversation && is_array($source)) $values['mode'] = $source['mode'];
+        if (!$temporaryChild && !$freshConversation && is_array($source) && $source['mode'] === 'regular' && !empty($source['conversation_id'])) {
             // An internal task ID rotation is not deletion of its saved Web conversation.
             // Release the unique UUID conditionally before assigning it to the same native conversation.
             // The enclosing ledger transaction rolls both writes back if any later reservation fails.
@@ -84,7 +88,8 @@ final class TaskWebChat
     }
 
     /**
-     * Stage a temporary task's first ordinary submission using its complete readable history.
+     * Stage a root's first ordinary submission, or a settled legacy child's forced temporary
+     * submission, using its complete readable history. Never migrate an issued tool round.
      * Call only after SteeringContext has deferred outstanding host calls; receipt-only rounds keep the old page.
      * @param array $spec Prepared native request inside its admission transaction.
      * @return array Full first-ordinary transport and a new lease, or the unchanged request.
@@ -96,7 +101,10 @@ final class TaskWebChat
             || (!empty($spec['tool_outputs']) && empty($spec['steering_restart']))) {
             return $spec;
         }
-        if ((GatewaySettings::internal()['web_chat_mode'] ?? 'temporary') !== 'regular') {
+        $child = $spec['budget']['native_subagent'] ?? null;
+        $targetMode = is_array($child) ? 'temporary' : (GatewaySettings::internal()['web_chat_mode'] ?? 'temporary');
+        if (is_array($child) && !empty($child['deferred'])) return $spec;
+        if ($targetMode !== 'regular' && !is_array($child)) {
             return $spec;
         }
         $db = SDB(null, 'medoo', 'sqlite');
@@ -105,7 +113,7 @@ final class TaskWebChat
         if ($task === false) {
             throw new GatewayError('storage_unavailable', 'Web chat identity is temporarily unavailable.', 503);
         }
-        if (!is_array($task) || self::state($taskId)['mode'] !== 'temporary') {
+        if (!is_array($task) || self::state($taskId)['mode'] === $targetMode) {
             return $spec;
         }
         $pending = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
@@ -120,26 +128,29 @@ final class TaskWebChat
         $context = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
         unset($context['continuation']);
         $spec['web_chat_mode_change'] = true;
+        $spec['web_chat_mode_target'] = $targetMode;
         $spec['steering_full_context'] = true;
         unset($spec['steering_delta'], $spec['budget']['steering_delta'], $spec['budget']['postcompact_page']);
+        if ($targetMode === 'temporary') unset($spec['budget']['regular_chat']);
         $spec['context_json'] = $spec['full_context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($context);
         $spec['continuation_source_response_id'] = $spec['rolling_source_response_id'] = null;
-        $spec['browser_lease_key'] = hash('sha256', $spec['browser_lease_key'] . '|web-chat-mode|regular');
+        $spec['browser_lease_key'] = hash('sha256', $spec['browser_lease_key'] . '|web-chat-mode|' . $targetMode);
         $spec['prompt'] = ($spec['operation_kind'] ?? 'response') === 'response'
             ? ContextHistory::plainPrompt($context) : ContextCompaction::prompt($spec['context_json']);
         return $spec;
     }
 
     /**
-     * Commit the staged mode only after reservation isolated an unsent ordinary destination.
+     * Commit the staged mode only after reservation isolated an unsent destination.
      * @param array $spec Request returned by prepareModeChangeUnlocked.
      * @param array $reservation Current task/surface reservation; the caller owns its transaction.
-     * @return void Existing ordinary bindings are never replaced by a preference change.
+     * @return void Root bindings keep the existing migration rules; verified settled children may migrate to Temporary Chat.
      * @throws GatewayError If the destination is not isolated or a conditional identity write fails.
      */
     public static function commitModeChangeUnlocked(array $spec, array $reservation): void
     {
         if (empty($spec['web_chat_mode_change'])) return;
+        $targetMode = (string) ($spec['web_chat_mode_target'] ?? 'regular');
         $db = SDB(null, 'medoo', 'sqlite');
         $surface = $db->table('gateway_browser_surfaces')->where('id', $reservation['surface_id'])
             ->where('task_id', $reservation['task_id'])->find();
@@ -150,6 +161,16 @@ final class TaskWebChat
         if ($row === false) throw new GatewayError('storage_unavailable', 'Web chat identity is temporarily unavailable.', 503);
         if (!is_array($row)) {
             self::createUnlocked($reservation['task_id']);
+            return;
+        }
+        if ($targetMode === 'temporary') {
+            if (empty($spec['budget']['native_subagent']) || $row['mode'] !== 'regular') {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The subagent Temporary Chat destination could not be confirmed.', 409);
+            }
+            $changed = $db->table('gateway_task_web_chats')->where('task_id', $reservation['task_id'])
+                ->where('mode', 'regular')->where('conversation_id', $row['conversation_id'])->update([
+                    'mode'=>'temporary', 'conversation_id'=>null, 'account_key'=>null, 'updated_at'=>time()]);
+            if (!$changed || $changed->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Subagent Temporary Chat preference could not be saved.', 503);
             return;
         }
         if ($row['mode'] !== 'temporary' || !empty($row['conversation_id'])) {
@@ -207,6 +228,8 @@ final class TaskWebChat
     /**
      * Project only unseen native updates for a saved ordinary chat, independent of tab/document lifetimes.
      * The complete native request stays in full_context_json for audit and a future explicitly new chat.
+     * Proven mailbox replacements carry their operational suffix with the same owned-page fence,
+     * without replaying the latest human request or classifying an agent result as human steering.
      * @param array $spec Routed native request. @return array Same request with an ordinary-chat physical suffix.
      * @throws GatewayError When an exact steering source or current human message cannot be identified.
      */
@@ -214,6 +237,7 @@ final class TaskWebChat
     {
         $chat = self::boundSpec($spec);
         if ($chat === null || ($spec['operation_kind'] ?? 'response') !== 'response'
+            || (($spec['web_chat_mode_target'] ?? null) === 'temporary' && !empty($spec['web_chat_mode_change']))
             || (!empty($spec['tool_outputs']) && empty($spec['steering_restart']))) return $spec;
         $full = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
         $physical = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
@@ -247,6 +271,8 @@ final class TaskWebChat
         if ($checkpointResume !== null) {
             $messages = $checkpointResume['messages'];
             $spec['postcompact_user_input'] = $checkpointResume['user_input'];
+        } elseif (!empty($spec['mailbox_context_restart'])) {
+            $messages = array_values((array) ($spec['mailbox_context_messages'] ?? []));
         } elseif (($physical['continuation']['mode'] ?? '') === 'exact_prefix') {
             $messages = $physical['messages'];
         } elseif (!empty($spec['steering_messages'])) {
@@ -303,7 +329,8 @@ final class TaskWebChat
         $proof = ['task_id' => $chat['task_id'], 'conversation_id' => $chat['conversation_id'],
             'request_hash' => $spec['request_hash'], 'source_response_id' => $source['id'] ?? null];
         $spec['budget']['regular_chat'] = $proof;
-        if ((!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id'])) && is_array($source)) {
+        if ((!empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id'])
+            || !empty($spec['mailbox_context_restart'])) && is_array($source)) {
             $surface = $db->table('gateway_browser_surfaces')->where('id', $source['surface_id'])->find();
             $anchor = $db->table('gateway_response_jobs')->where('task_id', $chat['task_id'])
                 ->where('submit_intent_at', '<>', null)->order([['rowid', 'DESC']])->limit(1)->find('id');

@@ -7,7 +7,7 @@ use app\gateway\database\Schema;
 /** Strongly typed, user-editable Step 06 settings persisted in SQLite. */
 final class GatewaySettings
 {
-    /** @return array Public preferences, including the persisted inactive-task cleanup switch; never exposes secrets. */
+    /** @return array Public preferences, including independent child model/effort and cleanup choices; never exposes secrets. */
     public static function snapshot(): array
     {
         Schema::initialize();
@@ -18,6 +18,8 @@ final class GatewaySettings
             'connector_name' => (string) $row['connector_name'],
             'web_chat_mode' => (string) ($row['web_chat_mode'] ?? 'temporary'),
             'web_chat_fallback_at' => (int) ($row['web_chat_fallback_at'] ?? 0),
+            'subagent_web_model' => (string) $row['subagent_web_model'],
+            'subagent_reasoning_effort' => (string) $row['subagent_reasoning_effort'],
             'ui_locale' => (string) ($row['ui_locale'] ?: \RC\Config::get('gateway', 'default_locale')),
             'pro_weekly_budget' => (int) ($row['pro_weekly_budget'] ?? 0),
             'mcp_invoke_timeout_ms' => (int) $row['mcp_invoke_timeout_ms'],
@@ -68,6 +70,7 @@ final class GatewaySettings
     {
         $allowed = [
             'ui_locale', 'pro_weekly_budget', 'auto_cleanup_inactive_tasks', 'web_chat_mode',
+            'subagent_web_model', 'subagent_reasoning_effort',
             'expected_updated_at', 'mcp_enabled', 'auto_approve_tool_calls', 'connector_name', 'mcp_invoke_timeout_ms',
             'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'tunnel_id', 'runtime_key', 'runtime_key_action',
@@ -85,6 +88,10 @@ final class GatewaySettings
         $input['pro_weekly_budget'] ??= $current['pro_weekly_budget'] ?? 0;
         $input['auto_cleanup_inactive_tasks'] ??= $current['auto_cleanup_inactive_tasks'];
         $input['web_chat_mode'] ??= $current['web_chat_mode'] ?? 'temporary';
+        foreach (['subagent_web_model','subagent_reasoning_effort'] as $field) {
+            $input[$field] ??= $current[$field];
+            if (!is_string($input[$field])) throw new GatewayError('INVALID_SETTINGS', 'Subagent model and reasoning level must be strings.', 400);
+        }
         foreach (['context_transport', 'context_max_parts', 'context_extended', 'response_timeout_seconds',
             'context_stage_timeout_seconds', 'compaction_timeout_seconds', 'skill_transport',
             'official_handoff_summary', 'steering_full_context', 'web_initial_contract_template', 'web_resume_contract_template',
@@ -103,6 +110,8 @@ final class GatewaySettings
             $data = validator()->input($input, [
                 'ui_locale' => ['rule' => 'string', 'len' => [2, 5], 'name' => 'Language'],
                 'web_chat_mode' => ['rule' => 'string', 'len' => [7, 9], 'name' => 'Web chat mode'],
+                'subagent_web_model' => ['rule'=>'string', 'len'=>[0,128], 'required'=>false, 'name'=>'Subagent Web model'],
+                'subagent_reasoning_effort' => ['rule'=>'string', 'len'=>[3,6], 'name'=>'Subagent reasoning level'],
                 'pro_weekly_budget' => ['rule' => 'nnint', 'range' => [0, 100000], 'name' => 'Weekly Pro tracking budget'],
                 'auto_cleanup_inactive_tasks' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'Inactive task cleanup'],
                 'expected_updated_at' => ['rule' => 'nnint', 'name' => '设置版本'],
@@ -133,7 +142,8 @@ final class GatewaySettings
         } catch (\Throwable) {
             throw new GatewayError('INVALID_SETTINGS', '请检查工具配置的数值范围和字段长度。');
         }
-        $data += ['tunnel_id' => '', 'runtime_key' => ''];
+        $data += ['tunnel_id' => '', 'runtime_key' => '', 'subagent_web_model'=>''];
+        CodexSubagent::validateSelection($data['subagent_web_model'], $data['subagent_reasoning_effort']);
         if (!in_array($data['ui_locale'], ['en', 'zh-CN'], true)) throw new GatewayError('INVALID_SETTINGS', 'Unsupported language.');
         if (!in_array($data['web_chat_mode'], ['temporary', 'regular'], true)) throw new GatewayError('INVALID_SETTINGS', 'Unsupported Web chat mode.');
         if (!in_array($data['context_transport'], ['auto', 'single'], true)) throw new GatewayError('INVALID_SETTINGS', '上下文传输请选择自动或单条。');

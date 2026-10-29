@@ -14,12 +14,14 @@ final class ResponseJob
      * read-only readiness checks outside the reservation transaction. SDB cannot express
      * that nested aggregate as a structured condition; reuse the framework DB connection.
      * @param string $taskId Already authorized durable task identity.
+     * @param bool $metadataOnly Avoid loading archived context/results for child routing and maintenance.
      * @return array|null Internal persisted job row, or null when the task has no rounds.
      * @throws GatewayError If the framework cannot read the latest-round metadata.
      */
-    public static function latestForTaskUnlocked(string $taskId): ?array
+    public static function latestForTaskUnlocked(string $taskId, bool $metadataOnly = false): ?array
     {
-        $statement = DB('medoo', 'sqlite')->query('SELECT * FROM gateway_response_jobs
+        $fields = $metadataOnly ? 'id,model,reasoning_effort,status,round_kind,operation_kind,durable_turn_id,finished_at' : '*';
+        $statement = DB('medoo', 'sqlite')->query('SELECT ' . $fields . ' FROM gateway_response_jobs
             WHERE task_id=:task AND rowid=(SELECT MAX(rowid) FROM gateway_response_jobs WHERE task_id=:task)', [':task'=>$taskId]);
         if (!$statement) throw new GatewayError('storage_unavailable', '任务时间线读取失败。', 503);
         try {
@@ -83,6 +85,7 @@ final class ResponseJob
         // An accepted tool result resumes an existing Web turn and sends no new browser
         // message. Keep its exact receipt drainable while new submissions are cooling down.
         $isToolContinuation = (array) ($spec['tool_outputs'] ?? []) !== [];
+        $spec = CodexSubagent::prepare($spec);
         // Reserve durably even during a shared 429 cooldown. The browser worker waits
         // asynchronously before dispatch; HTTP subscribers keep their existing heartbeats.
         $budget = $spec['budget'] ?? ContextBudget::snapshot($spec['model'], $spec['reasoning_effort'] ?? null);
@@ -138,6 +141,7 @@ final class ResponseJob
                 if (is_array($existing)) return (string) $existing['id'];
             }
             $spec = ContextHistory::demoteHistoricalToolOutputsUnlocked($spec);
+            $spec = CodexSubagent::prepare($spec);
             // The early lookup avoids browser admission for a replay; repeat it under the
             // write transaction so concurrent temporary threads cannot reserve two producers.
             if ($idempotencyKey === null) {
@@ -201,9 +205,11 @@ final class ResponseJob
                     (string) ($spec['operation_kind'] ?? 'response'));
                 $outputControl = (array)($spec['budget']['output_control'] ?? []);
                 $configuration = $spec['budget']['reasoning_configuration'] ?? null;
+                $subagent = $spec['budget']['native_subagent'] ?? null;
                 $spec['budget'] = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
                 if ($outputControl !== []) $spec['budget']['output_control'] = $outputControl;
                 if ($configuration !== null) $spec['budget']['reasoning_configuration'] = $configuration;
+                if ($subagent !== null) $spec['budget']['native_subagent'] = $subagent;
                 $spec['budget'] = ContextRecovery::applyObservedMessageLimitUnlocked($spec, $spec['budget']);
             }
             $budget = $spec['budget'] ?? $budget;

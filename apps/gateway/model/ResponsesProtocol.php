@@ -724,6 +724,7 @@ final class ResponsesProtocol
         $route = ModelCatalog::identity($spec['model'], $configuration['effort']);
         $budget = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
         if (isset($spec['budget']['output_control'])) $budget['output_control'] = $spec['budget']['output_control'];
+        if (isset($spec['budget']['native_subagent'])) $budget['native_subagent'] = $spec['budget']['native_subagent'];
         $budget['reasoning_configuration'] = $configuration;
         $spec['budget'] = $budget;
         $spec['reasoning_effort'] = $route['effort'];

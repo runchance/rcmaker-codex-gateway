@@ -533,6 +533,13 @@ final class Schema
                 "CREATE TABLE gateway_surface_retirements (surface_id TEXT PRIMARY KEY REFERENCES gateway_browser_surfaces(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES gateway_tasks(id) ON DELETE CASCADE, state TEXT NOT NULL CHECK(state IN ('pending','stopped','closed')), snapshot_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
                 'CREATE INDEX gateway_surface_retirements_pending ON gateway_surface_retirements(task_id,state,updated_at)',
             ],
+            66 => [
+                // Small settings/task metadata only; no history rewrite or response-body index.
+                "ALTER TABLE gateway_settings ADD COLUMN subagent_web_model TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE gateway_settings ADD COLUMN subagent_reasoning_effort TEXT NOT NULL DEFAULT 'xhigh'",
+                'ALTER TABLE gateway_tasks ADD COLUMN native_parent_thread_id TEXT',
+                "ALTER TABLE gateway_tasks ADD COLUMN native_agent_path TEXT NOT NULL DEFAULT ''",
+            ],
         ];
     }
 

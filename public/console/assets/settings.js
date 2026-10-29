@@ -8,7 +8,7 @@
     let modelReading = false;
     let savedNoticeTimer = null;
     const savedForms = {general: null, contracts: null};
-    const generalFields = ['pro-weekly-budget', 'context-parts', 'skill-transport',
+    const generalFields = ['pro-weekly-budget', 'subagent-model', 'subagent-effort', 'context-parts', 'skill-transport',
         'context-extended', 'official-handoff-summary', 'steering-full-context', 'response-timeout', 'stage-timeout',
         'compact-timeout', 'invoke-timeout', 'wait-poll', 'max-tools', 'auto-approve-tools', 'auto-cleanup-inactive-tasks'];
     const contracts = [
@@ -43,11 +43,33 @@
     function hasDraft() {
         return Object.keys(savedForms).some(section => savedForms[section] !== null && savedForms[section] !== formSnapshot(section));
     }
+    /** Keep the saved model visible during account refreshes; never replace a user's unavailable choice silently. */
+    function renderSubagentModels(model, effort) {
+        const selector = byId('subagent-model');
+        selector.replaceChildren(new Option(I18n.t('跟随主任务家族（不继承 Pro）'), ''));
+        models.filter(row => (row.efforts || []).some(level => ['low', 'medium', 'high', 'xhigh'].includes(level)))
+            .forEach(row => selector.add(new Option(I18n.t(row.label || row.id), row.id)));
+        if (model && !Array.from(selector.options).some(option => option.value === model)) selector.add(new Option(model, model));
+        selector.value = model || '';
+        renderSubagentEfforts(effort);
+    }
+    /** Offer only this model's declared non-Pro levels; an old selection remains explicit until changed. */
+    function renderSubagentEfforts(effort) {
+        const model = models.find(row => row.id === byId('subagent-model').value);
+        const supported = model ? (model.efforts || []) : ['low', 'medium', 'high', 'xhigh'];
+        const selector = byId('subagent-effort');
+        selector.replaceChildren();
+        const labels = {low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High'};
+        supported.filter(level => Object.hasOwn(labels, level)).forEach(level => selector.add(new Option(I18n.t(labels[level]), level)));
+        if (!Array.from(selector.options).some(option => option.value === effort)) selector.add(new Option(effort, effort));
+        selector.value = effort;
+    }
     function render(data, section = 'all') {
         current = data;
         if (section === 'all' || section === 'general') {
         byId('ui-locale').value = data.ui_locale || 'en';
         byId('pro-weekly-budget').value = data.pro_weekly_budget || 0;
+        renderSubagentModels(data.subagent_web_model || '', data.subagent_reasoning_effort || 'xhigh');
         byId('context-parts').value = String(data.context_max_parts || 6);
         byId('skill-transport').checked = data.skill_transport === 'file';
         byId('context-extended').checked = !!data.context_extended;
@@ -150,6 +172,8 @@
             else Object.assign(payload, {
                 ui_locale: byId('ui-locale').value,
                 pro_weekly_budget: Number(byId('pro-weekly-budget').value),
+                subagent_web_model: byId('subagent-model').value,
+                subagent_reasoning_effort: byId('subagent-effort').value,
                 context_transport: 'auto',
                 context_max_parts: Number(byId('context-parts').value),
                 skill_transport: byId('skill-transport').checked ? 'file' : 'inline',
@@ -220,6 +244,9 @@
     });
     window.addEventListener('gateway-language-changed', () => {
         if (!current) return;
+        // Layui copies option labels into readonly inputs; rebuild these labels without changing drafts.
+        renderSubagentModels(byId('subagent-model').value, byId('subagent-effort').value);
+        layui.form.render('select');
         renderBudgets();
         contracts.forEach(contractStatus);
     });
@@ -232,6 +259,13 @@
         });
     });
     layui.form.on('checkbox(context-budget)', renderBudgets);
+    layui.form.on('select(subagent-model)', () => {
+        const model = models.find(row => row.id === byId('subagent-model').value);
+        const supported = (model?.efforts || ['low', 'medium', 'high', 'xhigh']).filter(level => ['low', 'medium', 'high', 'xhigh'].includes(level));
+        const currentEffort = byId('subagent-effort').value;
+        renderSubagentEfforts(supported.includes(currentEffort) ? currentEffort : (supported.includes('xhigh') ? 'xhigh' : (supported[0] || 'xhigh')));
+        layui.form.render('select');
+    });
     byId('context-extended').addEventListener('change', renderBudgets);
     byId('context-parts').addEventListener('change', renderBudgets);
     /** Returning to Settings refreshes derived account budgets, never the editable preference or contract fields. */

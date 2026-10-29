@@ -1013,6 +1013,7 @@ final class TaskLedger
 
     /**
      * Reserve one logical turn and its task surface inside the caller's existing transaction.
+     * Verified child metadata is stamped once for operator projections, never used to borrow a parent capability.
      * @return array{reused:bool,response_id:?string,task_id:string,epoch_id:string,turn_id:string,surface_id:string,generation_id:string,round_no:int}
      */
     public static function reserveTurnUnlocked(array $spec, string $responseId): array
@@ -1050,6 +1051,16 @@ final class TaskLedger
         }
         if ((string) $task['status'] === 'cancelled') {
             throw new GatewayError('task_cancelled', '该任务已经取消，不能继续创建新回合。', 409);
+        }
+        $child = $spec['budget']['native_subagent'] ?? null;
+        if (is_array($child) && ($child['thread_id'] ?? null) === $threadId
+            && empty($task['native_parent_thread_id'])) {
+            $marked = $db->table('gateway_tasks')->where('id', $taskId)->where('thread_id', $threadId)
+                ->where('native_parent_thread_id', null)->update([
+                    'native_parent_thread_id'=>$child['parent_thread_id'], 'native_agent_path'=>$child['agent_path']]);
+            if (!$marked || $marked->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Subagent identity could not be saved.', 503);
+            $task['native_parent_thread_id'] = $child['parent_thread_id'];
+            $task['native_agent_path'] = $child['agent_path'];
         }
         if ((string) $task['status'] === 'needs_attention') {
             $last = $db->table('gateway_response_jobs')->where('task_id', $taskId)->where('status', 'failed')->order([['rowid','DESC']])->limit(1)->find();
@@ -1931,6 +1942,7 @@ final class TaskLedger
         });
     }
 
+    /** Record only this task's failure; child diagnostics include identity without propagating cancellation to its parent. */
     public static function failed(string $responseId, string $code, bool $unknown = false): void
     {
         Schema::transaction(function () use ($responseId, $code, $unknown): void {
@@ -1959,8 +1971,14 @@ final class TaskLedger
                     'status' => 'ready', 'session_id' => null, 'updated_at' => $now,
                 ]);
             }
+            $diagnostic = ['code' => $code];
+            $task = $db->table('gateway_tasks')->where('id', $turn['task_id'])->find('native_parent_thread_id,native_agent_path');
+            if (is_array($task) && !empty($task['native_parent_thread_id'])) {
+                $diagnostic['parent_thread_id'] = $task['native_parent_thread_id'];
+                $diagnostic['agent_path'] = $task['native_agent_path'];
+            }
             self::eventUnlocked((string) $turn['task_id'], (string) $turn['id'], $responseId, (string) $surface['id'],
-                $unknown ? 'outcome_unknown' : 'turn_failed', ['code' => $code]);
+                $unknown ? 'outcome_unknown' : 'turn_failed', $diagnostic);
         });
     }
 
@@ -3567,18 +3585,22 @@ final class TaskLedger
             'latest_user' => TaskLabel::summarize($latest)];
     }
 
-    /** Small read-only projection for the console browser monitor. */
+    /** Small read-only operator projection; child execution pages never select the default workspace frame. */
     public static function monitor(): array
     {
         Schema::initialize();
         $db = SDB(null, 'medoo', 'sqlite');
-        $turn = $db->table('gateway_task_turns')
-            ->where('status', 'IN', self::ACTIVE_TURNS)
-            ->order([['updated_at', 'DESC'], ['created_at', 'DESC']])
-            ->limit(1)
-            ->find();
-        if ($turn === false) throw new GatewayError('storage_unavailable', '任务监看状态暂不可读取。', 503);
-        if (!is_array($turn)) return ['active' => false];
+        $turns = $db->table('gateway_task_turns AS r')->join('gateway_tasks AS t', 't.id', 'r.task_id')
+            ->where('t.native_parent_thread_id', null)->where('r.status', 'IN', self::ACTIVE_TURNS)
+            ->order([['r.updated_at', 'DESC'], ['r.created_at', 'DESC']])->limit(self::MAX_SURFACES)
+            ->select('r.id,r.task_id,r.surface_id,r.response_id,r.status,r.updated_at,r.created_at');
+        if (!is_array($turns)) throw new GatewayError('storage_unavailable', '任务监看状态暂不可读取。', 503);
+        $turn = null;
+        foreach ($turns as $candidate) {
+            $identity = $db->table('gateway_tasks')->where('id', $candidate['task_id'])->find('thread_id');
+            if (is_array($identity) && CodexSubagent::scope($identity['thread_id'] ?? null) === null) { $turn = $candidate; break; }
+        }
+        if ($turn === null) return ['active' => false];
 
         $surface = $db->table('gateway_browser_surfaces')->where('id', (string) $turn['surface_id'])->find();
         $task = $db->table('gateway_tasks')->where('id', (string) $turn['task_id'])->find();
@@ -3601,6 +3623,7 @@ final class TaskLedger
 
     /**
      * Project retained pages and bounded pending physical closes into the browser workspace.
+     * Native child pages remain available to execution but never occupy an operator tab.
      * Closing rows do not reserve task slots and disappear only after the browser confirms absence.
      * @param list<string> $closingSurfaceIds Up to five operator-requested closes, shown first.
      * @return list<array> At most five retained pages plus five pending physical closes.
@@ -3613,8 +3636,10 @@ final class TaskLedger
         // in this API worker so frequent console polling does not decode large histories.
         static $titleByTask = [];
         $db = SDB(null, 'medoo', 'sqlite');
-        $surfaces = $db->table('gateway_browser_surfaces')->where('status', '<>', 'retired')
-            ->order([['created_at', 'ASC'], ['id', 'ASC']])->limit(self::MAX_SURFACES)->select();
+        $surfaces = $db->table('gateway_browser_surfaces AS s')->join('gateway_tasks AS t', 't.id', 's.task_id')
+            ->where('t.native_parent_thread_id', null)->where('s.status', '<>', 'retired')
+            ->order([['s.created_at', 'ASC'], ['s.id', 'ASC']])->limit(self::MAX_SURFACES)
+            ->select('s.id,s.task_id,s.epoch_id,s.status,s.url,s.created_at,s.retired_at');
         if (!is_array($surfaces)) throw new GatewayError('storage_unavailable', '任务页面列表暂不可读取。', 503);
         $requestedClosing = [];
         if ($closingSurfaceIds !== []) {
@@ -3637,6 +3662,7 @@ final class TaskLedger
             $taskId = (string) $surface['task_id'];
             $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
             if (!is_array($task) || (string) $task['status'] === 'cancelled') continue;
+            if (!empty($task['native_parent_thread_id']) || CodexSubagent::scope($task['thread_id'] ?? null) !== null) continue;
             $seenTasks[$taskId] = true;
             $turn = $db->table('gateway_task_turns')->where('surface_id', (string) $surface['id'])
                 ->order([['rowid', 'DESC']])->limit(1)->find();
@@ -3720,6 +3746,77 @@ final class TaskLedger
             self::retireEpochUnlocked($taskId, (string) $surface['epoch_id'], 'operator_closed_idle_page');
             return ['task_id' => $taskId, 'surface_id' => $surfaceId, 'closing' => !empty($surface['target_id'])];
         });
+    }
+
+    /**
+     * Retire settled child pages after their exact Web parent finishes its ordinary response.
+     * The independent maintenance worker calls this bounded reconciliation after restart too.
+     * Repeated child turns retain their page while the parent is running; active/unknown host
+     * work, undelivered receipts, parent failures and newer parent turns never authorize closure.
+     * Existing page retirement performs Stop/confirmation before physical target closure.
+     * @return int Number of retired pages; task records and immutable receipts remain available.
+     * @throws GatewayError On unavailable durable state; retries cannot cancel other tasks.
+     */
+    public static function retireFinishedSubagentPages(): int
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $candidates = $db->table('gateway_browser_surfaces AS s')->join('gateway_tasks AS t', 't.id', 's.task_id')
+            ->where('s.status', 'ready')->where('t.native_parent_thread_id', '<>', null)
+            ->order([['s.updated_at', 'ASC']])->limit(self::MAX_SURFACES)->select('s.id');
+        if (!is_array($candidates)) throw new GatewayError('storage_unavailable', 'Subagent page cleanup state is unavailable.', 503);
+        $retired = 0;
+        foreach ($candidates as $candidate) {
+            $retired += Schema::transaction(static function () use ($candidate): int {
+                $db = SDB(null, 'medoo', 'sqlite');
+                $surface = $db->table('gateway_browser_surfaces')->where('id', $candidate['id'])->find();
+                if (!is_array($surface) || $surface['status'] !== 'ready') return 0;
+                $child = $db->table('gateway_tasks')->where('id', $surface['task_id'])->find();
+                if (!is_array($child) || empty($child['native_parent_thread_id'])) return 0;
+                // Resolve only the parent's exact native client/thread/branch, including its recovery alias.
+                $owner = hash('sha256', json_encode(['kind'=>'thread', 'id'=>$child['native_parent_thread_id']], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+                $base = 'task_' . substr(hash('sha256', json_encode(['client'=>$child['client_id'], 'owner'=>$owner,
+                    'branch'=>$child['branch_id']], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)), 0, 24);
+                $link = $db->table('gateway_task_conversations')->where('base_task_id', $base)->find('current_task_id');
+                $parent = $db->table('gateway_tasks')->where('id', $link['current_task_id'] ?? $base)->find();
+                if (!is_array($parent) || $parent['thread_id'] !== $child['native_parent_thread_id']
+                    || $parent['client_id'] !== $child['client_id'] || $parent['branch_id'] !== $child['branch_id']
+                    || $parent['status'] !== 'active') return 0;
+                $last = ResponseJob::latestForTaskUnlocked((string)$parent['id'], true);
+                if (!is_array($last) || $last['status'] !== 'completed' || $last['round_kind'] !== 'text'
+                    || $last['operation_kind'] !== 'response') return 0;
+                $parentTurn = $db->table('gateway_task_turns')->where('id', $last['durable_turn_id'])->find('status');
+                if (!is_array($parentTurn) || $parentTurn['status'] !== 'committed') return 0;
+                $childTurn = $db->table('gateway_task_turns')->where('surface_id', $surface['id'])
+                    ->order([['rowid', 'DESC']])->limit(1)->find();
+                if (!is_array($childTurn) || (int)$childTurn['created_at'] > (int)$last['finished_at']) return 0;
+                $knownFailure = $childTurn['status'] === 'failed' && $child['status'] === 'active'
+                    && $child['current_epoch_id'] === $surface['epoch_id'];
+                if (!$knownFailure && !self::idleSurfaceClosableUnlocked($db, $child, $surface, $childTurn)) return 0;
+                $pending = $db->table('gateway_tool_invocations')->where('task_id', $child['id'])
+                    ->where('status', 'IN', ['registered','delivered','unknown'])->count();
+                $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $child['id'])
+                    ->where('status', 'completed')->where('result_delivered_at', null)->count();
+                $activities = $db->table('gateway_mcp_activities AS a')->join('gateway_mcp_bindings AS b', 'b.id', 'a.binding_id')
+                    ->where('b.task_id', $child['id'])->where('a.status', 'active')->count('a.id');
+                if (!is_numeric($pending) || !is_numeric($undelivered) || !is_numeric($activities)) throw new GatewayError('storage_unavailable', 'Subagent receipt cleanup state is unavailable.', 503);
+                if ((int)$pending !== 0 || (int)$undelivered !== 0 || (int)$activities !== 0) return 0;
+                if ($knownFailure) {
+                    $failed = $db->table('gateway_response_jobs')->where('id', $childTurn['response_id'])
+                        ->where('task_id', $child['id'])->where('status', 'failed')->find('id');
+                    $active = $db->table('gateway_task_turns')->where('task_id', $child['id'])
+                        ->where('status', 'IN', self::ACTIVE_TURNS)->count();
+                    if (!is_array($failed) || !is_numeric($active) || (int)$active !== 0) return 0;
+                    $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $child['id'])
+                        ->where('status', 'IN', ['awaiting_start','running'])->select('id');
+                    if (!is_array($bindings)) throw new GatewayError('storage_unavailable', 'Subagent receipt cleanup state is unavailable.', 503);
+                    foreach ($bindings as $binding) if (ToolBroker::hasUnsettledCallsUnlocked($binding['id'])) return 0;
+                    ToolBroker::revokeTaskUnlocked((string)$child['id'], 'native_parent_completed');
+                }
+                self::retireEpochUnlocked((string)$child['id'], (string)$surface['epoch_id'], 'native_parent_completed');
+                return 1;
+            });
+        }
+        return $retired;
     }
 
     /** Authoritative close guard shared by the list hint and the transactional close action. */
@@ -4067,13 +4164,19 @@ final class TaskLedger
         if (!$ok) throw new GatewayError('storage_unavailable', '任务时间线事件无法保存。', 503);
     }
 
+    /** Expose child labels in the task center, including verified legacy metadata without modifying a read request. */
     private static function publicTask(array $task, ?array $epoch, ?array $surface, ?array $turn): array
     {
         $chat = TaskWebChat::state((string) $task['id']);
+        $child = !empty($task['native_parent_thread_id'])
+            ? ['parent_thread_id'=>$task['native_parent_thread_id'], 'agent_path'=>$task['native_agent_path']]
+            : CodexSubagent::scope($task['thread_id'] ?? null);
         return [
             'id' => (string) $task['id'], 'client_id' => (string) $task['client_id'],
             'web_chat_mode' => $chat['mode'], 'web_conversation_id' => $chat['conversation_id'] ?? null,
             'thread_id' => $task['thread_id'], 'branch_id' => (string) $task['branch_id'],
+            'is_subagent'=>is_array($child), 'parent_thread_id'=>$child['parent_thread_id'] ?? null,
+            'agent_path'=>$child['agent_path'] ?? null,
             'status' => (string) $task['status'], 'current_epoch_id' => $task['current_epoch_id'],
             'consecutive_gateway_errors'=>(int)($task['consecutive_gateway_errors'] ?? 0),
             'gateway_rebuild_pending'=>!empty($task['gateway_rebuild_pending']),

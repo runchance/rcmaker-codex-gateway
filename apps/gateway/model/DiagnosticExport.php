@@ -18,7 +18,7 @@ final class DiagnosticExport
 
     /** Fixed projections only. Large payload/secret columns must never be added to these lists. */
     private const TABLES = [
-        'tasks' => ['gateway_tasks', 60, 'id,thread_id,status,current_epoch_id,consecutive_gateway_errors,gateway_rebuild_pending,created_at,updated_at,cancelled_at'],
+        'tasks' => ['gateway_tasks', 60, 'id,thread_id,native_parent_thread_id,native_agent_path,status,current_epoch_id,consecutive_gateway_errors,gateway_rebuild_pending,created_at,updated_at,cancelled_at'],
         'turns' => ['gateway_task_turns', 240, 'id,task_id,epoch_id,surface_id,client_turn_id,request_hash,response_id,status,fencing_version,deadline_at,submit_intent_at,submitted_at,committed_at,retired_at,error_code,created_at,updated_at'],
         'responses' => ['gateway_response_jobs', 240, 'id,task_id,epoch_id,durable_turn_id,surface_id,model,reasoning_effort,operation_kind,round_kind,round_no,status,request_hash,previous_response_id,rolling_source_response_id,continuation_source_response_id,compact_id,command_id,input_tokens,output_started,sequence_next,terminal_type,transport_parts_total,transport_stage_sent,transport_stage_acked,transport_stage_effort,transport_final_effort,repair_count,accepted_at,submit_intent_at,created_at,started_at,finished_at,error_json,budget_json,transport_decision_json,physical_selection_json'],
         'tools' => ['gateway_tool_invocations', 400, 'id,task_id,turn_id,response_id,binding_id,call_id,wire_name,request_hash,result_hash,status,delivery_count,created_at,updated_at,delivered_at,completed_at,result_delivered_at,result_delivered_at_us'],
@@ -32,7 +32,7 @@ final class DiagnosticExport
         'connector' => ['gateway_connector_state', 1, 'id,status,verified_at,updated_at'],
         'network' => ['gateway_network_state', 1, 'id,saved_revision,applied_php_revision,last_apply_revision,probe_heartbeat'],
         'network_tests' => ['gateway_network_tests', 20, 'id,revision,target_id,status,created_at,started_at,finished_at,result_json'],
-        'settings' => ['gateway_settings', 1, 'id,mcp_enabled,mcp_invoke_timeout_ms,wait_poll_interval_ms,max_tool_calls_per_turn,tool_result_max_bytes,context_max_parts,context_transport,context_extended,response_timeout_seconds,context_stage_timeout_seconds,compaction_timeout_seconds,ui_locale,updated_at'],
+        'settings' => ['gateway_settings', 1, 'id,mcp_enabled,subagent_web_model,subagent_reasoning_effort,mcp_invoke_timeout_ms,wait_poll_interval_ms,max_tool_calls_per_turn,tool_result_max_bytes,context_max_parts,context_transport,context_extended,response_timeout_seconds,context_stage_timeout_seconds,compaction_timeout_seconds,ui_locale,updated_at'],
         'catalog' => ['gateway_model_catalog', 1, 'id,observed_at,browser_generation,native_verified_at'],
         'schema' => ['gateway_schema', 100, 'version'],
         // High-volume timeline evidence comes last so it cannot crowd out recovery/health state.
@@ -47,6 +47,7 @@ final class DiagnosticExport
         'status', 'state', 'type', 'kind', 'mode', 'reason', 'protocol', 'version',
         'task_id', 'turn_id', 'response_id', 'source_response_id', 'checkpoint_id', 'surface_id',
         'binding_id', 'call_id', 'epoch_id', 'source_epoch_id', 'current_response_id', 'client_turn_id',
+        'native_subagent', 'thread_id', 'parent_thread_id', 'agent_path', 'depth', 'deferred',
         'request_hash', 'source_request_hash', 'result_hash', 'completion_hash',
         'binding_status', 'binding_expires_at', 'binding_current_response_id', 'binding_turn_id',
         'tool_count', 'argument_count', 'input_bytes', 'output_bytes', 'bytes', 'event_count',
