@@ -793,9 +793,15 @@ final class ContextHistory
                     // A full native transcript already orders interleaved human/runtime
                     // updates and the newly received calls. Regrouping them for the Web
                     // projection would break the next native request's exact-prefix proof.
+                    $lite = !empty($spec['native_responses_lite']);
+                    $proofPrior = $priorFull;
+                    if (!$receiptDelta && !self::matchesCompactionSource($priorFull, $context, $lite)) {
+                        $proofPrior = self::legacyMailboxReceiptPrefixUnlocked($prior, $priorFull, $context, $lite) ?? $priorFull;
+                    }
                     $completeNativeHistory = !$receiptDelta
-                        && self::matchesCompactionSource($priorFull, $context, !empty($spec['native_responses_lite']))
-                        && self::matchesNativeToolRound($priorFull, $context, $round, !empty($spec['native_responses_lite']));
+                        && self::matchesCompactionSource($proofPrior, $context, $lite)
+                        && self::matchesNativeToolRound($proofPrior, $context, $round, $lite,
+                            self::containsAgentMessage(['messages'=>$pending['messages']]) ? count($pending['event_ids']) : 0);
                     if ($completeNativeHistory) {
                         $spec['full_context_json'] = self::canonical($context);
                     } else {
@@ -1106,10 +1112,15 @@ final class ContextHistory
      * Preserve a complete native receipt suffix only when it contains exactly the
      * published source output, selected receipts and proven updates in the Web round.
      * Their interleaving can differ; extra/altered assistant or call records cannot
-     * acquire provenance through this ordering repair. Call/output wire bookkeeping
-     * is normalized with the existing native history comparator.
+     * acquire provenance through this ordering repair. A proven queued mailbox join can
+     * replay already published commentary/summary when its SSE stream reconnects. Allow
+     * at most that many byte-identical public replays while keeping every call, receipt
+     * and update exact; retain the incoming native order rather than regrouping it.
+     * Call/output bookkeeping uses the existing native history comparator.
+     * @param int $mailboxReplays Source-bound queued mailbox record count, an upper bound on interrupted-stream replays.
      */
-    private static function matchesNativeToolRound(array $prior, array $context, array $round, bool $lite): bool
+    private static function matchesNativeToolRound(array $prior, array $context, array $round, bool $lite,
+        int $mailboxReplays = 0): bool
     {
         $known = (array) ($prior['messages'] ?? []);
         $records = (array) ($context['messages'] ?? []);
@@ -1121,6 +1132,28 @@ final class ContextHistory
         $normalize = static fn(array $record): string => self::nativeToolHistoryCanonical([$record]);
         $expectedRecords = (array) ($round['messages'] ?? []);
         $requestedRecords = array_slice($records, count($known) + $offset);
+        if ($mailboxReplays > 0) {
+            $publicCounts = [];
+            foreach ($expectedRecords as $record) {
+                if ((($record['role'] ?? '') === 'assistant' && ($record['phase'] ?? '') === 'commentary')
+                    || ($record['type'] ?? '') === 'reasoning_summary') {
+                    $key = $normalize($record);
+                    $publicCounts[$key] = ($publicCounts[$key] ?? 0) + 1;
+                }
+            }
+            $seen = [];
+            $compared = [];
+            foreach ($requestedRecords as $record) {
+                $key = $normalize($record);
+                if (isset($publicCounts[$key])) {
+                    $seen[$key] = ($seen[$key] ?? 0) + 1;
+                    if ($seen[$key] > $publicCounts[$key] * (1 + $mailboxReplays)) return false;
+                    if ($seen[$key] > $publicCounts[$key]) continue;
+                }
+                $compared[] = $record;
+            }
+            $requestedRecords = $compared;
+        }
         $modelRecord = static fn(array $record): bool =>
             !in_array($record['role'] ?? '', ['user', 'developer', 'agent_message'], true);
         if (array_values(array_map($normalize, array_filter($expectedRecords, $modelRecord)))
@@ -1180,6 +1213,84 @@ final class ContextHistory
     public static function activeMailboxContextUpdateUnlocked(array $spec, ?string $taskId = null): ?array
     {
         return self::activeNativeContextUpdateUnlocked($spec, $taskId, false);
+    }
+
+    /**
+     * Read-only compatibility proof for one receipt round regrouped by an older mailbox join.
+     * Only the exact attached agent events, direct completed predecessor and unchanged native
+     * calls/results can restore its incoming order. This never edits archived jobs or ACKs.
+     * @param array $source Owned current source job. @param array $stored Its canonical context.
+     * @param array $incoming Complete native request. @param bool $lite Native wire mode.
+     * @return ?array Exact incoming source prefix, or null for missing/ambiguous/altered evidence.
+     * @throws GatewayError If the existing ledger cannot be read or decoded.
+     */
+    public static function legacyMailboxReceiptPrefixUnlocked(array $source, array $stored, array $incoming, bool $lite): ?array
+    {
+        if (empty($source['previous_response_id'])) return null;
+        $storedTop = $stored; $incomingTop = $incoming;
+        unset($storedTop['messages'], $incomingTop['messages']);
+        if (self::canonical($storedTop) !== self::canonical($incomingTop)) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $attached = $db->table('gateway_task_events')->where('task_id', $source['task_id'])
+            ->where('turn_id', $source['durable_turn_id'])->where('response_id', $source['id'])
+            ->where('event_type', 'native_context_updates_attached')->limit(2)->select('data_json');
+        if (!is_array($attached)) throw new GatewayError('storage_unavailable', 'Native mailbox receipt proof is unavailable.', 503);
+        if (count($attached) !== 1) return null;
+        $ids = (array)(json_decode($attached[0]['data_json'], true, 128, JSON_THROW_ON_ERROR)['event_ids'] ?? []);
+        if ($ids === [] || count($ids) > 128 || count(array_unique($ids)) !== count($ids)) return null;
+        $previous = $db->table('gateway_response_jobs')->where('id', $source['previous_response_id'])->find();
+        if (!is_array($previous) || $previous['task_id'] !== $source['task_id']
+            || $previous['durable_turn_id'] !== $source['durable_turn_id'] || $previous['epoch_id'] !== $source['epoch_id']
+            || $previous['surface_id'] !== $source['surface_id'] || $previous['mcp_binding_id'] !== $source['mcp_binding_id']
+            || ($previous['operation_kind'] ?? 'response') !== 'response'
+            || $previous['model'] !== $source['model'] || $previous['reasoning_effort'] !== $source['reasoning_effort']
+            || $previous['status'] !== 'completed' || $previous['round_kind'] !== 'tool_call'
+            || (int)$previous['round_no'] + 1 !== (int)$source['round_no']) return null;
+        $events = $db->table('gateway_task_events')->where('id', 'IN', $ids)
+            ->where('task_id', $source['task_id'])->where('turn_id', $source['durable_turn_id'])
+            ->where('response_id', $previous['id'])->where('event_type', 'native_context_update_queued')->select('data_json');
+        if (!is_array($events)) throw new GatewayError('storage_unavailable', 'Native mailbox attachment proof is unavailable.', 503);
+        if (count($events) !== count($ids)) return null;
+        $queued = [];
+        foreach ($events as $event) {
+            $message = json_decode($event['data_json'], true, 128, JSON_THROW_ON_ERROR)['message'] ?? [];
+            if (($message['role'] ?? '') !== 'agent_message') return null;
+            $key = self::canonical($message);
+            if (isset($queued[$key])) return null;
+            $queued[$key] = $message;
+        }
+        $base = json_decode($previous['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        if (!self::matchesCompactionSource($base, $stored, $lite)) return null;
+        $baseRecords = (array)($base['messages'] ?? []);
+        $offset = static function(array $context) use ($base, $baseRecords, $lite): int {
+            $first = $context['messages'][0] ?? [];
+            return $lite && is_string($base['system'][0] ?? null) && $base['system'][0] !== ''
+                && ($first['role'] ?? '') === 'developer' && ($first['content'] ?? null) === $base['system'][0]
+                && self::canonical($baseRecords[0] ?? null) !== self::canonical($first) ? 1 : 0;
+        };
+        $round = ['messages'=>array_slice($stored['messages'], count($baseRecords) + $offset($stored))];
+        foreach ($queued as $message) if (!self::containsRecord($round['messages'], $message)) return null;
+        $required = []; $receipt = false;
+        foreach ($round['messages'] as $record) {
+            if (($record['role'] ?? '') === 'developer'
+                || (($record['role'] ?? '') === 'user' && !self::isOperationalUserMessage($record))) return null;
+            $output = in_array($record['type'] ?? '', ['function_call_output','custom_tool_call_output','tool_search_output'], true);
+            if (!$output && ($record['role'] ?? '') !== 'agent_message') continue;
+            $key = hash('sha256', self::nativeToolHistoryCanonical([$record]));
+            if (isset($required[$key])) return null;
+            $required[$key] = true; $receipt = $receipt || $output;
+        }
+        if (!$receipt || $required === []) return null;
+        $start = count($baseRecords) + $offset($incoming);
+        $limit = min(count($incoming['messages']), $start + count($round['messages']) * (1 + count($ids)));
+        for ($index = $start; $index < $limit; $index++) {
+            unset($required[hash('sha256', self::nativeToolHistoryCanonical([$incoming['messages'][$index]]))]);
+            if ($required !== []) continue;
+            $candidate = $incoming;
+            $candidate['messages'] = array_slice($incoming['messages'], 0, $index + 1);
+            return self::matchesNativeToolRound($base, $candidate, $round, $lite, count($ids)) ? $candidate : null;
+        }
+        return null;
     }
 
     /**
@@ -1328,8 +1439,13 @@ final class ContextHistory
         $priorTop = $prior;
         $incomingTop = $incoming;
         unset($priorTop['messages'], $priorTop['system'], $incomingTop['messages'], $incomingTop['system']);
-        if (self::canonical($priorTop) !== self::canonical($incomingTop)
-            || !self::matchesCompactionSource($prior, $prefix, $lite, true)) return null;
+        if (self::canonical($priorTop) !== self::canonical($incomingTop)) return null;
+        if (!self::matchesCompactionSource($prior, $prefix, $lite, true)) {
+            $restored = self::legacyMailboxReceiptPrefixUnlocked($source, $prior, $incoming, $lite);
+            if ($restored === null) return null;
+            $known = $restored['messages'];
+            $offset = 0;
+        }
         $response = json_decode((string) ($source['response_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
         $published = [];
         foreach ((array) ($response['output'] ?? []) as $item) {

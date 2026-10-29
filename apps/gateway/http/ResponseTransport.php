@@ -10,6 +10,7 @@ use Workerman\Timer;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\ResponsesProtocol;
 use app\gateway\model\TaskLedger;
+use app\gateway\model\ContextHistory;
 
 /** Non-blocking local HTTP subscribers for one SQLite-backed Responses job. */
 final class ResponseTransport
@@ -24,16 +25,20 @@ final class ResponseTransport
      *
      * @param TcpConnection $connection Open Workerman HTTP connection.
      * @param string $responseId Durable response identifier.
+     * @param array<string,true> $receivedPublic Exact public items already present in this client's input.
      * @return void
      * @throws \Throwable If the durable subscriber cannot be recorded before opening the stream.
      */
-    public static function stream(TcpConnection $connection, string $responseId): void
+    public static function stream(TcpConnection $connection, string $responseId, array $receivedPublic = []): void
     {
         $sequence = -1;
         $lastWrite = microtime(true);
         $timerId = null;
+        $removedIndices = [];
+        $projectedSequence = 0;
         $detach = self::observeClientTransport($connection, $responseId, $timerId);
-        $timerId = Timer::add(self::POLL_SECONDS, function () use ($connection, $responseId, $detach, &$sequence, &$lastWrite, &$timerId): void {
+        $timerId = Timer::add(self::POLL_SECONDS, function () use ($connection, $responseId, $detach, $receivedPublic,
+            &$removedIndices, &$projectedSequence, &$sequence, &$lastWrite, &$timerId): void {
             if (!self::open($connection)) {
                 $detach();
                 if ($timerId !== null) Timer::del($timerId);
@@ -57,6 +62,14 @@ final class ResponseTransport
                     if ($event['type'] === 'response.failed' && is_array($event['response']['error'] ?? null)) {
                         $event['response']['error'] = ResponsesProtocol::clientFailure(['error' => $event['response']['error']])['body']['error'];
                     }
+                    $sequence = $number;
+                    if ($receivedPublic !== []) {
+                        $event = self::withoutReceivedPublic($event, $receivedPublic, $removedIndices);
+                        if ($event === null) continue;
+                        // Subscriber numbering is contiguous; the durable cursor above
+                        // still advances by the original event number, including skips.
+                        $event['sequence_number'] = $projectedSequence++;
+                    }
                     $payload = json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
                     $frame = new ServerSentEvents(['event' => $event['type'], 'data' => $payload]);
                     if ($connection->send((string) $frame, true) === false) {
@@ -65,7 +78,6 @@ final class ResponseTransport
                         $connection->close();
                         return;
                     }
-                    $sequence = $number;
                     $lastWrite = microtime(true);
                     if (in_array($event['type'], ['response.completed', 'response.failed', 'response.incomplete'], true)) {
                         $terminal = true;
@@ -105,14 +117,15 @@ final class ResponseTransport
      * Poll metadata until a JSON terminal needs decoding, without cancelling on disconnect.
      * @param TcpConnection $connection Current local HTTP subscriber.
      * @param string $responseId Durable response to await or reconnect.
+     * @param array<string,true> $receivedPublic Exact public items already present in this client's input.
      * @return void
      * @throws \Throwable If the durable subscriber cannot be recorded before polling begins.
      */
-    public static function nonStream(TcpConnection $connection, string $responseId): void
+    public static function nonStream(TcpConnection $connection, string $responseId, array $receivedPublic = []): void
     {
         $timerId = null;
         $detach = self::observeClientTransport($connection, $responseId, $timerId);
-        $timerId = Timer::add(self::POLL_SECONDS, function () use ($connection, $responseId, $detach, &$timerId): void {
+        $timerId = Timer::add(self::POLL_SECONDS, function () use ($connection, $responseId, $detach, $receivedPublic, &$timerId): void {
             if (!self::open($connection)) {
                 $detach();
                 if ($timerId !== null) Timer::del($timerId);
@@ -125,7 +138,9 @@ final class ResponseTransport
                 if (($job['status'] ?? '') === 'completed' && is_array($job['response'] ?? null)) {
                     $detach(true);
                     if ($timerId !== null) Timer::del($timerId);
-                    self::finishJson($connection, 200, $job['response']);
+                    $response = $job['response'];
+                    if ($receivedPublic !== []) $response = self::publicOutputProjection($response, $receivedPublic);
+                    self::finishJson($connection, 200, $response);
                 } elseif (($job['status'] ?? '') === 'failed') {
                     $detach(true);
                     if ($timerId !== null) Timer::del($timerId);
@@ -143,6 +158,75 @@ final class ResponseTransport
                 ]);
             }
         }, null, true);
+    }
+
+    /**
+     * Prove public items this exact response already delivered before a mailbox reconnect.
+     * Matching IDs alone are insufficient; the readable commentary/summary must match too.
+     * Tools, finals, drafts, private reasoning and native forwarding are never filtered.
+     * @param mixed $input Parsed client input. @param ?array $response Reserved Web response snapshot.
+     * @return array<string,true> Already received public item IDs, empty for ordinary/new requests.
+     */
+    public static function receivedPublicItems(mixed $input, ?array $response): array
+    {
+        if (!is_array($input) || !is_array($response) || empty($response['output'])) return [];
+        $published = [];
+        foreach ($response['output'] as $item) {
+            if (!is_string($item['id'] ?? null)) continue;
+            $commentary = ($item['type'] ?? '') === 'message' && ($item['role'] ?? '') === 'assistant'
+                && ($item['phase'] ?? '') === 'commentary' && ($item['status'] ?? '') === 'completed';
+            $summary = ($item['type'] ?? '') === 'reasoning' && !empty($item['summary']);
+            if ($commentary || $summary) $published[$item['id']] = ContextHistory::canonical(ContextHistory::compile([$item], ''));
+        }
+        $received = [];
+        foreach ($input as $item) {
+            if (!is_array($item) || !is_string($item['id'] ?? null) || !isset($published[$item['id']])) continue;
+            // Only the same public wire shape may prove delivery; do not compile arbitrary
+            // input content (including attachments) just because it reuses an output ID.
+            if (($item['type'] ?? '') === 'message') {
+                if (($item['role'] ?? '') !== 'assistant' || ($item['phase'] ?? '') !== 'commentary'
+                    || ($item['status'] ?? 'completed') !== 'completed') continue;
+                $textOnly = is_string($item['content'] ?? null) || (is_array($item['content'] ?? null)
+                    && array_reduce($item['content'], static fn(bool $ok, mixed $part): bool => $ok && is_array($part)
+                        && in_array($part['type'] ?? '', ['text','input_text','output_text'], true)
+                        && is_string($part['text'] ?? null), true));
+                if (!$textOnly) continue;
+            } elseif (($item['type'] ?? '') !== 'reasoning' || empty($item['summary'])) continue;
+            if (ContextHistory::canonical(ContextHistory::compile([$item], '')) === $published[$item['id']]) {
+                $received[$item['id']] = true;
+            }
+        }
+        return $received;
+    }
+
+    /** Subscriber-only event projection; durable events and native call identities stay intact. */
+    private static function withoutReceivedPublic(array $event, array $received, array &$removedIndices): ?array
+    {
+        $itemId = $event['item']['id'] ?? $event['item_id'] ?? null;
+        $publicEvent = in_array($event['type'] ?? '', ['response.output_item.added','response.output_item.done',
+            'response.content_part.added','response.content_part.done','response.output_text.delta','response.output_text.done',
+            'response.output_text.annotation.added','response.reasoning_summary_part.added','response.reasoning_summary_part.done',
+            'response.reasoning_summary_text.delta','response.reasoning_summary_text.done'], true);
+        if ($publicEvent && is_string($itemId) && isset($received[$itemId])) {
+            if (isset($event['output_index'])) $removedIndices[(int)$event['output_index']] = true;
+            return null;
+        }
+        if (isset($event['output_index'])) {
+            $index = (int)$event['output_index'];
+            $event['output_index'] = $index - count(array_filter(array_keys($removedIndices), static fn(int $removed): bool => $removed < $index));
+        }
+        if (is_array($event['response']['output'] ?? null)) {
+            $event['response'] = self::publicOutputProjection($event['response'], $received);
+        }
+        return $event;
+    }
+
+    /** Remove only the previously proved public IDs from a terminal/create response projection. */
+    private static function publicOutputProjection(array $response, array $received): array
+    {
+        if (is_array($response['output'] ?? null)) $response['output'] = array_values(array_filter($response['output'],
+            static fn(array $item): bool => !isset($received[$item['id'] ?? ''])));
+        return $response;
     }
 
     /**

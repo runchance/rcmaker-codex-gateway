@@ -66,6 +66,7 @@ final class SteeringContext
     /**
      * Pin the actual submitted source and build only its unseen suffix inside the reservation transaction.
      * Unsent consecutive steers accumulate against that source, not against an unsent predecessor.
+     * Source-bound legacy mailbox ordering can be proved without changing the archived history.
      * @param array $spec Prepared request with complete durable history.
      * @return array Request with a destination-proven physical suffix and unchanged canonical history.
      * @throws GatewayError When the current document, history prefix or compaction scope is unproven.
@@ -131,7 +132,12 @@ final class SteeringContext
         $systems = (array) ($prior['system'] ?? []);
         if (ContextHistory::canonical(array_slice($full['messages'], 0, count($known))) !== ContextHistory::canonical($known)
             || ContextHistory::canonical(array_slice($full['system'], 0, count($systems))) !== ContextHistory::canonical($systems)) {
-            throw new GatewayError('steering_history_mismatch', '插话历史与原页不一致；未发送增量或全量上下文。', 409);
+            // Old mailbox receipt rounds can contain the same exact records in their
+            // Web grouping. Reuse only the source-bound journal proof, in both chat modes.
+            $restored = ContextHistory::legacyMailboxReceiptPrefixUnlocked($source, $prior, $full,
+                !empty($spec['native_responses_lite']));
+            if ($restored === null) throw new GatewayError('steering_history_mismatch', '插话历史与原页不一致；未发送增量或全量上下文。', 409);
+            $known = $restored['messages'];
         }
         // A completed receipt can still be waiting for MCP delivery when steering wins the race.
         // Include its original call/result records, with exact text/image content, before the new suffix.

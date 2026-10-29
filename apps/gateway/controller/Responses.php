@@ -65,6 +65,7 @@ final class Responses
         }
     }
 
+    /** Accept a Web response or forward a native request; reconnects retain already received public items in client history. */
     public function create(Request $request)
     {
         $phase = 'schema';
@@ -119,11 +120,12 @@ final class Responses
                 ? ContextCompaction::create($spec, $idempotencyKey) : ResponseJob::createOrReuse($spec, $idempotencyKey);
             $responseId = (string) $job['id'];
             $phase = 'response_transport';
+            $receivedPublic = ResponseTransport::receivedPublicItems($body['input'] ?? null, $job['response'] ?? null);
             if ($spec['stream']) {
-                ResponseTransport::stream($connection, $responseId);
+                ResponseTransport::stream($connection, $responseId, $receivedPublic);
                 return $request->response('', 200, ['Content-Type' => 'text/event-stream']);
             }
-            ResponseTransport::nonStream($connection, $responseId);
+            ResponseTransport::nonStream($connection, $responseId, $receivedPublic);
             return new DeferredResponse($request);
         } catch (GatewayError $error) {
             $this->logFreeModelSelectionFailure($error, $phase, $spec ?? [], is_array($body ?? null) ? $body : []);
