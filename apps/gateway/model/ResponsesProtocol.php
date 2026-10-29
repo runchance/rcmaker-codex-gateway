@@ -82,7 +82,7 @@ final class ResponsesProtocol
         return TaskMaintenance::withAdmission(static fn(): array => self::parseAdmitted($raw));
     }
 
-    /** Parse under the shared maintenance boundary, so incoming attachment/context writes wait for idle reclamation. */
+    /** Parse under maintenance admission; route native effort controls while preserving task records and the original request hash. */
     private static function parseAdmitted(string $raw): array
     {
         if ($raw === '' || strlen($raw) > self::MAX_BODY_BYTES) {
@@ -123,10 +123,16 @@ final class ResponsesProtocol
             throw new GatewayError('invalid_request_error', 'parallel_tool_calls 必须是布尔值。', 400);
         }
         $metadata = self::turnMetadata($data['client_metadata'] ?? null);
-        $reasoning = self::reasoningEffort($data['reasoning'] ?? null);
+        $requestReasoning = self::reasoningEffort($data['reasoning'] ?? null);
+        $configuration = self::inputReasoningConfiguration($data['input']);
+        $reasoning = $configuration['effort'] ?? $requestReasoning;
         $route = ModelCatalog::identity($data['model'], $reasoning);
         $reasoning = $route['effort'];
         $budget = ContextBudget::snapshot($data['model'], $reasoning, $route['capabilities']);
+        if ($configuration['effort'] !== null) {
+            $budget['reasoning_configuration'] = ['model'=>$data['model'],
+                'effort'=>$configuration['effort'], 'request_effort'=>$requestReasoning];
+        }
         $outputControl = self::textControls($data['text'] ?? null);
         if ($outputControl !== []) $budget['output_control'] = $outputControl;
         $promptCacheKey = self::optionalIdentity($data['prompt_cache_key'] ?? null, 'prompt_cache_key');
@@ -206,6 +212,8 @@ final class ResponsesProtocol
             'thread_id' => $threadId,
             'turn_id' => $turnId,
             'reasoning_effort' => $reasoning,
+            'request_reasoning_effort' => $requestReasoning,
+            'reasoning_configuration_reset' => $configuration['reset'],
             'compaction_epoch' => $compactionEpoch,
             'browser_owner_key' => $ownerKey,
             'browser_lease_key' => $leaseKey,
@@ -626,6 +634,106 @@ final class ResponsesProtocol
         return strtolower($effort === 'ultra' ? 'max' : $effort);
     }
 
+    /**
+     * Validate an execution control, never chat text or authority to change a tool environment.
+     * Empty/null reasoning is a no-op. Agent-scoped controls require native routing, which this
+     * single Web response cannot emulate. Keep wire aliases consistent with request reasoning.
+     * @param array $item Native configuration_update in object/array-normalized form.
+     * @return ?string The selected wire effort, or null when no effort was changed.
+     * @throws GatewayError For malformed, unknown or agent-scoped configuration fields.
+     */
+    public static function configurationEffort(array $item): ?string
+    {
+        if (array_diff(array_keys($item), ['type', 'id', 'reasoning', 'agent']) !== []
+            || (isset($item['id']) && !is_string($item['id']))) {
+            throw new GatewayError('invalid_request_error', 'Invalid configuration_update fields.', 400);
+        }
+        if (isset($item['agent'])) {
+            throw new GatewayError('unsupported_parameter', 'Agent-scoped configuration_update requires the native model route.', 400);
+        }
+        $reasoning = $item['reasoning'] ?? null;
+        if ($reasoning === null) return null;
+        if (is_array($reasoning) && array_is_list($reasoning)) {
+            throw new GatewayError('invalid_request_error', 'configuration_update.reasoning must be an object.', 400);
+        }
+        if ($reasoning instanceof \stdClass) $reasoning = get_object_vars($reasoning);
+        if (!is_array($reasoning) || ($reasoning !== [] && array_is_list($reasoning))
+            || array_diff(array_keys($reasoning), ['effort']) !== []) {
+            throw new GatewayError('invalid_request_error', 'configuration_update.reasoning must contain only effort.', 400);
+        }
+        $effort = $reasoning['effort'] ?? null;
+        if ($effort === null) return null;
+        if (!is_string($effort)) {
+            throw new GatewayError('invalid_request_error', 'configuration_update.reasoning.effort must be a string.', 400);
+        }
+        try {
+            $effort = validator()->check($effort, ['rule'=>'string', 'len'=>[1,32], 'name'=>'configuration_update.reasoning.effort']);
+        } catch (\Throwable) {
+            throw new GatewayError('invalid_request_error', 'Invalid configuration_update reasoning effort.', 400);
+        }
+        return self::reasoningEffort(['effort'=>$effort]);
+    }
+
+    /**
+     * Resolve ordered effort updates outside the browser transcript. A checkpoint replaces
+     * the preceding conversation, so only a fresh update after it controls the next sample.
+     * @param mixed $input Original native input; its canonical request hash remains untouched.
+     * @return array{effort:?string,reset:bool} Latest update and checkpoint inheritance barrier.
+     */
+    private static function inputReasoningConfiguration(mixed $input): array
+    {
+        $state = ['effort'=>null, 'reset'=>false];
+        if (!is_array($input)) return $state;
+        foreach ($input as $item) {
+            if ($item instanceof \stdClass) $item = get_object_vars($item);
+            if (!is_array($item)) continue;
+            if (in_array($item['type'] ?? '', ['compaction', 'compaction_summary', 'context_compaction'], true)) {
+                $state = ['effort'=>null, 'reset'=>true];
+            } elseif (($item['type'] ?? 'message') === 'message') {
+                try { $content = ContextHistory::text($item['content'] ?? ''); }
+                catch (GatewayError) { $content = ''; }
+                if (str_starts_with($content, ContextCompaction::SUMMARY_PREFIX)) {
+                    $state = ['effort'=>null, 'reset'=>true];
+                }
+            } elseif (($item['type'] ?? '') === 'configuration_update') {
+                $effort = self::configurationEffort($item);
+                if ($effort !== null) $state['effort'] = $effort;
+            }
+        }
+        return $state;
+    }
+
+    /**
+     * Carry an earlier update only through an exact task-owned delta/receipt continuation.
+     * A new model, explicit request effort change or checkpoint starts its own selection.
+     * Callers prove delta shape; reservation rechecks the same task-owned source under its transaction.
+     * @param array $spec Fresh parsed request, before its tool budget is pinned.
+     * @param array $source Exact owned response row supplying the omitted configuration.
+     * @return array Spec with effective route, budget and lease selected consistently.
+     */
+    public static function inheritReasoningConfiguration(array $spec, array $source): array
+    {
+        if (isset($spec['budget']['reasoning_configuration']) || !empty($spec['reasoning_configuration_reset'])
+            || $source['model'] !== $spec['model']
+            || ($source['task_id'] ?? null) !== 'task_' . substr((string) $spec['task_key'], 0, 24)) return $spec;
+        $budget = json_decode((string) $source['budget_json'], true, 32, JSON_THROW_ON_ERROR);
+        $configuration = $budget['reasoning_configuration'] ?? null;
+        if (!is_array($configuration) || !is_string($configuration['effort'] ?? null)
+            || ($configuration['model'] ?? null) !== $spec['model']
+            || ($configuration['request_effort'] ?? null) !== ($spec['request_reasoning_effort'] ?? null)) return $spec;
+        $route = ModelCatalog::identity($spec['model'], $configuration['effort']);
+        $budget = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
+        if (isset($spec['budget']['output_control'])) $budget['output_control'] = $spec['budget']['output_control'];
+        $budget['reasoning_configuration'] = $configuration;
+        $spec['budget'] = $budget;
+        $spec['reasoning_effort'] = $route['effort'];
+        $spec['browser_lease_key'] = hash('sha256', json_encode([
+            'namespace'=>'rcmaker-chatgpt-web-v1', 'owner'=>$spec['browser_owner_key'], 'model'=>$spec['model'],
+            'reasoning'=>$route['effort'], 'compaction'=>$spec['compaction_epoch'],
+        ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+        return $spec;
+    }
+
     private static function optionalIdentity(mixed $value, string $name): ?string
     {
         if ($value === null) return null;
@@ -820,6 +928,7 @@ final class ResponsesProtocol
      * Human input does not end a parallel receipt batch; the preceding assistant/call or
      * compaction record remains the boundary. Task ownership and issued call IDs are then
      * verified by ContextHistory and ToolBroker before any result can be accepted.
+     * Execution-only configuration updates do not split that native receipt batch.
      */
     private static function toolOutputs(mixed $input): array
     {
@@ -834,7 +943,7 @@ final class ResponsesProtocol
             if ($item instanceof \stdClass) $item = get_object_vars($item);
             if (!is_array($item)) break;
             $type = $item['type'] ?? 'message';
-            if ($type === 'additional_tools') continue;
+            if (in_array($type, ['additional_tools', 'configuration_update'], true)) continue;
             // Native hooks and the agent mailbox can append context after each
             // result, including between results in a parallel batch. compile()
             // preserves their roles; they are not receipt boundaries.

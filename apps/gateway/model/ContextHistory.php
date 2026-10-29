@@ -5,7 +5,7 @@ namespace app\gateway\model;
 /** Canonical readable Codex history, exact-prefix deltas and task-scoped tool-result continuation. */
 final class ContextHistory
 {
-    /** Preserve roles, tools and selected skills; mark provider-private agent history as unavailable. */
+    /** Preserve readable roles/tools/skills; execution configuration is validated and routed by ResponsesProtocol. */
     public static function compile(mixed $input, string $instructions, ?array &$attachments = null, string $skillTransport = 'inline'): array
     {
         $attachments ??= [];
@@ -19,6 +19,10 @@ final class ContextHistory
             if (!is_array($item)) throw new GatewayError('invalid_request_error', '历史记录必须是对象。', 400);
             $type = (string) ($item['type'] ?? 'message');
             if ($type === 'additional_tools') continue;
+            if ($type === 'configuration_update') {
+                ResponsesProtocol::configurationEffort($item);
+                continue;
+            }
             if ($type === 'compaction_trigger') { $atCurrentPreamble = false; continue; }
             if ($type === 'compaction') {
                 $replayed = self::compile(ContextCompaction::replay((string)($item['encrypted_content'] ?? '')), '', $attachments, $skillTransport);
@@ -284,6 +288,7 @@ final class ContextHistory
      * @param array $prior Exact task-owned tool-call response, inside the reservation transaction.
      * @param bool $freshSteering Whether this request itself supplies a new human revision.
      * @return array Request selecting a new generation, or the unchanged pinned receipt.
+     * Effort controls on a bare receipt configure future work, never the already submitted Web turn.
      * @throws GatewayError When a bare receipt or compaction attempts to change model scope.
      */
     private static function prepareReceiptModelSelection(array $spec, array $prior, bool $freshSteering): array
@@ -291,6 +296,10 @@ final class ContextHistory
         $selection = $spec['budget']['deferred_model_selection'] ?? null;
         $hasHuman = ($spec['steering_messages'] ?? []) !== [];
         $responseOperation = ($spec['operation_kind'] ?? 'response') === 'response';
+        if (!$hasHuman && $prior['model'] === $spec['model'] && isset($spec['budget']['reasoning_configuration'])) {
+            $spec['reasoning_effort'] = $prior['reasoning_effort'];
+            $spec['browser_lease_key'] = $prior['browser_lease_key'];
+        }
         $sameSource = $prior['model'] === $spec['model']
             && $prior['reasoning_effort'] === ($spec['reasoning_effort'] ?? null);
         if ($responseOperation && $hasHuman && !$freshSteering && is_array($selection)) {
@@ -582,6 +591,7 @@ final class ContextHistory
     /**
      * Called inside the existing short reservation transaction. Infer native continuation by a
      * locally issued call_id, and send only an exact matching history suffix on the same epoch.
+     * Inherit omitted effort controls only from that task's proven delta/receipt source.
      * A changed prefix rotates the lease before submitting, so edits cannot contaminate old pages.
      */
     public static function prepareUnlocked(array $spec): array
@@ -593,8 +603,17 @@ final class ContextHistory
         $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $context = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $previous = (string) ($spec['previous_response_id'] ?? '');
+        if ($previous === '' && !empty($spec['input_is_delta'])) {
+            $deltaSource = ResponseJob::latestForTaskUnlocked($taskId);
+            if (is_array($deltaSource)) $spec = ResponsesProtocol::inheritReasoningConfiguration($spec, $deltaSource);
+        }
         if ($previous !== '') {
             $parent = $db->table('gateway_response_jobs')->where('id', $previous)->find();
+            if (is_array($parent) && $parent['task_id'] === $taskId
+                && ((array) ($spec['tool_outputs'] ?? []) !== [] || !empty($spec['input_is_delta'])
+                    || (count($context['messages']) === 1 && ($context['messages'][0]['role'] ?? '') === 'user'))) {
+                $spec = ResponsesProtocol::inheritReasoningConfiguration($spec, $parent);
+            }
             if (!is_array($parent)) {
                 $roles = array_column($context['messages'], 'role');
                 // A decoded checkpoint replaces the earlier assistant transcript. It is a complete
@@ -699,7 +718,15 @@ final class ContextHistory
                 }
                 // A receipt belongs to an already executing physical turn, including its budget.
                 // A temporary catalog refresh or subscription upgrade cannot discard that receipt.
+                $spec = ResponsesProtocol::inheritReasoningConfiguration($spec, $prior);
+                $configuration = $spec['budget']['reasoning_configuration'] ?? null;
                 $spec['budget'] = json_decode((string) $prior['budget_json'], true, 32, JSON_THROW_ON_ERROR);
+                if ($configuration === null && !empty($spec['budget']['deferred_model_selection'])
+                    && empty($spec['reasoning_configuration_reset'])) {
+                    $configuration = $spec['budget']['reasoning_configuration'] ?? null;
+                }
+                unset($spec['budget']['reasoning_configuration']);
+                if ($configuration !== null) $spec['budget']['reasoning_configuration'] = $configuration;
                 if (in_array($spec['operation_kind'] ?? 'response', ['compact_v1', 'compact_v2'], true)) {
                     // The separate summary operation pins the current administrative wait;
                     // every other limit remains the source turn's exact snapshot.
@@ -1089,7 +1116,7 @@ final class ContextHistory
         return self::activeNativeContextUpdateUnlocked($spec, $taskId, true);
     }
 
-    /** Match exact public output; a new native turn may recover an unreceived batch only after detachment. */
+    /** Match exact public output and inherited delta effort; new turns recover unreceived batches only after detachment. */
     private static function activeNativeContextUpdateUnlocked(array $spec, ?string $taskId, bool $humanSteering): ?array
     {
         if (($spec['operation_kind'] ?? 'response') !== 'response'
@@ -1151,6 +1178,10 @@ final class ContextHistory
         $previous = (string) ($spec['previous_response_id'] ?? '');
         if ($sourceId === '' || ($previous !== '' && $previous !== $sourceId)) return null;
         $source = $db->table('gateway_response_jobs')->where('id', $sourceId)->find();
+        if (is_array($source) && (!empty($spec['input_is_delta']) || ($previous !== '' && count($records) === 1))) {
+            if (is_array($link)) $spec['task_key'] = (string) $link['current_task_key'];
+            $spec = ResponsesProtocol::inheritReasoningConfiguration($spec, $source);
+        }
         if (!is_array($source) || $source['task_id'] !== $taskId
             || $source['durable_turn_id'] !== $turn['id'] || $source['generation_id'] !== $turn['generation_id']
             || ($source['operation_kind'] ?? 'response') !== 'response'

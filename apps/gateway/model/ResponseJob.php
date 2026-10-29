@@ -47,7 +47,7 @@ final class ResponseJob
         }
     }
 
-    /** Preserve the existing reservation protocol inside the shared maintenance admission boundary. */
+    /** Reserve under maintenance admission; capacity refreshes preserve the request's native effort control. */
     private static function reserveOrReuse(array $spec, ?string $idempotencyKey): array
     {
         Schema::initialize();
@@ -200,8 +200,10 @@ final class ResponseJob
                 $route = ModelCatalog::resolveForOperation($spec['model'], $spec['reasoning_effort'] ?? null,
                     (string) ($spec['operation_kind'] ?? 'response'));
                 $outputControl = (array)($spec['budget']['output_control'] ?? []);
+                $configuration = $spec['budget']['reasoning_configuration'] ?? null;
                 $spec['budget'] = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
                 if ($outputControl !== []) $spec['budget']['output_control'] = $outputControl;
+                if ($configuration !== null) $spec['budget']['reasoning_configuration'] = $configuration;
                 $spec['budget'] = ContextRecovery::applyObservedMessageLimitUnlocked($spec, $spec['budget']);
             }
             $budget = $spec['budget'] ?? $budget;
@@ -1398,7 +1400,7 @@ final class ResponseJob
         return $cancelled;
     }
 
-    /** Only a plausible same-turn user update may bypass the busy page's editor snapshot. */
+    /** Only a plausible same-turn user update, including its inherited effort, may bypass the busy editor snapshot. */
     private static function potentialActiveUserSteering(array $spec): bool
     {
         if (($spec['operation_kind'] ?? 'response') !== 'response'
@@ -1430,6 +1432,11 @@ final class ResponseJob
             || (string) $turn['request_hash'] === (string) ($spec['request_hash'] ?? '')) return false;
         $source = $db->table('gateway_response_jobs')->where('id', (string) $turn['response_id'])->find();
         $previous = (string) ($spec['previous_response_id'] ?? '');
+        if (is_array($source) && (!empty($spec['input_is_delta']) || ($previous !== '' && count($messages) === 1))) {
+            // Read-only preflight; the reservation normalizer repeats this owned selection.
+            if (is_array($link)) $spec['task_key'] = (string) $link['current_task_key'];
+            $spec = ResponsesProtocol::inheritReasoningConfiguration($spec, $source);
+        }
         return is_array($source) && ($previous === '' || $previous === (string) $source['id'])
             && in_array((string) $source['status'], ['queued', 'running'], true)
             && (string) $source['model'] === (string) ($spec['model'] ?? '')

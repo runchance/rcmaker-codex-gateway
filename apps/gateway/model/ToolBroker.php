@@ -635,6 +635,7 @@ final class ToolBroker
     /**
      * Plan a full native request after an inert import or legacy regular-page replacement failed.
      * Reads only: history selection and physical budget planning never hold the SQLite writer lock.
+     * Native effort controls remain attached when refreshing this plan's capacity snapshot.
      * @param array $spec Incoming native request; routing and receipt ownership remain authoritative.
      * @param string $responseId Proposed response ID, used only to count the initial page marker.
      * @return array|null Exact source proof and selected working context, or null outside this recovery.
@@ -669,8 +670,10 @@ final class ToolBroker
         if (!self::failedRegularAdmissionRequest($spec)) return null;
         $route = ModelCatalog::resolveForOperation($spec['model'], $spec['reasoning_effort'] ?? null, 'response');
         $outputControl = (array)($spec['budget']['output_control'] ?? []);
+        $configuration = $spec['budget']['reasoning_configuration'] ?? null;
         $spec['budget'] = ContextBudget::snapshot($spec['model'], $route['effort'], $route['capabilities']);
         if ($outputControl !== []) $spec['budget']['output_control'] = $outputControl;
+        if ($configuration !== null) $spec['budget']['reasoning_configuration'] = $configuration;
         $spec['budget'] = ContextRecovery::applyObservedMessageLimitUnlocked($spec, $spec['budget']);
         $receiptSource = $source['job'];
         $receiptSource['transport_context_json'] = $spec['full_context_json'] ?? $spec['context_json'];
