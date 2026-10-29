@@ -69,6 +69,28 @@ final class CodexSubagent
     }
 
     /**
+     * Prove legacy active child-page identities before entering the writer transaction.
+     * Pre-policy stores had at most five retained pages. Inspect that bounded set plus
+     * five current primary pages; never scan response history or read session files under a write lock.
+     * @return list<array> Immutable native scope paired with the exact existing task owner.
+     * @throws GatewayError When the page metadata cannot be read.
+     */
+    public static function legacyPageEvidence(): array
+    {
+        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces AS s')
+            ->join('gateway_tasks AS t', 't.id', 's.task_id')->where('s.status', '<>', 'retired')
+            ->where('t.native_parent_thread_id', null)->limit(TaskLedger::MAX_SURFACES * 2)
+            ->select('t.id,t.thread_id,t.client_id,t.branch_id,t.owner_key');
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', 'Subagent page identity is unavailable.', 503);
+        $evidence = [];
+        foreach ($rows as $row) {
+            $scope = self::scope($row['thread_id']);
+            if ($scope !== null) $evidence[] = ['task'=>$row, 'scope'=>$scope];
+        }
+        return $evidence;
+    }
+
+    /**
      * Validate a console selection independently of transient account availability.
      * @param string $model Empty follows the requested child family without Pro; explicit values are Web IDs.
      * @param string $effort Supported non-Pro wire effort. @return void

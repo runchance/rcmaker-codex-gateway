@@ -1202,5 +1202,7 @@
     "本任务已成功恢复，连续错误计数已清零": "本任务已成功恢复，连续错误计数已清零",
     "本任务连续网关错误：": "本任务连续网关错误：",
     "下次续发将重建任务页面": "下次续发将重建任务页面",
+    "最多只能同时保留 5 个主任务页面；请先关闭或取消一个主任务页面后再试。": "最多只能同时保留 5 个主任务页面；请先关闭或取消一个主任务页面后再试。",
+    "Subagent page identity is unavailable.": "子智能体页面身份暂不可读取。",
     "The encrypted subagent assignment has no unique verified parent tool input. Provide a readable assignment; no Web message was sent.": "加密子任务分工缺少唯一可核对的父任务调用原文。请提供可读分工；未向网页发送消息。"
 }

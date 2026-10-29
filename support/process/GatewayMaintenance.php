@@ -8,7 +8,7 @@ use app\gateway\model\TaskLedger;
 use app\gateway\model\CodexIntegration;
 use app\gateway\model\GatewayError;
 
-/** Independent storage worker for cleanup batches, settled child pages and nonblocking WAL checkpoints. */
+/** Independent storage worker for explicit cleanup batches, empty reservations and nonblocking WAL checkpoints. */
 final class GatewayMaintenance
 {
     private bool $compressionChecked = false;
@@ -37,7 +37,6 @@ final class GatewayMaintenance
             try {
                 Schema::initialize();
                 TaskLedger::retireCancelledUnsentSurfaces();
-                TaskLedger::retireFinishedSubagentPages();
             } catch (\Throwable) {
                 // Ownership and receipt checks are retried here; never fail a parent response.
             }

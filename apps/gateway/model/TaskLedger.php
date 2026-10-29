@@ -5,11 +5,12 @@ namespace app\gateway\model;
 use app\gateway\database\Schema;
 
 /**
- * Durable Step 05 task/epoch/turn ledger and five-surface reservation policy.
+ * Durable Step 05 task/epoch/turn ledger and five-primary-page reservation policy.
  * All external effects happen outside these short SQLite transactions.
  */
 final class TaskLedger
 {
+    /** Main/fork page limit; verified native subagent pages retain their independent identity and reuse. */
     public const MAX_SURFACES = 5;
     private const ACTIVE_TURNS = ['queued', 'submit_intent', 'submitted', 'running'];
     private const CLIENT_TRANSPORT_EVENT_LIMIT = 256;
@@ -1023,8 +1024,12 @@ final class TaskLedger
 
     /**
      * Reserve one logical turn and its task surface inside the caller's existing transaction.
-     * Verified child metadata is stamped once for operator projections, never used to borrow a parent capability.
+     * Verified child metadata scopes operator projections and excludes children from the main-page quota;
+     * it never borrows a parent capability or relaxes turn, surface, model or receipt ownership.
+     * @param array $spec Parsed and owner-routed request with optional read-only legacy identity evidence.
+     * @param string $responseId Unique response identity to reserve.
      * @return array{reused:bool,response_id:?string,task_id:string,epoch_id:string,turn_id:string,surface_id:string,generation_id:string,round_no:int}
+     * @throws GatewayError For quota, ownership, active-turn or storage conflicts.
      */
     public static function reserveTurnUnlocked(array $spec, string $responseId): array
     {
@@ -1222,12 +1227,28 @@ final class TaskLedger
         if (!is_array($epoch)) {
             if ($currentEpochId !== '') self::retireEpochUnlocked($taskId, $currentEpochId,
                 isset($spec['budget']['postcompact_page']) ? 'checkpoint_page_retained' : 'lease_changed');
-            $activeSurfaces = $db->table('gateway_browser_surfaces')->where('status', '<>', 'retired')->count();
-            if ($activeSurfaces === false || $activeSurfaces === null) {
-                throw new GatewayError('storage_unavailable', '任务页面池状态暂不可读取。', 503);
-            }
-            if ((int) $activeSurfaces >= self::MAX_SURFACES) {
-                throw new GatewayError('surface_capacity_exceeded', '最多只能同时保留 5 个任务页面；请先关闭或取消一个任务页面后再试。', 409);
+            if (empty($task['native_parent_thread_id'])) {
+                foreach ((array) ($spec['legacy_subagent_pages'] ?? []) as $evidence) {
+                    $legacy = $evidence['task'];
+                    $scope = $evidence['scope'];
+                    $marked = $db->table('gateway_tasks')->where('id', $legacy['id'])->where('thread_id', $scope['thread_id'])
+                        ->where('client_id', $legacy['client_id'])->where('branch_id', $legacy['branch_id'])
+                        ->where('owner_key', $legacy['owner_key'])->where('native_parent_thread_id', null)->update([
+                            'native_parent_thread_id'=>$scope['parent_thread_id'], 'native_agent_path'=>$scope['agent_path']]);
+                    if (!$marked) throw new GatewayError('storage_unavailable', 'Subagent identity could not be saved.', 503);
+                    if ($marked->rowCount() === 1) self::eventUnlocked((string)$legacy['id'], null, null, null,
+                        'subagent_identity_restored', ['parent_thread_id'=>$scope['parent_thread_id']]);
+                }
+                // The same durable native-child marker already hides children from the
+                // workspace. Count only primary pages here too; keep child pages reusable.
+                $activeSurfaces = $db->table('gateway_browser_surfaces AS s')->join('gateway_tasks AS t', 't.id', 's.task_id')
+                    ->where('s.status', '<>', 'retired')->where('t.native_parent_thread_id', null)->count('s.id');
+                if ($activeSurfaces === false || $activeSurfaces === null) {
+                    throw new GatewayError('storage_unavailable', '任务页面池状态暂不可读取。', 503);
+                }
+                if ((int) $activeSurfaces >= self::MAX_SURFACES) {
+                    throw new GatewayError('surface_capacity_exceeded', '最多只能同时保留 5 个主任务页面；请先关闭或取消一个主任务页面后再试。', 409);
+                }
             }
             $last = $db->table('gateway_task_epochs')->where('task_id', $taskId)->order([['epoch_no', 'DESC']])->limit(1)->find();
             $epochNo = is_array($last) ? (int) $last['epoch_no'] + 1 : 1;
@@ -3805,77 +3826,6 @@ final class TaskLedger
         ToolBroker::revokeTaskUnlocked((string)$task['id'], 'cancelled_unsent_reservation');
         self::retireEpochUnlocked((string)$task['id'], (string)$surface['epoch_id'], 'cancelled_unsent_reservation');
         return 1;
-    }
-
-    /**
-     * Retire settled child pages after their exact Web parent finishes its ordinary response.
-     * The independent maintenance worker calls this bounded reconciliation after restart too.
-     * Repeated child turns retain their page while the parent is running; active/unknown host
-     * work, undelivered receipts, parent failures and newer parent turns never authorize closure.
-     * Existing page retirement performs Stop/confirmation before physical target closure.
-     * @return int Number of retired pages; task records and immutable receipts remain available.
-     * @throws GatewayError On unavailable durable state; retries cannot cancel other tasks.
-     */
-    public static function retireFinishedSubagentPages(): int
-    {
-        $db = SDB(null, 'medoo', 'sqlite');
-        $candidates = $db->table('gateway_browser_surfaces AS s')->join('gateway_tasks AS t', 't.id', 's.task_id')
-            ->where('s.status', 'ready')->where('t.native_parent_thread_id', '<>', null)
-            ->order([['s.updated_at', 'ASC']])->limit(self::MAX_SURFACES)->select('s.id');
-        if (!is_array($candidates)) throw new GatewayError('storage_unavailable', 'Subagent page cleanup state is unavailable.', 503);
-        $retired = 0;
-        foreach ($candidates as $candidate) {
-            $retired += Schema::transaction(static function () use ($candidate): int {
-                $db = SDB(null, 'medoo', 'sqlite');
-                $surface = $db->table('gateway_browser_surfaces')->where('id', $candidate['id'])->find();
-                if (!is_array($surface) || $surface['status'] !== 'ready') return 0;
-                $child = $db->table('gateway_tasks')->where('id', $surface['task_id'])->find();
-                if (!is_array($child) || empty($child['native_parent_thread_id'])) return 0;
-                // Resolve only the parent's exact native client/thread/branch, including its recovery alias.
-                $owner = hash('sha256', json_encode(['kind'=>'thread', 'id'=>$child['native_parent_thread_id']], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
-                $base = 'task_' . substr(hash('sha256', json_encode(['client'=>$child['client_id'], 'owner'=>$owner,
-                    'branch'=>$child['branch_id']], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)), 0, 24);
-                $link = $db->table('gateway_task_conversations')->where('base_task_id', $base)->find('current_task_id');
-                $parent = $db->table('gateway_tasks')->where('id', $link['current_task_id'] ?? $base)->find();
-                if (!is_array($parent) || $parent['thread_id'] !== $child['native_parent_thread_id']
-                    || $parent['client_id'] !== $child['client_id'] || $parent['branch_id'] !== $child['branch_id']
-                    || $parent['status'] !== 'active') return 0;
-                $last = ResponseJob::latestForTaskUnlocked((string)$parent['id'], true);
-                if (!is_array($last) || $last['status'] !== 'completed' || $last['round_kind'] !== 'text'
-                    || $last['operation_kind'] !== 'response') return 0;
-                $parentTurn = $db->table('gateway_task_turns')->where('id', $last['durable_turn_id'])->find('status');
-                if (!is_array($parentTurn) || $parentTurn['status'] !== 'committed') return 0;
-                $childTurn = $db->table('gateway_task_turns')->where('surface_id', $surface['id'])
-                    ->order([['rowid', 'DESC']])->limit(1)->find();
-                if (!is_array($childTurn) || (int)$childTurn['created_at'] > (int)$last['finished_at']) return 0;
-                $knownFailure = $childTurn['status'] === 'failed' && $child['status'] === 'active'
-                    && $child['current_epoch_id'] === $surface['epoch_id'];
-                if (!$knownFailure && !self::idleSurfaceClosableUnlocked($db, $child, $surface, $childTurn)) return 0;
-                $pending = $db->table('gateway_tool_invocations')->where('task_id', $child['id'])
-                    ->where('status', 'IN', ['registered','delivered','unknown'])->count();
-                $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $child['id'])
-                    ->where('status', 'completed')->where('result_delivered_at', null)->count();
-                $activities = $db->table('gateway_mcp_activities AS a')->join('gateway_mcp_bindings AS b', 'b.id', 'a.binding_id')
-                    ->where('b.task_id', $child['id'])->where('a.status', 'active')->count('a.id');
-                if (!is_numeric($pending) || !is_numeric($undelivered) || !is_numeric($activities)) throw new GatewayError('storage_unavailable', 'Subagent receipt cleanup state is unavailable.', 503);
-                if ((int)$pending !== 0 || (int)$undelivered !== 0 || (int)$activities !== 0) return 0;
-                if ($knownFailure) {
-                    $failed = $db->table('gateway_response_jobs')->where('id', $childTurn['response_id'])
-                        ->where('task_id', $child['id'])->where('status', 'failed')->find('id');
-                    $active = $db->table('gateway_task_turns')->where('task_id', $child['id'])
-                        ->where('status', 'IN', self::ACTIVE_TURNS)->count();
-                    if (!is_array($failed) || !is_numeric($active) || (int)$active !== 0) return 0;
-                    $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $child['id'])
-                        ->where('status', 'IN', ['awaiting_start','running'])->select('id');
-                    if (!is_array($bindings)) throw new GatewayError('storage_unavailable', 'Subagent receipt cleanup state is unavailable.', 503);
-                    foreach ($bindings as $binding) if (ToolBroker::hasUnsettledCallsUnlocked($binding['id'])) return 0;
-                    ToolBroker::revokeTaskUnlocked((string)$child['id'], 'native_parent_completed');
-                }
-                self::retireEpochUnlocked((string)$child['id'], (string)$surface['epoch_id'], 'native_parent_completed');
-                return 1;
-            });
-        }
-        return $retired;
     }
 
     /** Authoritative close guard shared by the list hint and the transactional close action. */

@@ -86,6 +86,9 @@ final class ResponseJob
         // message. Keep its exact receipt drainable while new submissions are cooling down.
         $isToolContinuation = (array) ($spec['tool_outputs'] ?? []) !== [];
         $spec = CodexSubagent::prepare($spec);
+        // Legacy identity discovery can read native headers. Keep it outside the writer;
+        // quota admission later rechecks each exact owner before stamping child metadata.
+        if (empty($spec['budget']['native_subagent'])) $spec['legacy_subagent_pages'] = CodexSubagent::legacyPageEvidence();
         // Reserve durably even during a shared 429 cooldown. The browser worker waits
         // asynchronously before dispatch; HTTP subscribers keep their existing heartbeats.
         $budget = $spec['budget'] ?? ContextBudget::snapshot($spec['model'], $spec['reasoning_effort'] ?? null);
