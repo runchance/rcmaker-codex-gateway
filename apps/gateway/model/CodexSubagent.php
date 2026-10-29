@@ -11,6 +11,52 @@ final class CodexSubagent
     private static array $scopes = [];
 
     /**
+     * Project native collaboration spawn/followup guidance exposed by a Web binding.
+     * Its console-selected Web child model/effort is applied by prepare(); inheriting the
+     * parent's Web transport first prevents an optional native override bypassing that policy.
+     * The raw host capability snapshot and unrelated connectors remain unchanged.
+     * @param array $tool One normalized bound host descriptor. @return array Visible descriptor.
+     */
+    public static function hostTool(array $tool): array
+    {
+        if (($tool['wire_name'] ?? '') === 'collaboration__followup_task'
+            && ($tool['namespace'] ?? '') === 'collaboration' && ($tool['name'] ?? '') === 'followup_task'
+            && ($tool['type'] ?? '') === 'function' && empty($tool['freeform'])) {
+            $tool['description'] = ($tool['description'] ?? '')
+                . "\nReusing an agent does not change its original model. If a native-model child's initial assignment failed with invalid_encrypted_content before work started, "
+                . 'create a fresh child inheriting this Web transport for that unstarted assignment instead of retrying the same failed native agent. '
+                . 'Healthy Web children remain reusable; preserve completed work and exact receipts.';
+            return $tool;
+        }
+        if (!self::isHostSpawn($tool)) return $tool;
+        unset($tool['parameters']['properties']['model'], $tool['parameters']['properties']['reasoning_effort']);
+        $tool['description'] = ($tool['description'] ?? '') . "\nRCMAKER manages this Web task's child model and reasoning level in the console. "
+            . 'Omit model and reasoning_effort: the new native agent must inherit this Web transport; RCMAKER then applies the configured child selection. '
+            . 'Keep the authorized assignment and fork_turns unchanged.';
+        return $tool;
+    }
+
+    /**
+     * Normalize a newly issued Web-origin spawn to inherit transport, including cached catalogs.
+     * No task text, history choice, native identity, other host tool or existing call is rewritten.
+     * @param array $tool Exact bound descriptor. @param array $arguments Validated function object.
+     * @return array Effective spawn arguments before assigning its durable native call identity.
+     */
+    public static function hostArguments(array $tool, array $arguments): array
+    {
+        if (self::isHostSpawn($tool)) unset($arguments['model'], $arguments['reasoning_effort']);
+        return $arguments;
+    }
+
+    /** Match the actual native collaboration capability, never a tool sharing its display name. */
+    private static function isHostSpawn(array $tool): bool
+    {
+        return ($tool['wire_name'] ?? '') === 'collaboration__spawn_agent'
+            && ($tool['namespace'] ?? '') === 'collaboration' && ($tool['name'] ?? '') === 'spawn_agent'
+            && ($tool['type'] ?? '') === 'function' && empty($tool['freeform']);
+    }
+
+    /**
      * Read only the exact native session header, not task instructions or its parent history.
      * UUIDv7 dates bound normal lookup to three day folders; older UUIDs use the existing
      * literal session layout once per cached lookup. A parent_thread_id alone is a fork, not proof.

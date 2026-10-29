@@ -1320,6 +1320,8 @@ final class ToolBroker
      * Register one generic Codex host call. The returned call_id is the exact Responses identity.
      * Calls beyond a serial round's first invocation, and calls arriving after a batch is sealed,
      * wait unassigned for a later round. Repeated call keys retain their original identity.
+     * Newly issued native subagents inherit the Web transport before console child policy;
+     * previously issued calls retain their exact original arguments on upgrade.
      * @param string $token Current turn capability. @param string $wireName Registered host tool name.
      * @param string $callKey Stable caller operation identity. @param mixed $arguments Function arguments.
      * @param string|null $input Freeform tool input, when applicable.
@@ -1377,6 +1379,18 @@ final class ToolBroker
                 ->order([['created_at', 'DESC'], ['id', 'DESC']])
                 ->limit(1)
                 ->find();
+            // Already issued calls retain their exact old arguments on upgrade. New Web
+            // spawns inherit the parent's transport before the verified child policy runs.
+            // Normalize retries too, so cached native overrides cannot register a second child.
+            if (!$freeform && (!is_array($existing) || !hash_equals((string)$existing['request_hash'], $requestHash))) {
+                $effective = CodexSubagent::hostArguments($tool, $arguments);
+                if ($effective !== $arguments) {
+                    $argumentsJson = $effective === [] ? '{}' : self::canonicalJson($effective);
+                    $requestHash = hash('sha256', self::canonicalJson([
+                        'call_key'=>$callKey, 'wire_name'=>$wireName, 'arguments'=>$argumentsJson, 'input'=>$input,
+                    ]));
+                }
+            }
             $reusedNativeWait = false;
             if (!is_array($existing) && $nativeSourceCallId !== null) {
                 $source = self::codeModeContinuation($token, $nativeSourceCallId);
@@ -3942,7 +3956,7 @@ final class ToolBroker
     }
 
     /**
-     * Preserve raw names while filtering bridge descriptors from the visible catalog.
+     * Preserve raw names, exclude bridge descriptors and project console-managed child routing.
      * @return array{visible:list<array<string,mixed>>,bound_wire_names:list<string>}
      */
     private static function catalogSnapshot(array $binding): array
@@ -3961,8 +3975,8 @@ final class ToolBroker
             }
         }
         return [
-            'visible'=>array_values(array_filter($tools, static fn($tool): bool => is_array($tool)
-                && !self::isBridgeTool($tool) && !isset($bridgeNamespaces[(string) ($tool['namespace'] ?? '')]))),
+            'visible'=>array_map([CodexSubagent::class, 'hostTool'], array_values(array_filter($tools, static fn($tool): bool => is_array($tool)
+                && !self::isBridgeTool($tool) && !isset($bridgeNamespaces[(string) ($tool['namespace'] ?? '')])))),
             'bound_wire_names'=>$boundWireNames,
         ];
     }
@@ -4267,7 +4281,7 @@ final class ToolBroker
      * Reduce avoidable tool round trips without changing authorization, receipts or task routing.
      * Interaction guidance is conditional on the current host catalog, including customized prompts.
      * @param array<string> $hostToolNames Exact wire names in this turn's authorized registry.
-     * @return string Small execution and optional user-question notice; no history or schemas duplicated.
+     * @return string Small execution, child-routing and optional user-question notice; no history or schemas duplicated.
      */
     private static function efficientToolNotice(array $hostToolNames): string
     {
@@ -4280,6 +4294,12 @@ final class ToolBroker
             . 'When needed evidence already exists in this page or exact tool receipts, use it; query archived history only for missing facts or a required recovery check. '
             . 'These are efficiency rules, not permission to skip required checks, public progress replies, approvals or unresolved results.'
             . "\n</codex_tool_efficiency>";
+        if (in_array('collaboration__spawn_agent', $hostToolNames, true)) {
+            $notice .= "\n<codex_web_subagents>RCMAKER applies the console's Web child model and reasoning selection. "
+                . 'New native agents must inherit this Web transport; omit model and reasoning_effort overrides. '
+                . 'If a native-model child failed its initial assignment with invalid_encrypted_content before work started, create a fresh Web-inherited child for that unstarted assignment. '
+                . 'Reusing its ID cannot change its original model. Reuse healthy Web children and preserve completed work and exact receipts.</codex_web_subagents>';
+        }
         $async = in_array('request_user_input_async', $hostToolNames, true) ? 'request_user_input_async'
             : (in_array('functions__request_user_input_async', $hostToolNames, true) ? 'functions__request_user_input_async' : '');
         $blocking = in_array('request_user_input', $hostToolNames, true) ? 'request_user_input'
