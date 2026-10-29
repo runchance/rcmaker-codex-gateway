@@ -335,6 +335,12 @@ final class ResponseJob
                 ? ($prior['checkpoint_marker'] ?? null) : ($spec['checkpoint_marker'] ?? LunaCheckpoint::marker($spec));
             $spec['checkpoint_marker'] = $marker;
             $bridge = ToolBroker::prepareRoundUnlocked($spec, $reservation, $responseId);
+            // The broker proves settled receipts for a mailbox restart or its unsent
+            // failed setup. Their historical tool tail can use the existing staging
+            // policy; every record retains its original index and exact contents.
+            if (!empty($bridge['mailbox_context_restart']) || !empty($bridge['recovery_receipt_staging'])) {
+                $budget['recovery_receipt_staging'] = true;
+            }
             $prompt = (string) $spec['prompt'];
             if ($bridge['control_prompt'] !== '') {
                 $prompt = $bridge['control_prompt'];

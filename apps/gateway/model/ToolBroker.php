@@ -333,7 +333,11 @@ final class ToolBroker
 
     /**
      * Prepare a Responses round while the caller owns the Schema transaction.
-     * @return array{binding_id:?string,token:?string,control_prompt:string,is_continuation:bool}
+     * @param array $spec Validated request and its exact native tool environment.
+     * @param array $reservation TaskLedger reservation belonging to this request.
+     * @param string $responseId Newly reserved response identity.
+     * @return array{binding_id:?string,token:?string,control_prompt:string,is_continuation:bool,mailbox_context_restart?:bool,recovery_receipt_staging?:bool}
+     * @throws GatewayError When tool ownership, exact receipts or persisted execution evidence disagree.
      */
     public static function prepareRoundUnlocked(array $spec, array $reservation, string $responseId): array
     {
@@ -492,6 +496,7 @@ final class ToolBroker
             ];
         }
 
+        $receiptStaging = self::failedMailboxReceiptStagingUnlocked($spec, (string) $reservation['task_id']);
         $settings = GatewaySettings::internal();
         $previewToken = is_array($spec['budget']['imported_history_selection'] ?? null)
             && isset($spec['imported_prompt_turn_token']) ? (string)$spec['imported_prompt_turn_token'] : null;
@@ -542,7 +547,52 @@ final class ToolBroker
                  self::hostShellFromContext((string)($spec['full_context_json'] ?? $spec['context_json'] ?? '')),
                  (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
             'is_continuation' => false,
+            'recovery_receipt_staging' => $receiptStaging,
         ];
+    }
+
+    /**
+     * Preserve safe receipt staging when an older mailbox rebuild failed before its executable send.
+     * The new round may contain only an agent notification, so its historical tool tail still
+     * needs staging. Prove the exact failed setup and its settled receipts again; never inherit
+     * this permission from a request flag or from an unrelated failed response.
+     * @param array $spec Current routed request with its complete physical receipt history.
+     * @param string $taskId Exact task reserved by this admission transaction.
+     * @return bool Whether the existing receipt-staging policy is safe for this new binding.
+     * @throws GatewayError When persisted execution evidence cannot be read.
+     */
+    private static function failedMailboxReceiptStagingUnlocked(array $spec, string $taskId): bool
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response' || !empty($spec['tool_outputs'])) return false;
+        $prior = ResponseJob::latestForTaskUnlocked($taskId, true);
+        if (!is_array($prior) || $prior['status'] !== 'failed' || $prior['operation_kind'] !== 'response'
+            || $prior['model'] !== $spec['model'] || $prior['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $details = $db->table('gateway_response_jobs')->where('id', $prior['id'])->find(
+            'submit_intent_at,accepted_at,output_started,output_text,mcp_binding_id,error_json,previous_response_id');
+        if (!is_array($details)) throw new GatewayError('storage_unavailable', 'Mailbox recovery setup is unavailable.', 503);
+        $prior += $details;
+        if ($prior['submit_intent_at'] !== null || $prior['accepted_at'] !== null
+            || (int) $prior['output_started'] !== 0 || (string) $prior['output_text'] !== ''
+            || empty($prior['mcp_binding_id'])) return false;
+        $error = json_decode((string) $prior['error_json'], true);
+        if (($error['error']['code'] ?? null) !== 'CHATGPT_CONTEXT_TOO_LARGE') return false;
+        $binding = self::bindingByIdUnlocked((string) $prior['mcp_binding_id']);
+        if ($binding['task_id'] !== $taskId || $binding['turn_id'] !== $prior['durable_turn_id']
+            || $binding['current_response_id'] !== $prior['id'] || $binding['sent_at'] !== null
+            || $binding['started_at'] !== null || !in_array($binding['status'], ['awaiting_start','revoked'], true)) return false;
+        $event = $db->table('gateway_task_events')->where('response_id', $prior['id'])
+            ->where('task_id', $taskId)->where('turn_id', $prior['durable_turn_id'])
+            ->where('event_type', 'mcp_mailbox_context_restart_prepared')->limit(1)->find();
+        $proof = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
+        if (!is_array($proof) || ($proof['binding_id'] ?? null) !== $binding['id']
+            || ($proof['previous_response_id'] ?? null) !== $prior['previous_response_id']) return false;
+        $active = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])->where('status', 'active')->count();
+        if (!is_numeric($active)) throw new GatewayError('storage_unavailable', 'Mailbox recovery activity is unavailable.', 503);
+        return (int) $active === 0 && self::hasCompleteReceiptHistory($binding, [
+            'context_json'=>$spec['context_json'],
+            'transport_context_json'=>$spec['transport_context_json'] ?? $spec['context_json'],
+        ]);
     }
 
     public static function markSentByResponse(string $responseId): void
