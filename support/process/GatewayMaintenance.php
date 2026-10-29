@@ -36,6 +36,7 @@ final class GatewayMaintenance
         $timer::add(5, static function (): void {
             try {
                 Schema::initialize();
+                TaskLedger::retireCancelledUnsentSurfaces();
                 TaskLedger::retireFinishedSubagentPages();
             } catch (\Throwable) {
                 // Ownership and receipt checks are retried here; never fail a parent response.

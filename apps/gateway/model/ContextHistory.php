@@ -5,6 +5,11 @@ namespace app\gateway\model;
 /** Canonical readable Codex history, exact-prefix deltas and task-scoped tool-result continuation. */
 final class ContextHistory
 {
+    /** Stable canonical boundary; readable parent input may replace it only in a verified browser projection. */
+    public const OPAQUE_AGENT_NOTICE = '[RCMAKER context boundary: provider-private encrypted agent history is unavailable. '
+        . 'Use the readable instructions and actual project or tool results; do not infer '
+        . 'the missing assignment or treat it as evidence of completed work. If the active '
+        . 'assignment is available only in this missing content, request a readable assignment.]';
     /** Preserve readable roles/tools/skills; execution configuration is validated and routed by ResponsesProtocol. */
     public static function compile(mixed $input, string $instructions, ?array &$attachments = null, string $skillTransport = 'inline'): array
     {
@@ -819,7 +824,12 @@ final class ContextHistory
         $priorContext = json_decode((string) $last['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $priorRecords = (array) ($priorContext['messages'] ?? []);
         $records = (array) ($context['messages'] ?? []);
-        if (($previous !== '' || !empty($spec['input_is_delta'])) && count($records) <= 1 && ($records[0]['role'] ?? '') === 'user') {
+        $terminalUpdate = $spec['terminal_user_update'] ?? [];
+        $terminalDelta = !empty($terminalUpdate['delta']) && ($terminalUpdate['task_id'] ?? null) === $taskId
+            && ($terminalUpdate['source_response_id'] ?? null) === $last['id']
+            && ($terminalUpdate['request_hash'] ?? null) === $spec['request_hash'];
+        if ($terminalDelta || (($previous !== '' || !empty($spec['input_is_delta']))
+            && count($records) <= 1 && ($records[0]['role'] ?? '') === 'user')) {
             $answer = ($last['status'] ?? '') === 'completed' && ($last['round_kind'] ?? '') === 'text'
                 && (string) ($last['output_text'] ?? '') !== ''
                 ? [['role' => 'assistant', 'content' => (string) $last['output_text']]] : [];
@@ -913,7 +923,59 @@ final class ContextHistory
     }
 
     /**
-     * Distinguish old transcript outputs from pending host receipts before routing a new user item.
+     * Prove a fresh user request before a trailing native mailbox/environment update on a cancelled task.
+     * A late agent result alone, a known user record or a retry of the cancelled native turn cannot
+     * restart it. This private in-transaction proof never revives a tool token or changes message order.
+     * @param array $spec Parsed request, with the current conversation alias already resolved for lookup.
+     * @param array $task Exact cancelled owner row. @return ?array Internal source/request/delta proof.
+     * @throws GatewayError If the owning source context cannot be read.
+     */
+    public static function terminalUserUpdateUnlocked(array $spec, array $task): ?array
+    {
+        if ($task['status'] !== 'cancelled' || ($spec['operation_kind'] ?? 'response') !== 'response'
+            || empty($spec['thread_id']) || empty($spec['turn_id'])
+            || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
+            || $task['thread_id'] !== $spec['thread_id'] || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')
+            || $task['owner_key'] !== ($spec['browser_owner_key'] ?? null)) return null;
+        $cached = $spec['terminal_user_update'] ?? [];
+        if (($cached['task_id'] ?? null) === $task['id']
+            && ($cached['request_hash'] ?? null) === $spec['request_hash']) return $cached;
+        $context = json_decode((string)$spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        $records = (array)($context['messages'] ?? []);
+        $index = count($records) - 1;
+        for (; $index >= 0; $index--) {
+            $record = $records[$index];
+            if (in_array($record['role'] ?? '', ['agent_message','developer'], true)
+                || self::isOperationalUserMessage($record)) continue;
+            break;
+        }
+        $user = $records[$index] ?? [];
+        if ($index === count($records) - 1 || ($user['role'] ?? '') !== 'user'
+            || in_array($user['origin'] ?? '', ['codex_skill','codex_delegation'], true)
+            || (trim(self::text($user['content'] ?? '')) === '' && AttachmentStore::checkpointReferenceIds([$user]) === [])) return null;
+        $source = ResponseJob::latestForTaskUnlocked((string)$task['id']);
+        if (!is_array($source) || ($source['turn_id'] ?? null) === $spec['turn_id']) return null;
+        $known = json_decode((string)$source['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        foreach ((array)($known['messages'] ?? []) as $prior) {
+            if (($prior['role'] ?? '') !== 'user') continue;
+            if (!empty($user['id'])) {
+                if (($prior['id'] ?? null) === $user['id']) return null;
+            } else {
+                unset($prior['id']);
+                if (self::canonical($prior) === self::canonical($user)) return null;
+            }
+        }
+        $delta = ($spec['previous_response_id'] ?? null) === $source['id'] || !empty($spec['input_is_delta']);
+        foreach (array_slice($records, 0, $index) as $record) {
+            if (($record['role'] ?? '') !== 'developer' && !self::isOperationalUserMessage($record)) $delta = false;
+        }
+        return ['task_id'=>$task['id'], 'source_response_id'=>$source['id'],
+            'request_hash'=>$spec['request_hash'], 'delta'=>$delta];
+    }
+
+    /**
+     * Distinguish old transcript outputs from pending host receipts before routing a new user item,
+     * including a proven fresh cancelled-task request followed by native operational messages.
      * The caller owns the reservation transaction; the incoming key still identifies the original
      * conversation, so cancelled/restarted conversations must resolve their current task first.
      * @param array $spec Normalized request with the native conversation key and trailing outputs.
@@ -925,13 +987,29 @@ final class ContextHistory
         if ($outputs === []) return $spec;
         $context = json_decode((string) $spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $last = $context['messages'][array_key_last($context['messages'])] ?? null;
-        if (($last['role'] ?? '') !== 'user') return $spec;
+        // Preserve the existing role=user environment-tail behavior for active receipt rounds.
+        $trailingOperational = ($last['role'] ?? '') !== 'user';
         $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
         $db = SDB(null, 'medoo', 'sqlite');
         $link = $db->table('gateway_task_conversations')->where('base_task_id', $taskId)->find();
         if (is_array($link)) {
             // Match TaskLedger's routing without rewriting the request key twice.
             $taskId = 'task_' . substr((string) $link['current_task_key'], 0, 24);
+        }
+        if ($trailingOperational) {
+            $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+            $lookup = $spec;
+            if (is_array($link)) $lookup['browser_owner_key'] = $link['current_owner_key'];
+            $proof = is_array($task) ? self::terminalUserUpdateUnlocked($lookup, $task) : null;
+            if ($proof !== null) $spec['terminal_user_update'] = $proof;
+            else {
+                // A completed result followed by a late child report is history, not a
+                // second delivery. The existing mailbox verifier must prove the exact
+                // current task and append-only update before the receipt loop may demote it.
+                $mailboxProbe = $spec;
+                $mailboxProbe['tool_outputs'] = [];
+                if (self::activeMailboxContextUpdateUnlocked($mailboxProbe) === null) return $spec;
+            }
         }
         foreach ($outputs as $output) {
             $call = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
@@ -1118,7 +1196,7 @@ final class ContextHistory
         return self::activeNativeContextUpdateUnlocked($spec, $taskId, true);
     }
 
-    /** Match exact public output and inherited delta effort; new turns recover unreceived batches only after detachment. */
+    /** Match exact public output/effort; a running round with no public text can accept a proven mailbox suffix too. */
     private static function activeNativeContextUpdateUnlocked(array $spec, ?string $taskId, bool $humanSteering): ?array
     {
         if (($spec['operation_kind'] ?? 'response') !== 'response'
@@ -1296,8 +1374,20 @@ final class ContextHistory
                 return null;
             }
         }
-        if ($humanSteering ? !$hasHuman : (!$hasMailbox || $publishedIndex === 0)) return null;
-        return ['source' => $source, 'restart' => (int) $pending === 0,
+        // A child can report immediately after a receipt, before the Web model emits
+        // commentary. Exact source/history/turn ownership above is sufficient then;
+        // existing public output still requires the original published-prefix proof.
+        $emptyRunningOutput = $running && $published === [] && (string)$source['output_text'] === '';
+        if ($humanSteering ? !$hasHuman : (!$hasMailbox || ($publishedIndex === 0 && !$emptyRunningOutput))) return null;
+        $restart = (int)$pending === 0;
+        if ($emptyRunningOutput && $restart) {
+            $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
+                ->where('turn_id', $turn['id'])->where('binding_id', $source['mcp_binding_id'])
+                ->where('status', 'completed')->where('result_delivered_at', null)->count();
+            if (!is_numeric($undelivered)) return null;
+            $restart = (int)$activities === 0 && (int)$undelivered === 0;
+        }
+        return ['source' => $source, 'restart' => $restart,
             'client_turn_id' => (string) $turn['client_turn_id'],
             'updates' => ['version' => 3, 'system' => [], 'messages' => $updates]];
     }
@@ -1559,11 +1649,7 @@ final class ContextHistory
             // Some native records carry public text beside a private payload. Preserve
             // that text through the same projection as a normal agent message.
             if (!$encryptedBlock) $readable[] = $part;
-            $readable[] = ['type' => 'input_text', 'text' =>
-                '[RCMAKER context boundary: provider-private encrypted agent history is unavailable. '
-                . 'Use the readable instructions and actual project or tool results; do not infer '
-                . 'the missing assignment or treat it as evidence of completed work. If the active '
-                . 'assignment is available only in this missing content, request a readable assignment.]'];
+            $readable[] = ['type' => 'input_text', 'text' => self::OPAQUE_AGENT_NOTICE];
         }
         return self::messageContent($readable, 'agent_message', false, 'inline', $attachments);
     }

@@ -498,6 +498,8 @@ In **Settings → Web subagents**, choose the model and reasoning level for nati
 
 Each subagent uses its own Temporary Chat, without automatic fallback to a saved chat. Its first submission carries the context supplied by Codex; `fork_turns=none` supplies the assignment, while `all` may include inherited history. Repeated dispatches reuse the child's owned page when possible. Subagents appear in Task Center with a parent-thread identifier, but do not occupy Browser Workspace tabs.
 
+If Codex supplies the initial assignment as encrypted agent content, the gateway can recover its exact readable text from the verified parent's unique issued `spawn_agent` input. This is a browser-only projection: native history and tool receipts remain unchanged. Missing or ambiguous evidence stops that submission with an explicit error instead of running a child with no assignment. Other private encrypted agent history remains unavailable; this does not decrypt arbitrary history.
+
 After the tracked Web parent finishes, settled child pages are retired through the normal Stop/confirm/close path; task history and receipts remain available. Running tools, undelivered receipts and unknown outcomes prevent premature cleanup. Child errors retain their own task diagnostics without revoking parent or sibling tool capabilities. Shared browser capacity, account limits and connector availability still apply. A Temporary Chat without the connector reports an error instead of switching chat mode.
 
 ### Context parts, compaction and Pro

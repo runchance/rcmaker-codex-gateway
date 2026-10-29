@@ -360,6 +360,8 @@ final class ResponseJob
                     json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR));
             }
             if (!$bridge['is_continuation']) $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $reservation['task_id']);
+            [$prompt, $transportContext, $budget, $inputTokens] = NativeAgentAssignment::projectUnlocked(
+                $spec, $prompt, $transportContext, $budget, $inputTokens, $contextTokens, $attachmentTokens, $budgetContext);
             $roundInfo = $bridge;
             if (!$db->table('gateway_response_jobs')->add([
                 'id' => $responseId,

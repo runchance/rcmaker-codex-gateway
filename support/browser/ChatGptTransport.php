@@ -941,7 +941,7 @@ final class ChatGptTransport
      * @return array{start:int,end:int,context:array} Byte offsets of the tags and decoded v3 history.
      * @throws GatewayError When the envelope is missing, malformed or unsupported.
      */
-    private static function contextEnvelope(string $prompt): array
+    public static function contextEnvelope(string $prompt): array
     {
         $open = '<codex_context_json>';
         $close = '</codex_context_json>';

@@ -1,5 +1,6 @@
 /* Local product phrases. Rebuild with data/scripts/build-console-locales.php. */
 window.GatewayTranslations = {
+    "已取消页面的清理状态暂不可读取。": "Cancelled page cleanup state is unavailable.",
     "低": "Low",
     "中": "Medium",
     "高": "High",
@@ -1201,5 +1202,6 @@ window.GatewayTranslations = {
     "已记录本任务的网关错误": "Gateway error recorded for this task",
     "本任务已成功恢复，连续错误计数已清零": "This task succeeded; its consecutive error count was reset",
     "本任务连续网关错误：": "Consecutive gateway errors for this task: ",
-    "下次续发将重建任务页面": "Task page will be rebuilt on the next continuation"
+    "下次续发将重建任务页面": "Task page will be rebuilt on the next continuation",
+    "The encrypted subagent assignment has no unique verified parent tool input. Provide a readable assignment; no Web message was sent.": "The encrypted subagent assignment has no unique verified parent tool input. Provide a readable assignment; no Web message was sent."
 };

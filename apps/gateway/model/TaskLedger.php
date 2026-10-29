@@ -401,6 +401,13 @@ final class TaskLedger
         $lastMessage = $messages[array_key_last($messages)] ?? [];
         $newUserMessage = ($lastMessage['role'] ?? '') === 'user'
             && !ContextHistory::isOperationalUserMessage($lastMessage);
+        if (!$newUserMessage && is_array($task) && $task['status'] === 'cancelled') {
+            $terminalUpdate = ContextHistory::terminalUserUpdateUnlocked($spec, $task);
+            if ($terminalUpdate !== null) {
+                $spec['terminal_user_update'] = $terminalUpdate;
+                $newUserMessage = true;
+            }
+        }
         $operation = (string) ($spec['operation_kind'] ?? 'response');
         if (is_array($task) && $newUserMessage && !$hasToolOutputs && $operation === 'response') {
             TaskWebChat::initializeMissingUnsentUnlocked($taskId);
@@ -617,6 +624,9 @@ final class TaskLedger
                 'status' => 'cancelled', 'cancelled_at' => $now, 'updated_at' => $now,
             ]);
             if (!$retired || $retired->rowCount() !== 1) throw new GatewayError('storage_unavailable', '未提交回合无法安全退休。', 503);
+            $emptySurface = $db->table('gateway_browser_surfaces')->where('task_id', $taskId)
+                ->where('epoch_id', $task['current_epoch_id'])->where('status', 'reserved')->where('target_id', null)->find('id');
+            if (is_array($emptySurface)) self::retireCancelledUnsentSurfaceUnlocked((string)$emptySurface['id']);
         }
         $values = ['current_task_id' => $newTaskId, 'current_task_key' => $taskKey,
             'current_owner_key' => $ownerKey, 'generation' => $generation, 'updated_at' => $now];
@@ -3746,6 +3756,55 @@ final class TaskLedger
             self::retireEpochUnlocked($taskId, (string) $surface['epoch_id'], 'operator_closed_idle_page');
             return ['task_id' => $taskId, 'surface_id' => $surfaceId, 'closing' => !empty($surface['target_id'])];
         });
+    }
+
+    /**
+     * Release a legacy cancelled reservation only after proving that no page was ever submitted.
+     * Run in the independent maintenance worker: no target, session, active command/turn, uncertain
+     * tool or undelivered result may be discarded. A real or uncertain browser page keeps its slot.
+     * @return int Number of empty cancelled reservations reconciled; task history remains unchanged.
+     * @throws GatewayError On unavailable storage; the next maintenance tick retries independently.
+     */
+    public static function retireCancelledUnsentSurfaces(): int
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $candidates = $db->table('gateway_browser_surfaces AS s')->join('gateway_tasks AS t', 't.id', 's.task_id')
+            ->where('s.status', 'reserved')->where('s.target_id', null)->where('s.session_id', null)
+            ->where('t.status', 'cancelled')->limit(self::MAX_SURFACES)->select('s.id');
+        if (!is_array($candidates)) throw new GatewayError('storage_unavailable', 'Cancelled page cleanup state is unavailable.', 503);
+        $retired = 0;
+        foreach ($candidates as $candidate) $retired += Schema::transaction(
+            static fn(): int => self::retireCancelledUnsentSurfaceUnlocked((string)$candidate['id']));
+        return $retired;
+    }
+
+    /** Share the exact empty-reservation proof between admission retirement and independent legacy cleanup. */
+    private static function retireCancelledUnsentSurfaceUnlocked(string $surfaceId): int
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $surface = $db->table('gateway_browser_surfaces')->where('id', $surfaceId)->find();
+        if (!is_array($surface) || $surface['status'] !== 'reserved' || !empty($surface['target_id']) || !empty($surface['session_id'])) return 0;
+        $task = $db->table('gateway_tasks')->where('id', $surface['task_id'])->find('id,status');
+        if (!is_array($task) || $task['status'] !== 'cancelled') return 0;
+        $checks = [
+            $db->table('gateway_task_turns')->where('task_id', $task['id'])->where('status', 'IN', self::ACTIVE_TURNS)->count(),
+            $db->table('gateway_response_jobs')->where('surface_id', $surface['id'])->where('status', 'IN', ['queued','running'])->count(),
+            $db->table('gateway_response_jobs')->where('surface_id', $surface['id'])->where('submit_intent_at', '<>', null)->count(),
+            $db->table('gateway_response_jobs')->where('surface_id', $surface['id'])->where('accepted_at', '<>', null)->count(),
+            $db->table('gateway_browser_commands AS c')->join('gateway_response_jobs AS j', 'j.command_id', 'c.id')
+                ->where('j.surface_id', $surface['id'])->where('c.status', 'IN', ['queued','running'])->count('c.id'),
+            $db->table('gateway_tool_invocations')->where('task_id', $task['id'])->where('status', 'IN', ['registered','delivered','unknown'])->count(),
+            $db->table('gateway_tool_invocations')->where('task_id', $task['id'])->where('status', 'completed')->where('result_delivered_at', null)->count(),
+            $db->table('gateway_mcp_activities AS a')->join('gateway_mcp_bindings AS b', 'b.id', 'a.binding_id')
+                ->where('b.task_id', $task['id'])->where('a.status', 'active')->count('a.id'),
+        ];
+        foreach ($checks as $count) {
+            if (!is_numeric($count)) throw new GatewayError('storage_unavailable', 'Cancelled page cleanup state is unavailable.', 503);
+            if ((int)$count !== 0) return 0;
+        }
+        ToolBroker::revokeTaskUnlocked((string)$task['id'], 'cancelled_unsent_reservation');
+        self::retireEpochUnlocked((string)$task['id'], (string)$surface['epoch_id'], 'cancelled_unsent_reservation');
+        return 1;
     }
 
     /**
