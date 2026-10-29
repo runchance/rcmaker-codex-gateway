@@ -516,9 +516,18 @@ final class ModelCatalog
             if (!is_array($row) || ($row['visibility'] ?? '') !== 'list') continue;
             $id = $row['slug'] ?? null;
             if (!is_string($id) || $id === '' || isset($models[$id])) continue;
+            $metadata = ['display_name'=>(string) ($row['display_name'] ?? $id)];
+            // Export the actual wire efforts, including fixed Pro's High identity.
+            // Never infer tiers from a display name or alter Codex's source catalog.
+            if (is_array($row['supported_reasoning_levels'] ?? null)) {
+                $metadata['supported_reasoning_levels'] = $row['supported_reasoning_levels'];
+            }
+            if (is_string($row['default_reasoning_level'] ?? null)) {
+                $metadata['default_reasoning_level'] = $row['default_reasoning_level'];
+            }
             $models[$id] = ['id'=>$id, 'object'=>'model', 'created'=>0,
                 'owned_by'=>str_starts_with($id, 'chatgpt-web/') ? 'chatgpt-web' : 'codex',
-                'metadata'=>['display_name'=>(string) ($row['display_name'] ?? $id)]];
+                'metadata'=>$metadata];
         }
         return ['object'=>'list', 'data'=>array_values($models)];
     }

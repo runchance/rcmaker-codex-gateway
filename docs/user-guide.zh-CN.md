@@ -335,6 +335,8 @@ php index.php start
 
 带认证的普通 `GET /v1/<integration>/models` 继续返回 Codex 的 `models/slug` 目录和原有 Web 注入字段。需要 OpenAI 风格 `data/id` 的平台须显式请求 `GET /v1/<integration>/models?format=openai`，获得实际可见的原生和 Web 模型，不改名、不显示隐藏兼容别名，也不会将这次目录读取记作 Codex 已重启或连接。
 
+每个条目的 `metadata` 还会在源目录提供时带出 `supported_reasoning_levels`（包含 `effort`、`description` 的对象数组）及 `default_reasoning_level`。这些是该模型实际接受的协议值：固定 Web Pro 条目返回 `high`，仍选中已有 Pro 路由，不能依据名称改传 `max`。字段缺失表示支持情况未知，不等于空档位列表。平台刷新目录后应按模型保存元数据，只展示自身支持且目录明确提供的显式档位；不传档位时使用模型默认。未来新增的未知档位不能擅自映射为其他值。
+
 原生目录仍使用调用方自身的 Codex 订阅登录凭据，不能用 OpenAI API Key 替代。仅此显式兼容请求缺少 `client_version` 时，网关会从配置的 Codex 目录内有界读取 `models_cache.json` 的版本，不猜测固定版本；缓存缺失时先启动一次 Codex 或显式提供版本。目录兼容不代表把 Codex 原生后端变成通用 OpenAI API；第三方平台须保留 `chatgpt-web/...` 完整模型ID，并使用匹配的执行器，例如其已有 Codex CLI 接入。原有 Codex 目录、响应转发、工具契约与模型注入保持不变。
 
 ## 6. 发起并核对首次任务
