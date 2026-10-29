@@ -192,7 +192,7 @@ final class ToolBroker
         }
         foreach ($bindings as $candidate) {
             if ((string) $candidate['id'] !== (string) $binding['id']) {
-                if (self::retireTerminalOtherBindingUnlocked($candidate, $binding)) continue;
+                if (self::retireTerminalOtherBindingUnlocked($candidate, $taskId, $binding)) continue;
                 throw new GatewayError('compaction_source_unavailable', '其他工具能力尚未结束，不能压缩当前任务。', 409);
             }
         }
@@ -235,22 +235,24 @@ final class ToolBroker
     }
 
     /**
-     * Retire an old recovery-reset capability only after its job, turn and every host receipt
-     * have settled. The compact reservation owns this transaction, so later source-validation
+     * Retire an old recovery-reset or failed-running capability only after its job, turn and every
+     * host receipt have settled. The compact reservation owns this transaction, so later source-validation
      * failures roll back this retirement. Current source capabilities and genuinely live work
      * retain the existing compaction fence; no host call is cancelled, inferred or replayed.
      *
-     * @param array $candidate Other awaiting-start binding from the same task's compact fence.
-     * @param array $sourceBinding Exact binding that owns the compact request's tool batch.
+     * @param array $candidate Other awaiting-start or failed-running binding from the same task's compact fence.
+     * @param string $taskId Exact task selected by compact admission.
+     * @param array|null $sourceBinding Current tool source, or null at a settled compact boundary.
      * @return bool Whether the proven terminal orphan was retired without changing host results.
      * @throws GatewayError When the saved job, activity or receipt state cannot be read.
      */
-    private static function retireTerminalOtherBindingUnlocked(array $candidate, array $sourceBinding): bool
+    private static function retireTerminalOtherBindingUnlocked(array $candidate, string $taskId, ?array $sourceBinding = null): bool
     {
-        if ((string) ($candidate['status'] ?? '') !== 'awaiting_start'
-            || (string) ($candidate['id'] ?? '') === (string) ($sourceBinding['id'] ?? '')
-            || (string) ($candidate['task_id'] ?? '') !== (string) ($sourceBinding['task_id'] ?? '')
-            || (string) ($candidate['turn_id'] ?? '') === (string) ($sourceBinding['turn_id'] ?? '')
+        if (!in_array((string) ($candidate['status'] ?? ''), ['awaiting_start', 'running'], true)
+            || (string) ($candidate['task_id'] ?? '') !== $taskId
+            || ($sourceBinding !== null && ((string) ($sourceBinding['task_id'] ?? '') !== $taskId
+                || (string) ($candidate['id'] ?? '') === (string) ($sourceBinding['id'] ?? '')
+                || (string) ($candidate['turn_id'] ?? '') === (string) ($sourceBinding['turn_id'] ?? '')))
             || empty($candidate['current_response_id']) || empty($candidate['turn_id'])) return false;
 
         $db = SDB(null, 'medoo', 'sqlite');
@@ -264,6 +266,10 @@ final class ToolBroker
             || (string) $turn['response_id'] !== (string) $job['id']
             || !in_array((string) $job['status'], ['completed', 'failed'], true)
             || !in_array((string) $turn['status'], ['committed', 'failed', 'cancelled'], true)) return false;
+        // A failed browser response can leave its started capability running after all host work
+        // has drained. Do not extend this case to a live, unknown or merely completed Web turn.
+        if ((string) $candidate['status'] === 'running'
+            && ((string) $job['status'] !== 'failed' || (string) $turn['status'] !== 'failed')) return false;
 
         $liveJobs = $db->table('gateway_response_jobs')->where('task_id', (string) $candidate['task_id'])
             ->where('mcp_binding_id', (string) $candidate['id'])
@@ -2828,22 +2834,30 @@ final class ToolBroker
     }
 
     /**
-     * Retire capabilities left by a failed browser setup that never reached ChatGPT or Codex.
-     * A compact request can follow later successful turns in the same task; an old unsent
-     * capability must not be mistaken for live tool work. Caller owns the ledger transaction.
+     * Retire unsent failed setups or proven drained failed-running capabilities before compact.
+     * Settled and active compaction boundaries share the same terminal/receipt proof; unfinished
+     * calls and active MCP requests remain fenced. Caller owns the ledger transaction.
+     * @param string $taskId Exact task selected by compact admission.
+     * @return int Number of capabilities safely retired in the caller's transaction.
+     * @throws GatewayError When persisted capability or host activity state cannot be read.
      */
     public static function retireInertFailedBindingsUnlocked(string $taskId): int
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $bindings = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)
-            ->where('status', 'awaiting_start')->select();
+            ->where('status', 'IN', ['awaiting_start', 'running'])->select();
         if (!is_array($bindings)) throw new GatewayError('storage_unavailable', '工具能力状态暂不可读取。', 503);
         $retired = 0;
         foreach ($bindings as $binding) {
-            $responseId = (string) ($binding['current_response_id'] ?? '');
-            if ($responseId === '' || !ContextRecovery::canRetryFailedBeforeCommitUnlocked($responseId)) continue;
-            self::revokeBindingUnlocked($binding, 'failed_before_web_commit');
-            $retired++;
+            if ((string) $binding['status'] === 'awaiting_start') {
+                $responseId = (string) ($binding['current_response_id'] ?? '');
+                if ($responseId !== '' && ContextRecovery::canRetryFailedBeforeCommitUnlocked($responseId)) {
+                    self::revokeBindingUnlocked($binding, 'failed_before_web_commit');
+                    $retired++;
+                    continue;
+                }
+            }
+            if (self::retireTerminalOtherBindingUnlocked($binding, $taskId)) $retired++;
         }
         return $retired;
     }
