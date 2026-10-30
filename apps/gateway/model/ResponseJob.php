@@ -113,7 +113,10 @@ final class ResponseJob
             if ($page['fresh'] && $page['login_required']) {
                 throw new GatewayError('authentication_required', 'ChatGPT 网页需要重新登录。', 401);
             }
-            if ((!$page['on_chatgpt'] || !$page['editor_ready']) && !$activeSteeringCandidate) {
+            // The setup/native page is an account source, not this task's composer.
+            // Owned task pages verify their own editor before sending; a composer-free
+            // authenticated setup page must not reject independent starts or continuations.
+            if (!self::accountReady($browser, $page) && !$activeSteeringCandidate) {
                 throw new GatewayError('chatgpt_surface_not_ready', 'ChatGPT 页面尚未进入可发送状态；请在浏览器工作区完成登录并等待编辑器出现。', 503);
             }
             if (!$activeSteeringCandidate) ModelCatalog::awaitCurrentObservation((string) $spec['model']);
