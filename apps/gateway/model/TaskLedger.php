@@ -2602,20 +2602,23 @@ final class TaskLedger
     }
 
     /**
-     * Preserve the actual Page.enable failure without storing browser content or CDP payloads.
+     * Preserve the exact local page-control failure without storing browser content or CDP payloads.
      * @param string $responseId Physical observer or current response on this generation.
      * @param array $error CDP error; only its numeric code and known transport reason are retained.
      * @param float $waitSeconds Preparation budget used, bounded by the existing turn deadline.
      * @param string $incarnation Browser worker owning the claimed surface.
      * @param int $fence Exact ownership fence; stale diagnostics must not cross generations.
+     * @param string $method Allow-listed initialization method; omitted legacy calls retain Page.enable.
      * @return bool Whether the diagnostic belongs to the still-owned task generation.
      * @throws GatewayError On unavailable storage or changed ownership.
      */
     public static function browserPageInitializationFailed(string $responseId, array $error, float $waitSeconds,
-        string $incarnation, int $fence): bool
+        string $incarnation, int $fence, string $method = 'Page.enable'): bool
     {
         $reason = (string) ($error['message'] ?? '');
-        $facts = ['method'=>'Page.enable', 'cdp_code'=>max(-2147483648, min(2147483647, (int) ($error['code'] ?? 0))),
+        $method = in_array($method, ['Page.enable','Network.enable','Emulation.setDeviceMetricsOverride',
+            'Emulation.setFocusEmulationEnabled'], true) ? $method : 'Page.enable';
+        $facts = ['method'=>$method, 'cdp_code'=>max(-2147483648, min(2147483647, (int) ($error['code'] ?? 0))),
             'cause'=>in_array($reason, ['BROWSER_CDP_TIMEOUT','BROWSER_CDP_DISCONNECTED','BROWSER_CDP_ERROR','BROWSER_CDP_SEND_FAILED'], true)
                 ? $reason : 'CDP_PROTOCOL_ERROR',
             'wait_budget_ms'=>(int) round(max(0.0, min(600.0, $waitSeconds)) * 1000)];

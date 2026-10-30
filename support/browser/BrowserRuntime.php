@@ -3446,7 +3446,7 @@ JS;
                 $pageDeadline = min((float) $ledger['turn']['deadline_at'], microtime(true)
                     + (float) Config::get('gateway', 'browser_start_timeout_seconds'));
                 $pageWait = max(0.0, $pageDeadline - microtime(true));
-                $pageEnabled = function ($pageError) use ($responseId, $commandId, $sessionId, $recover, $pageOwner, $pageGeneration, $pageWait): void {
+                $pageEnabled = function ($pageError) use ($responseId, $commandId, $sessionId, $recover, $pageOwner, $pageGeneration, $pageWait, $pageDeadline): void {
                     $currentOwner = $this->taskSessions[$sessionId] ?? [];
                     foreach (['response_id','surface_id','owner_incarnation','fencing_version'] as $key) {
                         if (($currentOwner[$key] ?? null) !== ($pageOwner[$key] ?? null)) return;
@@ -3503,26 +3503,8 @@ JS;
                             $frameId = (string) ($frameResult['frameTree']['frame']['id'] ?? '');
                             if ($frameId !== '') $this->taskSessions[$sessionId]['main_frame_id'] = $frameId;
                         }, 3.0);
-                    $this->taskCdp->send('Network.enable', [], $sessionId, function ($networkError) use ($responseId, $commandId, $sessionId, $recover): void {
-                        if ($networkError !== null) {
-                            $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_OBSERVATION_FAILED', '任务页面网络状态监听初始化失败。', $recover);
-                            return;
-                        }
-                        $this->taskCdp->send('Emulation.setDeviceMetricsOverride', [
-                            'width' => 1280, 'height' => 720, 'deviceScaleFactor' => 1, 'mobile' => false,
-                        ], $sessionId, function ($metricsError) use ($responseId, $commandId, $sessionId, $recover): void {
-                            if ($metricsError !== null) {
-                                $this->taskFailTurn($responseId, 'CHATGPT_VIEWPORT_FAILED', '任务页面尺寸初始化失败。', $recover);
-                                return;
-                            }
-                            $this->taskCdp->send('Emulation.setFocusEmulationEnabled', ['enabled'=>true], $sessionId,
-                                function ($focusError) use ($responseId, $commandId, $sessionId, $recover): void {
-                                    if ($focusError !== null) { $this->taskFailTurn($responseId,'CHATGPT_FOCUS_FAILED','任务页面无法保持交互焦点。',$recover); return; }
-                                    $this->applyTaskBrowserIdentity($sessionId,
-                                        fn() => $this->prepareTaskTemporarySurface($responseId, $commandId, $sessionId, $recover), $recover);
-                                }, 3.0);
-                        }, 3.0);
-                    }, 3.0);
+                    $this->initializeTaskControlStep($responseId, $commandId, $sessionId, $recover,
+                        $this->taskSessions[$sessionId], $pageGeneration, $pageDeadline);
                 };
                 if ($pageWait <= 0.0) {
                     $pageEnabled(['code'=>-2, 'message'=>'BROWSER_CDP_TIMEOUT']);
@@ -3530,6 +3512,89 @@ JS;
                 }
                 $this->taskCdp->send('Page.enable', [], $sessionId, $pageEnabled, $pageWait);
             }, 5.0);
+    }
+
+    /**
+     * Finish local page control using one remaining preparation budget, not independent short deadlines.
+     * Every acknowledgement rechecks the exact session/generation/fence and stopped-user state. A resumed
+     * logical receipt round may advance only through the existing physical-turn recovery resolver.
+     * @param string $responseId Current logical round. @param int $commandId Owning browser command.
+     * @param string $sessionId Attached task session. @param bool $recover Whether this is a retained recovery.
+     * @param array $owner Exact local session ownership snapshot. @param string $generation Physical generation.
+     * @param float $deadline Shared Page.enable/control preparation deadline. @param int $step Next control step.
+     * @param ?array $stepError An acknowledged CDP failure, validated before recording or failing this turn.
+     * @param ?float $failedWait Actual wait budget for that failed request, retained for safe diagnostics.
+     */
+    private function initializeTaskControlStep(string $responseId, int $commandId, string $sessionId, bool $recover,
+        array $owner, string $generation, float $deadline, int $step = 0, ?array $stepError = null, ?float $failedWait = null): void
+    {
+        $current = $this->taskSessions[$sessionId] ?? [];
+        foreach (['response_id','surface_id','owner_incarnation','fencing_version'] as $key) {
+            if (($current[$key] ?? null) !== ($owner[$key] ?? null)) return;
+        }
+        if (!$this->taskCdp->ready()) return;
+        try {
+            $ledger = $recover ? $this->currentTaskResumeLedger($responseId, $commandId) : TaskLedger::pollExecution($responseId);
+            if ($ledger === null) {
+                unset($this->taskSessions[$sessionId]);
+                $this->detachTaskSessionRaw($sessionId);
+                return;
+            }
+            if ($recover && (string)$ledger['job']['id'] !== $responseId) {
+                $responseId = (string)$ledger['job']['id'];
+                $generation = (string)$ledger['job']['generation_id'];
+                $this->taskSessions[$sessionId]['response_id'] = $responseId;
+                $owner['response_id'] = $responseId;
+                $resumeKey = (string)$ledger['job']['surface_id'] . ':' . $commandId;
+                if (isset($this->taskResumeAttachments[$resumeKey])) $this->taskResumeAttachments[$resumeKey] = $responseId;
+            }
+        } catch (\Throwable $failure) {
+            if ($recover) $this->deferTaskResumeReadFailure($responseId, $commandId, $sessionId, $owner, $failure);
+            elseif (!($failure instanceof GatewayError)) throw $failure;
+            return;
+        }
+        if ((string)$ledger['turn']['generation_id'] !== $generation
+            || (string)$ledger['surface']['owner_incarnation'] !== (string)$owner['owner_incarnation']
+            || (int)$ledger['surface']['fencing_version'] !== (int)$owner['fencing_version']
+            || in_array($ledger['turn']['status'], ['failed','cancelled','committed','needs_attention'], true)) return;
+        if (in_array($ledger['turn']['error_code'] ?? '', ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS'], true)) {
+            unset($this->taskSessions[$sessionId]);
+            $this->detachTaskSessionRaw($sessionId);
+            $this->finishCommand($commandId, ['status'=>'user_stop_pending']);
+            return;
+        }
+        if ($step >= 3) {
+            $this->applyTaskBrowserIdentity($sessionId,
+                fn() => $this->prepareTaskTemporarySurface($responseId, $commandId, $sessionId, $recover), $recover);
+            return;
+        }
+        $controls = [
+            ['Network.enable', [], 'CHATGPT_NETWORK_OBSERVATION_FAILED', '任务页面网络状态监听初始化失败。'],
+            ['Emulation.setDeviceMetricsOverride', ['width'=>1280,'height'=>720,'deviceScaleFactor'=>1,'mobile'=>false],
+                'CHATGPT_VIEWPORT_FAILED', '任务页面尺寸初始化失败。'],
+            ['Emulation.setFocusEmulationEnabled', ['enabled'=>true], 'CHATGPT_FOCUS_FAILED', '任务页面无法保持交互焦点。'],
+        ];
+        [$method, $parameters, $code, $message] = $controls[$step];
+        $remaining = max(0.0, min($deadline, (float)$ledger['turn']['deadline_at']) - microtime(true));
+        if ($stepError === null && $remaining <= 0.0) $stepError = ['code'=>-2,'message'=>'BROWSER_CDP_TIMEOUT'];
+        if ($stepError !== null) {
+            try {
+                if (!TaskLedger::browserPageInitializationFailed($responseId, $stepError, $failedWait ?? $remaining,
+                    (string)$owner['owner_incarnation'], (int)$owner['fencing_version'], $method)) return;
+            } catch (GatewayError $error) {
+                if (in_array($error->errorCode, ['surface_fence_lost','response_superseded','task_ledger_missing'], true)) return;
+            } catch (\Throwable) { /* Keep the original CDP failure when diagnostics are unavailable. */ }
+            $this->taskFailTurn($responseId, $code, $message, $recover);
+            return;
+        }
+        $this->taskCdp->send($method, $parameters, $sessionId,
+            function ($error) use ($responseId, $commandId, $sessionId, $recover, $owner, $generation, $deadline, $step, $remaining): void {
+                // A stalled event loop may deliver an acknowledgement before its due timer.
+                // Keep that late completion scoped to the control that exhausted the budget.
+                if ($error === null && microtime(true) >= $deadline) $error = ['code'=>-2,'message'=>'BROWSER_CDP_TIMEOUT'];
+                $this->initializeTaskControlStep($responseId, $commandId, $sessionId, $recover, $owner,
+                    $generation, $deadline, $error === null ? $step + 1 : $step, $error, $error === null ? null : $remaining);
+            }, $remaining);
     }
 
     /**
