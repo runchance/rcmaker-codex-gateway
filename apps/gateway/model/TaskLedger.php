@@ -1850,7 +1850,7 @@ final class TaskLedger
     /**
      * Record a delayed renderer observation without ending or extending the owned turn.
      * @param string $responseId Existing logical round. @param string $phase Observation stage.
-     * @param array $observation Allow-listed stop readiness or load cooldown facts, never page text or tokens.
+     * @param array $observation Allow-listed stop readiness, load cooldown or verification facts; never page text or tokens.
      * @return void
      * @throws GatewayError When the durable job/ledger is unavailable.
      */
@@ -1860,13 +1860,15 @@ final class TaskLedger
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             if (!self::ownsCurrentGeneration($job, $turn)) return;
             $steering = $phase === 'steering_stop' && SteeringContext::isDelta($job) && $turn['status'] === 'queued';
-            $loading = $phase === 'saved_chat_load' && $job['status'] === 'running'
+            $loading = $phase === 'saved_chat_load' && in_array($job['status'], ['queued','running'], true)
                 && $job['operation_kind'] === 'response' && $turn['status'] === 'queued' && empty($job['submit_intent_at']);
             $cooling = $phase === 'rate_limit' && in_array($job['status'], ['queued', 'running'], true);
             if (!$steering && !$loading && !$cooling && ($job['status'] !== 'running' || !in_array($turn['status'], ['submit_intent', 'submitted', 'running'], true))) return;
             $data = ['deadline_at' => (int) $turn['deadline_at'],
                 'phase' => $cooling ? 'rate_limit' : ($loading ? 'saved_chat_load' : ($steering ? 'steering_stop' : ($phase === 'send_confirmation' ? 'send_confirmation' : 'response')))];
-            if ($loading || $cooling) $data += ['http_status'=>429,'attempt'=>max(0,min(64,(int)($observation['attempt']??0))),
+            if ($loading || $cooling) $data += [
+                'http_status'=>$loading && (int)($observation['http_status']??0) === 403 ? 403 : 429,
+                'attempt'=>max(0,min(64,(int)($observation['attempt']??0))),
                 'retry_after_seconds'=>max(1,min(86400,(int)($observation['retry_after_seconds']??30)))];
             if ($steering) foreach (['owned', 'generation_running', 'editor_ready', 'stop_clicked', 'observation_failed',
                 'initial_binding_witness', 'initial_response_witness', 'token_witness', 'retained_identity_witness'] as $key) {

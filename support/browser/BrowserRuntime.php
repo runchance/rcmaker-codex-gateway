@@ -3848,6 +3848,16 @@ JS;
                         $idleSince ??= microtime(true);
                     } else $idleSince = null;
                 } else $idleSince = null;
+                if ($error === null && is_array($state) && ($state['generation_running'] ?? null) === false
+                    && empty($state['editor_ready']) && empty($state['page_invalid']) && ($state['user_count'] ?? null) === 0
+                    && empty($state['token_witness']) && empty($state['initial_binding_witness'])
+                    && empty($state['initial_response_witness']) && empty($state['retained_identity_witness'])) {
+                    $resume = fn() => $this->prepareSteeringSurface($responseId, $commandId, $sessionId, $deadline, $clicked);
+                    // A failed history GET has no composer to acknowledge Stop. Use the
+                    // existing cooldown/load observer before asking for that acknowledgement.
+                    // Neither branch sends a message or treats the empty DOM as a stopped task.
+                    if ($this->deferSavedChatLoad($responseId, $sessionId, $resume)) return;
+                }
                 if (!empty($state['page_invalid'])) {
                     if ($this->recoverSteeringPreparation($responseId, $sessionId)) return;
                 }
@@ -4284,16 +4294,21 @@ JS;
     }
 
     /**
-     * Validate an unsent response's exact saved chat before any load recovery; no host effects are authorized.
+     * Validate an unsent response's exact chat before load recovery; no host effects are authorized.
+     * Temporary chats qualify only for a proven retained steering document with a natural UUID load.
+     * After a reload, that observer may only resume the original stop/recovery fence.
      * @param string $responseId Current response. @param string $sessionId Exact attached owner.
-     * @param array $phase Optional captured generation. @return array|null Fresh metadata, or no authority.
+     * @param array $phase Optional captured generation and owner/target scope.
+     * @return array|null Fresh metadata, or no authority.
+     * @throws GatewayError On unavailable state or a changed temporary route during recovery.
      */
     private function savedChatLoadLedger(string $responseId, string $sessionId, array $phase = []): ?array
     {
         $owner = $this->taskSessions[$sessionId] ?? [];
         $chat = $owner['web_chat'] ?? [];
-        if (($owner['response_id'] ?? '') !== $responseId || ($chat['mode'] ?? '') !== 'regular'
-            || empty($chat['conversation_id']) || empty($chat['account_key'])) return null;
+        $mode = $chat['mode'] ?? '';
+        if (($owner['response_id'] ?? '') !== $responseId || !in_array($mode, ['regular','temporary'], true)
+            || ($mode === 'regular' && (empty($chat['conversation_id']) || empty($chat['account_key'])))) return null;
         $ledger = TaskLedger::pollExecution($responseId);
         $job = $ledger['job']; $turn = $ledger['turn']; $surface = $ledger['surface'];
         $observer = $this->chatGptTurns[$responseId] ?? [];
@@ -4307,14 +4322,39 @@ JS;
             || $surface['id'] !== ($owner['surface_id'] ?? '') || $surface['session_id'] !== $sessionId
             || $surface['owner_incarnation'] !== ($owner['owner_incarnation'] ?? '')
             || (int) $surface['fencing_version'] !== (int) ($owner['fencing_version'] ?? -1)
-            || ($phase !== [] && $phase['generation_id'] !== $job['generation_id'])
-            || !WebModelPage::isTaskChatUrl($surface['url'], self::modelUrl(), 'regular', $chat['conversation_id'])) return null;
+            || ($phase !== [] && ($phase['generation_id'] !== $job['generation_id']
+                || $phase['target_id'] !== $surface['target_id'] || $phase['mode'] !== $mode
+                || $phase['owner_incarnation'] !== $surface['owner_incarnation']
+                || (int) $phase['fencing_version'] !== (int) $surface['fencing_version']))) return null;
+        if (!WebModelPage::isTaskChatUrl($surface['url'], self::modelUrl(), $mode, $chat['conversation_id'] ?? null)) {
+            if ($phase !== [] && $mode === 'temporary') throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED',
+                'The retained temporary Web chat changed during history-load recovery; no message was sent.', 409);
+            return null;
+        }
+        // Only the initial admission needs the immutable budget/proof body. Polls
+        // revalidate lightweight ownership and reuse this generation's captured flag.
+        $initialJob = $phase === [] ? ResponseJob::execution($responseId) : null;
+        $steering = $initialJob !== null ? \app\gateway\model\SteeringContext::isDelta($initialJob) : !empty($phase['steering']);
+        $conversationId = (string) ($chat['conversation_id'] ?? '');
+        if ($mode === 'temporary') {
+            if (!$steering || preg_match('~^/c/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$~iD',
+                (string) parse_url($surface['url'], PHP_URL_PATH), $match) !== 1) return null;
+            $conversationId = strtolower($match[1]);
+            if ($phase === []) {
+                if (!\app\gateway\model\SteeringContext::retained($initialJob, $surface)) return null;
+            } elseif (($phase['url'] ?? null) !== $surface['url']) {
+                throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED',
+                    'The retained temporary Web chat changed during history-load recovery; no message was sent.', 409);
+            }
+        }
+        $ledger['chat_load'] = ['mode'=>$mode,'conversation_id'=>$conversationId,'url'=>$surface['url'],'steering'=>$steering];
         return $ledger;
     }
 
     /**
-     * Detect saved-chat load throttling before generic editor timeouts. Temporary/submitted pages are untouched.
-     * @param string $responseId Unsent response. @param string $sessionId Owned ordinary chat session.
+     * Detect natural history-load throttling before generic editor/stop timeouts.
+     * New temporary roots and submitted messages remain outside this recovery path.
+     * @param string $responseId Unsent response. @param string $sessionId Exact owned chat session.
      * @param callable():void $resume Existing readiness path, resumed only after observation/recovery.
      * @return bool Whether this observer owns the asynchronous readiness check.
      */
@@ -4331,13 +4371,17 @@ JS;
         $deadline = min((float) $ledger['turn']['deadline_at'], (float) ($this->chatGptTurns[$responseId]['deadline'] ?? PHP_FLOAT_MAX));
         $phase = ['id'=>bin2hex(random_bytes(8)), 'generation_id'=>$ledger['job']['generation_id'],
             'deadline'=>$deadline, 'turn_deadline'=>$deadline,
+            'steering'=>$ledger['chat_load']['steering'],'mode'=>$ledger['chat_load']['mode'],
+            'url'=>$ledger['surface']['url'],'target_id'=>$ledger['surface']['target_id'],
+            'owner_incarnation'=>$ledger['surface']['owner_incarnation'],'fencing_version'=>(int)$ledger['surface']['fencing_version'],
             'attempt'=>0, 'not_before'=>0.0, 'failure_key'=>'', 'seen_429'=>false, 'reload_document'=>null];
+        $this->taskSessions[$sessionId]['task_load_conversation_id'] = $ledger['chat_load']['conversation_id'];
         $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
         $this->pollSavedChatLoad($responseId, $sessionId, $phase['id'], $resume);
         return true;
     }
 
-    /** Poll a bounded read-only load observation; only an elapsed 429 cooldown may reload the exact unsent page. */
+    /** Poll readiness/verification; only an elapsed 429 cooldown may reload the exact unsent page. */
     private function pollSavedChatLoad(string $responseId, string $sessionId, string $phaseId, callable $resume): void
     {
         $phase = $this->taskSessions[$sessionId]['saved_load_wait'] ?? [];
@@ -4352,8 +4396,9 @@ JS;
         }
         if ($ledger === null) return;
         $chat = $this->taskSessions[$sessionId]['web_chat'];
-        $this->evaluateTaskSession($sessionId, WebModelPage::savedChatLoadExpression($chat['conversation_id']),
-            function ($error, $snapshot) use ($responseId, $sessionId, $phaseId, $resume, $again, $chat): void {
+        $loadIdentity = $ledger['chat_load'];
+        $this->evaluateTaskSession($sessionId, WebModelPage::savedChatLoadExpression($loadIdentity['conversation_id']),
+            function ($error, $snapshot) use ($responseId, $sessionId, $phaseId, $resume, $again, $chat, $loadIdentity): void {
                 $phase = $this->taskSessions[$sessionId]['saved_load_wait'] ?? [];
                 if (($phase['id'] ?? '') !== $phaseId) return;
                 try { $ledger = $this->savedChatLoadLedger($responseId, $sessionId, $phase); }
@@ -4365,8 +4410,15 @@ JS;
                 if ($ledger === null) return;
                 $now = microtime(true);
                 $owned = $error === null && is_array($snapshot)
-                    && WebModelPage::isTaskChatUrl((string) ($snapshot['url'] ?? ''), self::modelUrl(), 'regular', $chat['conversation_id']);
+                    && WebModelPage::isTaskChatUrl((string) ($snapshot['url'] ?? ''), self::modelUrl(), $loadIdentity['mode'],
+                        $loadIdentity['mode'] === 'regular' ? $loadIdentity['conversation_id'] : null)
+                    && ($loadIdentity['mode'] !== 'temporary' || ($snapshot['url'] ?? '') === $loadIdentity['url']);
                 if ($owned && !empty($snapshot['editor_ready']) && ($snapshot['generation_running'] ?? null) === false) {
+                    if ($loadIdentity['mode'] === 'temporary') {
+                        unset($this->taskSessions[$sessionId]['saved_load_wait']);
+                        $resume(); // Revalidate the retained-document proof; never mark Stop here.
+                        return;
+                    }
                     $this->evaluateTaskSession($sessionId, WebModelPage::accountFingerprintExpression(),
                         function ($accountError, $account) use ($responseId, $sessionId, $phaseId, $resume, $again, $chat): void {
                             $phase = $this->taskSessions[$sessionId]['saved_load_wait'] ?? [];
@@ -4392,7 +4444,13 @@ JS;
                     return;
                 }
                 // A running Stop always prevents reload, even when a stale 429 remains visible.
-                if ($owned && !empty($snapshot['generation_running']) && $now < $phase['turn_deadline']) { $again(); return; }
+                if ($owned && !empty($snapshot['generation_running']) && $now < $phase['turn_deadline']) {
+                    if (!empty($phase['steering'])) {
+                        unset($this->taskSessions[$sessionId]['saved_load_wait']);
+                        $resume(); // The recovered Stop must be handled by the original steering path.
+                    } else $again();
+                    return;
+                }
                 $load = $this->taskSessions[$sessionId]['saved_chat_load'] ?? [];
                 $status = (int) ($load['status'] ?? ($snapshot['http_status'] ?? 0));
                 if ($status === 429 && ($owned || !empty($load['request_id']))) {
@@ -4409,8 +4467,25 @@ JS;
                         catch (\Throwable) { /* Diagnostics cannot cancel load recovery. */ }
                     }
                 }
-                // A new explicit non-rate error belongs to the existing login/deletion/error
-                // path. An earlier 429 must not hide it or keep refreshing a missing chat.
+                if ($status === 403 && !empty($load['security_challenge'])) {
+                    // Only the exact history GET can establish this wait. Unrelated
+                    // background challenges must not suppress Stop or extend a cooldown.
+                    if ($now >= $phase['deadline']) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_CHAT_VERIFICATION_REQUIRED',
+                            'The original ChatGPT conversation still requires browser verification; no new message was sent and tool results are preserved.');
+                    } else {
+                        if ($now - (float)($phase['verification_notice_at'] ?? 0) >= 30.0) {
+                            $phase['verification_notice_at'] = $now;
+                            $this->taskSessions[$sessionId]['saved_load_wait'] = $phase;
+                            try { TaskLedger::observationDelayed($responseId, 'saved_chat_load', ['http_status'=>403]); }
+                            catch (\Throwable) { /* Verification cannot be bypassed by a diagnostic failure. */ }
+                        }
+                        $again();
+                    }
+                    return;
+                }
+                // Other explicit errors keep the existing login/deletion/error path.
+                // A stale 429 must not keep refreshing a missing conversation.
                 if (!$phase['seen_429'] || ($status >= 400 && $status !== 429)) {
                     unset($this->taskSessions[$sessionId]['saved_load_wait']);
                     $this->taskSessions[$sessionId]['saved_load_bypass'] = true;
@@ -10865,6 +10940,12 @@ JS;
         return $until;
     }
 
+    /**
+     * Record scoped CDP lifecycle/transport events; natural history loads stay pinned to this chat.
+     * @param array $message Browser event with its attached task session identity.
+     * @return void
+     * @throws GatewayError When required persisted task execution evidence is unavailable.
+     */
     private function onTaskEvent(array $message): void
     {
         $this->retiredTaskPageStop?->onEvent($message);
@@ -10892,9 +10973,11 @@ JS;
         $owner = $this->taskSessions[$sessionId];
         if ($method === 'Network.requestWillBeSent') {
             $chat = $owner['web_chat'] ?? [];
-            if (($chat['mode'] ?? '') === 'regular' && !empty($chat['conversation_id'])
+            $loadConversationId = ($chat['mode'] ?? '') === 'regular'
+                ? ($chat['conversation_id'] ?? null) : ($owner['task_load_conversation_id'] ?? null);
+            if (!empty($loadConversationId)
                 && ($params['request']['method'] ?? '') === 'GET' && !empty($params['requestId'])
-                && WebModelPage::isSavedChatLoadUrl((string) ($params['request']['url'] ?? ''), $chat['conversation_id'], self::modelUrl())) {
+                && WebModelPage::isSavedChatLoadUrl((string) ($params['request']['url'] ?? ''), $loadConversationId, self::modelUrl())) {
                 $reads = $owner['saved_chat_load_requests'] ?? [];
                 $reads[(string) $params['requestId']] = true;
                 $this->taskSessions[$sessionId]['saved_chat_load_requests'] = array_slice($reads, -8, null, true);
@@ -10960,10 +11043,14 @@ JS;
             $url = (string) ($response['url'] ?? '');
             if (!WebModelPage::isBackendUrl($url, self::modelUrl())) return;
             $savedChat = $owner['web_chat'] ?? [];
-            if (($savedChat['mode'] ?? '') === 'regular' && !empty($savedChat['conversation_id'])
+            $loadConversationId = ($savedChat['mode'] ?? '') === 'regular'
+                ? ($savedChat['conversation_id'] ?? null) : ($owner['task_load_conversation_id'] ?? null);
+            if (!empty($loadConversationId)
                 && isset($owner['saved_chat_load_requests'][(string) ($params['requestId'] ?? '')])
-                && WebModelPage::isSavedChatLoadUrl($url, $savedChat['conversation_id'], self::modelUrl())) {
+                && WebModelPage::isSavedChatLoadUrl($url, $loadConversationId, self::modelUrl())) {
                 $load = ['request_id'=>(string)$params['requestId'], 'status'=>(int)$response['status']];
+                $load['security_challenge'] = WebModelPage::isBackendSecurityChallenge($url,
+                    $load['status'], (array)($response['headers'] ?? []), self::modelUrl());
                 foreach ((array) ($response['headers'] ?? []) as $name=>$value) {
                     if (strtolower((string)$name) !== 'retry-after' || !is_string($value) || strlen($value)>64) continue;
                     $seconds = ctype_digit(trim($value)) ? (int)trim($value) : max(0, (int)strtotime($value)-time());
@@ -10974,7 +11061,9 @@ JS;
                         (string)$params['requestId'], (array)($response['headers'] ?? []));
                 }
                 $this->taskSessions[$sessionId]['saved_chat_load'] = $load;
-                if (in_array($load['status'], [404,410], true)) $this->taskSessions[$sessionId]['saved_chat_missing'] = true;
+                if (($savedChat['mode'] ?? '') === 'regular' && in_array($load['status'], [404,410], true)) {
+                    $this->taskSessions[$sessionId]['saved_chat_missing'] = true;
+                }
             }
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')) {
                 $this->taskSessions[$sessionId]['submission_protocol'] = $response['protocol'] ?? null;
