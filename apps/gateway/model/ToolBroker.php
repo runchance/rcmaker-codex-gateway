@@ -1562,6 +1562,8 @@ final class ToolBroker
                 throw new GatewayError('tool_call_limit', '本回合工具调用已达到设置上限。', 409);
             }
             $id = self::opaque('inv');
+            $capacity = SubagentCapacity::reserveHostUnlocked($tool, $freeform ? [] : $arguments, $binding, $id);
+            if ($capacity !== null) return $capacity;
             $callId = self::opaque('call');
             $invocationResponseId = $queueForNextRound ? null : $currentResponseId;
             $now = time();

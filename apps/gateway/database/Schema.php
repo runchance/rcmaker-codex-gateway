@@ -540,6 +540,14 @@ final class Schema
                 'ALTER TABLE gateway_tasks ADD COLUMN native_parent_thread_id TEXT',
                 "ALTER TABLE gateway_tasks ADD COLUMN native_agent_path TEXT NOT NULL DEFAULT ''",
             ],
+            67 => [
+                'ALTER TABLE gateway_settings ADD COLUMN subagent_max_concurrency INTEGER NOT NULL DEFAULT 4',
+                // Small admission metadata only: never copy transcripts or cancel issued tools.
+                "CREATE TABLE gateway_subagent_slots (id TEXT PRIMARY KEY, thread_id TEXT UNIQUE, parent_thread_id TEXT, agent_path TEXT NOT NULL DEFAULT '', invocation_id TEXT UNIQUE REFERENCES gateway_tool_invocations(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED, turn_id TEXT REFERENCES gateway_task_turns(id) ON DELETE SET NULL, status TEXT NOT NULL CHECK(status IN ('held','released')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+                'CREATE INDEX gateway_subagent_slots_status ON gateway_subagent_slots(status)',
+                'CREATE INDEX gateway_subagent_slots_parent ON gateway_subagent_slots(parent_thread_id,agent_path,status)',
+                'CREATE INDEX gateway_tasks_native_child ON gateway_tasks(thread_id,native_parent_thread_id)',
+            ],
         ];
     }
 

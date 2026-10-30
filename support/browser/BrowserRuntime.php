@@ -15,6 +15,7 @@ use app\gateway\model\ContextHistory;
 use app\gateway\model\CodexCancellation;
 use app\gateway\model\GatewayError;
 use app\gateway\model\GatewaySettings;
+use app\gateway\model\SubagentCapacity;
 use app\gateway\model\NetworkSettings;
 use app\gateway\model\ModelCooldown;
 use app\gateway\model\ResponseJob;
@@ -3274,6 +3275,23 @@ JS;
                         || !in_array($fresh['turn']['status'], ['queued','submit_intent','submitted','running'], true)) return;
                     $this->prepareTaskSurface($responseId, $commandId, $recover);
                 } catch (GatewayError) {}
+            }, null, false);
+            return;
+        }
+        if (!SubagentCapacity::acquire($responseId)) {
+            if (time() >= (int)$turn['deadline_at']) {
+                $this->taskFailTurn($responseId, 'WEB_SUBAGENT_CAPACITY_WAIT_TIMEOUT',
+                    'The Web subagent waited until its task deadline for a global running slot. No new page message was sent.');
+                return;
+            }
+            $generation = $turn['generation_id'];
+            Timer::add(5, function () use ($responseId, $commandId, $recover, $generation): void {
+                try {
+                    $fresh = TaskLedger::execution($responseId);
+                    if ($fresh['turn']['response_id'] !== $responseId || $fresh['turn']['generation_id'] !== $generation
+                        || !in_array($fresh['turn']['status'], ['queued','submit_intent','submitted','running'], true)) return;
+                    $this->prepareTaskSurface($responseId, $commandId, $recover);
+                } catch (GatewayError $error) { $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage()); }
             }, null, false);
             return;
         }

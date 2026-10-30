@@ -41,7 +41,9 @@
             <div class="settings-grid">
                 <div class="field"><label for="subagent-model">子智能体模型</label><select id="subagent-model" lay-filter="subagent-model"><option value="">跟随主任务家族（不继承 Pro）</option></select></div>
                 <div class="field"><label for="subagent-effort">子智能体推理强度</label><select id="subagent-effort" lay-filter="subagent-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh" selected>Extra High</option></select></div>
+                <div class="field"><label for="subagent-concurrency">子智能体全局并发上限</label><input id="subagent-concurrency" class="layui-input" type="number" min="1" max="32" step="1" value="4" aria-describedby="subagent-concurrency-help"></div>
             </div>
+            <p id="subagent-concurrency-help" class="help">默认 4，范围 1–32，整个网关共用。满额时暂缓新分工；空闲子智能体保留复用，不占运行名额。降低上限不会中断正在执行的任务和工具。</p>
             <p class="help">默认使用极高档位。子智能体始终使用独立临时聊天，不自动转为普通聊天；当前页无法使用连接器时会说明原因。</p>
             <p class="help">模型设置从子智能体的下一次生成生效，已提交的工具和结果仍按原模型结清。不会启用子智能体或改变主任务的授权。</p>
         </section>
@@ -128,6 +130,6 @@
     <script src="../component/layui/layui.js"></script>
     <script src="../assets/gateway.js"></script>
 <script src="../assets/login-reminder.js"></script>
-    <script src="../assets/settings.js?v=20261029-subagents"></script>
+    <script src="../assets/settings.js?v=20261030-subagent-capacity"></script>
 </body>
 </html>

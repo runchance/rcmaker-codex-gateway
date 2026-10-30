@@ -25,14 +25,17 @@ final class CodexSubagent
             $tool['description'] = ($tool['description'] ?? '')
                 . "\nReusing an agent does not change its original model. If a native-model child's initial assignment failed with invalid_encrypted_content before work started, "
                 . 'create a fresh child inheriting this Web transport for that unstarted assignment instead of retrying the same failed native agent. '
-                . 'Healthy Web children remain reusable; preserve completed work and exact receipts.';
+                . 'Healthy Web children remain reusable; preserve completed work and exact receipts. '
+                . 'A gateway capacity_limited notice means no new assignment was issued; wait for existing children or continue independent work yourself. Do not wait for an unissued assignment or retry rapidly.';
             return $tool;
         }
         if (!self::isHostSpawn($tool)) return $tool;
         unset($tool['parameters']['properties']['model'], $tool['parameters']['properties']['reasoning_effort']);
         $tool['description'] = ($tool['description'] ?? '') . "\nRCMAKER manages this Web task's child model and reasoning level in the console. "
             . 'Omit model and reasoning_effort: the new native agent must inherit this Web transport; RCMAKER then applies the configured child selection. '
-            . 'Keep the authorized assignment and fork_turns unchanged.';
+            . 'Keep the authorized assignment and fork_turns unchanged. '
+            . 'The console sets a gateway-wide running-child limit. A capacity_limited notice means no child was created; '
+            . 'wait for existing children or continue independent work yourself, without blocking on an uncreated descendant or retrying rapidly.';
         return $tool;
     }
 
