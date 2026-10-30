@@ -7044,7 +7044,7 @@ JS;
                     if ($this->modelReadbackOwner($responseId) === $owner) $after();
                 };
                 $read = fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $safeAfter,
-                    min($deadline, microtime(true) + 4.0), $owner);
+                    $deadline, $owner);
                 if (!empty($focused['expanded'])) { $read(); return; }
                 $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $read, $owner): void {
                     if ($this->modelReadbackOwner($responseId) !== $owner) return;
@@ -7066,6 +7066,11 @@ JS;
         $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
             function ($error, $slider) use ($responseId, $mode, $after, $deadline, $owner): void {
                 if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                if (microtime(true) >= $deadline) {
+                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
+                        'ChatGPT reasoning control did not become verifiable within the model preparation deadline.');
+                    return;
+                }
                 if ($error === null && is_array($slider) && !empty($slider['ok'])) {
                     $familyMatches = !is_string($mode['family'] ?? null)
                         || ChatGptTransport::familyChecked($slider, $mode['family']);

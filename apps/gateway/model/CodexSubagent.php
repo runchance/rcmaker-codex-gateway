@@ -12,8 +12,8 @@ final class CodexSubagent
 
     /**
      * Project native collaboration spawn/followup guidance exposed by a Web binding.
-     * Its console-selected Web child model/effort is applied by prepare(); inheriting the
-     * parent's Web transport first prevents an optional native override bypassing that policy.
+     * Console selection is pinned for independent native spawns and checked again by prepare();
+     * optional native-model overrides cannot bypass the Web-only child policy.
      * The raw host capability snapshot and unrelated connectors remain unchanged.
      * @param array $tool One normalized bound host descriptor. @return array Visible descriptor.
      */
@@ -26,28 +26,79 @@ final class CodexSubagent
                 . "\nReusing an agent does not change its original model. If a native-model child's initial assignment failed with invalid_encrypted_content before work started, "
                 . 'create a fresh child inheriting this Web transport for that unstarted assignment instead of retrying the same failed native agent. '
                 . 'Healthy Web children remain reusable; preserve completed work and exact receipts. '
+                . 'Reusing an inherited-model child also keeps its native context-window metadata. If a new assignment is rejected for context_length_exceeded before Web submission and that child cannot compact, preserve completed results and delegate only the remaining work to a fresh independent child with fork_turns=none; do not repeat completed operations. '
                 . 'A gateway capacity_limited notice means no new assignment was issued; wait for existing children or continue independent work yourself. Do not wait for an unissued assignment or retry rapidly.';
             return $tool;
         }
         if (!self::isHostSpawn($tool)) return $tool;
         unset($tool['parameters']['properties']['model'], $tool['parameters']['properties']['reasoning_effort']);
         $tool['description'] = ($tool['description'] ?? '') . "\nRCMAKER manages this Web task's child model and reasoning level in the console. "
-            . 'Omit model and reasoning_effort: the new native agent must inherit this Web transport; RCMAKER then applies the configured child selection. '
+            . 'Omit model and reasoning_effort: RCMAKER pins independent new agents to the console-selected Web model in both the native runtime and gateway. '
+            . 'Full-history forks retain native inheritance and do not accept overrides. '
             . 'Keep the authorized assignment and fork_turns unchanged. '
             . 'The console sets a gateway-wide running-child limit. A capacity_limited notice means no child was created; '
-            . 'wait for existing children or continue independent work yourself, without blocking on an uncreated descendant or retrying rapidly.';
+            . 'wait for existing children or continue independent work yourself, without blocking on an uncreated descendant or retrying rapidly. '
+            . 'If native collaboration reports its agent thread limit, no new agent started; reuse a known idle agent instead of repeatedly spawning another name.';
         return $tool;
     }
 
     /**
-     * Normalize a newly issued Web-origin spawn to inherit transport, including cached catalogs.
+     * Pin an independent new Web child to the native catalog row matching its actual budget.
+     * Full-history forks retain inheritance. Exact issued calls retain their pinned arguments.
      * No task text, history choice, native identity, other host tool or existing call is rewritten.
      * @param array $tool Exact bound descriptor. @param array $arguments Validated function object.
      * @return array Effective spawn arguments before assigning its durable native call identity.
      */
-    public static function hostArguments(array $tool, array $arguments): array
+    public static function hostArguments(array $tool, array $arguments, array $binding = [], ?array $existing = null): array
     {
-        if (self::isHostSpawn($tool)) unset($arguments['model'], $arguments['reasoning_effort']);
+        if (!self::isHostSpawn($tool)) return $arguments;
+        unset($arguments['model'], $arguments['reasoning_effort']);
+        if (is_array($existing)) {
+            $pinned = json_decode((string)$existing['arguments_json'], true);
+            if (is_array($pinned)) {
+                $plain = $pinned;
+                unset($plain['model'], $plain['reasoning_effort']);
+                if (ContextHistory::canonical($plain) === ContextHistory::canonical($arguments)) return $pinned;
+            }
+        }
+        if (($arguments['fork_turns'] ?? 'all') !== 'none') return $arguments;
+        $parameters = $tool['parameters'] ?? [];
+        // The visible catalog deliberately hides overrides. Check support against
+        // this exact binding's immutable raw descriptor before adding native fields.
+        if (!isset($parameters['properties']['model'], $parameters['properties']['reasoning_effort'])) {
+            $environment = json_decode((string)($binding['tool_environment_json'] ?? ''), true);
+            foreach ((array)($environment['tools'] ?? []) as $raw) {
+                if (is_array($raw) && self::isHostSpawn($raw) && $raw['wire_name'] === $tool['wire_name']) {
+                    $parameters = $raw['parameters'] ?? []; break;
+                }
+            }
+        }
+        if (!isset($parameters['properties']['model'], $parameters['properties']['reasoning_effort'])) return $arguments;
+        $settings = GatewaySettings::internal();
+        $model = (string)$settings['subagent_web_model'];
+        $effort = (string)$settings['subagent_reasoning_effort'];
+        self::validateSelection($model, $effort);
+        if ($model === '') {
+            $parent = empty($binding['current_response_id']) ? null : SDB(null, 'medoo', 'sqlite')
+                ->table('gateway_response_jobs')->where('id', $binding['current_response_id'])->find('model');
+            $family = is_array($parent) ? (ModelCatalog::identity($parent['model'], null)['family'] ?? 'latest') : 'latest';
+            $model = 'chatgpt-web/model/' . $family;
+        }
+        $identity = ModelCatalog::identity($model, $effort);
+        $effort = $identity['effort'];
+        $family = $identity['family'] ?? 'latest';
+        $route = in_array($model, ['chatgpt-web/luna','chatgpt-web/think'], true)
+            ? ['id'=>$model] : (method_exists(ModelCatalog::class, 'childRuntimeRow')
+                ? ModelCatalog::childRuntimeRow($family, $effort) : null);
+        if (is_array($route)) {
+            // Family-wide rows advertise their largest effort's context. The dedicated
+            // Thinking/Instant row keeps native compaction aligned with this child's budget.
+            $arguments['model'] = $route['id'];
+            $arguments['reasoning_effort'] = $effort;
+            return $arguments;
+        }
+        // Older/unprobed catalogs do not prove a dedicated family row. Preserve their
+        // existing inheritance instead of inventing a model ID or rejecting a valid spawn.
         return $arguments;
     }
 
@@ -113,8 +164,62 @@ final class CodexSubagent
             $scope = ['thread_id'=>$threadId, 'parent_thread_id'=>$spawn['parent_thread_id'],
                 'agent_path'=>$spawn['agent_path'], 'depth'=>$spawn['depth']];
         }
-        self::$scopes[$key] = ['at'=>microtime(true), 'verified'=>true, 'scope'=>$scope];
+        self::$scopes[$key] = ['at'=>microtime(true), 'verified'=>true, 'scope'=>$scope, 'path'=>$path];
         return $scope;
+    }
+
+    /** Return only an already verified child's exact session path for bounded metadata evidence reads. */
+    public static function sessionPath(string $threadId): ?string
+    {
+        if (self::scope($threadId) === null) return null;
+        $root = realpath(rtrim((string)Config::get('gateway', 'codex_home'), '/\\') . '/sessions');
+        $entry = $root === false ? null : (self::$scopes[$root . '|' . $threadId] ?? null);
+        return is_string($entry['path'] ?? null) ? $entry['path'] : null;
+    }
+
+    /**
+     * Read bounded native lifecycle metadata outside a database writer. Completion is
+     * evidence for this exact native turn, never proof that an uncertain Web turn stopped.
+     */
+    public static function terminalTurn(string $threadId): ?array
+    {
+        $path = self::sessionPath($threadId);
+        $stream = $path === null ? false : @fopen($path, 'rb');
+        if (!is_resource($stream)) return null;
+        try {
+            $header = json_decode((string)fgets($stream, 262145), true);
+            if (($header['payload']['id'] ?? null) !== $threadId) return null;
+            $offset = max(0, fstat($stream)['size'] - 1048576);
+            fseek($stream, $offset);
+            if ($offset > 0) fgets($stream);
+            $turn = null;
+            while (($line = fgets($stream, 65537)) !== false) {
+                if (!str_ends_with($line, "\n")) {
+                    while (!feof($stream) && !str_ends_with($line, "\n")) $line = (string)fgets($stream, 65537);
+                    continue;
+                }
+                if (!str_contains($line, '"event_msg"')
+                    || (!str_contains($line, '"task_started"') && !str_contains($line, '"task_complete"'))) continue;
+                $row = json_decode($line, true);
+                $event = $row['payload'] ?? null;
+                if (($row['type'] ?? '') !== 'event_msg' || !is_array($event)) continue;
+                if (!is_string($row['timestamp'] ?? null) || $row['timestamp'] === '') continue;
+                try {
+                    $date = new \DateTimeImmutable((string)($row['timestamp'] ?? ''));
+                    $at = (int)$date->format('U');
+                    $atUs = (int)$date->format('Uu');
+                } catch (\Throwable) { continue; }
+                if (($event['type'] ?? '') === 'task_started') {
+                    $turn = is_string($event['turn_id'] ?? null) && CodexCancellation::uuid($event['turn_id'])
+                        ? ['native_turn_id'=>$event['turn_id'], 'started_at'=>$at, 'started_at_us'=>$atUs] : null;
+                } elseif (($event['type'] ?? '') === 'task_complete' && $turn !== null
+                    && (!isset($event['turn_id']) || $event['turn_id'] === $turn['native_turn_id'])) {
+                    $turn['finished_at'] = $at;
+                    $turn['finished_at_us'] = $atUs;
+                }
+            }
+            return isset($turn['finished_at']) ? $turn : null;
+        } finally { fclose($stream); }
     }
 
     /**
@@ -224,6 +329,7 @@ final class CodexSubagent
             'namespace'=>'rcmaker-chatgpt-web-v1', 'owner'=>$spec['browser_owner_key'], 'model'=>$model,
             'reasoning'=>$route['effort'], 'compaction'=>$spec['compaction_epoch'],
         ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
-        return $spec;
+        // A running worker can still hold the older companion class during a source upgrade.
+        return method_exists(NativeAgentAssignment::class, 'prepareEvidence') ? NativeAgentAssignment::prepareEvidence($spec) : $spec;
     }
 }

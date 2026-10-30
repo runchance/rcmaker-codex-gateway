@@ -1370,7 +1370,7 @@ final class ToolBroker
      * Register one generic Codex host call. The returned call_id is the exact Responses identity.
      * Calls beyond a serial round's first invocation, and calls arriving after a batch is sealed,
      * wait unassigned for a later round. Repeated call keys retain their original identity.
-     * Newly issued native subagents inherit the Web transport before console child policy;
+     * Independent native subagents pin the configured Web selection before console child policy;
      * previously issued calls retain their exact original arguments on upgrade.
      * @param string $token Current turn capability. @param string $wireName Registered host tool name.
      * @param string $callKey Stable caller operation identity. @param mixed $arguments Function arguments.
@@ -1430,10 +1430,10 @@ final class ToolBroker
                 ->limit(1)
                 ->find();
             // Already issued calls retain their exact old arguments on upgrade. New Web
-            // spawns inherit the parent's transport before the verified child policy runs.
+            // independent spawns pin the configured Web row before child policy runs.
             // Normalize retries too, so cached native overrides cannot register a second child.
             if (!$freeform && (!is_array($existing) || !hash_equals((string)$existing['request_hash'], $requestHash))) {
-                $effective = CodexSubagent::hostArguments($tool, $arguments);
+                $effective = CodexSubagent::hostArguments($tool, $arguments, $binding, is_array($existing) ? $existing : null);
                 if ($effective !== $arguments) {
                     $argumentsJson = $effective === [] ? '{}' : self::canonicalJson($effective);
                     $requestHash = hash('sha256', self::canonicalJson([

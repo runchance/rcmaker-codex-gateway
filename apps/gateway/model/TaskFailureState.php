@@ -92,15 +92,18 @@ final class TaskFailureState
         $write = $db->table('gateway_tasks')->where('id', $task['id'])->update([
             'consecutive_gateway_errors'=>$count, 'gateway_rebuild_pending'=>(int)($count >= self::REBUILD_THRESHOLD)]);
         if (!$write || $write->rowCount() !== 1) throw new GatewayError('storage_unavailable', 'Gateway failure state could not be saved.', 503);
-        self::eventUnlocked((string)$task['id'], $responseId, 'gateway_failure_recorded', $count, $code);
+        self::eventUnlocked((string)$task['id'], $responseId, 'gateway_failure_recorded', $count, $code,
+            is_string($request['turn_id'] ?? null) && CodexCancellation::uuid($request['turn_id']) ? $request['turn_id'] : null);
     }
 
     /** Persist scalar-only timeline evidence through the existing framework connection. */
-    private static function eventUnlocked(string $taskId, ?string $responseId, string $type, int $count, ?string $code = null): void
+    private static function eventUnlocked(string $taskId, ?string $responseId, string $type, int $count, ?string $code = null,
+        ?string $nativeTurnId = null): void
     {
         if (!SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->add([
             'task_id'=>$taskId, 'response_id'=>$responseId, 'event_type'=>$type,
-            'data_json'=>ContextHistory::canonical(['count'=>$count, 'error_code'=>$code]), 'created_at'=>time(),
+            'data_json'=>ContextHistory::canonical(['count'=>$count, 'error_code'=>$code]
+                + ($nativeTurnId === null ? [] : ['native_turn_id'=>$nativeTurnId])), 'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', 'Gateway failure event could not be saved.', 503);
     }
 }

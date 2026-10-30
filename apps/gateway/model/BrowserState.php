@@ -302,7 +302,8 @@ final class BrowserState
             }
             $maxQueueAge = in_array($row['action'], ['reset_profile', 'restart'], true) ? 600
                 : (in_array((string) $row['action'], ['chatgpt_text', 'verify_connector', 'probe_models'], true) ? 180 : 30);
-            if ((int) $row['created_at'] < time() - $maxQueueAge) {
+            if ((int) $row['created_at'] < time() - $maxQueueAge
+                && !self::ownedTaskQueueDeadlineOpen($row)) {
                 $rejected = ['command'=>$row, 'code'=>'BROWSER_COMMAND_EXPIRED', 'message'=>'浏览器操作等待过久，已取消。'];
                 self::finish((int)$row['id'], false, ['code'=>$rejected['code'], 'message'=>$rejected['message']]);
                 return null;
@@ -331,6 +332,30 @@ final class BrowserState
         // exits here, recoverInterrupted rechecks the still-bound unsent task on the next boot.
         if (is_array($rejected)) self::rejectQueuedResponse($rejected['command'], $rejected['code'], $rejected['message']);
         return $claimedCommand;
+    }
+
+    /**
+     * A durable task can wait for shared browser readiness longer than a UI command.
+     * Use its already-pinned deadline without extending it or loading archived context.
+     * Stale, terminal and unowned commands retain the ordinary queue-age protection.
+     */
+    private static function ownedTaskQueueDeadlineOpen(array $command): bool
+    {
+        if ($command['action'] !== 'chatgpt_text') return false;
+        $payload = json_decode((string)$command['payload_json'], true);
+        if (!is_string($payload['response_id'] ?? null)) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $job = $db->table('gateway_response_jobs')->where('id', $payload['response_id'])
+            ->find('id,command_id,durable_turn_id,generation_id,status');
+        if ($job === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', 'Task command ownership is unavailable.', 503);
+        if (!is_array($job) || (int)$job['command_id'] !== (int)$command['id']
+            || !in_array($job['status'], ['queued','running'], true)) return false;
+        $turn = $db->table('gateway_task_turns')->where('id', $job['durable_turn_id'])
+            ->find('response_id,generation_id,status,deadline_at');
+        if ($turn === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', 'Task command deadline is unavailable.', 503);
+        return is_array($turn) && $turn['response_id'] === $job['id'] && $turn['generation_id'] === $job['generation_id']
+            && in_array($turn['status'], ['queued','submit_intent','submitted','running'], true)
+            && (int)$turn['deadline_at'] > time();
     }
 
     /** Publish the rejected command's still-bound response terminal after the queue transaction. */

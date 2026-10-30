@@ -215,6 +215,21 @@ final class ResponsesProtocol
             (string) ($settings['skill_transport'] ?? 'inline')
         ));
         $contextJson = json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        // Native agent IDs identify encrypted deliveries, but are not conversation text
+        // and must not change archived context hashes or existing receipt-prefix matching.
+        $agentIds = [];
+        if (is_array($data['input'])) foreach ($data['input'] as $item) {
+            if ($item instanceof \stdClass && ($item->type ?? '') === 'agent_message') {
+                $id = $item->id ?? null;
+                $agentIds[] = is_string($id) && str_starts_with($id, 'amsg_')
+                    && CodexCancellation::uuid(substr($id, 5)) ? $id : null;
+            }
+        }
+        $agentRecords = [];
+        foreach ($context['messages'] as $record) if (($record['role'] ?? '') === 'agent_message') {
+            $agentRecords[] = ['id'=>$agentIds[count($agentRecords)] ?? null,
+                'record_sha256'=>hash('sha256', ContextHistory::canonical($record))];
+        }
         $attachments = AttachmentStore::selectForContext($attachments, $contextJson);
         $prompt = ContextHistory::plainPrompt($context);
         // Native receipts return directly to MCP, and complete histories can span multiple
@@ -253,6 +268,7 @@ final class ResponsesProtocol
             // Lite rebuilds prompt-only base instructions and removes image detail hints.
             // Keep that wire-mode evidence outside the user-facing task context.
             'native_responses_lite' => $nativeResponsesLite,
+            'native_agent_records' => $agentRecords,
             'budget' => $budget,
             'operation_kind' => is_array($data['input']) && (($data['input'][array_key_last($data['input'])]->type ?? null) === 'compaction_trigger') ? 'compact_v2' : 'response',
             'stream' => (bool) ($data['stream'] ?? false),

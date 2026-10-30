@@ -197,6 +197,28 @@ final class ModelCatalog
         return is_array($caps) && empty($caps['refresh_required']) ? $caps : null;
     }
 
+    /**
+     * Find the dedicated native row for a child's model metadata, not current Web admission.
+     * A task navigation may stale the public probe generation while its previously advertised
+     * family rows remain valid runtime identities. Actual browser selection still rechecks availability.
+     */
+    public static function childRuntimeRow(string $family, string $effort): ?array
+    {
+        $routes = self::routes();
+        $known = SDB(null, 'medoo', 'sqlite')->table('gateway_model_catalog')->where('id', 1)->find('capabilities_json,observed_at');
+        if (is_array($known) && (int)$known['observed_at'] > 0) {
+            $caps = json_decode((string)$known['capabilities_json'], true);
+            if (is_array($caps)) $routes = array_merge($routes, self::splitFamilyRoutes($caps));
+        }
+        foreach ($routes as $route) {
+            if (str_starts_with($route['id'], 'chatgpt-web/model/') || str_ends_with($route['id'], '-pro')
+                || ($family !== 'latest' && ($route['family'] ?? '') !== $family)
+                || !in_array($effort, $route['efforts'], true)) continue;
+            return $route;
+        }
+        return null;
+    }
+
     /** Keep pre-family saved task identities executable with their original effort binding. */
     private static function legacyRoutes(array $capabilities): array
     {

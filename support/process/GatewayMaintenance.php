@@ -7,6 +7,7 @@ use app\gateway\model\TaskMaintenance;
 use app\gateway\model\TaskLedger;
 use app\gateway\model\CodexIntegration;
 use app\gateway\model\GatewayError;
+use app\gateway\model\SubagentCapacity;
 
 /** Independent storage worker for explicit cleanup batches, empty reservations and nonblocking WAL checkpoints. */
 final class GatewayMaintenance
@@ -37,6 +38,7 @@ final class GatewayMaintenance
             try {
                 Schema::initialize();
                 TaskLedger::retireCancelledUnsentSurfaces();
+                if (method_exists(SubagentCapacity::class, 'refreshNativeTerminals')) SubagentCapacity::refreshNativeTerminals();
             } catch (\Throwable) {
                 // Ownership and receipt checks are retried here; never fail a parent response.
             }

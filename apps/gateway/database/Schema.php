@@ -8,6 +8,8 @@ use app\gateway\model\GatewayError;
 /** Owns SQLite schema, writer transactions and maintenance checkpoints through the framework connection. */
 final class Schema
 {
+    /** Companion capability for precise native pending-reservation ownership on source upgrades. */
+    public const SUBAGENT_RESERVATION_CLOCK_VERSION = 68;
     private static bool $ready = false;
     private const WRITER_WAIT_MILLISECONDS = 5000;
     private const WRITER_LOCK_ATTEMPTS = 3;
@@ -547,6 +549,9 @@ final class Schema
                 'CREATE INDEX gateway_subagent_slots_status ON gateway_subagent_slots(status)',
                 'CREATE INDEX gateway_subagent_slots_parent ON gateway_subagent_slots(parent_thread_id,agent_path,status)',
                 'CREATE INDEX gateway_tasks_native_child ON gateway_tasks(thread_id,native_parent_thread_id)',
+            ],
+            68 => [
+                'ALTER TABLE gateway_subagent_slots ADD COLUMN reserved_at_us INTEGER',
             ],
         ];
     }
