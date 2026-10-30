@@ -87,20 +87,7 @@ final class Responses
             $raw = $this->withMetadata($request, $raw);
             $phase = 'composer_suggestion';
             $suggestion = ResponsesProtocol::localComposerSuggestion($raw);
-            if ($suggestion !== null) {
-                if (!$suggestion['stream']) {
-                    return $request->json($suggestion['response']);
-                }
-                $frames = '';
-                foreach ($suggestion['events'] as $event) {
-                    $frames .= 'event: ' . $event['type'] . "\ndata: "
-                        . json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
-                        . "\n\n";
-                }
-                return $request->response($frames, 200, [
-                    'Content-Type' => 'text/event-stream', 'Cache-Control' => 'no-cache',
-                ]);
-            }
+            if ($suggestion !== null) return $this->localSuggestionReply($request, $suggestion);
             $phase = 'portability';
             if ((int) GatewaySettings::internal()['official_handoff_summary'] === 1) {
                 $plan = ContextPortability::prepareNativeHandoff($raw, $this->nativeHeaders($request));
@@ -109,6 +96,8 @@ final class Responses
             } else $raw = ContextPortability::prepareWeb($raw);
             $phase = 'parse';
             $spec = ResponsesProtocol::parse($raw);
+            $suggestion = ResponsesProtocol::localComposerSuggestionFromContext($spec);
+            if ($suggestion !== null) return $this->localSuggestionReply($request, $suggestion);
             $spec['integration_id'] = $this->integrationId($request);
             $idempotencyKey = $this->idempotencyKey($request);
             $connection = $request->RCresponse?->getConnection();
@@ -155,6 +144,18 @@ final class Responses
                 'service_unavailable', null, 'server_error'))
                 ->withStatus(503);
         }
+    }
+
+    /** Format the same local, tool-free advisory response before any browser job is reserved. */
+    private function localSuggestionReply(Request $request, array $suggestion): mixed
+    {
+        if (!$suggestion['stream']) return $request->json($suggestion['response']);
+        $frames = '';
+        foreach ($suggestion['events'] as $event) {
+            $frames .= 'event: ' . $event['type'] . "\ndata: "
+                . json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n\n";
+        }
+        return $request->response($frames, 200, ['Content-Type'=>'text/event-stream', 'Cache-Control'=>'no-cache']);
     }
 
     /**

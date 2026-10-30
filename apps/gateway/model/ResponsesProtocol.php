@@ -32,14 +32,26 @@ final class ResponsesProtocol
         catch (GatewayError) { return null; }
         if (empty($metadata['thread_id']) || empty($metadata['turn_id'])
             || !in_array($metadata['client_id'] ?? 'codex', ['codex'], true)) return null;
-        $last = $body->input[array_key_last($body->input)];
+        $lastIndex = array_key_last($body->input);
+        $controls = [];
+        // Environment/effort controls are not user messages. Defer their normal validation
+        // until the explicit app contract is proven, avoiding extra tool-catalog work on real turns.
+        while ($lastIndex >= 0 && in_array($body->input[$lastIndex]->type ?? null, ['configuration_update','additional_tools'], true)) {
+            $controls[] = $body->input[$lastIndex];
+            $lastIndex--;
+        }
+        if ($lastIndex < 0) return null;
+        $last = $body->input[$lastIndex];
         if (!$last instanceof \stdClass || ($last->role ?? null) !== 'user'
-            || (isset($last->type) && $last->type !== 'message') || !is_array($last->content ?? null)
-            || count($last->content) !== 1) return null;
-        $part = $last->content[0];
-        if (!$part instanceof \stdClass || ($part->type ?? null) !== 'input_text'
-            || !is_string($part->text ?? null)) return null;
-        $text = $part->text;
+            || (isset($last->type) && $last->type !== 'message')) return null;
+        if (is_string($last->content ?? null)) $text = $last->content;
+        else {
+            if (!is_array($last->content ?? null) || count($last->content) !== 1) return null;
+            $part = $last->content[0];
+            if (!$part instanceof \stdClass || ($part->type ?? null) !== 'input_text'
+                || !is_string($part->text ?? null)) return null;
+            $text = $part->text;
+        }
         if (!str_starts_with($text,
             "This is an app-generated request for a suggested next user message. The user did not write this message.\n\n")
             || !str_contains($text, "Your suggestion will appear in the user's empty message composer. They can accept it, edit it, or ignore it; it will not be sent automatically.")
@@ -58,6 +70,15 @@ final class ResponsesProtocol
                 ['type'=>['string','null']],
                 ['type'=>['null','string']],
             ], true)) return null;
+        try {
+            foreach ($controls as $control) {
+                if ($control->type === 'configuration_update') self::configurationEffort(get_object_vars($control));
+                else {
+                    if (!is_array($control->tools ?? null)) return null;
+                    self::mergeToolInventories([$control->tools]);
+                }
+            }
+        } catch (\Throwable) { return null; }
         $key = substr(hash('sha256', $raw), 0, 24);
         $responseId = 'resp_' . $key;
         $itemId = 'msg_' . $key;
@@ -74,6 +95,33 @@ final class ResponsesProtocol
         unset($event);
         return ['stream'=>($body->stream ?? false) === true,
             'response'=>$events[array_key_last($events)]['response'], 'events'=>$events];
+    }
+
+    /**
+     * Recheck an explicitly app-generated suggestion after supported native wire encodings are normalized.
+     * The same identity, composer contract and nullable-schema proof remains mandatory; receipts and
+     * compaction are never intercepted. Only the final text is projected, not the archived conversation.
+     * @param array $spec Validated Responses context and native identity. @return ?array Local reply or null.
+     */
+    public static function localComposerSuggestionFromContext(array $spec): ?array
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response' || (array)($spec['tool_outputs'] ?? []) !== []) return null;
+        $contextJson = $spec['context_json'] ?? null;
+        if (!is_string($contextJson) || !str_contains($contextJson,
+            'This is an app-generated request for a suggested next user message.')) return null;
+        try { $context = json_decode($contextJson, true, 128, JSON_THROW_ON_ERROR); }
+        catch (\Throwable) { return null; }
+        $messages = $context['messages'] ?? [];
+        $last = is_array($messages) && $messages !== [] ? $messages[array_key_last($messages)] : null;
+        if (!is_array($last) || ($last['role'] ?? '') !== 'user' || !is_string($last['content'] ?? null)) return null;
+        // Avoid copying ordinary task histories or formatting arbitrary messages into this special path.
+        if (!str_starts_with($last['content'], 'This is an app-generated request for a suggested next user message.')) return null;
+        return self::localComposerSuggestion(json_encode([
+            'model'=>$spec['model'] ?? '', 'stream'=>$spec['stream'] ?? false,
+            'input'=>[['role'=>'user', 'content'=>$last['content']]],
+            'client_metadata'=>['x-codex-turn-metadata'=>[
+                'client_id'=>$spec['client_id'] ?? '', 'thread_id'=>$spec['thread_id'] ?? null, 'turn_id'=>$spec['turn_id'] ?? null]],
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
     }
 
     /** Parse supported Codex wire fields while preserving history, host-tool permissions and browser identity. */
