@@ -67,6 +67,8 @@ final class NativeAgentAssignment
      * Project proven parent NEW_TASK/MESSAGE records at browser dispatch preparation. The canonical
      * native archive stays byte-for-byte unchanged for receipt, restart and checkpoint matching.
      * Parent tool inputs are readable evidence, not a replay or a claim that a pending spawn finished.
+     * Retained readable rows and normalized tool-contract envelopes are accepted only as exact
+     * generated views of these same proven source records; arbitrary replacement text is rejected.
      * @param array $spec Reserved request whose native child scope was independently verified.
      * @param string $prompt Final browser prompt including its existing execution contracts.
      * @param string $transport Physical context selected by the existing history planner.
@@ -264,7 +266,7 @@ final class NativeAgentAssignment
                 'native_at'=>$spec['native_agent_evidence'][$id]['at'] ?? ($pin['native_at'] ?? null),
                 'source_sha256'=>$logicalHash]);
         }
-        $project = static function(array $context) use ($full, $replacements): array {
+        $project = static function(array $context, bool $readable = true) use ($full, $replacements): array {
             $messages = (array)($context['messages'] ?? []);
             $indices = $context['original_context']['working_message_indices'] ?? null;
             if (!is_array($indices)) {
@@ -274,8 +276,13 @@ final class NativeAgentAssignment
             if (count($indices) !== count($messages)) self::unavailable();
             foreach ($messages as $i=>$record) {
                 $at = $indices[$i];
-                if (!isset($full[$at]) || ContextHistory::canonical($full[$at]) !== ContextHistory::canonical($record)) self::unavailable();
-                if (isset($replacements[$at])) $context['messages'][$i] = $replacements[$at];
+                // A retained mailbox view can already contain a previous round's
+                // proven readable assignment. Accept only this exact re-projection,
+                // not arbitrary readable text in place of the canonical opaque row.
+                if (!isset($full[$at]) || (ContextHistory::canonical($full[$at]) !== ContextHistory::canonical($record)
+                    && (!isset($replacements[$at])
+                        || ContextHistory::canonical($replacements[$at]) !== ContextHistory::canonical($record)))) self::unavailable();
+                if (isset($replacements[$at])) $context['messages'][$i] = $readable ? $replacements[$at] : $full[$at];
             }
             return $context;
         };
@@ -285,9 +292,24 @@ final class NativeAgentAssignment
             $envelope = \support\browser\ChatGptTransport::contextEnvelope($prompt);
             // The prompt's semantic view merges native tool calls/results and may
             // omit old uploads. Compare that exact existing projection, not raw indices.
-            $semanticBefore = ContextHistory::semanticWebContext(AttachmentStore::transportContext($beforeProjection));
-            if (ContextHistory::canonical($envelope['context']) !== ContextHistory::canonical($semanticBefore)) self::unavailable();
-            $semanticAfter = ContextHistory::semanticWebContext(AttachmentStore::transportContext($physical));
+            $expected = ContextHistory::canonical($envelope['context']);
+            $matched = false;
+            $contractView = false;
+            // The control prompt can use the canonical opaque rows while its
+            // retained physical view already has proved readable rows. Both must
+            // match an exact generated view of those same source records.
+            foreach ([$beforeProjection, $project($beforeProjection, false)] as $before) {
+                $semanticBefore = ContextHistory::semanticWebContext(AttachmentStore::transportContext($before));
+                if ($expected === ContextHistory::canonical($semanticBefore)) { $matched = true; break; }
+                // Tool contracts omit continuation metadata and superseded model
+                // switches. Do not reinsert either into that existing envelope.
+                $contractBefore = json_decode(WebContract::contextJson(ContextHistory::canonical($before)), true, 128, JSON_THROW_ON_ERROR);
+                if ($expected === ContextHistory::canonical($contractBefore)) { $matched = true; $contractView = true; break; }
+            }
+            if (!$matched) self::unavailable();
+            $semanticAfter = $contractView
+                ? json_decode(WebContract::contextJson(ContextHistory::canonical($physical)), true, 128, JSON_THROW_ON_ERROR)
+                : ContextHistory::semanticWebContext(AttachmentStore::transportContext($physical));
             $at = $envelope['start'] + strlen('<codex_context_json>');
             $prompt = substr($prompt, 0, $at) . "\n" . ContextHistory::canonical($semanticAfter)
                 . "\n" . substr($prompt, $envelope['end']);
