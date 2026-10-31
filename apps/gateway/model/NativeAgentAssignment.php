@@ -279,7 +279,10 @@ final class NativeAgentAssignment
                 // A retained mailbox view can already contain a previous round's
                 // proven readable assignment. Accept only this exact re-projection,
                 // not arbitrary readable text in place of the canonical opaque row.
-                if (!isset($full[$at]) || (ContextHistory::canonical($full[$at]) !== ContextHistory::canonical($record)
+                // Native tool turn/time annotations can differ in a retained view.
+                // Reuse the established tool-history comparison; actual call IDs,
+                // parameters, results and every non-tool record remain exact.
+                if (!isset($full[$at]) || (ContextHistory::nativeToolHistoryCanonical([$full[$at]]) !== ContextHistory::nativeToolHistoryCanonical([$record])
                     && (!isset($replacements[$at])
                         || ContextHistory::canonical($replacements[$at]) !== ContextHistory::canonical($record)))) self::unavailable();
                 if (isset($replacements[$at])) $context['messages'][$i] = $readable ? $replacements[$at] : $full[$at];
