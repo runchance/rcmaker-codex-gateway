@@ -1555,6 +1555,7 @@ final class ContextCompaction
             'data_json'=>json_encode(['checkpoint_id'=>$checkpoint['id'], 'source_response_id'=>$source['id'],
                 'delivered_tool_calls'=>count(array_filter($calls, static fn(array $call): bool => $call['result_delivered_at'] !== null)),
                 'completed_tool_calls'=>count($calls),
+                'confirmed_user_stop'=>$state['confirmedStop'],
                 'native_base_task_id'=>$spec['readonly_source_base_task_id'] ?? null,
                 'expanded_native_receipts'=>$state['expandedReceipts']], JSON_THROW_ON_ERROR), 'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', '源摘要等待替换证据无法保存。', 503);
@@ -1569,7 +1570,9 @@ final class ContextCompaction
      * A known pre-summary receipt rejection, or an expired ordinary-chat source wait with
      * a saved conversation, still requires complete byte-verified results. Its old token is
      * revoked by the routing transaction before read-only recovery, never revived. Other
-     * unknown source outcomes keep their independent completion-fence requirement.
+     * unknown source outcomes keep their independent completion-fence requirement. An unsent
+     * summary stopped by the user requires its ordered confirmation, current-source ACKs
+     * and the existing proof for any historical lost-ACK receipt.
      * @param string $taskId Routed task whose owner is encoded in the request.
      * @param array $spec Complete normalized read-only checkpoint request.
      * @param bool $missingReplay Inspect only queued/running same-scope page recovery.
@@ -1632,6 +1635,8 @@ final class ContextCompaction
         if (!$running && ($job['terminal_type'] !== 'response.failed' || $job['finished_at'] === null)) return null;
         $sameScope = (string) $source['epoch_id'] === (string) $job['epoch_id']
             && (string) $source['surface_id'] === (string) $job['surface_id'];
+        $confirmedStop = !$running && $sameScope
+            && self::hasConfirmedUnsentSourceStopUnlocked($job, $turn, $epoch, $surface);
         $movedFailure = false;
         $settledSourceRequired = false;
         if ($running) {
@@ -1640,11 +1645,11 @@ final class ContextCompaction
                 || $epoch['status'] !== 'active'
                 || !in_array($surface['status'], $missingReplay ? ['reserved', 'busy'] : ['busy'], true)) return null;
         } else {
-            if (!in_array($turn['status'], ['failed', 'needs_attention'], true)) return null;
+            if (!$confirmedStop && !in_array($turn['status'], ['failed', 'needs_attention'], true)) return null;
             if (!$sameScope) {
                 $movedFailure = self::hasFailedReadonlyMigrationUnlocked($job, $source, $turn, $epoch, $surface);
                 if (!$movedFailure) return null;
-            } elseif ($epoch['status'] !== 'retired' || $surface['status'] !== 'retired') {
+            } elseif (!$confirmedStop && ($epoch['status'] !== 'retired' || $surface['status'] !== 'retired')) {
                 // A missing physical page is not an unknown host effect when its source
                 // already committed a completion fence and the summary was never sent.
                 // Verify that source fence below before releasing this failed checkpoint.
@@ -1707,7 +1712,19 @@ final class ContextCompaction
             // Missing delivery is transport uncertainty, not host uncertainty. This
             // exception requires a revoked capability, proven missing page, and the
             // full byte-verified receipt proof below; stored delivery ACKs stay intact.
-            if ($call['status'] !== 'completed' || (!$retiredSource && !$closedMissingSource && $call['result_delivered_at'] === null)) return null;
+            if ($call['status'] !== 'completed') return null;
+            if (!$retiredSource && !$closedMissingSource && $call['result_delivered_at'] === null) {
+                // A stopped summary may inherit an older lost-ACK result already proven
+                // consumed or conclusively closed. Reuse the normal compact proofs;
+                // the stopped source itself still needs its real delivery ACK below.
+                $historical = $confirmedStop && $call['binding_id'] !== $job['mcp_binding_id']
+                    && $call['turn_id'] !== $job['durable_turn_id']
+                    && (ToolBroker::closedWaitReceiptForCompactionUnlocked($call, $spec, $taskId)
+                        || ToolBroker::completedHistoricalReceiptForRecoveryUnlocked($call,
+                            array_replace($spec, ['task_id'=>$taskId, 'mcp_binding_id'=>$job['mcp_binding_id'],
+                                'durable_turn_id'=>$job['durable_turn_id']])));
+                if (!$historical) return null;
+            }
         }
         $sourceBinding = null;
         $settledSource = false;
@@ -1741,7 +1758,7 @@ final class ContextCompaction
         $after = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
         $expandedReceipts = [];
         $comparison = $after;
-        if (!$running && $retiredSource && $job['model'] === ($spec['model'] ?? null)
+        if (!$running && ($retiredSource || $confirmedStop) && $job['model'] === ($spec['model'] ?? null)
             && $job['reasoning_effort'] === ($spec['reasoning_effort'] ?? null)
             && ($job['integration_id'] ?? null) === ($spec['integration_id'] ?? null)) {
             $comparison = self::compareExpandedNativeReceipts($before, $after, $calls, $job, $source, $expandedReceipts);
@@ -1752,7 +1769,59 @@ final class ContextCompaction
         $receiptSpec = $spec;
         if ($expandedReceipts !== []) $receiptSpec['context_json'] = $receiptSpec['full_context_json'] = ContextHistory::canonical($comparison);
         self::assertRetiredSourceReceiptsUnlocked($receiptSpec, $job, $taskId);
-        return compact('task', 'checkpoint', 'job', 'source', 'turn', 'epoch', 'surface', 'calls', 'expandedReceipts');
+        return compact('task', 'checkpoint', 'job', 'source', 'turn', 'epoch', 'surface', 'calls', 'expandedReceipts', 'confirmedStop');
+    }
+
+    /**
+     * Recognize a confirmed native stop of an unsent source-waiting summary after restart.
+     * The caller already verified the current owner, generation, no summary send and source scope;
+     * it still requires exact receipts, current-source ACKs and no active MCP work below. A stop flag alone
+     * cannot release a checkpoint, and this proof never revives the revoked source capability.
+     * @param array $job Failed unsent compact. @param array $turn Its current durable turn.
+     * @param array $epoch Current source epoch. @param array $surface Retained stopped surface.
+     * @return bool Whether ordered stop/revocation/confirmation evidence belongs to this source.
+     */
+    private static function hasConfirmedUnsentSourceStopUnlocked(array $job, array $turn, array $epoch, array $surface): bool
+    {
+        $error = json_decode((string) ($job['error_json'] ?? ''), true);
+        if (($error['error']['code'] ?? '') !== 'codex_user_cancelled' || $turn['status'] !== 'cancelled'
+            || ($turn['error_code'] ?? '') !== 'CODEX_USER_STOPPED' || $turn['retired_at'] === null
+            || $epoch['status'] !== 'active' || $surface['status'] !== 'ready') return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $binding = $db->table('gateway_mcp_bindings')->where('id', (string) $job['mcp_binding_id'])->find();
+        if (!is_array($binding) || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $turn['id']
+            || $binding['current_response_id'] !== $job['id'] || $binding['status'] !== 'revoked'
+            || $binding['revoked_at'] === null) return false;
+        $events = [];
+        foreach (['mcp_capability_revoked', 'codex_user_stop_requested', 'codex_user_stop_confirmed'] as $type) {
+            $event = $db->table('gateway_task_events')->where('task_id', (string) $job['task_id'])
+                ->where('turn_id', (string) $turn['id'])->where('response_id', (string) $job['id'])
+                ->where('event_type', $type)->order([['id', 'DESC']])->limit(1)->find();
+            if (!is_array($event)) return false;
+            $events[] = $event;
+        }
+        [$revoked, $requested, $confirmed] = $events;
+        $revocation = json_decode((string) $revoked['data_json'], true);
+        $request = json_decode((string) $requested['data_json'], true);
+        $confirmation = json_decode((string) $confirmed['data_json'], true);
+        return (int) $revoked['id'] < (int) $requested['id'] && (int) $requested['id'] < (int) $confirmed['id']
+            && $requested['surface_id'] === $surface['id'] && $confirmed['surface_id'] === $surface['id']
+            && ($revocation['reason'] ?? null) === 'codex_user_interrupted'
+            && ($revocation['delivered_unknown'] ?? null) === 0 && ($revocation['registered_cancelled'] ?? null) === 0
+            && ($request['reason'] ?? null) === 'interrupted'
+            && CodexCancellation::uuid((string) ($request['turn_id'] ?? ''))
+            && is_int($request['interrupted_at'] ?? null) && $request['interrupted_at'] >= (int) $turn['created_at']
+            && $request['interrupted_at'] <= (int) $requested['created_at'] + 5
+            && ($request['turn_id'] ?? null) === TaskLedger::cancellationNativeTurn(['job'=>$job, 'turn'=>$turn])
+            && is_bool($confirmation['page_missing'] ?? null) && ($confirmation['page_invalid'] ?? null) === false
+            && ($confirmation['unknown_host_results'] ?? null) === 0
+            && (int) $binding['revoked_at'] >= (int) $turn['created_at']
+            && (int) $binding['revoked_at'] <= (int) $revoked['created_at']
+            && (int) $revoked['created_at'] <= (int) $requested['created_at']
+            && (int) $requested['created_at'] <= (int) $confirmed['created_at']
+            && (int) $requested['created_at'] <= (int) $turn['retired_at']
+            && (int) $turn['retired_at'] <= (int) $job['finished_at']
+            && (int) $job['finished_at'] <= (int) $confirmed['created_at'];
     }
 
     /**
