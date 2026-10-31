@@ -105,7 +105,11 @@ final class TunnelRuntime
                 'control_plane' => ['base_url' => 'https://api.openai.com', 'tunnel_id' => $tunnelId, 'api_key' => 'file:' . self::runtimeKeyPath()],
                 'health' => ['listen_addr' => '127.0.0.1:0', 'url_file' => $health],
                 'log' => ['file' => 'stdout', 'format' => 'json', 'level' => 'warn'],
-                'mcp' => ['commands' => [['channel' => 'main', 'command' => self::mcpCommand()]]],
+                // The stdio child is shared by independent Web callers. Complete each
+                // successful handshake before another caller can enter the legacy guard;
+                // Tunnel suppresses the caller's later duplicate initialized notification.
+                'mcp' => ['commands' => [['channel' => 'main', 'command' => self::mcpCommand()]],
+                    'stdio_send_initialized_notification' => true],
             ];
             $profile = self::profileDir() . '/owned-runtime.json';
             self::atomicWrite($profile, json_encode($config, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
