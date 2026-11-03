@@ -1680,11 +1680,14 @@ final class BrowserRuntime
 
     /**
      * Shared probe/task permission policy; disabled or submitted controls keep waiting.
+     * Another App's native permission requires separate consent, not a guessed bridge grant.
      * @return array{string,string}|null Stable error code and localizable message, or no failure.
      */
     private static function toolConfirmationFailure(array $confirmation, bool $enabled): ?array
     {
         if (empty($confirmation['visible'])) return null;
+        if (($confirmation['code'] ?? '') === 'other_connector') return ['CHATGPT_OTHER_TOOL_CONFIRMATION_REQUIRED',
+            'ChatGPT is waiting for another connector to be authorized. No permission was granted automatically; the task is preserved.'];
         if (!$enabled) return ['CHATGPT_TOOL_CONFIRMATION_REQUIRED',
             'ChatGPT 正在等待连接器授权。请在设置中开启自动选择“始终允许”后重试。'];
         if (!empty($confirmation['pending'])) return null;

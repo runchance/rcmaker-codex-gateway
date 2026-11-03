@@ -72,6 +72,7 @@ final class TaskFailureState
             && !str_contains($code, 'SUPERSEDED') && !in_array($code, [
                 'TASK_CANCELLED', 'TASK_DELETED', 'CODEX_USER_CANCELLED', 'AUTHENTICATION_REQUIRED', 'INVALID_API_KEY',
                 'BROWSER_PROFILE_RESET_PENDING', 'BROWSER_RESTART_PENDING', 'BROWSER_RESTARTING',
+                'CHATGPT_OTHER_TOOL_CONFIRMATION_REQUIRED',
             ], true);
     }
 

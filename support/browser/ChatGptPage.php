@@ -1156,6 +1156,7 @@ JS);
 
     /**
      * Inspect native permission UI for the configured connector, without approving it.
+     * Other Apps are reported separately; their request details cannot identify this connector.
      * @return string DOM expression returning a document-local confirmation ID and action readiness.
      */
     public static function toolConfirmationExpression(string $connectorName): string
@@ -1194,9 +1195,19 @@ const label=el=>{
 };
 const key=(el,pattern)=>pattern.test(norm(el.getAttribute('aria-keyshortcuts')))
     ||[...el.querySelectorAll('kbd')].some(node=>pattern.test(text(node)));
-const named=el=>permission.name!==''&&[...el.querySelectorAll('*')].some(node=>
-    !node.closest('form')&&rendered(node)
-    &&node.childElementCount===0&&text(node)===norm(permission.name));
+// Bind the native card's leading connector identity, never a later request/detail
+// leaf that happens to mention the configured connector's name.
+const connectorHeader=el=>[...el.querySelectorAll('*')].find(node=>
+    !node.closest('form,svg,pre,code')&&rendered(node)&&node.childElementCount===0&&text(node)!=='');
+const named=el=>{const header=connectorHeader(el);return permission.name!==''&&!!header&&text(header)===norm(permission.name);};
+const legacyNamed=el=>{
+    const header=connectorHeader(el),titles=[header?text(header):''];
+    if(el.matches('[role="dialog"],[role="alertdialog"]')&&!el.matches('[data-codex-approval-surface]'))titles.push(el.getAttribute('aria-label'));
+    return titles.map(norm).some(title=>[
+    `Allow ChatGPT to use ${permission.name}?`,`允许 ChatGPT 使用 ${permission.name} 吗？`,
+    `允许 ChatGPT 使用 ${permission.name} 吗?`,`允许 ChatGPT 使用 ${permission.name}？`
+    ].includes(title));
+};
 // Native permission UI has a deny/Escape action and an Enter action paired with
 // a menu. The remaining action is persistent. Labels, CSS classes and order vary.
 const shape=el=>{
@@ -1237,16 +1248,18 @@ for(const dialog of document.querySelectorAll('[role="dialog"],[role="alertdialo
     ].includes(title)))cards.push(dialog);
 }
 cards=[...new Set(cards)].filter(el=>!cards.some(other=>other!==el&&el.contains(other)));
+const own=cards.filter(card=>named(card)||legacyNamed(card));
+const foreign=cards.filter(card=>!own.includes(card)&&!!connectorHeader(card)&&!!shape(card));
+const unknown=cards.filter(card=>!own.includes(card)&&!foreign.includes(card));
+// Other Apps can request approval in the same ChatGPT generation. Their forms
+// must neither count as duplicate RCMAKER cards nor receive RCMAKER's consent.
+if(own.length>0&&unknown.length===0)cards=own;
 const base={visible:cards.length>0,dialog_count:cards.length,persistent_count:0,ready:false,clicked:false,pending:false};
 if(location.origin!=='https://chatgpt.com'||permission.name==='')return {...base,code:'scope_mismatch'};
+if(own.length===0&&foreign.length>0&&unknown.length===0)return {...base,foreign_count:foreign.length,code:'other_connector'};
 if(cards.length!==1)return {...base,code:cards.length?'ambiguous':'absent'};
 const card=cards[0];
-const titles=[card.getAttribute('aria-label'),...[...card.querySelectorAll('h1,h2,h3,[role="heading"]')].map(text)].map(norm);
-const legacyTitle=titles.some(title=>[
-    `Allow ChatGPT to use ${permission.name}?`,`允许 ChatGPT 使用 ${permission.name} 吗？`,
-    `允许 ChatGPT 使用 ${permission.name} 吗?`,`允许 ChatGPT 使用 ${permission.name}？`
-].includes(title));
-if(!named(card)&&!legacyTitle)return {...base,code:'connector_mismatch'};
+if(!named(card)&&!legacyNamed(card))return {...base,code:'connector_mismatch'};
 const registryKey=Symbol.for('rcmaker.tool.permission');
 const registry=globalThis[registryKey]??={cards:new WeakMap(),next:0,epoch:Date.now()+':'+Math.random().toString(36).slice(2)};
 let state=registry.cards.get(card);
