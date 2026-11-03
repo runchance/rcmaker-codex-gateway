@@ -5908,9 +5908,13 @@ JS;
         if (!isset($this->chatGptTurns[$responseId])) return;
         if (!empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
         $documentNonce = (string) ($this->chatGptTurns[$responseId]['document_nonce'] ?? '');
+        $checkpointCurrent = ($this->chatGptTurns[$responseId]['compaction_phase'] ?? null) === 'preparing'
+            ? fn() => $this->checkpointConnectorSearchCurrent($responseId, $documentNonce) : null;
+        if ($checkpointCurrent !== null && !$checkpointCurrent()) return;
         $this->chatGptTurns[$responseId]['connector_attempt'] = (int)($this->chatGptTurns[$responseId]['connector_attempt'] ?? 0) + 1;
         $this->evaluateTask($responseId, WebModelPage::connectorSelectedExpression($connectorName),
-            function ($error, $selected) use ($responseId, $connectorName, $attempt, $documentNonce): void {
+            function ($error, $selected) use ($responseId, $connectorName, $attempt, $documentNonce, $checkpointCurrent): void {
+                if ($checkpointCurrent !== null && !$checkpointCurrent()) return;
                 if (!isset($this->chatGptTurns[$responseId])) return;
                 if (($this->chatGptTurns[$responseId]['document_nonce'] ?? '') !== $documentNonce
                     || !empty($this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'])) return;
@@ -5928,7 +5932,12 @@ JS;
                 }
                 if (($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular') {
                     $this->clearSavedTaskConnectorComposer($responseId,
-                        function (callable $isCurrent) use ($responseId, $connectorName, $attempt, $documentNonce): void {
+                        function (callable $isCurrent) use ($responseId, $connectorName, $attempt, $documentNonce, $checkpointCurrent): void {
+                            if ($checkpointCurrent !== null) {
+                                $composerCurrent = $isCurrent;
+                                $isCurrent = fn() => $composerCurrent() && $checkpointCurrent();
+                            }
+                            if (!$isCurrent()) return;
                             $turn = $this->chatGptTurns[$responseId];
                             $this->typeConnectorMention($this->taskCdp, (string)$turn['session_id'],
                                 function ($insertError) use ($responseId, $connectorName, $attempt, $documentNonce, $isCurrent): void {
@@ -5946,14 +5955,17 @@ JS;
                                             // Keep a valid query in place while the asynchronous catalog loads.
                                             $deadline = min((float)$this->chatGptTurns[$responseId]['deadline'],
                                                 microtime(true) + self::TASK_CONNECTOR_READY_SECONDS);
-                                            $this->waitTaskConnectorMenu($responseId, $connectorName, 3, $deadline, $documentNonce, $isCurrent);
+                                            $checkpoint = ($this->chatGptTurns[$responseId]['compaction_phase'] ?? null) === 'preparing';
+                                            $this->waitTaskConnectorMenu($responseId, $connectorName, $checkpoint ? $attempt : 3,
+                                                $deadline, $documentNonce, $isCurrent);
                                         }, 15.0);
                                 }, 30.0, $connectorName, $isCurrent);
                         });
                     return;
                 }
                 $this->evaluateTask($responseId, WebModelPage::focusAndClearExpression(),
-                    function ($clearError, $cleared) use ($responseId, $connectorName, $attempt, $documentNonce): void {
+                    function ($clearError, $cleared) use ($responseId, $connectorName, $attempt, $documentNonce, $checkpointCurrent): void {
+                        if ($checkpointCurrent !== null && !$checkpointCurrent()) return;
                         $turn = $this->chatGptTurns[$responseId] ?? null;
                         if (!is_array($turn) || ($turn['document_nonce'] ?? '') !== $documentNonce
                             || !empty($turn['connector_catalog_refresh_pending'])) return;
@@ -5962,7 +5974,8 @@ JS;
                             return;
                         }
                         $this->typeConnectorMention($this->taskCdp, (string) $turn['session_id'],
-                            function ($insertError) use ($responseId, $connectorName, $attempt, $documentNonce): void {
+                            function ($insertError) use ($responseId, $connectorName, $attempt, $documentNonce, $checkpointCurrent): void {
+                                if ($checkpointCurrent !== null && !$checkpointCurrent()) return;
                                 // A lost CDP acknowledgement may still have opened the menu.
                                 // Read the current menu before deciding to clear/retry the draft.
                                 $turn = $this->chatGptTurns[$responseId] ?? null;
@@ -5972,11 +5985,42 @@ JS;
                                 $checkpoint = ($turn['compaction_phase'] ?? null) === 'preparing';
                                 $deadline = min((float)$turn['deadline'],
                                     microtime(true) + ($checkpoint ? self::TASK_CONNECTOR_READY_SECONDS : 2.5));
-                                $this->waitTaskConnectorMenu($responseId, $connectorName, $checkpoint ? 3 : $attempt,
-                                    $deadline, $documentNonce);
-                            }, 5.0, $connectorName);
+                                $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt,
+                                    $deadline, $documentNonce, $checkpointCurrent);
+                            }, 5.0, $connectorName, $checkpointCurrent);
                     });
             });
+    }
+
+    /**
+     * A checkpoint autocomplete retry may edit only its current unsent preparation document.
+     * The source turn can retain earlier submit evidence; inspect the compact job's own
+     * submit boundary and preserve its exact generation, surface and native tool receipts.
+     * @param string $responseId Physical observer with the logical compact response attached.
+     * @param string $documentNonce Preparation document captured before asynchronous work.
+     * @return bool Whether that same checkpoint may still prepare its connector search.
+     */
+    private function checkpointConnectorSearchCurrent(string $responseId, string $documentNonce): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || ($turn['compaction_phase'] ?? null) !== 'preparing'
+            || ($turn['document_nonce'] ?? '') !== $documentNonce) return false;
+        try { $ledger = TaskLedger::pollExecution((string) ($turn['logical_response_id'] ?? $responseId)); }
+        catch (\Throwable) { return false; }
+        $job = $ledger['job']; $durableTurn = $ledger['turn']; $surface = $ledger['surface'];
+        return in_array($job['operation_kind'], ['compact_v1','compact_v2'], true)
+            && in_array($job['status'], ['queued','running'], true)
+            && empty($job['submit_intent_at']) && empty($job['accepted_at'])
+            && ($durableTurn['response_id'] ?? '') === $job['id']
+            && $durableTurn['generation_id'] === $job['generation_id']
+            && in_array($durableTurn['status'], ['queued','submit_intent','submitted','running'], true)
+            && !in_array($durableTurn['error_code'] ?? '',
+                ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+            && $surface['id'] === $turn['surface_id'] && $surface['task_id'] === $job['task_id']
+            && $surface['session_id'] === $turn['session_id'] && $surface['target_id'] === $turn['target_id']
+            && $surface['owner_incarnation'] === $turn['owner_incarnation']
+            && (int) $surface['fencing_version'] === (int) $turn['fencing_version']
+            && $surface['document_nonce'] === $documentNonce;
     }
 
     /**
@@ -6197,11 +6241,19 @@ JS;
                     Timer::add($delay, fn() => $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, $deadline, $expectedNonce, $isCurrent), null, false);
                     return;
                 }
-                if ($attempt < 3) {
-                    $this->prepareTaskConnector($responseId, $connectorName, $attempt + 1);
+                $turn = $this->chatGptTurns[$responseId] ?? null;
+                $checkpoint = is_array($turn) && ($turn['compaction_phase'] ?? null) === 'preparing';
+                if ($attempt < 3 && (!$checkpoint || microtime(true) < (float) $turn['deadline'])) {
+                    // A checkpoint has not been sent yet. Retry only its autocomplete search,
+                    // after the full catalog wait and any shared cooldown, never its message/tools.
+                    $retry = function () use ($responseId, $connectorName, $attempt, $isCurrent): void {
+                        if ($isCurrent !== null && !$isCurrent()) return;
+                        $this->prepareTaskConnector($responseId, $connectorName, $attempt + 1);
+                    };
+                    if ($checkpoint && $this->deferTaskCooldown($responseId, $retry, true)) return;
+                    $retry();
                     return;
                 }
-                $turn = $this->chatGptTurns[$responseId] ?? null;
                 // A saved ordinary chat can lose its loaded App catalog between messages.
                 // Refresh this exact unsent page before any retained-page rebuild/error path.
                 if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular') {
