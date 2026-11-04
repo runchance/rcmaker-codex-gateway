@@ -29,6 +29,7 @@ function smokeBinary({ outputDir, tag, commit, platform, arch, execute = execFil
   if (!/^8\.5\./.test(runtime.php) || runtime.os !== targetOs || canonicalArch !== arch || runtime.sapi !== 'micro') {
     throw new Error('Packaged PHP / OS / architecture / Micro runtime differs from the target');
   }
+  if (runtime.memory_limit !== '-1') throw new Error('Packaged PHP must start with memory_limit=-1');
   const required = ['curl', 'openssl', 'pdo_sqlite', 'sqlite3', 'mbstring', 'sockets', 'zip', 'phar', 'sodium'];
   if (platform !== 'windows') required.push('pcntl', 'posix');
   for (const extension of required) {

@@ -21,7 +21,7 @@ function scenario(platform, arch, mutate = () => {}, version = `RCMAKER AI Gatew
   }));
   const info = { tag, commit, platform, arch, php: '8.5', encrypted: true,
     runtime: { php: '8.5.9', sapi: 'micro', os: { windows: 'Windows', linux: 'Linux', macos: 'Darwin' }[platform],
-      arch: arch === 'x86_64' ? 'AMD64' : 'arm64',
+      arch: arch === 'x86_64' ? 'AMD64' : 'arm64', memory_limit: '-1',
       extensions: Object.fromEntries(['curl', 'openssl', 'pdo_sqlite', 'sqlite3', 'mbstring', 'sockets',
         'zip', 'phar', 'sodium', 'pcntl', 'posix'].map(key => [key, key === 'pcntl' || key === 'posix' ? platform !== 'windows' : true])) } };
   mutate(info);
@@ -51,6 +51,7 @@ for (const mutate of [
   info => { info.platform = 'macos'; }, info => { info.arch = 'aarch64'; },
   info => { info.runtime.php = '8.4.9'; }, info => { info.runtime.sapi = 'cli'; },
   info => { info.runtime.os = 'Darwin'; }, info => { info.runtime.arch = 'aarch64'; },
+  info => { info.runtime.memory_limit = '128M'; }, info => { delete info.runtime.memory_limit; },
 ]) {
   assert.throws(() => scenario('linux', 'x86_64', mutate));
   checks++;

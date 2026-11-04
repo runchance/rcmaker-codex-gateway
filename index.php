@@ -1,5 +1,8 @@
 <?php
 define('ROOT_PATH', dirname(__FILE__));
+// Windows handler children do not apply the framework's per-process memory setting.
+// Set the gateway default before bootstrap, including each fresh Micro process.
+ini_set('memory_limit', '-1');
 // Query the encrypted package before framework bootstrap; do not open ports or initialize data.
 if (in_array($argv[1] ?? '', ['--version', '--build-info'], true)) {
     $release = require ROOT_PATH . '/config/release.php';
@@ -12,7 +15,7 @@ if (in_array($argv[1] ?? '', ['--version', '--build-info'], true)) {
         }
         echo json_encode(['name' => 'RCMAKER AI Gateway'] + $release + [
             'runtime' => ['php' => PHP_VERSION, 'sapi' => PHP_SAPI, 'os' => PHP_OS_FAMILY,
-                'arch' => php_uname('m'), 'extensions' => $extensions],
+                'arch' => php_uname('m'), 'memory_limit' => ini_get('memory_limit'), 'extensions' => $extensions],
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR), PHP_EOL;
     }
     exit;
