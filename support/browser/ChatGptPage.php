@@ -651,17 +651,19 @@ JS);
      * @param bool $verifiedSavedChat Caller verified the exact saved chat, account, document and current owner; user bubbles may be virtualized.
      * @param bool $confirm Allow the known native stop confirmation during this owned stop operation; false is read-only when click is false.
      * @param string $initialBindingMarker Exact physical response ID whose binding header was durably submitted in this ordinary document.
+     * @param string $temporarySubmission Exact accepted physical response ID for the fenced temporary document.
      * @return string CDP expression returning ownership, composer readiness and generation state.
      */
     public static function userStopExpression(string $url, array $tokens, array $users, bool $click,
         bool $requireWitness = false, bool $acceptedInitialUser = false, string $chatMode = 'temporary',
-        bool $verifiedSavedChat = false, bool $confirm = false, string $initialBindingMarker = ''): string
+        bool $verifiedSavedChat = false, bool $confirm = false, string $initialBindingMarker = '',
+        string $temporarySubmission = ''): string
     {
         $expected = json_encode(['url' => $url, 'tokens' => array_values($tokens), 'users' => array_values($users),
             'click' => $click, 'requireWitness' => $requireWitness,
             'acceptedInitialUser' => $acceptedInitialUser, 'chatMode' => $chatMode,
             'verifiedSavedChat' => $verifiedSavedChat, 'confirm' => $confirm,
-            'initialBindingMarker' => $initialBindingMarker], JSON_THROW_ON_ERROR);
+            'initialBindingMarker' => $initialBindingMarker, 'temporarySubmission' => $temporarySubmission], JSON_THROW_ON_ERROR);
         return self::wrap('const expected=' . $expected . ";\n" . <<<'JS'
 const composer=visibleOne(COMPOSER),rows=userTurns();
 const latest=rows.at(-1),identity=latest?turnId(latest,rows.length-1,'user'):null;
@@ -680,6 +682,16 @@ const initialBindingWitness=expected.chatMode==='regular'&&!!expected.initialBin
 // same document. A new page, another response or another saved URL has no witness.
 const initialResponseWitness=expected.chatMode==='regular'&&expected.acceptedInitialUser
     &&expected.users.length===0&&rows.length===0&&observedInitialResponse(expected.initialBindingMarker);
+// A Temporary Chat can unmount its user bubble during a tool-running answer. The
+// earlier native group on this very document can still identify the active reply.
+const temporaryAnchor=globalThis[Symbol.for('rcmaker.temporary.response')];
+const temporaryResponseWitness=expected.chatMode==='temporary'&&!!expected.temporarySubmission
+    &&rows.length===0&&temporaryAnchor?.source===expected.temporarySubmission
+    &&temporaryAnchor.url===expected.url&&temporaryAnchor.url===String(location.href||'')
+    &&(()=>{
+        const ids=assistantTurns().map((el,index)=>turnId(el,index,'assistant'));
+        return ids.at(-1)===temporaryAnchor.assistant&&ids.filter(id=>id===temporaryAnchor.assistant).length===1;
+    })();
 // ChatGPT truncates long user bubbles in the DOM, not merely their visible layout.
 // On the exact retained URL, one fresh native group after still-present baseline
 // groups proves the submitted user turn without requiring its hidden token tail.
@@ -693,7 +705,7 @@ const initialWitness=expected.acceptedInitialUser&&expected.users.length===0&&id
 const retainedIdentityWitness=String(location.href||'')===expected.url&&(baselineWitness||initialWitness)
     &&fresh.length===1&&fresh[0]===identity
     &&/^group:user:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity||'');
-let witness=tokenWitness||initialBindingWitness||initialResponseWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
+let witness=tokenWitness||initialBindingWitness||initialResponseWitness||temporaryResponseWitness||retainedIdentityWitness||(!expected.tokens.length&&!!identity&&!expected.users.includes(identity));
 const evidence={url:String(location.href||''),initial_binding_witness:initialBindingWitness,token_witness:tokenWitness,
     initial_response_witness:initialResponseWitness,retained_identity_witness:retainedIdentityWitness,user_count:rows.length};
 let sameOrigin=false;try{sameOrigin=new URL(location.href).origin===new URL(expected.url).origin;}catch(_){}
@@ -1331,11 +1343,12 @@ JS));
      * @param string $boundResponseId Previously observed assistant identity; empty before first binding.
      * @param bool $legacyCitations Preserve bytes when resuming a generation with already published old citation markup.
      * @param bool $regularRecovery Accept an owned native stream-error Retry card in ordinary mode only.
+     * @param string $temporarySubmission Current physical temporary response ID, scoped to this document.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false,
-        string $initialBindingMarker = '', bool $regularRecovery = false): string
+        string $initialBindingMarker = '', bool $regularRecovery = false, string $temporarySubmission = ''): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1344,6 +1357,7 @@ JS));
         $marker = json_encode($continuationMarker, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $bound = json_encode($boundResponseId, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $initialBinding = json_encode($initialBindingMarker, JSON_THROW_ON_ERROR);
+        $temporary = json_encode($temporarySubmission, JSON_THROW_ON_ERROR);
         $body = <<<'JS'
 const beforeUsers=new Set(__USERS__);const beforeAssistants=new Set(__ASSISTANTS__);
 const beforeUserCount=__USER_COUNT__;const beforeAssistantCount=__ASSISTANT_COUNT__;
@@ -1395,6 +1409,18 @@ const promoted=boundMatches.length===0
     ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
         ||remountedInitialAssistant(assistants,beforeAssistants,boundResponseId,expectedInitialBinding,beforeUsers,users):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
+const temporarySubmission=__TEMPORARY_SUBMISSION__;
+// Cache only a native group actually observed with both roles after submission.
+// The same response may not adopt a different conversation or answer later.
+if(temporarySubmission&&temporaryChatPage(location.pathname,location.search)
+    &&/^\/c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(location.pathname)
+    &&answer&&newUser&&answer.id===sameGroupResponseId&&sameGroupAnswers.length===1
+    &&/^group:assistant:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(answer.id)){
+    const key=Symbol.for('rcmaker.temporary.response');
+    if(globalThis[key]?.source!==temporarySubmission){
+        globalThis[key]={source:temporarySubmission,url:String(location.href||''),assistant:answer.id};
+    }
+}
 // Keep one document-local native response anchor for the first ordinary send.
 // This does not infer acceptance or ownership: stop callers still require the
 // durable accepted submission, current task fence and freshly verified account.
@@ -1667,8 +1693,8 @@ else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]
 return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,error};
 JS;
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__'],
-            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound, $initialBinding, $regularRecovery ? 'true' : 'false'],
+            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__'],
+            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound, $initialBinding, $regularRecovery ? 'true' : 'false', $temporary],
             $body
         ), $legacyCitations);
     }

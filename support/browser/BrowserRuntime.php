@@ -3888,7 +3888,8 @@ JS;
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
             (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface),
-            $this->taskSessions[$sessionId]['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true, $initialBinding);
+            $owner['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true, $initialBinding,
+            self::acceptedTemporaryStopSource($source, $surface, $owner['web_chat']['mode'] ?? 'temporary'));
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface, $initialBinding): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
@@ -7618,7 +7619,8 @@ JS;
             // the first response can still remount. The adapter requires an empty
             // pre-submit baseline plus the exact rendered marker or fenced POST witness.
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
-            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular',
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'temporary' ? $responseId : '');
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
@@ -9537,6 +9539,16 @@ JS;
             ? $id : '';
     }
 
+    /** Bind a temporary Stop read to its accepted physical response on the same owned document. */
+    private static function acceptedTemporaryStopSource(array $source, array $surface, string $mode): string
+    {
+        if ($mode !== 'temporary' || empty($source['submit_intent_at']) || empty($source['accepted_at'])
+            || empty($surface['document_nonce']) || ($source['task_id'] ?? null) !== ($surface['task_id'] ?? null)
+            || ($source['surface_id'] ?? null) !== ($surface['id'] ?? null)
+            || ($source['submitted_document_nonce'] ?? null) !== $surface['document_nonce']) return '';
+        return (string) ($source['id'] ?? '');
+    }
+
     /** Refresh account ownership after a legitimate first-chat main-frame navigation, then re-observe the page. */
     private function verifyInitialRegularChatAccount(string $responseId, string $sessionId, string $documentNonce): void
     {
@@ -9726,7 +9738,8 @@ JS;
         $this->evaluateTask($responseId, WebModelPage::userStopExpression((string)$ledger['surface']['url'], $witnesses,
             (array)$physical['baseline_users'], !$state['clicked'], true, self::acceptedInitialUser($physical, $ledger['surface']),
             $turn['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true,
-            self::submittedChatBindingMarker($physical, $ledger['surface'], $turn['web_chat']['mode'] ?? 'temporary')),
+            self::submittedChatBindingMarker($physical, $ledger['surface'], $turn['web_chat']['mode'] ?? 'temporary'),
+            self::acceptedTemporaryStopSource($physical, $ledger['surface'], $turn['web_chat']['mode'] ?? 'temporary')),
             function ($error, $snapshot) use ($responseId, $ledger): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn)) return;
