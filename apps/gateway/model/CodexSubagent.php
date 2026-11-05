@@ -115,7 +115,7 @@ final class CodexSubagent
      * UUIDv7 dates bound normal lookup to three day folders; older UUIDs use the existing
      * literal session layout once per cached lookup. A parent_thread_id alone is a fork, not proof.
      * @param ?string $threadId Native thread UUID.
-     * @return ?array Verified child/parent/path/depth, or null without unambiguous native evidence.
+     * @return ?array Verified child/parent, stable agent key and depth, or null without native proof.
      */
     public static function scope(?string $threadId): ?array
     {
@@ -154,15 +154,22 @@ final class CodexSubagent
         $source = is_array($meta['source'] ?? null) ? $meta['source'] : [];
         $subagent = is_array($source['subagent'] ?? null) ? $source['subagent'] : [];
         $spawn = $subagent['thread_spawn'] ?? null;
+        $agentPath = $spawn['agent_path'] ?? null;
+        if (is_array($spawn) && $agentPath === null
+            && ($meta['multi_agent_version'] ?? null) === 'v1'
+            && ($meta['thread_source'] ?? null) === 'subagent'
+            && isset($meta['parent_thread_id']) && $meta['parent_thread_id'] === ($spawn['parent_thread_id'] ?? null)) {
+            // V1 uses UUIDs instead of named paths. Keep its keys disjoint from named task paths.
+            $agentPath = '/root/@v1/' . $threadId;
+        }
         $scope = null;
         if (is_array($spawn) && is_string($spawn['parent_thread_id'] ?? null)
             && CodexCancellation::uuid($spawn['parent_thread_id']) && $spawn['parent_thread_id'] !== $threadId
             && (!isset($meta['parent_thread_id']) || $meta['parent_thread_id'] === $spawn['parent_thread_id'])
             && is_int($spawn['depth'] ?? null) && $spawn['depth'] > 0 && $spawn['depth'] <= 32
-            && is_string($spawn['agent_path'] ?? null) && str_starts_with($spawn['agent_path'], '/root/')
-            && strlen($spawn['agent_path']) <= 512) {
+            && is_string($agentPath) && str_starts_with($agentPath, '/root/') && strlen($agentPath) <= 512) {
             $scope = ['thread_id'=>$threadId, 'parent_thread_id'=>$spawn['parent_thread_id'],
-                'agent_path'=>$spawn['agent_path'], 'depth'=>$spawn['depth']];
+                'agent_path'=>$agentPath, 'depth'=>$spawn['depth']];
         }
         self::$scopes[$key] = ['at'=>microtime(true), 'verified'=>true, 'scope'=>$scope, 'path'=>$path];
         return $scope;
