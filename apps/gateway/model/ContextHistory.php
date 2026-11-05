@@ -714,6 +714,7 @@ final class ContextHistory
                 $spec['operational_context_source_response_id'] = (string) $mailbox['source']['id'];
                 $spec['operational_context_updates'] = $mailbox['updates'];
                 $spec['mailbox_context_join'] = true;
+                $spec['settled_subagent_notice'] = $mailbox['settled_subagent_notice'];
                 return $spec;
             }
             $spec = self::prepareActiveUserSteeringUnlocked($spec, $context, $taskId);
@@ -1252,7 +1253,7 @@ final class ContextHistory
      * mailbox arriving at that publication boundary rejoins the already issued calls.
      * @param array $spec Compiled complete native request; no fresh tool receipt is permitted.
      * @param ?string $taskId Routed task ID inside reservation, or null for a readiness check.
-     * @return ?array{source:array,updates:array,restart:bool,client_turn_id:string} Proven source,
+     * @return ?array{source:array,updates:array,restart:bool,settled_subagent_notice:bool,client_turn_id:string} Proven source,
      *     role-preserving updates and whether no pending host execution requires a new model round.
      * @throws GatewayError If durable source evidence cannot be decoded or read.
      */
@@ -1493,18 +1494,26 @@ final class ContextHistory
             $offset = 0;
         }
         $response = json_decode((string) ($source['response_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
+        $tail = array_slice($records, count($known) + $offset);
+        $settledNotice = $completedText && !$humanSteering
+            && array_filter($tail, static fn(array $record): bool => self::isSubagentNotification($record)) !== []
+            && array_filter($tail, static fn(array $record): bool => ($record['role'] ?? '') !== 'assistant'
+                && ($record['type'] ?? '') !== 'reasoning_summary' && !self::isOperationalUserMessage($record)) === [];
         $published = [];
         foreach ((array) ($response['output'] ?? []) as $item) {
             $commentary = ($item['type'] ?? '') === 'message' && ($item['role'] ?? '') === 'assistant'
                 && ($item['phase'] ?? '') === 'commentary' && ($item['status'] ?? '') === 'completed';
+            $final = $settledNotice && ($item['type'] ?? '') === 'message' && ($item['role'] ?? '') === 'assistant'
+                && ($item['phase'] ?? '') === 'final_answer' && ($item['status'] ?? '') === 'completed';
             // These are the exact public status/summary items already emitted to Codex.
             // compile() retains their public summary only, never private reasoning content.
             $summary = ($item['type'] ?? '') === 'reasoning' && !empty($item['summary']);
-            if ($commentary || $summary) {
+            if ($commentary || $summary || $final) {
                 $published[] = self::compile([$item], '')['messages'][0];
             }
         }
         $publishedIndex = 0;
+        $finalMatched = false;
         $updates = [];
         $hasMailbox = false;
         $hasHuman = false;
@@ -1512,10 +1521,15 @@ final class ContextHistory
         foreach ($known as $record) {
             if (($record['role'] ?? '') === 'user' && !empty($record['id'])) $knownUserIds[(string) $record['id']] = true;
         }
-        foreach (array_slice($records, count($known) + $offset) as $record) {
+        foreach ($tail as $record) {
             if (($record['role'] ?? '') === 'assistant' || ($record['type'] ?? '') === 'reasoning_summary') {
+                // Codex can omit public reasoning summaries when replaying its final items.
+                // Only allow that omission for a notice joined to an exact committed answer.
+                while ($settledNotice && ($record['role'] ?? '') === 'assistant'
+                    && ($published[$publishedIndex]['type'] ?? '') === 'reasoning_summary') $publishedIndex++;
                 if (!isset($published[$publishedIndex])
                     || self::canonical($record) !== self::canonical($published[$publishedIndex++])) return null;
+                $finalMatched = $finalMatched || ($record['phase'] ?? '') === 'final_answer';
             } elseif ($humanSteering && ($record['role'] ?? '') === 'developer') {
                 // Codex appends privileged runtime updates between native turns. Keep
                 // their role after the exact source proof, alongside the new human input.
@@ -1542,9 +1556,10 @@ final class ContextHistory
         // existing public output still requires the original published-prefix proof.
         $emptyRunningOutput = $running && $published === [] && (string)$source['output_text'] === '';
         if ($humanSteering ? !$hasHuman : (!$hasMailbox || ($publishedIndex === 0 && !$emptyRunningOutput))) return null;
+        if ($settledNotice && !$finalMatched) return null;
         // Delivery of an operational notification alone must not interrupt a live reply.
         $noticeOnly = $hasMailbox && array_filter($updates, static fn(array $record): bool => !self::isOperationalUserMessage($record)) === [];
-        $restart = (int)$pending === 0 && !($running && $noticeOnly);
+        $restart = (int)$pending === 0 && !$settledNotice && !($running && $noticeOnly);
         if ($emptyRunningOutput && $restart) {
             $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
                 ->where('turn_id', $turn['id'])->where('binding_id', $source['mcp_binding_id'])
@@ -1552,7 +1567,7 @@ final class ContextHistory
             if (!is_numeric($undelivered)) return null;
             $restart = (int)$activities === 0 && (int)$undelivered === 0;
         }
-        return ['source' => $source, 'restart' => $restart,
+        return ['source' => $source, 'restart' => $restart, 'settled_subagent_notice' => $settledNotice,
             'client_turn_id' => (string) $turn['client_turn_id'],
             'updates' => ['version' => 3, 'system' => [], 'messages' => $updates]];
     }

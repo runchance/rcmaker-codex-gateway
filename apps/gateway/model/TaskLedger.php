@@ -3974,16 +3974,19 @@ final class TaskLedger
      * @param bool $steeringJoin Permit human/runtime records only after the exact pending-tool source proof.
      * @param bool $joinResponse False when a receipt request must reserve its own next batch.
      * @param ?string $nativeTurnId Native UUID of a proven human tool join, retained for later stop/steering.
+     * @param bool $settledSubagentNotice Retain a typed notice on the exact committed source for the next real turn.
      * @return void
      * @throws GatewayError If source ownership changed or a record does not belong to this channel.
      */
     public static function queueOperationalContextUnlocked(array $source, array $updates, string $requestHash,
         ?string $idempotencyKey, bool $mailboxJoin = false, bool $steeringJoin = false, bool $joinResponse = true,
-        ?string $nativeTurnId = null): void
+        ?string $nativeTurnId = null, bool $settledSubagentNotice = false): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $turn = $db->table('gateway_task_turns')->where('id', (string) $source['durable_turn_id'])->find();
-        if (!is_array($turn) || !in_array((string) $turn['status'], self::ACTIVE_TURNS, true)
+        $settled = $settledSubagentNotice && $mailboxJoin && !$steeringJoin && ($turn['status'] ?? null) === 'committed'
+            && ($source['status'] ?? null) === 'completed' && ($source['round_kind'] ?? null) === 'text';
+        if (!is_array($turn) || (!$settled && !in_array((string) $turn['status'], self::ACTIVE_TURNS, true))
             || (string) $turn['response_id'] !== (string) $source['id']) {
             throw new GatewayError('context_update_source_closed', '环境更新的源回合已结束。', 409);
         }
@@ -4001,6 +4004,9 @@ final class TaskLedger
                 && !empty($message['id'])) $humanIds[(string) $message['id']] = (string) $data['record_hash'];
         }
         foreach ((array) ($updates['messages'] ?? []) as $message) {
+            if ($settled && !ContextHistory::isOperationalUserMessage($message)) {
+                throw new GatewayError('invalid_context_update', 'A settled response can only retain native operational context.', 400);
+            }
             if (!ContextHistory::isOperationalUserMessage($message)
                 && !(($mailboxJoin || $steeringJoin) && ($message['role'] ?? '') === 'agent_message')
                 && !($steeringJoin && ($message['role'] ?? '') === 'developer')
@@ -4023,6 +4029,7 @@ final class TaskLedger
         self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
             (string) $source['id'], (string) $source['surface_id'], 'native_context_request_joined',
             ['request_hash' => $requestHash, 'idempotency_key' => $idempotencyKey,
+                ...($settled ? ['settled_subagent_notice' => true] : []),
                 ...($mailboxJoin ? ['mailbox_join' => true] : []),
                 ...($steeringJoin ? ['steering_join' => true] : [])]);
         if ($steeringJoin && CodexCancellation::uuid((string) $nativeTurnId)) {
@@ -4054,9 +4061,15 @@ final class TaskLedger
             (string) $source['surface_id'], 'codex_user_stop_superseded', json_decode($event['data_json'], true, 32, JSON_THROW_ON_ERROR));
     }
 
-    /** A reconnect of a coalesced request keeps its original response, even after the model advanced. */
-    public static function joinedOperationalContextResponse(array $spec, ?string $idempotencyKey): ?string
+    /**
+     * A reconnect of a coalesced request keeps its original response, even after the model advanced.
+     * @param array $spec Current native request. @param ?string $idempotencyKey Request replay key.
+     * @param bool $settledNotice Set only for a durable join to an already delivered final response.
+     * @return ?string Exact joined response ID when it is still available.
+     */
+    public static function joinedOperationalContextResponse(array $spec, ?string $idempotencyKey, bool &$settledNotice = false): ?string
     {
+        $settledNotice = false;
         if (($spec['operation_kind'] ?? 'response') !== 'response') return null;
         $db = SDB(null, 'medoo', 'sqlite');
         $baseTaskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
@@ -4095,6 +4108,7 @@ final class TaskLedger
                     $pending = self::pendingOperationalContextUnlocked($source);
                     foreach ($pending['messages'] as $record) if (($record['role'] ?? '') === 'agent_message') return null;
                 }
+                $settledNotice = !empty($data['settled_subagent_notice']);
                 return (string) $source['id'];
             }
         }

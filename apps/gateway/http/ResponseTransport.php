@@ -163,18 +163,21 @@ final class ResponseTransport
     /**
      * Prove public items this exact response already delivered before a mailbox reconnect.
      * Matching IDs alone are insufficient; the readable commentary/summary must match too.
-     * Tools, finals, drafts, private reasoning and native forwarding are never filtered.
+     * A proven settled notification join may also omit its already received final.
+     * Tools, drafts, private reasoning and native forwarding retain their existing behavior.
      * @param mixed $input Parsed client input. @param ?array $response Reserved Web response snapshot.
+     * @param bool $settledNotice Exact durable notification join to a committed response.
      * @return array<string,true> Already received public item IDs, empty for ordinary/new requests.
      */
-    public static function receivedPublicItems(mixed $input, ?array $response): array
+    public static function receivedPublicItems(mixed $input, ?array $response, bool $settledNotice = false): array
     {
         if (!is_array($input) || !is_array($response) || empty($response['output'])) return [];
+        $phases = $settledNotice ? ['commentary', 'final_answer'] : ['commentary'];
         $published = [];
         foreach ($response['output'] as $item) {
             if (!is_string($item['id'] ?? null)) continue;
             $commentary = ($item['type'] ?? '') === 'message' && ($item['role'] ?? '') === 'assistant'
-                && ($item['phase'] ?? '') === 'commentary' && ($item['status'] ?? '') === 'completed';
+                && in_array($item['phase'] ?? '', $phases, true) && ($item['status'] ?? '') === 'completed';
             $summary = ($item['type'] ?? '') === 'reasoning' && !empty($item['summary']);
             if ($commentary || $summary) $published[$item['id']] = ContextHistory::canonical(ContextHistory::compile([$item], ''));
         }
@@ -184,7 +187,7 @@ final class ResponseTransport
             // Only the same public wire shape may prove delivery; do not compile arbitrary
             // input content (including attachments) just because it reuses an output ID.
             if (($item['type'] ?? '') === 'message') {
-                if (($item['role'] ?? '') !== 'assistant' || ($item['phase'] ?? '') !== 'commentary'
+                if (($item['role'] ?? '') !== 'assistant' || !in_array($item['phase'] ?? '', $phases, true)
                     || ($item['status'] ?? 'completed') !== 'completed') continue;
                 $textOnly = is_string($item['content'] ?? null) || (is_array($item['content'] ?? null)
                     && array_reduce($item['content'], static fn(bool $ok, mixed $part): bool => $ok && is_array($part)

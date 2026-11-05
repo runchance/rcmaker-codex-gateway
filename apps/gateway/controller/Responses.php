@@ -109,7 +109,8 @@ final class Responses
                 ? ContextCompaction::create($spec, $idempotencyKey) : ResponseJob::createOrReuse($spec, $idempotencyKey);
             $responseId = (string) $job['id'];
             $phase = 'response_transport';
-            $receivedPublic = ResponseTransport::receivedPublicItems($body['input'] ?? null, $job['response'] ?? null);
+            $receivedPublic = ResponseTransport::receivedPublicItems($body['input'] ?? null, $job['response'] ?? null,
+                !empty($job['settled_subagent_notice_ack']));
             if ($spec['stream']) {
                 ResponseTransport::stream($connection, $responseId, $receivedPublic);
                 return $request->response('', 200, ['Content-Type' => 'text/event-stream']);

@@ -53,8 +53,9 @@ final class ResponseJob
     private static function reserveOrReuse(array $spec, ?string $idempotencyKey): array
     {
         Schema::initialize();
-        $joined = TaskLedger::joinedOperationalContextResponse($spec, $idempotencyKey);
-        if ($joined !== null) return self::get($joined);
+        $settledNotice = false;
+        $joined = TaskLedger::joinedOperationalContextResponse($spec, $idempotencyKey, $settledNotice);
+        if ($joined !== null) return self::get($joined) + ($settledNotice ? ['settled_subagent_notice_ack'=>true] : []);
         if ($idempotencyKey !== null) {
             $existing = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('idempotency_key', $idempotencyKey)->find();
             if (is_array($existing)) {
@@ -129,9 +130,9 @@ final class ResponseJob
         // Plan the next explicit request before taking the writer lock or validating its archive.
         $replacementHistory = ToolBroker::prepareFailedRegularAdmission($spec, $responseId);
         $reservedId = Schema::transaction(function () use ($spec, $idempotencyKey, $responseId, $itemId,
-            $created, $requestIdentity, $budget, $replacementHistory, &$roundInfo): string {
+            $created, $requestIdentity, $budget, $replacementHistory, &$roundInfo, &$settledNotice): string {
             $db = SDB(null, 'medoo', 'sqlite');
-            $joined = TaskLedger::joinedOperationalContextResponse($spec, $idempotencyKey);
+            $joined = TaskLedger::joinedOperationalContextResponse($spec, $idempotencyKey, $settledNotice);
             if ($joined !== null) return $joined;
             if ($idempotencyKey !== null) {
                 $existing = $db->table('gateway_response_jobs')->where('idempotency_key', $idempotencyKey)->find();
@@ -173,9 +174,11 @@ final class ResponseJob
             $spec = SteeringContext::deferToolsUnlocked($spec);
             if (!empty($spec['operational_context_source_response_id'])) {
                 $source = $db->table('gateway_response_jobs')->where('id', (string) $spec['operational_context_source_response_id'])->find();
+                $settledNotice = !empty($spec['settled_subagent_notice']);
                 TaskLedger::queueOperationalContextUnlocked($source, $spec['operational_context_updates'],
                     (string) $spec['request_hash'], $idempotencyKey, !empty($spec['mailbox_context_join']),
-                    !empty($spec['steering_context_join']), true, (string) ($spec['turn_id'] ?? ''));
+                    !empty($spec['steering_context_join']), true, (string) ($spec['turn_id'] ?? ''),
+                    $settledNotice);
                 return (string) $source['id'];
             }
             // Steering policy is selected once per request, never inherited from an older round.
@@ -438,7 +441,7 @@ final class ResponseJob
             }
             return $responseId;
         });
-        if ($reservedId !== $responseId) return self::get($reservedId);
+        if ($reservedId !== $responseId) return self::get($reservedId) + ($settledNotice ? ['settled_subagent_notice_ack'=>true] : []);
         if (is_array($roundInfo) && !empty($roundInfo['is_continuation'])) {
             return self::get($responseId);
         }
