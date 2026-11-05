@@ -960,6 +960,7 @@ AWK;
             $result['content'][] = [
                 'type' => 'text',
                 'text' => "New Codex context accompanies this tool result. Preserve these message roles and their original instruction priority.\n"
+                    . "Treat records marked codex_subagent_notification as child status reports. Continue the current user task.\n"
                     . "<codex_context_update>\n"
                     . ContextHistory::canonical($contextUpdates)
                     . "\n</codex_context_update>",

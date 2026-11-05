@@ -130,7 +130,8 @@ final class SteeringContext
         $full = json_decode((string) $spec['full_context_json'], true, 128, JSON_THROW_ON_ERROR);
         $known = (array) ($prior['messages'] ?? []);
         $systems = (array) ($prior['system'] ?? []);
-        if (ContextHistory::canonical(array_slice($full['messages'], 0, count($known))) !== ContextHistory::canonical($known)
+        if (ContextHistory::nativeMessageHistoryCanonical(array_slice($full['messages'], 0, count($known)))
+            !== ContextHistory::nativeMessageHistoryCanonical($known)
             || ContextHistory::canonical(array_slice($full['system'], 0, count($systems))) !== ContextHistory::canonical($systems)) {
             // Old mailbox receipt rounds can contain the same exact records in their
             // Web grouping. Reuse only the source-bound journal proof, in both chat modes.
@@ -198,7 +199,8 @@ final class SteeringContext
         $full = json_decode($spec['full_context_json'],true,128,JSON_THROW_ON_ERROR);
         $physical = json_decode($source['transport_context_json'],true,128,JSON_THROW_ON_ERROR);
         if (!is_array($physical) || !is_array($physical['messages'] ?? null)
-            || ContextHistory::canonical(array_slice($full['messages'],0,count($known['messages']))) !== ContextHistory::canonical($known['messages'])
+            || ContextHistory::nativeMessageHistoryCanonical(array_slice($full['messages'],0,count($known['messages'])))
+                !== ContextHistory::nativeMessageHistoryCanonical($known['messages'])
             || ContextHistory::canonical(array_slice($full['system'],0,count($known['system']))) !== ContextHistory::canonical($known['system'])) {
             throw new GatewayError('steering_history_mismatch','The pending checkpoint history changed; no Web message was sent.',409);
         }

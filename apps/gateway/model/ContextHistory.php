@@ -87,6 +87,9 @@ final class ContextHistory
                         $message['phase'] = $item['phase'];
                     }
                     if ($selectedSkill) $message['origin'] = 'codex_skill';
+                    if ($role === 'user' && self::nativeSubagentNotification($message, $metadata)) {
+                        $message['origin'] = 'codex_subagent_notification';
+                    }
                     // XML environment records retain their existing canonical representation.
                     // Preserve native provenance only when the metadata identifies a non-XML form.
                     if ($role === 'user' && is_array($metadata)
@@ -383,6 +386,16 @@ final class ContextHistory
                 unset($messages[$index]['internal_chat_message_metadata_passthrough']);
             }
         }
+        return self::nativeMessageHistoryCanonical($messages);
+    }
+
+    /** Older gateway records lack the notification origin. Compare exact IDs and payloads without that added provenance. */
+    public static function nativeMessageHistoryCanonical(array $messages): string
+    {
+        foreach ($messages as &$message) {
+            if (is_array($message) && self::isSubagentNotification($message)) unset($message['origin']);
+        }
+        unset($message);
         return self::canonical($messages);
     }
 
@@ -560,11 +573,34 @@ final class ContextHistory
         return hash('sha256', $text);
     }
 
-    /** Native environment data is not a human instruction, even though Codex uses role=user. */
+    /** Recognize only a complete notification with Codex's exact native message provenance. */
+    private static function nativeSubagentNotification(array $message, mixed $metadata): bool
+    {
+        $id = $message['id'] ?? '';
+        $content = $message['content'] ?? null;
+        if (!is_array($metadata) || ($metadata['content_item_kinds'] ?? null) !== ['multi_agent.subagent_notification']
+            || !is_string($id) || !str_starts_with($id, 'msg_') || !CodexCancellation::uuid(substr($id, 4))
+            || !is_string($content)) return false;
+        $content = trim($content);
+        $open = '<subagent_notification>';
+        $close = '</subagent_notification>';
+        if (!str_starts_with($content, $open) || !str_ends_with($content, $close)) return false;
+        $notification = json_decode(substr($content, strlen($open), -strlen($close)), true, 64);
+        return is_array($notification) && is_string($notification['agent_path'] ?? null)
+            && $notification['agent_path'] !== '' && array_key_exists('status', $notification);
+    }
+
+    /** Identify a notification already compiled from the native typed input, without interpreting its body. */
+    private static function isSubagentNotification(array $message): bool
+    {
+        return ($message['role'] ?? '') === 'user' && ($message['origin'] ?? '') === 'codex_subagent_notification';
+    }
+
+    /** Native environment and subagent notifications may arrive with role=user. */
     public static function isOperationalUserMessage(array $message): bool
     {
         if (($message['role'] ?? '') !== 'user') return false;
-        if (($message['origin'] ?? '') === 'codex_environment') return true;
+        if (($message['origin'] ?? '') === 'codex_environment' || self::isSubagentNotification($message)) return true;
         $metadata = $message['internal_chat_message_metadata_passthrough'] ?? null;
         if ($metadata instanceof \stdClass) $metadata = get_object_vars($metadata);
         if (is_array($metadata) && in_array('environments.environment_context',
@@ -588,8 +624,8 @@ final class ContextHistory
     /** Exact field/value identity independent of JSON object-key order. */
     private static function containsRecord(array $records, array $record): bool
     {
-        $canonical = self::canonical($record);
-        foreach ($records as $known) if (self::canonical($known) === $canonical) return true;
+        $canonical = self::nativeMessageHistoryCanonical([$record]);
+        foreach ($records as $known) if (self::nativeMessageHistoryCanonical([$known]) === $canonical) return true;
         return false;
     }
 
@@ -856,7 +892,8 @@ final class ContextHistory
         $spec['operational_context_event_ids'] = $pending['event_ids'];
         $sameSystem = self::canonical($context['system']) === self::canonical($priorContext['system'] ?? []);
         $samePrefix = count($records) >= count($priorRecords)
-            && self::canonical(array_slice($records, 0, count($priorRecords))) === self::canonical($priorRecords);
+            && self::nativeMessageHistoryCanonical(array_slice($records, 0, count($priorRecords)))
+                === self::nativeMessageHistoryCanonical($priorRecords);
         $sameLease = (string) $last['model'] === (string) $spec['model']
             && ($last['reasoning_effort'] ?? null) === ($spec['reasoning_effort'] ?? null)
             && (string) ($last['compaction_epoch'] ?? 'base') === (string) $spec['compaction_epoch'];
@@ -1043,7 +1080,8 @@ final class ContextHistory
         $records = (array) ($context['messages'] ?? []);
         $known = (array) ($prior['messages'] ?? []);
         $prefix = count($records) >= count($known)
-            && self::canonical(array_slice($records, 0, count($known))) === self::canonical($known);
+            && self::nativeMessageHistoryCanonical(array_slice($records, 0, count($known)))
+                === self::nativeMessageHistoryCanonical($known);
         $ids = array_fill_keys(array_column($outputs, 'call_id'), true);
         $last = null;
         foreach ($records as $index => $record) {
@@ -1091,8 +1129,15 @@ final class ContextHistory
      */
     private static function sharedHumanPrefixEnd(array $records, array $known): ?int
     {
-        $knownUsers = array_values(array_filter($known, static fn(array $record): bool =>
-            ($record['role'] ?? '') === 'user' && !self::isOperationalUserMessage($record)));
+        $notices = [];
+        foreach ($records as $record) {
+            if (self::isSubagentNotification($record) && !empty($record['id'])) $notices[$record['id']] = $record;
+        }
+        $knownUsers = array_values(array_filter($known, static function (array $record) use ($notices): bool {
+            if (($record['role'] ?? '') !== 'user' || self::isOperationalUserMessage($record)) return false;
+            $notice = $notices[$record['id'] ?? ''] ?? null;
+            return $notice === null || !self::containsRecord([$record], $notice);
+        }));
         if ($knownUsers === []) return null;
         $matched = 0;
         foreach ($records as $index => $record) {
@@ -1187,6 +1232,7 @@ final class ContextHistory
             }
             if (($afterReceipt && in_array($record['role'] ?? '', ['developer', 'agent_message'], true))
                 || (self::isOperationalUserMessage($record) && !self::containsRecord($known, $record))) {
+                if (self::isSubagentNotification($record) && self::containsRecord($messages, $record)) continue;
                 $messages[] = $record;
             }
         }
@@ -1479,6 +1525,7 @@ final class ContextHistory
                 $hasMailbox = true;
             } elseif (self::isOperationalUserMessage($record)) {
                 $updates[] = $record;
+                $hasMailbox = $hasMailbox || self::isSubagentNotification($record);
             } elseif ($humanSteering && ($record['role'] ?? '') === 'user') {
                 $id = (string) ($record['id'] ?? '');
                 if (($id !== '' && isset($knownUserIds[$id])) || self::containsRecord($known, $record)
@@ -1495,7 +1542,9 @@ final class ContextHistory
         // existing public output still requires the original published-prefix proof.
         $emptyRunningOutput = $running && $published === [] && (string)$source['output_text'] === '';
         if ($humanSteering ? !$hasHuman : (!$hasMailbox || ($publishedIndex === 0 && !$emptyRunningOutput))) return null;
-        $restart = (int)$pending === 0;
+        // Delivery of an operational notification alone must not interrupt a live reply.
+        $noticeOnly = $hasMailbox && array_filter($updates, static fn(array $record): bool => !self::isOperationalUserMessage($record)) === [];
+        $restart = (int)$pending === 0 && !($running && $noticeOnly);
         if ($emptyRunningOutput && $restart) {
             $undelivered = $db->table('gateway_tool_invocations')->where('task_id', $taskId)
                 ->where('turn_id', $turn['id'])->where('binding_id', $source['mcp_binding_id'])
@@ -1542,7 +1591,8 @@ final class ContextHistory
         $records = (array) ($incoming['messages'] ?? []);
         $samePrefix = count($records) > count($known)
             && self::canonical((array) ($incoming['system'] ?? [])) === self::canonical((array) ($prior['system'] ?? []))
-            && self::canonical(array_slice($records, 0, count($known))) === self::canonical($known);
+            && self::nativeMessageHistoryCanonical(array_slice($records, 0, count($known)))
+                === self::nativeMessageHistoryCanonical($known);
         if ($samePrefix) {
             $context = $incoming;
             $tail = array_slice($records, count($known));
@@ -1773,7 +1823,7 @@ final class ContextHistory
     private static function containsAgentMessage(array $context): bool
     {
         foreach ((array) ($context['messages'] ?? []) as $message) {
-            if (is_array($message) && ($message['role'] ?? null) === 'agent_message') return true;
+            if (is_array($message) && (($message['role'] ?? null) === 'agent_message' || self::isSubagentNotification($message))) return true;
         }
         return false;
     }
