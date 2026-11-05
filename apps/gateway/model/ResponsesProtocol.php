@@ -1020,10 +1020,13 @@ final class ResponsesProtocol
             // A steering item can precede, follow, or separate parallel results. Stopping
             // here would acknowledge only the last call and strand the remaining batch.
             if ($type === 'message' && ($item['role'] ?? null) === 'user') continue;
-            // Codex delivers created-thread and cross-thread work as a codex_app
-            // function output without a call_id. It is a new instruction, not the
-            // result of a pending host call.
-            if (self::isCodexDelegation($item)) break;
+            // A new assignment on this thread may arrive after its exact host
+            // result. Keep scanning for that receipt so admission can settle it
+            // before steering. A newly created thread still starts a boundary.
+            if (self::isCodexDelegation($item)) {
+                if ($item['name'] === 'send_message_to_thread') continue;
+                break;
+            }
             if (!in_array($type, ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)) break;
             $afterOutputs = false;
             $callId = $item['call_id'] ?? null;
