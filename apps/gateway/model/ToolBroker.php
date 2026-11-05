@@ -676,10 +676,11 @@ final class ToolBroker
         if (!is_array($binding) || $binding['current_response_id'] !== $responseId
             || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $job['durable_turn_id']
             || !in_array($binding['status'], ['awaiting_start','running'], true)
-            || self::activeCountUnlocked((string)$binding['id']) !== 0
-            || !self::hasCompleteReceiptHistory($binding, $job, $callIds)) return null;
+            || self::activeCountUnlocked((string)$binding['id']) !== 0) return null;
+        $context = self::retryContextSource($job, true);
+        if (!self::hasCompleteReceiptHistory($binding, $job, $callIds, $context)) return null;
         return ['source_hash'=>self::retryContextFingerprint($job, $binding),
-            'spec'=>self::retryContextSpec($job, $binding, true, true, $callIds)];
+            'spec'=>self::retryContextSpec($job, $binding, $context, true, true, $callIds)];
     }
 
     /**
@@ -903,7 +904,7 @@ final class ToolBroker
         $receiptSource['transport_context_json'] = $job['context_json'];
         if (!self::hasCompleteReceiptHistory($oldBinding, $receiptSource, $callIds)) return false;
         $prepared = ['source_hash'=>self::retryContextFingerprint($job, $binding),
-            'spec'=>self::retryContextSpec($job, $binding, true, true, $callIds)];
+            'spec'=>self::retryContextSpec($job, $binding, self::retryContextSource($job, true), true, true, $callIds)];
         if (!isset($prepared['spec']['imported_budget_context_json'])) return false;
         $oldHash = self::retryContextFingerprint($previous, $oldBinding);
         $attachments = AttachmentStore::selectForContext([], $prepared['spec']['transport_context_json']);
@@ -956,19 +957,27 @@ final class ToolBroker
         ]));
     }
 
+    /** A replacement must verify receipts against the same source used to build its prompt. */
+    private static function retryContextSource(array $job, bool $newOrdinaryChat): array
+    {
+        if (!$newOrdinaryChat) {
+            $transport = $job['transport_context_json'] ?? $job['context_json'];
+            $context = json_decode((string)$transport, true, 128, JSON_THROW_ON_ERROR);
+            if (empty($context['continuation'])) return $context;
+        }
+        return json_decode((string)$job['context_json'], true, 128, JSON_THROW_ON_ERROR);
+    }
+
     /**
      * Build one fresh-page transport, preserving complete canonical history outside its working view.
      * @param list<string>|null $settledCalls Exact delivered receipt IDs; only regular recovery may select history.
      * @return array Prepared context and pinned budget; no database state is changed.
      */
-    private static function retryContextSpec(array $job, array $binding, bool $newOrdinaryChat,
+    private static function retryContextSpec(array $job, array $binding, array $context, bool $newOrdinaryChat,
         bool $missingSurface, ?array $settledCalls = null): array
     {
         $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
         if ($newOrdinaryChat) unset($budget['regular_chat'], $budget['steering_delta'], $budget['postcompact_page']);
-        $transport = (string)($newOrdinaryChat ? $job['context_json'] : ($job['transport_context_json'] ?? $job['context_json']));
-        $context = json_decode($transport, true, 128, JSON_THROW_ON_ERROR);
-        if (!empty($context['continuation'])) $context = json_decode((string)$job['context_json'], true, 128, JSON_THROW_ON_ERROR);
         unset($context['continuation']);
         $transport = ContextHistory::canonical($context);
         if ($newOrdinaryChat && $missingSurface && $settledCalls !== null) $budget['recovery_receipt_staging'] = true;
@@ -1033,14 +1042,17 @@ final class ToolBroker
         $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
         if (!is_array($job)) throw new GatewayError('response_not_found', '任务恢复源记录不存在。', 404);
         $environment = json_decode($binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
-        if ($missingSurface && !self::hasCompleteReceiptHistory($binding, $job)) return null;
+        $context = self::retryContextSource($job, $newOrdinaryChat);
+        if ($missingSurface && ($binding['id'] !== $job['mcp_binding_id'] || $binding['task_id'] !== $job['task_id']
+            || $binding['turn_id'] !== $job['durable_turn_id']
+            || !self::hasCompleteReceiptHistory($binding, $job, context: $context))) return null;
         if ($newOrdinaryChat && $missingSurface && $job['operation_kind'] === 'response') {
             if (!is_array($preparedRegularContext)
                 || !hash_equals(self::retryContextFingerprint($job, $binding), (string)($preparedRegularContext['source_hash'] ?? ''))) return null;
             $retrySpec = $preparedRegularContext['spec'];
             if (isset($retrySpec['imported_budget_context_json']) && empty(GatewaySettings::internal()['mcp_enabled'])) return null;
         } else {
-            $retrySpec = self::retryContextSpec($job, $binding, $newOrdinaryChat, $missingSurface);
+            $retrySpec = self::retryContextSpec($job, $binding, $context, $newOrdinaryChat, $missingSurface);
         }
         $budget = $retrySpec['budget'];
         $transport = (string)$retrySpec['transport_context_json'];
@@ -1248,13 +1260,14 @@ final class ToolBroker
      * Missing-page continuation requires exact delivered receipts; pending/unknown effects never replay.
      * @param list<string>|null $settledCallIds Optional output of the completed receipts verified on success.
      */
-    private static function hasCompleteReceiptHistory(array $binding, array $job, ?array &$settledCallIds = null): bool
+    private static function hasCompleteReceiptHistory(array $binding, array $job, ?array &$settledCallIds = null,
+        ?array $context = null): bool
     {
         $settledCallIds = [];
         $calls = SDB(null,'medoo','sqlite')->table('gateway_tool_invocations')->where('binding_id', $binding['id'])->select();
         if (!is_array($calls)) throw new GatewayError('storage_unavailable', '工具执行回执暂不可读取。', 503);
         if ($calls === []) return true;
-        $context = json_decode((string)($job['transport_context_json'] ?? $job['context_json']), true);
+        $context ??= json_decode((string)($job['transport_context_json'] ?? $job['context_json']), true);
         $receipts = [];
         foreach ($context['messages'] ?? [] as $message) {
             if (in_array($message['type'] ?? '', ['function_call_output','custom_tool_call_output','tool_search_output'], true)
