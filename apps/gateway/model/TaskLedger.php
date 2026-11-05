@@ -716,9 +716,10 @@ final class TaskLedger
      * Prove all recorded subscribers of an already scoped response detached before its terminal.
      * The caller owns the transaction and separately validates the task, generation and request.
      * @param array $job Exact owned source with task_id and id, not an incoming client handle.
+     * @param ?int $before When provided, all transport evidence must precede this native terminal time.
      * @return bool False for live subscribers, missing/malformed evidence or a truncated event history.
      */
-    public static function clientTransportDetachedUnlocked(array $job): bool
+    public static function clientTransportDetachedUnlocked(array $job, ?int $before = null): bool
     {
         if (empty($job['task_id']) || empty($job['id'])) return false;
         $events = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
@@ -731,6 +732,7 @@ final class TaskLedger
         $subscribers = [];
         $nonterminalDetached = false;
         foreach ($events as $event) {
+            if ($before !== null && (int) $event['created_at'] >= $before) return false;
             $data = json_decode((string)$event['data_json'], true);
             $subscriber = $data['subscriber_id'] ?? null;
             if (!is_string($subscriber) || preg_match('/\Ahttp_[a-f0-9]{24}\z/D', $subscriber) !== 1
@@ -741,6 +743,79 @@ final class TaskLedger
             $nonterminalDetached = $nonterminalDetached || !$data['terminal'];
         }
         return $nonterminalDetached;
+    }
+
+    /**
+     * Retire only the generation still offering tools after its native child ended on admission failure.
+     * The browser's existing retired-page observer must confirm Stop before the slot is reusable.
+     * @param array $candidate Exact child slot, task, turn and tool-offer response from maintenance.
+     * @param array $terminal Latest exact native child lifecycle metadata, read outside the writer.
+     * @param int $failureEventId Admission rejection matching the native turn and this response interval.
+     * @return bool Whether retirement was recorded. Delivered calls stay unknown, never replayed here.
+     * @throws GatewayError If durable ownership or retirement cannot be saved.
+     */
+    public static function retireDetachedRejectedChild(array $candidate, array $terminal, int $failureEventId): bool
+    {
+        return Schema::transaction(static function () use ($candidate, $terminal, $failureEventId): bool {
+            $db = SDB(null, 'medoo', 'sqlite');
+            $turn = $db->table('gateway_task_turns')->where('id', $candidate['durable_turn_id'])
+                ->where('task_id', $candidate['task_id'])->where('response_id', $candidate['response_id'])
+                ->where('client_turn_id', $terminal['native_turn_id'])->where('error_code', null)
+                ->where('status', 'IN', ['submitted', 'running'])->find();
+            if (!is_array($turn)) return false;
+            $task = $db->table('gateway_tasks')->where('id', $turn['task_id'])->where('status', 'active')
+                ->where('thread_id', $candidate['thread_id'])->where('native_parent_thread_id', $candidate['parent_thread_id'])
+                ->where('native_agent_path', $candidate['agent_path'])->where('current_epoch_id', $turn['epoch_id'])->find('id');
+            $slot = $db->table('gateway_subagent_slots')->where('thread_id', $candidate['thread_id'])->where('status', 'held')
+                ->where('turn_id', $turn['id'])->where('parent_thread_id', $candidate['parent_thread_id'])
+                ->where('agent_path', $candidate['agent_path'])->find('id');
+            if (!is_array($task) || !is_array($slot) || empty($candidate['parent_thread_id'])) return false;
+            $job = $db->table('gateway_response_jobs')->where('id', $turn['response_id'])->where('task_id', $task['id'])
+                ->where('durable_turn_id', $turn['id'])->where('epoch_id', $turn['epoch_id'])->where('status', 'completed')
+                ->where('operation_kind', 'response')->where('round_kind', 'tool_call')
+                ->find('id,task_id,surface_id,generation_id,mcp_binding_id,created_at,finished_at');
+            $event = $db->table('gateway_task_events')->where('id', $failureEventId)->where('task_id', $task['id'])
+                ->where('response_id', null)->where('event_type', 'gateway_failure_recorded')->find('created_at,data_json');
+            if (!is_array($job) || !self::ownsCurrentGeneration($job, $turn) || !is_array($event)) return false;
+            $failure = json_decode((string) $event['data_json'], true);
+            $finished = $terminal['finished_at'];
+            if (($failure['error_code'] ?? null) !== 'context_length_exceeded'
+                || ($failure['native_turn_id'] ?? null) !== $turn['client_turn_id']
+                || (int) $event['created_at'] < (int) $job['created_at'] || (int) $event['created_at'] > $finished
+                || (int) $job['finished_at'] <= $finished || (int) $job['finished_at'] > time() - 30
+                || !self::clientTransportDetachedUnlocked($job, $finished)) return false;
+
+            $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->where('task_id', $task['id'])
+                ->where('turn_id', $turn['id'])->where('status', 'running')->where('current_response_id', $job['id'])->find('id');
+            if (!is_array($binding)) return false;
+            $otherTurns = $db->table('gateway_task_turns')->where('task_id', $task['id'])->where('id', '<>', $turn['id'])
+                ->where('status', 'IN', self::ACTIVE_TURNS)->count();
+            $deliveredCalls = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])->where('status', 'delivered')->count();
+            $lateOffers = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])->where('response_id', $job['id'])
+                ->where('status', 'delivered')->where('delivered_at', '>', $finished)->count();
+            $pendingReceipts = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+                ->where('status', 'completed')->where('result_delivered_at', null)->count();
+            if (!is_numeric($otherTurns) || !is_numeric($deliveredCalls) || !is_numeric($lateOffers) || !is_numeric($pendingReceipts)
+                || (int) $otherTurns !== 0 || (int) $lateOffers === 0 || (int) $deliveredCalls !== (int) $lateOffers
+                || (int) $pendingReceipts !== 0) return false;
+            $surface = $db->table('gateway_browser_surfaces')->where('id', $turn['surface_id'])->where('task_id', $task['id'])
+                ->where('epoch_id', $turn['epoch_id'])->where('status', 'busy')->find('id,target_id');
+            if (!is_array($surface) || empty($surface['target_id'])) return false;
+
+            ToolBroker::revokeTaskUnlocked((string) $task['id'], 'native_child_context_rejected', (string) $turn['id']);
+            self::retireEpochUnlocked((string) $task['id'], (string) $turn['epoch_id'], 'native_child_context_rejected');
+            $now = time();
+            $turnSaved = $db->table('gateway_task_turns')->where('id', $turn['id'])->update([
+                'status'=>'needs_attention', 'error_code'=>'NATIVE_CHILD_CONTEXT_REJECTED', 'retired_at'=>$now, 'updated_at'=>$now,
+            ]);
+            $taskSaved = $db->table('gateway_tasks')->where('id', $task['id'])->update(['status'=>'needs_attention', 'updated_at'=>$now]);
+            if (!$turnSaved || $turnSaved->rowCount() !== 1 || !$taskSaved || $taskSaved->rowCount() !== 1) {
+                throw new GatewayError('storage_unavailable', 'Detached child retirement could not be saved.', 503);
+            }
+            self::eventUnlocked((string) $task['id'], (string) $turn['id'], (string) $job['id'], (string) $surface['id'],
+                'native_child_context_rejected_retired', ['failure_event_id'=>$failureEventId, 'finished_at'=>$finished]);
+            return true;
+        });
     }
 
     /**

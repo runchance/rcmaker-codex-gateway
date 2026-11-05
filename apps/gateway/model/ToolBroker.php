@@ -2871,13 +2871,16 @@ final class ToolBroker
      * is authorized; this helper performs no browser send or local host execution.
      * @param string $taskId Exact durable task whose capabilities are being retired.
      * @param string $reason Recorded lifecycle reason; ordinary cancellation is unchanged.
+     * @param ?string $turnId Restrict revocation to this turn when its detached native execution ended.
      * @return void
      * @throws GatewayError If binding state or revocation evidence cannot be read or saved.
      */
-    public static function revokeTaskUnlocked(string $taskId, string $reason = 'task_cancelled'): void
+    public static function revokeTaskUnlocked(string $taskId, string $reason = 'task_cancelled', ?string $turnId = null): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
-        $rows = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)->where('status', 'IN', ['awaiting_start', 'running'])->select();
+        $query = $db->table('gateway_mcp_bindings')->where('task_id', $taskId)->where('status', 'IN', ['awaiting_start', 'running']);
+        if ($turnId !== null) $query->where('turn_id', $turnId);
+        $rows = $query->select();
         if (!is_array($rows)) throw new GatewayError('storage_unavailable', '工具能力状态暂不可读取。', 503);
         foreach ($rows as $binding) {
             self::revokeBindingUnlocked($binding, $reason);

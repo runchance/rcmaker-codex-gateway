@@ -56,9 +56,11 @@ final class SubagentCapacity
         return $proofs;
     }
 
-    /** Release only rechecked unused reservations; native files are never read under the writer. */
+    /** Reconcile native terminal evidence outside the writer before changing owned slot or page state. */
     public static function refreshNativeTerminals(): void
     {
+        try { self::retireDetachedRejectedTurns(); }
+        catch (\Throwable) { /* Retry page retirement without delaying unused reservation cleanup. */ }
         $proofs = self::pendingTerminalEvidence();
         if ($proofs === []) return;
         Schema::transaction(static function() use ($proofs): void {
@@ -106,6 +108,47 @@ final class SubagentCapacity
                     ->where('turn_id', null)->update(['status'=>'released','updated_at'=>time()])) self::unavailable();
             }
         });
+    }
+
+    /** Look for a tool offer recorded after the same native child ended on a budget rejection. */
+    private static function retireDetachedRejectedTurns(): void
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $candidates = $db->table('gateway_subagent_slots AS s')
+            ->join('gateway_task_turns AS t', 't.id', 's.turn_id')
+            ->join('gateway_response_jobs AS j', 'j.id', 't.response_id')
+            ->where('s.status', 'held')->where('t.status', 'IN', ['submitted', 'running'])
+            ->where('j.status', 'completed')->where('j.round_kind', 'tool_call')
+            ->where('j.finished_at', '<=', time() - 30)->limit(128)
+            ->select('s.thread_id,s.parent_thread_id,s.agent_path,t.id AS durable_turn_id,t.task_id,t.client_turn_id,j.id AS response_id,j.created_at,j.finished_at');
+        self::readable($candidates);
+        foreach ($candidates as $candidate) {
+            $thread = $candidate['thread_id'];
+            $nativeTurn = $candidate['client_turn_id'];
+            if (!is_string($thread) || !is_string($nativeTurn) || !CodexCancellation::uuid($nativeTurn)) continue;
+            // Read only a bounded indexed timeline tail, even for long reused children.
+            $events = $db->table('gateway_task_events')->where('task_id', $candidate['task_id'])
+                ->order([['id','DESC']])->limit(128)->select('id,response_id,event_type,created_at');
+            self::readable($events);
+            foreach ($events as $event) {
+                if ($event['response_id'] !== null || $event['event_type'] !== 'gateway_failure_recorded'
+                    || $event['created_at'] < $candidate['created_at'] || $event['created_at'] >= $candidate['finished_at']) continue;
+                $details = $db->table('gateway_task_events')->where('id', $event['id'])->find('data_json');
+                $failure = json_decode((string) ($details['data_json'] ?? ''), true);
+                if (($failure['error_code'] ?? null) !== 'context_length_exceeded'
+                    || ($failure['native_turn_id'] ?? null) !== $nativeTurn) continue;
+                $scope = CodexSubagent::scope($thread);
+                if (($scope['parent_thread_id'] ?? null) !== $candidate['parent_thread_id']
+                    || ($scope['agent_path'] ?? null) !== $candidate['agent_path']) break;
+                $terminal = CodexSubagent::terminalTurn($thread);
+                if (($terminal['native_turn_id'] ?? null) === $nativeTurn
+                    && $terminal['finished_at'] >= (int) $event['created_at']
+                    && $terminal['finished_at'] < (int) $candidate['finished_at']) {
+                    TaskLedger::retireDetachedRejectedChild($candidate, $terminal, (int) $event['id']);
+                }
+                break;
+            }
+        }
     }
 
     /** Preserve unknown native outcomes; recognize only definitive pre-start failure receipts. */
