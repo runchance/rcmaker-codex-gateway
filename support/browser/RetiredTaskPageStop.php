@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace support\browser;
 
+use app\gateway\model\SubagentCapacity;
 use app\gateway\model\TaskPageRetirement;
 
 /** Drain retired pages on independent CDP sessions before another page may run their task. */
@@ -35,14 +36,23 @@ final class RetiredTaskPageStop
             if ($this->observers[$id]['busy'] || microtime(true) < $this->observers[$id]['next_at']) continue;
             $this->observers[$id]['snapshot'] = $snapshot;
             $this->send($id, 'Target.getTargets', [], null, function (array $result) use ($id): void {
-                if (!is_array($result['targetInfos'] ?? null)) { $this->retry($id); return; }
+                if (!is_array($result['targetInfos'] ?? null) || !array_is_list($result['targetInfos'])) {
+                    $this->retry($id); return;
+                }
                 $snapshot = $this->observers[$id]['snapshot'];
                 $target = null;
                 $sameChatVisible = false;
+                $expectedChat = $this->conversationId($snapshot['url']);
                 foreach ($result['targetInfos'] as $candidate) {
-                    if (($candidate['type'] ?? '') === 'page'
-                        && $this->sameConversation($snapshot['url'], (string)($candidate['url'] ?? ''))) $sameChatVisible = true;
-                    if (($candidate['targetId'] ?? '') === $snapshot['target_id'] && ($candidate['type'] ?? '') === 'page') {
+                    if (!is_string($candidate['type'] ?? null) || !is_string($candidate['targetId'] ?? null)) {
+                        $this->retry($id); return;
+                    }
+                    if ($candidate['type'] !== 'page') continue;
+                    if (!is_string($candidate['url'] ?? null)) { $this->retry($id); return; }
+                    if ($expectedChat !== null && $expectedChat === $this->conversationId($candidate['url'])) {
+                        $sameChatVisible = true;
+                    }
+                    if ($candidate['targetId'] === $snapshot['target_id']) {
                         $target = $candidate; break;
                     }
                 }
@@ -56,7 +66,14 @@ final class RetiredTaskPageStop
                     } elseif (!$sameChatVisible && (TaskPageRetirement::closeMissingPendingCheckpointPage($snapshot)
                         || TaskPageRetirement::closeMissingCompletedPage($snapshot))) {
                         $this->finishClosed($id, $snapshot, true);
-                    } else $this->recover($id);
+                    } else {
+                        // A missing page can give back its local running slot while its
+                        // own unresolved Stop obligation still blocks any replacement submission.
+                        if (!$sameChatVisible && $expectedChat !== null) {
+                            SubagentCapacity::releaseAbsentRetiredPage($snapshot);
+                        }
+                        $this->recover($id);
+                    }
                     return;
                 }
                 if (!empty($snapshot['empty_page']) && $snapshot['url'] === 'about:blank'
@@ -246,15 +263,13 @@ final class RetiredTaskPageStop
         if ($session && $this->cdp->ready()) $this->cdp->send('Target.detachFromTarget', ['sessionId'=>$session], null, static function (): void {}, 5.0);
     }
 
-    /** Exact saved-page identity, with temporary flags kept significant. */
     /** Inventory must not declare a chat absent merely because its temporary/query flag changed. */
-    private function sameConversation(string $expected, string $actual): bool
+    private function conversationId(string $url): ?string
     {
-        $expectedId = WebModelPage::regularConversationId((string)preg_replace('~[?#].*\z~s','',$expected), $this->modelUrl);
-        return $expectedId !== null && $expectedId === WebModelPage::regularConversationId(
-            (string)preg_replace('~[?#].*\z~s','',$actual), $this->modelUrl);
+        return WebModelPage::regularConversationId((string)preg_replace('~[?#].*\z~s', '', $url), $this->modelUrl);
     }
 
+    /** Exact saved-page identity, with temporary flags kept significant. */
     private function samePage(string $expected, string $actual): bool
     {
         $a = parse_url($expected); $b = parse_url($actual);

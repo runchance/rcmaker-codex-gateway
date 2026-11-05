@@ -244,9 +244,65 @@ final class SubagentCapacity
     }
 
     /**
+     * Release the execution slot of a retired page with no remaining gateway work.
+     * The browser observer must positively inventory both the exact target and conversation absent.
+     * Preserve the stop obligation and unknown tool results for this task's own recovery.
+     * @param array $snapshot Exact owned retirement witness from the browser observer.
+     * @return bool Whether a held slot was released.
+     */
+    public static function releaseAbsentRetiredPage(array $snapshot): bool
+    {
+        if (!in_array($snapshot['chat_mode'] ?? null, ['temporary','regular'], true) || ($snapshot['state'] ?? '') !== 'pending'
+            || empty($snapshot['source_response_id'])
+            || isset($snapshot['origin_surface_id'])) return false;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $task = $db->table('gateway_tasks')->where('id', $snapshot['task_id'])
+            ->find('thread_id,native_parent_thread_id,native_agent_path');
+        if (empty($task['native_parent_thread_id'])) return false;
+        $slot = $db->table('gateway_subagent_slots')->where('thread_id', $task['thread_id'])
+            ->where('status', 'held')->find('id,turn_id,parent_thread_id,agent_path');
+        if (empty($slot['turn_id']) || $slot['parent_thread_id'] !== $task['native_parent_thread_id']
+            || $slot['agent_path'] !== $task['native_agent_path']) return false;
+
+        return Schema::transaction(static function () use ($snapshot, $slot, $task): bool {
+            $db = SDB(null, 'medoo', 'sqlite');
+            if (!TaskPageRetirement::owns($snapshot)) return false;
+            $turn = $db->table('gateway_task_turns')->where('id', $slot['turn_id'])
+                ->where('task_id', $snapshot['task_id'])->where('surface_id', $snapshot['surface_id'])
+                ->where('status', 'IN', ['failed','cancelled','needs_attention'])->find('id');
+            $source = $db->table('gateway_response_jobs')->where('id', $snapshot['source_response_id'])
+                ->where('durable_turn_id', $slot['turn_id'])->where('task_id', $snapshot['task_id'])
+                ->where('surface_id', $snapshot['surface_id'])->find('mcp_binding_id');
+            if (!is_array($turn) || empty($source['mcp_binding_id'])) return false;
+            $binding = $db->table('gateway_mcp_bindings')->where('id', $source['mcp_binding_id'])
+                ->where('turn_id', $turn['id'])->where('task_id', $snapshot['task_id'])
+                ->where('status', 'revoked')->find('id,token_hash,revoked_at');
+            if (empty($binding['revoked_at'])
+                || !in_array($binding['token_hash'], $snapshot['turn_token_hashes'] ?? [], true)) return false;
+
+            $active = [
+                $db->table('gateway_response_jobs')->where('task_id', $snapshot['task_id'])->where('status', 'IN', ['queued','running'])->count(),
+                $db->table('gateway_tool_invocations')->where('turn_id', $turn['id'])->where('status', 'IN', ['registered','delivered'])->count(),
+                $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])->where('status', 'active')->count(),
+            ];
+            foreach ($active as $count) {
+                if (!is_numeric($count)) self::unavailable();
+                if ((int)$count !== 0) return false;
+            }
+            $changed = $db->table('gateway_subagent_slots')->where('id', $slot['id'])
+                ->where('status', 'held')->where('turn_id', $turn['id'])->where('thread_id', $task['thread_id'])
+                ->where('parent_thread_id', $task['native_parent_thread_id'])->where('agent_path', $task['native_agent_path'])
+                ->update(['status'=>'released','updated_at'=>time()]);
+            if (!$changed) self::unavailable();
+            return $changed->rowCount() === 1;
+        });
+    }
+
+    /**
      * Refresh small durable admission records under the caller's writer; no filesystem/CDP/history reads.
-     * Existing active children are grandfathered on upgrade or limit reduction. Unknown page/tool outcomes
-     * retain their slots until confirmed completion/stop/retirement; heartbeat expiry is never proof.
+     * Existing active children are grandfathered on upgrade or limit reduction. Uncertain work keeps
+     * its slot until terminal evidence or the browser's verified absent, revoked retirement path.
      */
     private static function refreshUnlocked(): void
     {
@@ -285,7 +341,7 @@ final class SubagentCapacity
                 : $db->table('gateway_subagent_slots')->add($data + ['id'=>$turn['id'], 'created_at'=>time()]);
             if (!$saved) self::unavailable();
         }
-        $slots = $db->table('gateway_subagent_slots')->where('status', 'held')->select('id,turn_id,invocation_id');
+        $slots = $db->table('gateway_subagent_slots')->where('status', 'held')->select('id,thread_id,turn_id,invocation_id');
         self::readable($slots);
         foreach ($slots as $slot) {
             $release = false;
@@ -296,7 +352,8 @@ final class SubagentCapacity
                     $release = $turn['status'] === 'committed' || $turn['error_code'] === 'CODEX_USER_STOPPED'
                         || (in_array($turn['status'], ['failed','cancelled'], true) && $turn['submit_intent_at'] === null);
                     if (!$release && in_array($turn['status'], ['failed','cancelled','needs_attention'], true)) {
-                        $retired = $db->table('gateway_surface_retirements')->where('surface_id', $turn['surface_id'])->where('state','closed')->find('surface_id');
+                        $retired = $db->table('gateway_surface_retirements')->where('surface_id', $turn['surface_id'])
+                            ->where('state', 'IN', ['stopped','closed'])->find('surface_id');
                         if ($retired === false) self::unavailable();
                         $release = is_array($retired);
                     }
@@ -306,6 +363,13 @@ final class SubagentCapacity
                 if ($call === false) self::unavailable();
                 if (is_array($call)) {
                     $release = self::spawnDidNotStart($call);
+                }
+                if (!$release && $slot['thread_id'] !== null) {
+                    // An issued spawn without a child ID is still pending. A known child ID
+                    // comes from an existing task and can outlive that task's deletion.
+                    $child = $db->table('gateway_tasks')->where('thread_id', $slot['thread_id'])->find('id');
+                    if ($child === false) self::unavailable();
+                    $release = $child === null;
                 }
             }
             if ($release && !$db->table('gateway_subagent_slots')->where('id', $slot['id'])->update(['status'=>'released','updated_at'=>time()])) self::unavailable();

@@ -364,6 +364,11 @@ final class TaskMaintenance
             $db->table('gateway_task_cleanup')->where('id', $cleanupId)->update(['status'=>'deleting','error_code'=>null,'updated_at'=>time()]);
             return true;
         }
+        // Clear the deleted turn's exact child slot before its foreign key is set to NULL.
+        if (!empty($task['native_parent_thread_id'])) {
+            self::mustWrite($sql->query('DELETE FROM gateway_subagent_slots WHERE thread_id=:thread AND turn_id IN
+                (SELECT id FROM gateway_task_turns WHERE task_id=:task)', [':thread'=>$task['thread_id'], ':task'=>$taskId]));
+        }
         foreach (['gateway_compaction_handoffs','gateway_rolling_checkpoints','gateway_context_checkpoints','gateway_tool_invocations',
             'gateway_mcp_bindings','gateway_task_turns','gateway_browser_surfaces','gateway_task_epochs'] as $table) {
             self::mustWrite($db->table($table)->where('task_id', $taskId)->delete());
