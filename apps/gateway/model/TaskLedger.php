@@ -2116,15 +2116,22 @@ final class TaskLedger
         bool $missingSurface = false,
         string $retryCause = 'missing_surface_with_complete_receipts',
         ?array $terminalProof = null,
-        ?array $preparedRegularContext = null
+        ?array $preparedRetryContext = null
     ): array {
-        // A browser capacity recovery reads the current page after this expensive plan.
-        // Revalidate its source under the writer lock without repeating planning afterward.
-        $preparedRegularContext ??= $missingSurface && $maxRetries > 0
-            && in_array($retryCause, ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)
-            ? ToolBroker::prepareRegularRetryContext($responseId) : null;
+        $streamReplacement = $missingSurface && $maxRetries > 0
+            && in_array($retryCause, ['network_error_after_confirmed_receipts','message_stream_error_after_confirmed_receipts',
+                'connector_unavailable_after_receipts'], true);
+        // Plan and count the fresh-page context outside the SQLite writer. The
+        // transaction revalidates the exact source and all receipts before rotation.
+        if ($preparedRetryContext === null && $missingSurface && $maxRetries > 0) {
+            if (in_array($retryCause, ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)) {
+                $preparedRetryContext = ToolBroker::prepareRegularRetryContext($responseId);
+            } elseif ($streamReplacement) {
+                $preparedRetryContext = ToolBroker::prepareTemporaryRetryContext($responseId);
+            }
+        }
         return Schema::transaction(function () use ($responseId, $prompt, $incarnation, $fence, $maxRetries,
-            $missingSurface, $retryCause, $terminalProof, $preparedRegularContext): array {
+            $missingSurface, $retryCause, $terminalProof, $preparedRetryContext, $streamReplacement): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
@@ -2162,7 +2169,7 @@ final class TaskLedger
                     (string)($chat['conversation_id'] ?? ''), $userId, $assistantId,
                     (string)$terminalProof['descriptor_hash'], (string)$terminalProof['failure_id_hash'],
                 ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
-                if (self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                if (self::recoveryHumanUpdatePendingUnlocked($job, $turn)) {
                     return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0, 'waiting'=>true];
                 }
             }
@@ -2175,7 +2182,7 @@ final class TaskLedger
                     || ($recovery['document_nonce'] ?? '') !== $surface['document_nonce']) {
                     return ['retry' => false, 'exhausted' => false, 'attempt' => 0];
                 }
-                if (self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                if (self::recoveryHumanUpdatePendingUnlocked($job, $turn)) {
                     return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0, 'waiting'=>true];
                 }
             }
@@ -2203,13 +2210,20 @@ final class TaskLedger
 
             $retainedCompact = $missingSurface && !empty($job['previous_response_id'])
                 && in_array($job['operation_kind'], ['compact_v1', 'compact_v2'], true);
+            if ($streamReplacement && self::recoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                return ['retry'=>false, 'exhausted'=>false, 'attempt'=>0, 'waiting'=>true];
+            }
+            if ($streamReplacement && $job['operation_kind'] === 'response'
+                && !empty($job['mcp_binding_id']) && $preparedRetryContext === null) {
+                return ['retry'=>false, 'exhausted'=>false, 'attempt'=>$attempt];
+            }
             // A missing source page changes only the checkpoint transport: no historical
             // host permission may be replayed on the new page. Provenance remains pinned.
             $rotated = $retainedCompact
                 ? ToolBroker::prepareReadOnlyCompactionReplayUnlocked($job, true)
                 : ($missingSurface && empty($job['mcp_binding_id'])
                 ? ContextRecovery::prepareUnboundReplayUnlocked($job)
-                : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface, $regularRecovery, $preparedRegularContext));
+                : ToolBroker::rotateNoStartRetryUnlocked($responseId, $prompt, $missingSurface, $regularRecovery, $preparedRetryContext));
             if (!is_array($rotated)) {
                 if ($conversationCapacity) {
                     // Keep the terminal page parked while already-authorized work settles. Read
@@ -2770,7 +2784,7 @@ final class TaskLedger
                 throw new GatewayError('task_network_retry_unavailable', '网页重试的当前回合或页面所有权已变化。', 409);
             }
             $idle = ['retry'=>false,'waiting'=>false,'exhausted'=>false,'attempt'=>0];
-            if ($regularRecovery !== null && self::regularRecoveryHumanUpdatePendingUnlocked($job, $turn)) {
+            if (($regularRecovery !== null || $preferSamePage) && self::recoveryHumanUpdatePendingUnlocked($job, $turn)) {
                 return array_replace($idle, ['waiting'=>true]);
             }
             if (($regularRecovery['action'] ?? '') === 'refresh_observed' && is_array($binding)) {
@@ -2929,8 +2943,8 @@ final class TaskLedger
         return ($continuation['marker'] ?? '') !== ($state['marker'] ?? '') || !empty($continuation['pending']);
     }
 
-    /** A queued human update or explicit stop always takes priority over automated ordinary recovery. */
-    private static function regularRecoveryHumanUpdatePendingUnlocked(array $job, array $turn): bool
+    /** A queued human update or explicit stop always takes priority over automated stream recovery. */
+    private static function recoveryHumanUpdatePendingUnlocked(array $job, array $turn): bool
     {
         if (in_array($turn['error_code'] ?? '', ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)) return true;
         $updates = self::pendingOperationalContextUnlocked($job);

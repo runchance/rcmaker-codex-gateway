@@ -8870,6 +8870,11 @@ JS;
             $recoverySnapshot = $snapshot;
             $recoverySnapshot['error'] = ['code' => 'CHATGPT_MESSAGE_STREAM_ERROR'];
             if ($this->recoverRegularTaskStream($responseId, $recoverySnapshot, true)) return true;
+            // A stopped temporary page may still own the entire tool history. Reuse
+            // the existing exact-anchor, receipt-drained continuation before rebuilding it.
+            if (($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? 'temporary') === 'temporary' && $toolCapable
+                && ($evidence['ui_receipts_settled'] ?? null) === true
+                && $this->continueStoppedTaskStream($responseId, $recoverySnapshot)) return true;
             if (!$this->retryTaskNetworkError($responseId, $snapshot)) {
                 $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_MESSAGE_STREAM_ERROR');
             }

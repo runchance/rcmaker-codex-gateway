@@ -673,19 +673,44 @@ final class ToolBroker
      */
     public static function prepareRegularRetryContext(string $responseId): ?array
     {
+        return self::prepareFreshPageRetryContext($responseId, true);
+    }
+
+    /** A stopped temporary page must not be retired if its required history cannot fit a replacement. */
+    public static function prepareTemporaryRetryContext(string $responseId): ?array
+    {
+        $prepared = self::prepareFreshPageRetryContext($responseId, false);
+        if ($prepared === null) return null;
+        $spec = $prepared['spec'];
+        $transport = $spec['transport_context_json'];
+        $budget = $spec['budget'];
+        $attachments = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $transport), $budget);
+        try {
+            ContextBudget::validate(WebContract::contextJson($transport), $budget, $attachments);
+        } catch (GatewayError $error) {
+            if ($error->errorCode !== 'context_length_exceeded') throw $error;
+            $prepared['window_exceeded'] = true;
+        }
+        return $prepared;
+    }
+
+    private static function prepareFreshPageRetryContext(string $responseId, bool $regular): ?array
+    {
         $db = SDB(null, 'medoo', 'sqlite');
         $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
-        if (!is_array($job) || $job['status'] !== 'running' || $job['operation_kind'] !== 'response'
-            || empty($job['mcp_binding_id']) || TaskWebChat::state((string)$job['task_id'])['mode'] !== 'regular') return null;
+        $mode = $regular ? 'regular' : 'temporary';
+        if (!is_array($job) || !in_array($job['status'], $regular ? ['running'] : ['queued','running'], true)
+            || $job['operation_kind'] !== 'response' || empty($job['mcp_binding_id'])
+            || TaskWebChat::state((string)$job['task_id'])['mode'] !== $mode) return null;
         $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
         if (!is_array($binding) || $binding['current_response_id'] !== $responseId
             || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $job['durable_turn_id']
             || !in_array($binding['status'], ['awaiting_start','running'], true)
             || self::activeCountUnlocked((string)$binding['id']) !== 0) return null;
-        $context = self::retryContextSource($job, true);
+        $context = self::retryContextSource($job, $regular);
         if (!self::hasCompleteReceiptHistory($binding, $job, $callIds, $context)) return null;
-        return ['source_hash'=>self::retryContextFingerprint($job, $binding),
-            'spec'=>self::retryContextSpec($job, $binding, $context, true, true, $callIds)];
+        return ['source_hash'=>self::retryContextFingerprint($job, $binding), 'chat_mode'=>$mode,
+            'spec'=>self::retryContextSpec($job, $binding, $context, $regular, true, $callIds)];
     }
 
     /**
@@ -1026,11 +1051,11 @@ final class ToolBroker
      *
      * @param bool $missingSurface True only after an authoritative browser snapshot proves loss.
      * @param bool $newOrdinaryChat Rebuild a regular page from its full archive and receipt-proven working view.
-     * @param array|null $preparedRegularContext Read-only plan revalidated inside this writer transaction.
+     * @param array|null $preparedRetryContext Read-only plan revalidated inside this writer transaction.
      * @return array{binding_id:string,prompt:string,job_fields:array}|null
      */
     public static function rotateNoStartRetryUnlocked(string $responseId, string $prompt, bool $missingSurface = false,
-        bool $newOrdinaryChat = false, ?array $preparedRegularContext = null): ?array
+        bool $newOrdinaryChat = false, ?array $preparedRetryContext = null): ?array
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $binding = $db->table('gateway_mcp_bindings')->where('current_response_id', $responseId)->find();
@@ -1051,10 +1076,15 @@ final class ToolBroker
         if ($missingSurface && ($binding['id'] !== $job['mcp_binding_id'] || $binding['task_id'] !== $job['task_id']
             || $binding['turn_id'] !== $job['durable_turn_id']
             || !self::hasCompleteReceiptHistory($binding, $job, context: $context))) return null;
-        if ($newOrdinaryChat && $missingSurface && $job['operation_kind'] === 'response') {
-            if (!is_array($preparedRegularContext)
-                || !hash_equals(self::retryContextFingerprint($job, $binding), (string)($preparedRegularContext['source_hash'] ?? ''))) return null;
-            $retrySpec = $preparedRegularContext['spec'];
+        if ($missingSurface && $job['operation_kind'] === 'response' && ($newOrdinaryChat || $preparedRetryContext !== null)) {
+            if (!is_array($preparedRetryContext)
+                || (!$newOrdinaryChat && ($preparedRetryContext['chat_mode'] ?? '') !== 'temporary')
+                || !hash_equals(self::retryContextFingerprint($job, $binding), (string)($preparedRetryContext['source_hash'] ?? ''))) return null;
+            if (!$newOrdinaryChat && !empty($preparedRetryContext['window_exceeded'])) {
+                throw new GatewayError('CHATGPT_CONTEXT_TOO_LARGE',
+                    'The stopped temporary Web page and exact tool receipts are preserved. The replacement history exceeds the model budget. Compact the context before continuing.', 400);
+            }
+            $retrySpec = $preparedRetryContext['spec'];
             if (isset($retrySpec['imported_budget_context_json']) && empty(GatewaySettings::internal()['mcp_enabled'])) return null;
         } else {
             $retrySpec = self::retryContextSpec($job, $binding, $context, $newOrdinaryChat, $missingSurface);
