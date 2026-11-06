@@ -249,21 +249,26 @@ final class McpProtocol
             $query = isset($arguments['query']) && is_string($arguments['query']) ? trim($arguments['query']) : '';
             if (!$exact) $query = mb_strtolower($query);
             $search = self::inventorySearchPlan($query);
-            $tools = $exact
-                ? array_values(array_filter($outer, static fn(array $tool): bool => $tool['wire_name'] === $query))
-                : self::searchInventoryTools($outer, $search);
             $offset = isset($arguments['offset']) && is_int($arguments['offset']) ? max(0, min(100000, $arguments['offset'])) : 0;
             $limit = isset($arguments['limit']) && is_int($arguments['limit']) ? max(1, min(50, $arguments['limit'])) : 20;
             $includeSchema = !array_key_exists('include_schema', $arguments) || $arguments['include_schema'] === true;
-            $total = count($tools);
-            $page = array_map(
-                static fn(array $tool): array => self::inventoryPageEntry($tool, $includeSchema),
-                array_slice($tools, $offset, $limit)
-            );
+            $directPage = static function (array $tools) use ($exact, $query, $search, $offset, $limit, $includeSchema): array {
+                $matches = $exact
+                    ? array_values(array_filter($tools, static fn(array $tool): bool => $tool['wire_name'] === $query))
+                    : self::searchInventoryTools($tools, $search);
+                return [count($matches), array_map(
+                    static fn(array $tool): array => self::inventoryPageEntry($tool, $includeSchema),
+                    array_slice($matches, $offset, $limit)
+                )];
+            };
+            [$total, $page] = $directPage($outer);
             // Reuse this capability's snapshot, not a process-wide catalog or another
             // binding. A bound exact match is authoritative even on later pages.
-            $gateway = $exact && $total > 0 ? null : self::execGatewayIn($outer);
-            if ($gateway !== null) {
+            $gateway = self::execGatewayIn($outer);
+            $execRejected = $gateway !== null && $exact && $query === $gateway['wire_name']
+                && ToolBroker::nativeExecRejected($token, $gateway['wire_name']);
+            $native = null;
+            if ($gateway !== null && !($exact && $total > 0)) {
                 $excluded = $inventory['bound_wire_names'];
                 $nestedOffset = max(0, $offset - $total);
                 $nestedLimit = max(0, $limit - count($page));
@@ -272,7 +277,12 @@ final class McpProtocol
                 // RPC retries on the same generated program and idempotency key.
                 $marker = 'rcmaker-tool-catalog:' . substr(hash_hmac('sha256', $callKey, $token), 0, 32) . ':';
                 $program = self::nestedCatalogProgram($query, $nestedOffset, $nestedLimit, $excluded, $marker, $exact);
-                $native = self::invokeResolvedTool($token, $gateway, $callKey, null, $program);
+                try {
+                    $native = self::invokeResolvedTool($token, $gateway, $callKey, null, $program);
+                } catch (GatewayError $error) {
+                    if ($error->errorCode !== ToolBroker::NATIVE_CODE_MODE_UNAVAILABLE) throw $error;
+                    $execRejected = true;
+                }
                 if (!empty($native['paused'])) {
                     // Recovery, a queued user update or checkpoint deliberately prevents new discovery.
                     // Its control notice is not a malformed native catalog or a lost link.
@@ -285,6 +295,11 @@ final class McpProtocol
                     $native['instruction'] .= ' This invocation is native tool discovery: its eventual result lists tool names and descriptions; use each returned name as wire_name. Already available tools are supplied separately.';
                     return $native;
                 }
+                if (($native['__mcp_result']['structuredContent']['code'] ?? null) === ToolBroker::NATIVE_CODE_MODE_UNAVAILABLE) {
+                    $execRejected = true;
+                }
+            }
+            if ($native !== null && !$execRejected) {
                 $catalog = self::nestedCatalogFromHostResult($native, $marker);
                 if (!self::nestedCatalogPageIsComplete($catalog, $nestedOffset, $nestedLimit)) {
                     throw new GatewayError('nested_inventory_invalid', 'Codex 内层工具目录返回无效。', 502);
@@ -308,12 +323,25 @@ final class McpProtocol
                     $page[] = $tool;
                 }
             }
+            if ($execRejected) {
+                $outer = array_values(array_filter($outer, static fn(array $tool): bool => $tool['wire_name'] !== $gateway['wire_name']));
+                [$total, $page] = $directPage($outer);
+            }
             $discovery = $exact && $total > 0 ? [] : self::discoveryToolsForQuery($outer, $query, $includeSchema);
-            return [
+            $result = [
                 'tools' => $page,
                 'total' => $total,
                 'next_offset' => $offset + count($page) < $total ? $offset + count($page) : null,
-            ] + ($discovery !== [] ? ['discovery_tools'=>$discovery] : []);
+            ] + ($discovery !== [] ? ['discovery_tools'=>$discovery] : [])
+                + ($execRejected ? ['code'=>ToolBroker::NATIVE_CODE_MODE_UNAVAILABLE,
+                    'instruction'=>ToolBroker::NATIVE_CODE_MODE_FALLBACK] : []);
+            if ($execRejected && $native !== null) {
+                // Keep the exact rejected host receipt and its normal ACK; the catalog is a separate advisory.
+                array_pop($native['__mcp_result']['content']);
+                self::appendNativeAdvisory($native, $result);
+                return $native;
+            }
+            return $result;
         } finally {
             ToolBroker::completeActivity((string) $activity['binding_id'], (string) $activity['activity_id']);
         }
@@ -900,7 +928,10 @@ AWK;
         self::$hostReceipt = ['token' => $token, 'call_id' => $callId, 'settled' => true];
         $native = self::hostToolResultForToken($token, $result);
         $first = $native['__mcp_result']['content'][0] ?? [];
-        if (($first['type'] ?? '') === 'text' && str_starts_with((string) ($first['text'] ?? ''), 'Script running with cell ID ')
+        if (($result['wire_name'] ?? null) === 'exec' && ($result['output'] ?? null) === ToolBroker::NATIVE_EXEC_UNSUPPORTED_RESULT) {
+            self::appendNativeAdvisory($native, ['ok'=>false, 'code'=>ToolBroker::NATIVE_CODE_MODE_UNAVAILABLE,
+                'instruction'=>ToolBroker::NATIVE_CODE_MODE_FALLBACK]);
+        } elseif (($first['type'] ?? '') === 'text' && str_starts_with((string) ($first['text'] ?? ''), 'Script running with cell ID ')
             && ToolBroker::codeModeContinuation($token, $callId) !== null) {
             // Keep all native output blocks exact and acknowledge only this flushed receipt.
             // Outer exec completion means its yield arrived, not that the script finished.
@@ -908,11 +939,17 @@ AWK;
                 'resume'=>['tool'=>'codex_tool_call', 'wire_name'=>'codex.control.wait_code_mode',
                     'arguments'=>['call_id'=>$callId]],
                 'instruction'=>'The native receipt above yielded a still-running script; its task results are not final. With the same turn_token, call codex_tool_call using the exact resume wire_name and arguments above to collect this script. Repeat the returned continuation until it settles. Do not rerun exec or its batch, infer success, or give a final answer while required results are pending. This control uses the exact native cell already owned by this task. Honor newer user instructions before starting any new work.'];
-            $native['__mcp_result']['content'][] = ['type'=>'text', 'text'=>json_encode($pending,
-                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)];
-            $native['__mcp_result']['structuredContent'] = $pending;
+            self::appendNativeAdvisory($native, $pending);
         }
         return $native;
+    }
+
+    /** Append a model-facing control separately from the unchanged native output blocks. */
+    private static function appendNativeAdvisory(array &$native, array $advisory): void
+    {
+        $native['__mcp_result']['content'][] = ['type'=>'text', 'text'=>json_encode($advisory,
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)];
+        $native['__mcp_result']['structuredContent'] = $advisory;
     }
 
     /** Preserve the native host result and separately forward role-preserving Codex updates. */

@@ -12,6 +12,11 @@ use app\gateway\database\Schema;
  */
 final class ToolBroker
 {
+    public const NATIVE_EXEC_UNSUPPORTED_RESULT = 'unsupported custom tool call: exec';
+    public const NATIVE_CODE_MODE_UNAVAILABLE = 'native_code_mode_unavailable';
+    public const NATIVE_CODE_MODE_FALLBACK = 'Codex rejected its native exec entry point in this tool environment. '
+        . 'Use the directly listed Codex tools or its client tool discovery. Do not retry exec in this environment.';
+
     /** A receipt worker gets one full RPC slice plus scheduling grace before it can be proven orphaned. */
     private const RECEIPT_ORPHAN_GRACE_SECONDS = 15;
     private const CLOSED_WAIT_TRANSPORT_CODES = ['tool_wait_scope_changed', 'tool_receipt_transport_lost', 'tool_receipt_wait_closed'];
@@ -1356,6 +1361,29 @@ final class ToolBroker
         return ['tools'=>$tools, 'bound_wire_names'=>$catalog['bound_wire_names']];
     }
 
+    /** Check only the live turn's exact native tool environment and its recorded dispatch rejection. */
+    public static function nativeExecRejected(string $token, string $wireName): bool
+    {
+        $binding = self::bindingByTokenUnlocked($token);
+        self::assertLiveUnlocked($binding, true);
+        return self::nativeExecRejectedInBinding($binding, $wireName);
+    }
+
+    private static function nativeExecRejectedInBinding(array $binding, string $wireName): bool
+    {
+        $row = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations AS i')
+            ->join('gateway_response_jobs AS j', 'j.id', 'i.response_id')
+            ->where('i.binding_id', $binding['id'])->where('i.status', 'completed')
+            ->where('i.task_id', $binding['task_id'])->where('i.turn_id', $binding['turn_id'])
+            ->where('i.wire_name', $wireName)->where('i.input_text', '<>', null)
+            ->where('i.result_hash', hash('sha256', self::NATIVE_EXEC_UNSUPPORTED_RESULT))
+            ->where('j.mcp_binding_id', $binding['id'])
+            ->where('j.task_id', $binding['task_id'])->where('j.durable_turn_id', $binding['turn_id'])
+            ->where('j.tool_environment_hash', $binding['tool_environment_hash'])->find('i.id');
+        if ($row === false) throw new GatewayError('storage_unavailable', 'The native exec receipt could not be checked.', 503);
+        return is_array($row);
+    }
+
     /** Read only this live capability's original records; null leaves a colliding host tool untouched. */
     public static function readContext(string $token, mixed $arguments): ?array
     {
@@ -1530,6 +1558,11 @@ final class ToolBroker
             if (!is_array($job) || (!in_array((string) $job['status'], ['queued', 'running'], true) && !$closedToolRound)
                 || (string) ($job['mcp_binding_id'] ?? '') !== (string) $binding['id']) {
                 throw new GatewayError('tool_round_closed', '当前 Responses 工具批次已关闭，不能登记新的宿主调用。', 409);
+            }
+            if ($freeform && ($tool['name'] ?? null) === 'exec'
+                && in_array($tool['namespace'] ?? null, [null, 'functions'], true)
+                && self::nativeExecRejectedInBinding($binding, $wireName)) {
+                throw new GatewayError(self::NATIVE_CODE_MODE_UNAVAILABLE, self::NATIVE_CODE_MODE_FALLBACK, 409);
             }
             $inFlight = $db->table('gateway_tool_invocations')
                 ->where('binding_id', (string) $binding['id'])
