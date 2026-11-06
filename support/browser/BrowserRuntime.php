@@ -1452,11 +1452,11 @@ final class BrowserRuntime
                     ? (string) ($account['account_key'] ?? '') : '';
                 if ($accountKey === '') {
                     $reason = (string) ($account['reason'] ?? ($error !== null ? 'cdp_error' : 'identity_unavailable'));
-                    $allowed = ['http_error','invalid_json','invalid_session','expired_session','identity_unavailable',
+                    $allowed = ['http_error','invalid_json','invalid_session','expired_session','session_missing','identity_unavailable',
                         'wrong_origin','request_timeout','request_failed','cdp_error'];
                     if (!in_array($reason, $allowed, true)) $reason = 'identity_unavailable';
                     $status = max(0, min(599, (int) ($account['http_status'] ?? 0)));
-                    $retryable = in_array($reason, ['invalid_json','identity_unavailable','request_timeout','request_failed','cdp_error'], true)
+                    $retryable = in_array($reason, ['invalid_json','session_missing','identity_unavailable','request_timeout','request_failed','cdp_error'], true)
                         || ($reason === 'http_error' && in_array($status, [403,408,425,429,500,502,503,504], true));
                     $delay = max(min(20.0, 5.0 * (2 ** $accountAttempt)), $status === 429 ? 30.0 : 0.0,
                         max(0, min(900, (int) ($account['retry_after_seconds'] ?? 0))));
@@ -1477,8 +1477,8 @@ final class BrowserRuntime
                         }, null, false);
                         return;
                     }
-                    $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED',
-                        'The Web chat account could not be verified.', $diagnostics + ['account_checks'=>$accountChecks]);
+                    [$code, $message] = self::webChatAccountError($error === null ? $account : null);
+                    $this->connectorVerifyFail($commandId, $connectorName, $code, $message, $diagnostics + ['account_checks'=>$accountChecks]);
                     return;
                 }
                 $this->connectorProbeAccounts[$commandId] = $accountKey;
@@ -4071,8 +4071,19 @@ JS;
         }, 2.0);
     }
 
-    /** Verify ordinary-chat account ownership in the same document before reading or sending; retain one preparation deadline. */
-    private function verifyTaskChatAccount(string $responseId, int $commandId, string $sessionId, bool $recover, float $deadline): void
+    /** Only a definitive session response can request reauthentication. Transport failures remain unverified. */
+    private static function webChatAccountError(mixed $account): array
+    {
+        if (is_array($account) && (in_array($account['reason'] ?? null, ['session_missing', 'expired_session'], true)
+            || (($account['reason'] ?? null) === 'http_error' && ($account['http_status'] ?? null) === 401))) {
+            return ['authentication_required', 'Sign in to ChatGPT in the RCMAKER browser with the original account, then retry.'];
+        }
+        return ['CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.'];
+    }
+
+    /** Verify ordinary-chat account ownership in the same document before reading or sending. */
+    private function verifyTaskChatAccount(string $responseId, int $commandId, string $sessionId, bool $recover,
+        float $deadline, ?string $missingSessionDocument = null): void
     {
         $owner = $this->taskSessions[$sessionId] ?? null;
         if (!is_array($owner) || ($owner['response_id'] ?? '') !== $responseId) return;
@@ -4088,7 +4099,7 @@ JS;
         }
         $this->taskCdp->send('Runtime.evaluate', ['expression' => WebModelPage::accountFingerprintExpression(),
             'returnByValue' => true, 'awaitPromise' => true], $sessionId,
-            function ($error, $result) use ($responseId, $commandId, $sessionId, $recover, $deadline, $owner, $documentNonce): void {
+            function ($error, $result) use ($responseId, $commandId, $sessionId, $recover, $deadline, $owner, $documentNonce, $missingSessionDocument): void {
                 $currentOwner = $this->taskSessions[$sessionId] ?? [];
                 foreach (['response_id', 'surface_id', 'owner_incarnation', 'fencing_version'] as $key) {
                     if (($currentOwner[$key] ?? null) !== ($owner[$key] ?? null)) return;
@@ -4107,9 +4118,21 @@ JS;
                 }
                 $account = $result['result']['value'] ?? null;
                 if ($error !== null || !is_array($account) || empty($account['verified'])) {
-                    if (microtime(true) < $deadline) {
-                        Timer::add(1.0, fn() => $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, $recover, $deadline), [], false);
-                    } else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', $recover);
+                    [$code, $message] = self::webChatAccountError($error === null ? $account : null);
+                    $missing = $code === 'authentication_required';
+                    // A new document can briefly have no session while it initializes.
+                    // Ask once again on the same document before reporting a missing login.
+                    $delay = $missing ? 3.0 : 1.0;
+                    if ($missing && $missingSessionDocument === $documentNonce) {
+                        $this->taskFailTurn($responseId, $code, $message, $recover);
+                    } elseif (microtime(true) + $delay >= $deadline) {
+                        [$code, $message] = self::webChatAccountError(null);
+                        $this->taskFailTurn($responseId, $code, $message, $recover);
+                    } else {
+                        Timer::add($delay, fn() => $this->verifyTaskChatAccount(
+                            $responseId, $commandId, $sessionId, $recover, $deadline, $missing ? $documentNonce : null
+                        ), [], false);
+                    }
                     return;
                 }
                 $saved = (string) ($owner['web_chat']['account_key'] ?? '');
@@ -4519,7 +4542,10 @@ JS;
                             if ($ledger === null) return;
                             if ($accountError !== null || !is_array($account) || empty($account['verified'])) {
                                 if (microtime(true) < $phase['deadline']) $again();
-                                else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', true);
+                                else {
+                                    [$code, $message] = self::webChatAccountError($accountError === null ? $account : null);
+                                    $this->taskFailTurn($responseId, $code, $message, true);
+                                }
                                 return;
                             }
                             try { TaskWebChat::observe($ledger, $ledger['surface']['url'], (string) $account['account_key'], self::modelUrl()); }
@@ -6501,8 +6527,10 @@ JS;
                                     if ($accountError !== null || !is_array($account) || empty($account['verified'])) {
                                         if (microtime(true) < $deadline) {
                                             Timer::add(1.0, fn() => $this->waitTaskConnectorCatalogRefresh($responseId, $oldNonce, $deadline), null, false);
-                                        } else $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED',
-                                            'The Web chat account could not be verified.', true);
+                                        } else {
+                                            [$code, $message] = self::webChatAccountError($accountError === null ? $account : null);
+                                            $this->taskFailTurn($responseId, $code, $message, true);
+                                        }
                                         return;
                                     }
                                     try {
@@ -10282,7 +10310,8 @@ JS;
                         if (!is_array($turn)) return;
                         if ($error !== null || !is_array($account) || empty($account['verified'])) {
                             if (time() - $readySince >= 180) {
-                                $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_UNVERIFIED', 'The Web chat account could not be verified.', true);
+                                [$code, $message] = self::webChatAccountError($error === null ? $account : null);
+                                $this->taskFailTurn($responseId, $code, $message, true);
                                 return;
                             }
                             $this->scheduleTaskPoll($responseId, 1.0); return;

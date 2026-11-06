@@ -46,7 +46,8 @@ final class ChatGptPage
   if(new URL(response.url).origin!==location.origin)return failure('wrong_origin');
   if(!response.ok)return failure('http_error');
   let session;try{session=await response.json()}catch{return failure('invalid_json')}
-  if(!session||typeof session!=='object'||session.error)return failure('invalid_session');
+  if(!session||typeof session!=='object'||Array.isArray(session)||session.error)return failure('invalid_session');
+  if(Object.keys(session).length===0)return failure('session_missing');
   if(session.expires&&Date.parse(session.expires)<=Date.now())return failure('expired_session');
   const id=session.user?.id,account=session.account?.id;
   if([id,account].some(v=>typeof v!=='string'||!v||v.length>256))return failure('identity_unavailable');
