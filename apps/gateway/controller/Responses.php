@@ -120,6 +120,10 @@ final class Responses
         } catch (GatewayError $error) {
             $this->logFreeModelSelectionFailure($error, $phase, $spec ?? [], is_array($body ?? null) ? $body : []);
             $this->logSubagentAdmissionFailure($error, $phase, $spec ?? []);
+            if ($phase === 'parse' && $error->errorCode === 'invalid_request_error'
+                && str_starts_with($error->getMessage(), 'Invalid tool result call_id [')) {
+                $this->logUnexpectedCreateFailure($error, 'parse:invalid_tool_result_id', ['shape'=>$error->getMessage()]);
+            }
             if (in_array($error->errorCode, ['compaction_conflict', 'compaction_source_unavailable',
                 'compaction_busy', 'compaction_context_incomplete'], true) && isset($spec)) {
                 try {

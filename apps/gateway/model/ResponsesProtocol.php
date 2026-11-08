@@ -1031,7 +1031,15 @@ final class ResponsesProtocol
             $afterOutputs = false;
             $callId = $item['call_id'] ?? null;
             if (!is_string($callId) || !preg_match('/\A[A-Za-z0-9_.:-]{1,256}\z/', $callId)) {
-                throw new GatewayError('invalid_request_error', 'function_call_output.call_id 格式无效。', 400);
+                // This fails before a response job exists. Report only the field's
+                // structure so diagnostics can distinguish new native control items
+                // from malformed receipts without exposing IDs, output or arguments.
+                $present = array_key_exists('call_id', $item);
+                $reason = !$present ? 'missing' : (!is_string($callId) ? 'not_string'
+                    : ($callId === '' ? 'empty' : (strlen($callId) > 256 ? 'too_long' : 'invalid_characters')));
+                throw new GatewayError('invalid_request_error', 'Invalid tool result call_id [item=' . $type
+                    . '; reason=' . $reason . '; value_type=' . ($present ? get_debug_type($callId) : 'missing')
+                    . '; length=' . (is_string($callId) ? strlen($callId) : 0) . '].', 400);
             }
             $contentParts = null;
             if ($type === 'tool_search_output') {

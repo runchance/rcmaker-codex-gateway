@@ -394,7 +394,7 @@ final class DiagnosticExport
         return [array_reverse($entries), $meta];
     }
 
-    /** Extract known error signatures from free-form runtime output instead of exporting raw lines. */
+    /** Extract known error signatures and whitelisted receipt shapes; never export free-form log text. */
     private static function logSignals(string $line): array
     {
         if (preg_match('/\[storage-transaction\] (\{.*\})\s*$/D', $line, $match)) {
@@ -427,6 +427,12 @@ final class DiagnosticExport
             $signals[] = 'http_' . $match[1];
         }
         $entry = $signals === [] ? [] : ['signals' => $signals];
+        if (str_contains($line, '[responses.create]') && str_contains($line, ' phase=parse:invalid_tool_result_id ')
+            && preg_match('/selection=\{"shape":"Invalid tool result call_id \[item=(function_call_output|custom_tool_call_output|tool_search_output); reason=(missing|not_string|empty|too_long|invalid_characters); value_type=(missing|null|bool|int|float|string|array); length=([0-9]{1,12})\]\."\}\s*$/D', $line, $shape)) {
+            $entry += ['event'=>'invalid_tool_result_id', 'phase'=>'parse:invalid_tool_result_id',
+                'item_type'=>$shape[1], 'reason'=>$shape[2], 'value_type'=>$shape[3],
+                'value_length'=>min(2147483647, (int)$shape[4])];
+        }
         foreach (['phase', 'class', 'file', 'line', 'code', 'exitcode'] as $field) {
             if (preg_match('/\b' . $field . '=([A-Za-z0-9_\\\\.\-]{1,100})(?:\s|$)/', $line, $match)) {
                 $entry[$field] = self::scalar($match[1]);
