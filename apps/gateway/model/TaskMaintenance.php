@@ -8,6 +8,11 @@ use RC\Config;
 /** Task-only deletion with reusable SQLite space, consumed by the dedicated maintenance worker. */
 final class TaskMaintenance
 {
+    /** Continue the cleanup rotation across timer ticks; durable progress stays in each item. */
+    private static int $lastCleanupId = 0;
+    /** @var array<int,string> Last inspected task per unfinished batch, including clear-all requests. */
+    private static array $lastTaskIds = [];
+
     private const INACTIVE_SECONDS = 3 * 86400;
 
     /** SQL aliases are internal constants. In-flight work, not a task's display category, protects its records. */
@@ -213,27 +218,33 @@ final class TaskMaintenance
         }
     }
 
-    /** Select and recheck one unit under the admission lock; local exclusions last only for this batch. */
+    /** Rotate jobs across timer ticks, then recheck one unit under the existing admission and writer locks. */
     private static function consumeOne(array &$waitingTasks, array &$waitingJobs): bool
     {
         $lock = self::lock(LOCK_EX | LOCK_NB, false);
         if ($lock === null) return false;
         $id = null;
         try {
-            $parameters = [':retry_before' => time() - 30];
+            $parameters = [':retry_before' => time() - 30, ':after_cleanup' => self::$lastCleanupId];
             $excludedJobs = self::excludedIds('id', $waitingJobs, 'job', $parameters);
             $sql = DB('medoo', 'sqlite');
             $job = $sql->query("SELECT id FROM gateway_task_cleanup WHERE status IN ('queued','deleting','waiting_idle','compacting')
                 AND (error_code IS NULL OR error_code='' OR updated_at<=:retry_before)" . $excludedJobs . "
-                ORDER BY CASE WHEN status IN ('queued','deleting') THEN 0 ELSE 1 END,id LIMIT 1", $parameters)->fetch(\PDO::FETCH_ASSOC);
+                ORDER BY CASE WHEN id>:after_cleanup THEN 0 ELSE 1 END,id LIMIT 1", $parameters)->fetch(\PDO::FETCH_ASSOC);
             if (!is_array($job)) return self::cleanupFile(true);
             $id = (int) $job['id'];
-            $parameters = [':cleanup' => $id];
+            // Per-tick exclusions alone repeatedly revisit the oldest blocked pages
+            // when their count exceeds the operation/time budget. Keep the next turn
+            // after this job even if its page is waiting or its transaction must retry.
+            self::$lastCleanupId = $id;
+            $parameters = [':cleanup' => $id, ':after_task' => self::$lastTaskIds[$id] ?? ''];
             $excludedTasks = self::excludedIds('task_id', $waitingTasks, 'task', $parameters);
             $item = $sql->query("SELECT task_id,status FROM gateway_task_cleanup_items WHERE cleanup_id=:cleanup
-                AND status IN ('pending','waiting_surface','deleting_rows')" . $excludedTasks . ' ORDER BY task_id DESC LIMIT 1',
+                AND status IN ('pending','waiting_surface','deleting_rows')" . $excludedTasks
+                . ' ORDER BY CASE WHEN task_id<:after_task THEN 0 ELSE 1 END,task_id DESC LIMIT 1',
                 $parameters)->fetch(\PDO::FETCH_ASSOC);
             if (is_array($item)) {
+                self::$lastTaskIds[$id] = (string) $item['task_id'];
                 $progressed = Schema::transaction(static fn(): bool => self::deleteItemUnlocked($id, $item));
                 if (!$progressed) $waitingTasks[] = (string) $item['task_id'];
                 return true;
@@ -405,6 +416,7 @@ final class TaskMaintenance
         $sql->query('DELETE FROM gateway_task_cleanup WHERE status IN (\'completed\',\'failed\') AND id<:keep
             AND NOT EXISTS(SELECT 1 FROM gateway_task_cleanup_files f WHERE f.cleanup_id=gateway_task_cleanup.id)', [':keep'=>max(0,$cleanupId-20)]);
         $sql->query('DELETE FROM gateway_usage_archive WHERE accepted_at<:since', [':since'=>time()-8*86400]);
+        unset(self::$lastTaskIds[$cleanupId]);
     }
 
     /** @return int Main database file size, not an estimate of reclaimable pages. */
