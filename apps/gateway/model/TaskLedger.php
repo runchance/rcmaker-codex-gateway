@@ -1805,7 +1805,8 @@ final class TaskLedger
         WebMessageAudit::markAccepted($responseId, 'continuation');
     }
 
-    /** @return array<string,mixed> */
+    /** Replay accepted/pending continuation markers, preserving the sequence of proven-unsent abandoned controls.
+     * @return array<string,mixed> Current marker state within one durable turn. */
     private static function continuationStateUnlocked(string $turnId): array
     {
         $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $turnId)
@@ -1821,7 +1822,15 @@ final class TaskLedger
                 if (($data['reason'] ?? '') === 'audit') $auditSeen = true;
                 $state = $data + ['pending'=>true];
             } elseif (($state['marker'] ?? '') === ($data['marker'] ?? null)) {
-                if ($row['event_type'] === 'task_continuation_reset') $state = [];
+                if ($row['event_type'] === 'task_continuation_reset') {
+                    // A catalog refresh can abandon only a proven-unsent control. Keep its
+                    // sequence monotonic without counting it as a failed Web submission.
+                    $state = ($data['reason'] ?? '') === 'unsent_catalog_refresh'
+                        ? ['attempt'=>(int)$state['attempt'], 'reason'=>$state['reason'],
+                            'stream_recovery_attempt'=>max(0, (int)($state['stream_recovery_attempt'] ?? 0) - 1),
+                            'host_calls'=>(int)($state['host_calls'] ?? 0), 'pending'=>false,
+                            'marker'=>'', 'answer_hash'=>''] : [];
+                }
                 else $state['pending'] = false;
             }
         }
@@ -2739,7 +2748,8 @@ final class TaskLedger
      * @param bool $nativeControlAvailable Whether the observed native Retry can be clicked now.
      * A disabled button cannot reserve a click or prevent receipt-based page recovery.
      * @param bool $preferSamePage Caller proved a stopped, owned page with a returned Send button.
-     * @param array|null $regularRecovery Ordinary-chat-only anchored document facts; stopped_thinking also requires fresh baseline IDs.
+     * @param array|null $regularRecovery Ordinary-chat-only anchored document facts; stopped_thinking requires fresh baseline IDs.
+     * The internal catalog_refresh action additionally proves the accepted physical source, pending marker and unsent prompt hash.
      * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool,continue?:bool,marker?:string,deadline_at?:int,regular_action?:string,state?:array,published?:bool}
      * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
      */
@@ -2962,6 +2972,7 @@ final class TaskLedger
      * same-page continuation contract.
      * Caller owns the writer transaction and has validated task, capability, deadline and document.
      * @param array $facts Current bound user/assistant IDs and document time origin; resume adds fresh baseline proof.
+     * catalog_refresh abandons only a drained, proven-unsent control and restores its original observer before reloading.
      * @return array One durable action, bounded wait, or a request for the separately fenced fresh-chat fallback.
      * @throws GatewayError On changed chat/account/ownership or unavailable storage.
      */
@@ -2990,7 +3001,53 @@ final class TaskLedger
             && preg_match('/\A[a-f0-9]{64}\z/D', (string)($facts['rate_limit_key'] ?? '')) === 1;
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
         $refreshObserved = ($facts['action'] ?? '') === 'refresh_observed';
-        if ($expiredIdle) {
+        if (($facts['action'] ?? '') === 'catalog_refresh') {
+            $continuation = self::continuationStateUnlocked($turn['id']);
+            $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+                ->where('id', (string)($facts['source_response_id'] ?? ''))
+                ->find('task_id,durable_turn_id,surface_id,mcp_binding_id,command_id,accepted_at,submitted_document_nonce');
+            $sameSource = is_array($source) && !empty($source['accepted_at'])
+                && ($source['submitted_document_nonce'] === $surface['document_nonce']
+                    || $job['submitted_document_nonce'] === $surface['document_nonce']);
+            foreach (['task_id','durable_turn_id','surface_id','mcp_binding_id','command_id'] as $key) {
+                $sameSource = $sameSource && ($source[$key] ?? null) === ($job[$key] ?? null);
+            }
+            $marker = (string)($facts['marker'] ?? '');
+            if (!$sameSource || ($state['stage'] ?? '') !== 'resume' || !empty($state['connector_catalog_refreshed'])
+                || empty($continuation['pending']) || $marker === '' || ($continuation['marker'] ?? '') !== $marker
+                || ($state['marker'] ?? '') !== $marker || $state['failure_key'] !== $failureKey
+                || $state['document_nonce'] !== $surface['document_nonce']
+                || $state['document_id'] !== $facts['document_id'] || $state['user_id'] !== $facts['user_id']
+                || $state['assistant_id'] !== $facts['assistant_id']
+                || preg_match('/\A[a-f0-9]{64}\z/D', (string)($facts['prompt_hash'] ?? '')) !== 1) {
+                throw new GatewayError('continuation_marker_mismatch', 'The unsent recovery control could not be verified.', 409);
+            }
+            $outgoing = SDB(null, 'medoo', 'sqlite')->table('gateway_web_messages')->where('response_id', $job['id'])
+                ->where('direction', 'outbound')->where('kind', 'continuation')
+                ->where('sha256', $facts['prompt_hash'])->find('id');
+            if ($outgoing === false) throw new GatewayError('storage_unavailable', 'Continuation submission evidence could not be read.', 503);
+            if ($outgoing !== null) throw new GatewayError('continuation_outcome_unknown', 'The recovery control already crossed its send boundary.', 409);
+            $users = array_values(array_diff(json_decode((string)$job['baseline_users_json'], true, 512, JSON_THROW_ON_ERROR), [$state['user_id']]));
+            $assistants = array_values(array_diff(json_decode((string)$job['baseline_assistants_json'], true, 512, JSON_THROW_ON_ERROR), [$state['assistant_id']]));
+            $write = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $job['id'])
+                ->where('generation_id', $job['generation_id'])->update([
+                    'baseline_users_json'=>json_encode($users, JSON_THROW_ON_ERROR),
+                    'baseline_assistants_json'=>json_encode($assistants, JSON_THROW_ON_ERROR)]);
+            if (!$write || $write->rowCount() !== 1) throw new GatewayError('surface_fence_lost', 'Web recovery ownership changed.', 409);
+            self::eventUnlocked($job['task_id'], $turn['id'], $job['id'], $surface['id'],
+                'task_continuation_reset', ['marker'=>$marker,'reason'=>'unsent_catalog_refresh']);
+            $state['stage'] = 'refresh';
+            $state['intent_at'] = time();
+            $state['connector_catalog_refreshed'] = true;
+            $state['failure_key'] = hash('sha256', 'connector_catalog_refresh' . "\0" . $marker);
+            if (($continuation['reason'] ?? '') === 'stopped_thinking_recovery') {
+                $state['stopped_thinking_attempts'] = max(0, (int)($state['stopped_thinking_attempts'] ?? 0) - 1);
+            }
+            unset($state['marker']);
+            self::eventUnlocked($job['task_id'], $turn['id'], $job['id'], $surface['id'], 'regular_stream_recovery_intent', $state);
+            return array_replace($idle, ['regular_action'=>'refresh', 'state'=>$state,
+                'observer'=>['user_ids'=>$users,'assistant_ids'=>$assistants]]);
+        } elseif ($expiredIdle) {
             if (empty($facts['terminal']) || $hostCalls < 1
                 || !is_array($facts['user_ids'] ?? null) || !is_array($facts['assistant_ids'] ?? null)
                 || !in_array($facts['user_id'], $facts['user_ids'], true)
@@ -3124,7 +3181,8 @@ final class TaskLedger
             'document_nonce'=>$surface['document_nonce'], 'document_id'=>$facts['document_id'],
             'conversation_id'=>$chat['conversation_id'], 'user_id'=>$facts['user_id'],
             'assistant_id'=>$facts['assistant_id'], 'failure_key'=>$failureKey, 'host_calls'=>$hostCalls,
-            'intent_at'=>time()] + ($rateLimited ? ['rate_limit_attempts'=>$rateAttempts]
+            'intent_at'=>time()] + (!empty($state['connector_catalog_refreshed']) ? ['connector_catalog_refreshed'=>true] : [])
+            + ($rateLimited ? ['rate_limit_attempts'=>$rateAttempts]
                 : (!empty($state['rate_limit_attempts']) ? ['rate_limit_attempts'=>$state['rate_limit_attempts']] : []))
             + ($stoppedThinking ? ['stopped_thinking_attempts'=>$stoppedAttempts]
                 : (!empty($state['stopped_thinking_attempts']) ? ['stopped_thinking_attempts'=>$state['stopped_thinking_attempts']] : []))

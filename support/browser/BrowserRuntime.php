@@ -6401,6 +6401,10 @@ JS;
     private function refreshFreshTaskConnectorCatalog(string $responseId): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (is_array($turn) && ($turn['web_chat']['mode'] ?? '') === 'regular'
+            && !empty($turn['continuation_sending'])) {
+            return $this->refreshUnsentTaskConnectorContinuation($responseId, $turn);
+        }
         if (!is_array($turn) || !empty($turn['connector_catalog_refresh_used'])
             || !empty($turn['connector_catalog_refresh_pending'])) return false;
         try { $ledger = TaskLedger::execution($responseId); }
@@ -6415,6 +6419,59 @@ JS;
             + (($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? 120.0 : 60.0));
         $this->reloadTaskConnectorCatalog($responseId, $sessionId, $oldNonce, $deadline);
         return true;
+    }
+
+    /**
+     * Reconcile an unsent ordinary recovery control through the existing saved-chat refresh.
+     * A resumed original answer must be collected instead of receiving an extra Continue.
+     * @param string $responseId Physical observer of the accepted source message.
+     * @param array $turn Current in-memory connector preparation; the ledger proves its send boundary.
+     * @return bool Whether recovery was reserved or yielded to newer human input/work.
+     */
+    private function refreshUnsentTaskConnectorContinuation(string $responseId, array $turn): bool
+    {
+        $logicalId = (string) ($turn['logical_response_id'] ?? $responseId);
+        try {
+            $state = TaskLedger::regularStreamRecoveryState($logicalId);
+            if (($state['stage'] ?? '') !== 'resume' || !empty($state['connector_catalog_refreshed'])) return false;
+            $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId, $turn['owner_incarnation'],
+                (int) $turn['fencing_version'], $turn['document_nonce'], $state['failure_key'], false, false,
+                ['action'=>'catalog_refresh', 'source_response_id'=>$responseId,
+                    'marker'=>(string) ($turn['continuation_marker'] ?? ''),
+                    'prompt_hash'=>hash('sha256', (string) ($turn['prompt'] ?? '')),
+                    'user_id'=>$state['user_id'], 'assistant_id'=>$state['assistant_id'],
+                    'document_id'=>$state['document_id']]);
+            if (!empty($reservation['waiting'])) {
+                $ledger = TaskLedger::pollExecution($logicalId);
+                if (in_array($ledger['turn']['error_code'] ?? '',
+                    ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+                    || $this->stopForPendingSteering($responseId, $ledger)) {
+                    $this->scheduleTaskPoll($responseId, 1.0);
+                    return true;
+                }
+                Timer::add(1.0, fn() => $this->refreshFreshTaskConnectorCatalog($responseId), null, false);
+                return true;
+            }
+            if (($reservation['regular_action'] ?? '') !== 'refresh') return false;
+            $source = ResponseJob::execution($responseId);
+            $observer = $reservation['observer'];
+            $this->chatGptTurns[$responseId] = array_replace($this->chatGptTurns[$responseId], [
+                'prompt'=>$source['prompt'], 'attachments'=>$source['attachments'],
+                'baseline_users'=>$observer['user_ids'], 'baseline_assistants'=>$observer['assistant_ids'],
+                'bound_assistant_id'=>$state['assistant_id'], 'accepted'=>true,
+                'sent_at'=>(float) $source['accepted_at'], 'continuation_sending'=>false,
+                'continuation_pending'=>false, 'continuation_marker'=>'', 'connector_preparing'=>false,
+                'connector_catalog_refresh_pending'=>true, 'connector_catalog_refresh_used'=>true,
+            ]);
+            unset($this->chatGptTurns[$responseId]['regular_reload_issued'],
+                $this->chatGptTurns[$responseId]['regular_refresh_ready_since']);
+            $this->waitRegularStreamRefresh($responseId);
+            return true;
+        } catch (GatewayError) {
+            // Preserve the existing failure path for changed ownership, unknown effects or
+            // a message already across its send boundary; none authorizes a new submission.
+            return false;
+        }
     }
 
     /**
@@ -10348,6 +10405,9 @@ JS;
                                     'The refreshed Web chat could not be reattached safely; the original context and exact tool results are preserved.', 503);
                             }
                             $this->chatGptTurns[$responseId]['document_nonce'] = $nonce;
+                            if (!empty($state['connector_catalog_refreshed'])) {
+                                $this->chatGptTurns[$responseId]['connector_catalog_refresh_pending'] = false;
+                            }
                             $this->chatGptTurns[$responseId]['regular_stopped_observation'] = null;
                             unset($this->chatGptTurns[$responseId]['regular_reload_issued'],
                                 $this->chatGptTurns[$responseId]['regular_refresh_ready_since']);
