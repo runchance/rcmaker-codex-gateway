@@ -224,17 +224,23 @@ final class TaskLedger
      */
     public static function userStopOwns(array $expected): bool
     {
-        $actual = self::execution((string) $expected['job']['id']);
+        return self::ownedUserStopExecution($expected) !== null;
+    }
+
+    /** Reuse the same metadata-only ownership proof for observation and the stop transaction. */
+    private static function ownedUserStopExecution(array $expected): ?array
+    {
+        $actual = self::pollExecution((string) $expected['job']['id']);
         if (!self::ownsCurrentGeneration($actual['job'], $actual['turn'])
             || !self::userStopEligible($actual['job'], $actual['turn'], $actual['surface'])
-            || !in_array($actual['turn']['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS'], true)) return false;
+            || !in_array($actual['turn']['error_code'] ?? '', ['CODEX_USER_STOP_PENDING', 'CODEX_USER_STOP_WAITING_TOOLS'], true)) return null;
         foreach (['id', 'generation_id', 'surface_id', 'response_id'] as $key) {
-            if ($actual['turn'][$key] !== $expected['turn'][$key]) return false;
+            if ($actual['turn'][$key] !== $expected['turn'][$key]) return null;
         }
         foreach (['target_id', 'document_nonce', 'owner_incarnation', 'fencing_version'] as $key) {
-            if ($actual['surface'][$key] !== $expected['surface'][$key]) return false;
+            if ($actual['surface'][$key] !== $expected['surface'][$key]) return null;
         }
-        return true;
+        return $actual;
     }
 
     /**
@@ -294,8 +300,9 @@ final class TaskLedger
     public static function confirmUserStop(array $expected, bool $missing = false, bool $invalid = false): bool
     {
         return Schema::transaction(static function () use ($expected, $missing, $invalid): bool {
-            if (!self::userStopOwns($expected)) return false;
-            [$job, $turn, $surface] = self::executionRowsUnlocked((string) $expected['job']['id']);
+            $actual = self::ownedUserStopExecution($expected);
+            if ($actual === null) return false;
+            ['job'=>$job, 'turn'=>$turn, 'surface'=>$surface] = $actual;
             $db = SDB(null, 'medoo', 'sqlite');
             $now = time();
             if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS') {
@@ -327,14 +334,19 @@ final class TaskLedger
             if (!$updated) throw new GatewayError('storage_unavailable', '停止后的任务状态无法保存。', 503);
             // Completed tool-call responses are immutable. A live response gets one cancelled terminal.
             ResponseJob::failSupersededUnlocked((string) $job['id'], '当前回合已由 Codex 用户手动停止。', 'codex_user_cancelled');
-            $responses = $db->table('gateway_response_jobs')->where('durable_turn_id', $turn['id'])
-                ->where('command_id', '<>', null)->select('id,command_id');
-            if (!is_array($responses)) throw new GatewayError('storage_unavailable', '停止回合的浏览器命令无法读取。', 503);
-            foreach ($responses as $response) {
-                $command = $db->table('gateway_browser_commands')->where('id', $response['command_id'])->find();
-                if (!is_array($command) || !in_array($command['status'], ['queued', 'running'], true)) continue;
+            // Multiple tool receipt rounds share one physical command. Start from the
+            // indexed active command queue instead of reading every large historical row.
+            $commands = $db->table('gateway_browser_commands')->where('status', 'IN', ['queued', 'running'])
+                ->where('action', 'chatgpt_text')->select('id,payload_json');
+            if (!is_array($commands)) throw new GatewayError('storage_unavailable', '停止回合的浏览器命令无法读取。', 503);
+            foreach ($commands as $command) {
                 $payload = json_decode((string) $command['payload_json'], true);
-                if ($command['action'] === 'chatgpt_text' && ($payload['response_id'] ?? '') === $response['id']) {
+                $responseId = $payload['response_id'] ?? null;
+                if (!is_string($responseId) || $responseId === '') continue;
+                $response = $db->table('gateway_response_jobs')->where('id', $responseId)
+                    ->where('durable_turn_id', $turn['id'])->where('command_id', $command['id'])->find('id');
+                if ($response === false) throw new GatewayError('storage_unavailable', '停止回合的浏览器命令归属无法读取。', 503);
+                if (is_array($response)) {
                     BrowserState::finish((int) $command['id'], true, ['status' => 'codex_user_stopped']);
                 }
             }
