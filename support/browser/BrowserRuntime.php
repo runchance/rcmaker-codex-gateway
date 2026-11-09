@@ -4203,7 +4203,7 @@ JS;
                 $job = ResponseJob::execution($responseId);
             }
             $ledger = TaskLedger::execution($responseId);
-            $continuationState = TaskLedger::continuationState($responseId);
+            $continuationState = TaskLedger::continuationState($responseId, forBrowserObservation: true);
             $surface = $ledger['surface'];
             $session = $this->taskSessions[$sessionId] ?? null;
             if (!is_array($session)) throw new GatewayError('CHATGPT_SURFACE_ATTACH_FAILED', '任务页面控制会话已经失效。', 409);

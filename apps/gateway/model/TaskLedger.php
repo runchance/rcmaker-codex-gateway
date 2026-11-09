@@ -1774,12 +1774,19 @@ final class TaskLedger
         });
     }
 
-    /** Read the latest same-page continuation identity for safe browser recovery. */
-    public static function continuationState(string $responseId): array
+    /**
+     * Read the turn's continuation state, optionally scoped to one browser submission.
+     * @param string $responseId Response observing the page or reconciling the turn.
+     * @param bool $forBrowserObservation Restrict the marker to the same physical browser command.
+     * @return array Continuation state or an empty array when no applicable marker exists.
+     * @throws GatewayError If continuation ownership cannot be read.
+     */
+    public static function continuationState(string $responseId, bool $forBrowserObservation = false): array
     {
-        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find();
+        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)
+            ->find('task_id,durable_turn_id,surface_id,mcp_binding_id,command_id');
         if (!is_array($job) || empty($job['durable_turn_id'])) return [];
-        return self::continuationStateUnlocked((string)$job['durable_turn_id']);
+        return self::continuationStateUnlocked((string)$job['durable_turn_id'], $forBrowserObservation ? $job : null);
     }
 
     /** Confirm only the exact visible user message for a previously reserved continuation. */
@@ -1805,15 +1812,15 @@ final class TaskLedger
         WebMessageAudit::markAccepted($responseId, 'continuation');
     }
 
-    /** Replay accepted/pending continuation markers, preserving the sequence of proven-unsent abandoned controls.
-     * @return array<string,mixed> Current marker state within one durable turn. */
-    private static function continuationStateUnlocked(string $turnId): array
+    /** Replay turn-wide continuation history and scope its marker to a browser submission when requested. */
+    private static function continuationStateUnlocked(string $turnId, ?array $browserSubmission = null): array
     {
         $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $turnId)
             ->where('event_type', 'IN', ['task_continuation_intent','task_continuation_accepted','task_continuation_reset'])
-            ->order([['id','ASC']])->select('event_type,data_json');
+            ->order([['id','ASC']])->select('response_id,event_type,data_json');
         if (!is_array($rows)) throw new GatewayError('storage_unavailable', '任务继续状态暂不可读取。', 503);
         $state = [];
+        $markerResponseId = null;
         $auditSeen = false;
         foreach ($rows as $row) {
             $data = json_decode((string)$row['data_json'], true);
@@ -1821,6 +1828,7 @@ final class TaskLedger
             if ($row['event_type'] === 'task_continuation_intent') {
                 if (($data['reason'] ?? '') === 'audit') $auditSeen = true;
                 $state = $data + ['pending'=>true];
+                $markerResponseId = $row['response_id'];
             } elseif (($state['marker'] ?? '') === ($data['marker'] ?? null)) {
                 if ($row['event_type'] === 'task_continuation_reset') {
                     // A catalog refresh can abandon only a proven-unsent control. Keep its
@@ -1833,6 +1841,14 @@ final class TaskLedger
                 }
                 else $state['pending'] = false;
             }
+        }
+        if ($browserSubmission !== null && !empty($state['marker'])) {
+            // Receipt rounds change generation IDs but retain the physical browser command.
+            // A new human submission on the same turn and page has a different command.
+            $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', (string)$markerResponseId)
+                ->find('task_id,durable_turn_id,surface_id,mcp_binding_id,command_id');
+            if ($source === false) throw new GatewayError('storage_unavailable', '网页继续消息的来源暂不可读取。', 503);
+            if (!is_array($source) || empty($source['command_id']) || $source !== $browserSubmission) return [];
         }
         if ($auditSeen) $state['audit_seen'] = true;
         return $state;
