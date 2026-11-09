@@ -9992,11 +9992,12 @@ JS;
             return;
         }
         if (empty($retry['retry'])) {
-            if (!empty($retry['waiting'])) {
+            $capacityExpired = $errorCode === 'CHATGPT_CONVERSATION_EXHAUSTED' && !empty($turn['response_deadline_expired']);
+            if (!empty($retry['waiting']) && !$capacityExpired) {
                 $this->scheduleTaskPoll($responseId, 0.5);
                 return;
             }
-            if ($waitForPending && empty($job['output_started']) && (string)($job['output_text'] ?? '') === '') {
+            if ($waitForPending && !$capacityExpired && empty($job['output_started']) && (string)($job['output_text'] ?? '') === '') {
                 $db = SDB(null, 'medoo', 'sqlite');
                 $pending = $db->table('gateway_tool_invocations')->where('task_id', (string)$job['task_id'])
                     ->where('status', 'IN', ['registered','delivered'])->count();
@@ -10027,7 +10028,7 @@ JS;
 
     /**
      * A native current-turn capacity callout is a terminal property of this conversation.
-     * It has no useful same-page Retry action. Ordinary history planning can outlast a
+     * It has no useful same-page Retry action. History planning can outlast a
      * transient renderer state, so read the same owned callout again after that work and
      * replace only if the page is still stopped. Other failures retain their existing flow.
      * @param string $responseId Physical browser observer whose logical response may advance with tools.
@@ -10060,10 +10061,6 @@ JS;
             'document_nonce'=>(string)($turn['document_nonce'] ?? ''),
             'conversation_id'=>(string)($turn['web_chat']['conversation_id'] ?? ''),
         ];
-        if (($turn['web_chat']['mode'] ?? 'temporary') !== 'regular') {
-            $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_CONVERSATION_EXHAUSTED', false, $proof);
-            return;
-        }
         if (!empty($turn['capacity_planning_pending'])) return;
         $logicalId = (string)($turn['logical_response_id'] ?? $responseId);
         $planningKey = hash('sha256', $logicalId . '|' . $descriptorHash . '|' . $failureHash
@@ -10075,7 +10072,9 @@ JS;
             'request_fingerprint'=>$descriptorHash, 'response_fingerprint'=>$failureHash,
         ]);
         try {
-            $prepared = ToolBroker::prepareRegularRetryContext($logicalId);
+            $prepared = ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                ? ToolBroker::prepareRegularRetryContext($logicalId)
+                : ToolBroker::prepareTemporaryRetryContext($logicalId);
         } catch (GatewayError $error) {
             unset($this->chatGptTurns[$responseId]['capacity_planning_pending']);
             if ($error->errorCode === 'STORAGE_BUSY') $this->scheduleTaskPoll($responseId, 0.5);
@@ -10089,7 +10088,8 @@ JS;
         }
         $expression = WebModelPage::responseExpression((array)($turn['baseline_users'] ?? []),
             (array)($turn['baseline_assistants'] ?? []), (string)($turn['continuation_marker'] ?? ''),
-            (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), $responseId, true);
+            (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), $responseId,
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
         $this->evaluateTaskSession((string)($turn['session_id'] ?? ''), $expression,
             function ($error, $fresh) use ($responseId, $logicalId, $turn, $terminal,
                 $proof, $prepared, $planningKey, $started): void {

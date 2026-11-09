@@ -2254,6 +2254,11 @@ final class TaskLedger
                 && !empty($job['mcp_binding_id']) && $preparedRetryContext === null) {
                 return ['retry'=>false, 'exhausted'=>false, 'attempt'=>$attempt];
             }
+            if ($conversationCapacity && $job['operation_kind'] === 'response' && empty($preparedRetryContext)
+                && ToolBroker::retireCapacityUndeliveredCallsUnlocked($job) > 0) {
+                // Re-plan outside the writer using the updated receipt and capability state.
+                return ['retry'=>false, 'exhausted'=>false, 'attempt'=>(int)$attempts, 'waiting'=>true];
+            }
             // A missing source page changes only the checkpoint transport: no historical
             // host permission may be replayed on the new page. Provenance remains pinned.
             $rotated = $retainedCompact
@@ -2862,7 +2867,8 @@ final class TaskLedger
                 }
                 if ($call['status'] === 'cancelled') {
                     $result = json_decode((string)($call['result_json'] ?? ''), true);
-                    if (empty($result['compaction_interrupted']) && empty($result['steering_interrupted'])) {
+                    if (empty($result['compaction_interrupted']) && empty($result['steering_interrupted'])
+                        && empty($result['conversation_capacity_interrupted'])) {
                         throw new GatewayError('task_network_retry_unknown', '已取消工具缺少执行前中止证据，不能自动重试网页回答。', 409);
                     }
                 }

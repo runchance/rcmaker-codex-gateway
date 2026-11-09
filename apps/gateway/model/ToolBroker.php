@@ -694,6 +694,39 @@ final class ToolBroker
         return $prepared;
     }
 
+    /**
+     * Retire the exact unpublished queue of a verified terminal page under the recovery writer.
+     * @param array $job Current owned response whose capacity card was revalidated by the browser.
+     * @return int Number of registered calls cancelled before delivery. No result is manufactured.
+     * @throws GatewayError If the durable queue or capability state cannot be read or written.
+     */
+    public static function retireCapacityUndeliveredCallsUnlocked(array $job): int
+    {
+        $bindingId = (string) ($job['mcp_binding_id'] ?? '');
+        if ($bindingId === '') return 0;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $bindingId)
+            ->find('task_id,turn_id,current_response_id,status');
+        if ($binding === false) throw new GatewayError('storage_unavailable', 'The terminal tool binding could not be read.', 503);
+        if (!is_array($binding) || $binding['status'] !== 'running' || $binding['task_id'] !== $job['task_id']
+            || $binding['turn_id'] !== $job['durable_turn_id'] || $binding['current_response_id'] !== $job['id']
+            || self::activeCountUnlocked($bindingId) !== 0) return 0;
+        $updated = $db->table('gateway_tool_invocations')->where('binding_id', $bindingId)
+            ->where('task_id', $job['task_id'])->where('turn_id', $job['durable_turn_id'])->where('response_id', $job['id'])
+            ->where('status', 'registered')->where('delivery_count', 0)->where('delivered_at', null)
+            ->where('completed_at', null)->where('result_delivered_at', null)->where('result_json', null)->where('result_hash', null)
+            ->update(['status'=>'cancelled', 'result_json'=>json_encode(['conversation_capacity_interrupted'=>true], JSON_THROW_ON_ERROR),
+                'updated_at'=>time()]);
+        if (!$updated) throw new GatewayError('storage_unavailable', 'The terminal tool queue could not be retired.', 503);
+        $count = $updated->rowCount();
+        if ($count > 0) {
+            self::bumpRevisionUnlocked($bindingId);
+            self::eventUnlocked($job['task_id'], $job['durable_turn_id'], $job['id'],
+                'capacity_undelivered_tools_cancelled', ['count'=>$count]);
+        }
+        return $count;
+    }
+
     private static function prepareFreshPageRetryContext(string $responseId, bool $regular): ?array
     {
         $db = SDB(null, 'medoo', 'sqlite');
@@ -1312,7 +1345,8 @@ final class ToolBroker
         }
         foreach ($calls as $call) {
             $result = json_decode((string)($call['result_json'] ?? ''), true);
-            if ($call['status'] === 'cancelled' && !empty($result['steering_interrupted'])) continue;
+            if ($call['status'] === 'cancelled'
+                && (!empty($result['steering_interrupted']) || !empty($result['conversation_capacity_interrupted']))) continue;
             if ($call['status'] !== 'completed'
                 || ($call['result_delivered_at'] === null && empty($result['canonical_handoff_response_id']))
                 || !array_key_exists((string)$call['call_id'], $receipts)) return false;
