@@ -2184,9 +2184,12 @@ final class TaskLedger
             if ($conversationCapacity) {
                 $hash = static fn($value): bool => is_string($value) && preg_match('/\A[a-f0-9]{64}\z/', $value) === 1;
                 $userId = is_array($terminalProof) ? (string)($terminalProof['user_id'] ?? '') : '';
-                $assistantId = is_array($terminalProof) ? (string)($terminalProof['response_id'] ?? '') : '';
+                // An explicit empty assistant ID is the adapter's verified user-only terminal.
+                $assistantId = $terminalProof['response_id'] ?? null;
                 if (!is_array($terminalProof) || !$hash($terminalProof['descriptor_hash'] ?? null)
-                    || !$hash($terminalProof['failure_id_hash'] ?? null) || $userId === '' || $assistantId === ''
+                    || !$hash($terminalProof['failure_id_hash'] ?? null) || $userId === ''
+                    || !is_string($assistantId)
+                    || ($assistantId === '' && ($terminalProof['current_user_without_answer'] ?? null) !== true)
                     || strlen($userId) > 512 || strlen($assistantId) > 512
                     || !self::ownsCurrentGeneration($job, $turn)
                     || (string)($terminalProof['generation_id'] ?? '') !== (string)$job['generation_id']

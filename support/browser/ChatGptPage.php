@@ -236,7 +236,7 @@ JS;
         return false;
     }
 
-    /** Match the backend's explicit per-message HTTP 413 on conversation submission. */
+    /** Match a conversation POST rejection that still needs renderer classification. */
     public static function isBackendMessageTooLarge(string $url, int $status, string $modelUrl): bool
     {
         if ($status !== 413 || !self::isBackendUrl($url, $modelUrl)) return false;
@@ -1682,6 +1682,10 @@ const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(can
     return newUser?after(newUser.el,candidate):false;
 });
 const conversationReplacement=conversationReplacementCard(newUser,answer);
+if(conversationReplacement&&!answer&&newUser&&newUser===lastUser&&strong(newUser.id)
+    &&answerCandidates.length===0&&sameGroupAnswers.length===0){
+    conversationReplacement.descriptor.current_user_without_answer=true;
+}
 const networkCard=conversationReplacement?null:networkErrorCard(newUser,answer,__REGULAR_RECOVERY__);
 const networkRetry=networkCard?.descriptor||null;
 if(conversationReplacement)error={code:'CHATGPT_CONVERSATION_EXHAUSTED',message:'This ChatGPT conversation has reached its terminal capacity and must continue in a new chat.'};

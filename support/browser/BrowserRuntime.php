@@ -33,6 +33,7 @@ final class BrowserRuntime
     /** Coalesce user-visible waiting notices; polling must not turn into frequent SQLite writes. */
     private array $taskCooldownNotices = [];
     private const CONNECTOR_NO_START_MAX_RETRIES = 3;
+    private const SUBMISSION_REJECTION_RENDER_WAIT = 30.0;
     private const CONNECTOR_RUNTIME_PROBE_MAX_RETRIES = 3;
     /** A terminal DOM must remain unchanged before completion. */
     private const COMPLETION_SETTLE_SECONDS = 2.0;
@@ -7873,11 +7874,12 @@ JS;
                     return;
                 }
             }
+            if (($snapshot['error']['code'] ?? '') === 'CHATGPT_CONVERSATION_EXHAUSTED') {
+                $this->recoverExhaustedConversation($responseId, $snapshot);
+                return;
+            }
+            if ($this->handleTaskPayloadRejection($responseId, $snapshot, $session)) return;
             if (is_array($snapshot['error'] ?? null)) {
-                if (($snapshot['error']['code'] ?? '') === 'CHATGPT_CONVERSATION_EXHAUSTED') {
-                    $this->recoverExhaustedConversation($responseId, $snapshot);
-                    return;
-                }
                 if (($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING') {
                     $this->recordStoppedThinkingObservation($responseId, $snapshot);
                 }
@@ -10041,10 +10043,11 @@ JS;
         $terminal = $snapshot['conversation_replacement'] ?? null;
         if (!is_array($turn) || !is_array($terminal)
             || ($snapshot['generation_running'] ?? null) !== false
+            || !empty($snapshot['stop_confirmation_pending'])
             || empty($terminal['available']) || empty($terminal['failure_id']) || empty($terminal['fingerprint'])
-            || empty($terminal['user_id']) || empty($terminal['response_id'])
+            || empty($terminal['user_id']) || !is_string($terminal['response_id'] ?? null)
             || ($terminal['user_id'] ?? null) !== ($snapshot['new_user_id'] ?? null)
-            || ($terminal['response_id'] ?? null) !== ($snapshot['response_id'] ?? null)
+            || !self::capacityAnswerMatches($terminal, $snapshot)
             || !$this->taskChatMatches($responseId, (string)($snapshot['url'] ?? ''))) {
             $this->taskFailTurn($responseId, 'CHATGPT_CONVERSATION_EXHAUSTED',
                 'The Web conversation reached a terminal state, but its current task ownership could not be confirmed.', true);
@@ -10057,6 +10060,7 @@ JS;
             'failure_id_hash'=>$failureHash,
             'user_id'=>(string)$terminal['user_id'],
             'response_id'=>(string)$terminal['response_id'],
+            'current_user_without_answer'=>$terminal['response_id'] === '',
             'generation_id'=>(string)($turn['generation_id'] ?? ''),
             'document_nonce'=>(string)($turn['document_nonce'] ?? ''),
             'conversation_id'=>(string)($turn['web_chat']['conversation_id'] ?? ''),
@@ -10128,7 +10132,7 @@ JS;
                     $same = $same && ($replacement[$key] ?? null) === ($terminal[$key] ?? null);
                 }
                 $same = $same && ($fresh['new_user_id'] ?? null) === $terminal['user_id']
-                    && ($fresh['response_id'] ?? null) === $terminal['response_id'];
+                    && self::capacityAnswerMatches($terminal, $fresh);
                 $facts = ['same_terminal'=>$same,
                     'conversation_replacement_available'=>is_array($replacement) && !empty($replacement['available']),
                     'elapsed_ms'=>(int)round((microtime(true)-$started)*1000),
@@ -10146,6 +10150,21 @@ JS;
                 $this->recoverFailedMessageStream($responseId, true, 'CHATGPT_CONVERSATION_EXHAUSTED',
                     true, $proof, $prepared ?? []);
             }, 15.0);
+    }
+
+    /**
+     * A native capacity rejection can follow the submitted user message without
+     * creating an assistant turn. Require an unambiguous current user and no
+     * answer candidate; an unbound or replaced assistant is not an empty answer.
+     */
+    private static function capacityAnswerMatches(array $terminal, array $snapshot): bool
+    {
+        if ($terminal['response_id'] !== '') return ($snapshot['response_id'] ?? null) === $terminal['response_id'];
+        return ($terminal['current_user_without_answer'] ?? null) === true
+            && ($snapshot['new_user'] ?? null) === true
+            && ($snapshot['response_id'] ?? null) === null
+            && ($snapshot['response_present'] ?? null) === false
+            && ($snapshot['answer_candidate_count'] ?? null) === 0;
     }
 
     /**
@@ -11117,6 +11136,32 @@ JS;
     }
 
     /**
+     * Wait for the owned renderer to distinguish a full chat from a rejected
+     * message. A bare transport status cannot authorize replacement or compaction.
+     */
+    private function handleTaskPayloadRejection(string $responseId, array $snapshot, array $session): bool
+    {
+        $rejectedAt = (float)($session['submission_payload_rejected_at'] ?? 0.0);
+        if ($rejectedAt <= 0.0 || !empty($snapshot['generation_running']) || !empty($snapshot['content_present'])) return false;
+        if (microtime(true) - $rejectedAt < self::SUBMISSION_REJECTION_RENDER_WAIT
+            || $this->waitForTaskSubmissionError($responseId)) {
+            $this->scheduleTaskPoll($responseId, 0.5);
+            return true;
+        }
+        $sizeError = $session['submission_size_error'] ?? null;
+        if (is_string($sizeError)) {
+            $this->taskFailTurn($responseId, 'CHATGPT_MESSAGE_TOO_LARGE',
+                'ChatGPT 响应流明确拒绝当前单条消息（' . $sizeError . '）；完整上下文已保留。');
+        } elseif (($snapshot['error']['code'] ?? '') === 'CHATGPT_MESSAGE_TOO_LARGE') {
+            $this->taskFailTurn($responseId, 'CHATGPT_MESSAGE_TOO_LARGE', (string)$snapshot['error']['message']);
+        } else {
+            $this->taskFailTurn($responseId, 'CHATGPT_SUBMISSION_REJECTED',
+                'ChatGPT rejected this submission without a verified conversation capacity or message size error. The original context is preserved.');
+        }
+        return true;
+    }
+
+    /**
      * On a DOM failure, briefly allow the current browser POST to finish and inspect its body.
      * Successful replies incur no body reads; no private API is called or replayed here.
      */
@@ -11140,6 +11185,10 @@ JS;
                     $body = (string) ($result['body'] ?? '');
                     if (!empty($result['base64Encoded'])) $body = base64_decode($body, true) ?: '';
                     $code = WebModelPage::submissionSizeError($body);
+                    if (!empty($this->taskSessions[$sessionId]['submission_payload_rejected_at'])) {
+                        $this->taskSessions[$sessionId]['submission_size_error'] = $code;
+                        return;
+                    }
                     if ($code !== null) $this->taskFailTurn($responseId, 'CHATGPT_MESSAGE_TOO_LARGE',
                         'ChatGPT 响应流明确拒绝当前单条消息（' . $code . '）；完整上下文已保留。');
                 }, 2.0);
@@ -11242,6 +11291,8 @@ JS;
                     'submission_request_started_at'=>microtime(true), 'submission_finished_at'=>0.0,
                     'submission_failed'=>false,
                     'submission_canceled'=>false, 'submission_error_code'=>null, 'submission_http_status'=>null,
+                    'submission_payload_rejected_at'=>null,
+                    'submission_size_error'=>null,
                     'submission_protocol'=>null,
                     'submission_rate_limit_key'=>null,
                     'submission_limit_requires_action'=>false,
@@ -11338,6 +11389,13 @@ JS;
                 && WebModelPage::isBackendMessageTooLarge($url, $status, self::modelUrl())) {
                 $responseId = (string) ($owner['response_id'] ?? '');
                 if ($responseId !== '') {
+                    $turn = $this->chatGptTurns[$responseId] ?? [];
+                    if (!empty($turn['sent_at']) && ($turn['operation_kind'] ?? '') === 'response') {
+                        // Final executable submissions have an owned DOM observer. The
+                        // inert multipart staging path keeps its existing size recovery.
+                        $this->taskSessions[$sessionId]['submission_payload_rejected_at'] ??= microtime(true);
+                        return;
+                    }
                     $this->taskFailTurn(
                         $responseId,
                         'CHATGPT_MESSAGE_TOO_LARGE',
