@@ -49,9 +49,12 @@ final class TaskPageRetirement
         $physical = $source;
         if (!self::wasSubmitted($physical)) {
             foreach (['submit_intent_at','accepted_at','transport_stage_sent'] as $field) {
-                $query = $db->table('gateway_response_jobs')->where('task_id', $taskId)->where('surface_id', $sourceSurfaceId);
-                $candidate = $query->where($field, '>', 0)
-                    ->order([['rowid','DESC']])->limit(1)->find(self::SOURCE_FIELDS);
+                $candidate = $field === 'submit_intent_at' ? self::journaledSubmitSource($taskId, $sourceSurfaceId) : null;
+                if ($candidate === null) {
+                    $candidate = $db->table('gateway_response_jobs')->where('task_id', $taskId)
+                        ->where('surface_id', $sourceSurfaceId)->where($field, '>', 0)
+                        ->order([['rowid','DESC']])->limit(1)->find(self::SOURCE_FIELDS);
+                }
                 if ($candidate === false) throw new GatewayError('storage_unavailable', 'Retired page submission could not be read.', 503);
                 if (is_array($candidate) && self::wasSubmitted($candidate)
                     && ($source === null || $candidate['id'] !== $source['id'])) {
@@ -100,6 +103,37 @@ final class TaskPageRetirement
             'surface_id'=>$id, 'task_id'=>$taskId, 'state'=>$empty ? 'stopped' : 'pending',
             'snapshot_json'=>self::encode($snapshot), 'created_at'=>time(), 'updated_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', 'Retired page stop obligation could not be saved.', 503);
+    }
+
+    /**
+     * Resolve a physical submit through the intent event committed with submit_intent_at.
+     * Receipts may number in the hundreds but have no submit event of their own. Keep
+     * the original latest-response ordering, including when event order differs.
+     * @return array|null Exact source row, or no journaled intent for this surface.
+     */
+    private static function journaledSubmitSource(string $taskId, string $surfaceId): ?array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $events = $db->table('gateway_task_events')->where('task_id', $taskId)
+            ->where('surface_id', $surfaceId)->where('event_type', 'submit_intent')->select('response_id');
+        if (!is_array($events)) throw new GatewayError('storage_unavailable', 'Retired page submit events could not be read.', 503);
+        $ids = array_values(array_unique(array_filter(array_column($events, 'response_id'), 'is_string')));
+        $latest = null;
+        foreach (array_chunk($ids, 128) as $chunk) {
+            // Use primary-key lookups only. Adding the task predicate here can make
+            // SQLite walk the task's wide response history instead of these exact IDs.
+            $rows = $db->table('gateway_response_jobs')->where('id', 'IN', $chunk)
+                ->select('rowid,id,task_id,surface_id,submit_intent_at');
+            if (!is_array($rows)) throw new GatewayError('storage_unavailable', 'Retired page submit source could not be read.', 503);
+            foreach ($rows as $row) {
+                if ($row['task_id'] !== $taskId || $row['surface_id'] !== $surfaceId || (int)$row['submit_intent_at'] <= 0) continue;
+                if ($latest === null || (int)$row['rowid'] > (int)$latest['rowid']) $latest = $row;
+            }
+        }
+        if ($latest === null) return null;
+        $source = $db->table('gateway_response_jobs')->where('id', $latest['id'])->find(self::SOURCE_FIELDS);
+        if (!is_array($source)) throw new GatewayError('storage_unavailable', 'Retired page submit source could not be read.', 503);
+        return $source;
     }
 
     /**
