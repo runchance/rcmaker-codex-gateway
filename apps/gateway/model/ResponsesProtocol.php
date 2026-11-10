@@ -993,7 +993,7 @@ final class ResponsesProtocol
      * Human input does not end a parallel receipt batch; the preceding assistant/call or
      * compaction record remains the boundary. Task ownership and issued call IDs are then
      * verified by ContextHistory and ToolBroker before any result can be accepted.
-     * Execution-only configuration updates do not split that native receipt batch.
+     * Configuration updates and native Page snapshots do not split that batch.
      */
     private static function toolOutputs(mixed $input): array
     {
@@ -1027,6 +1027,7 @@ final class ResponsesProtocol
                 if ($item['name'] === 'send_message_to_thread') continue;
                 break;
             }
+            if ($type === 'function_call_output' && self::isCodexPageSnapshot($item)) continue;
             if (!in_array($type, ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)) break;
             $afterOutputs = false;
             $callId = $item['call_id'] ?? null;
@@ -1058,6 +1059,42 @@ final class ResponsesProtocol
                 ...($contentParts !== null ? ['content_parts' => $contentParts] : [])];
         }
         return array_reverse($outputs);
+    }
+
+    /**
+     * Recognize Codex desktop Page context carried in a function-output envelope.
+     * These sidecar records have no call ID and remain in history as untrusted
+     * context. Only their receipt classification changes; all actual calls still
+     * require their original call_id and the normal ownership checks.
+     */
+    private static function isCodexPageSnapshot(array $item): bool
+    {
+        if (($item['namespace'] ?? null) !== 'agent' || array_key_exists('call_id', $item)
+            || !is_string($item['name'] ?? null) || !is_string($item['output'] ?? null)) return false;
+        $name = $item['name'];
+        $output = $item['output'];
+        if ($name !== 'codex_apps_open_page'
+            && preg_match('/\Acodex_apps_selected_page_part_([1-9][0-9]{0,3})_of_([1-9][0-9]{0,3})\z/D', $name, $part) !== 1) return false;
+        $metadata = $item['internal_chat_message_metadata_passthrough'] ?? null;
+        if ($metadata instanceof \stdClass) $metadata = get_object_vars($metadata);
+        if (!is_array($metadata)) return false;
+        $turnId = $metadata['turn_id'] ?? null;
+        $createdAt = $metadata['create_time'] ?? null;
+        if (!is_string($turnId) || !CodexCancellation::uuid($turnId)
+            || (!is_int($createdAt) && !is_float($createdAt)) || !is_finite($createdAt) || $createdAt <= 0) return false;
+        if ($name !== 'codex_apps_open_page') {
+            if ((int)$part[1] > (int)$part[2]) return false;
+            $header = "Companion Page snapshot part {$part[1]} of {$part[2]}:";
+            $newline = strpos($output, "\n");
+            if ($newline === false || rtrim(substr($output, 0, $newline), "\r") !== $header) return false;
+            $output = substr($output, $newline + 1);
+            // A multipart record may contain only a fragment of the JSON snapshot.
+            if ($part[2] !== '1') return trim($output) !== '';
+        }
+        $snapshot = json_decode($output);
+        return $snapshot instanceof \stdClass && property_exists($snapshot, 'page_id')
+            && ($name === 'codex_apps_open_page' || property_exists($snapshot, 'document_view'))
+            && ($snapshot->page_id === null || is_string($snapshot->page_id));
     }
 
     public static function isCodexDelegation(array $item): bool
