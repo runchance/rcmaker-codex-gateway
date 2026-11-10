@@ -11,6 +11,7 @@ final class AttachmentStore
     public const MAX_ATTACHMENTS = 10;
     public const MAX_FILE_BYTES = 20000000;
     public const MAX_TURN_BYTES = 50000000;
+    private const LEGACY_REFERENCE_SCAN_MAX_BYTES = 64 * 1024 * 1024;
 
     private const IMAGE_EXTENSIONS = [
         'image/png' => 'png',
@@ -317,6 +318,7 @@ final class AttachmentStore
     public static function cleanupOrphans(int $olderThanSeconds = 86400, ?string &$afterId = null, int $limit = 0): int
     {
         Schema::initialize();
+        if (!self::canScanLegacyReferences()) return 0;
         $cutoff = time() - max(3600, $olderThanSeconds);
         $db = DB('medoo', 'sqlite');
         $candidates = $db->query(
@@ -379,6 +381,29 @@ final class AttachmentStore
             if ($removedCandidate === true) $removed++;
         }
         return $removed;
+    }
+
+    /**
+     * Bound optional legacy reference scans by the live SQLite page footprint.
+     * Modern relation lookups still work on large stores. If a legacy scan is
+     * too expensive or its size cannot be read, callers must preserve the file.
+     * @return bool Whether a full legacy reference scan fits the maintenance budget.
+     */
+    public static function canScanLegacyReferences(): bool
+    {
+        $db = DB('medoo', 'sqlite');
+        $values = [];
+        foreach (['page_count', 'freelist_count', 'page_size'] as $pragma) {
+            $statement = $db->query('PRAGMA ' . $pragma);
+            if (!$statement) return false;
+            try { $value = $statement->fetchColumn(); }
+            finally { $statement->closeCursor(); }
+            if (!is_numeric($value)) return false;
+            $values[] = (int) $value;
+        }
+        [$pages, $free, $pageSize] = $values;
+        return $free >= 0 && $pages >= $free && $pageSize > 0
+            && ($pages - $free) * $pageSize <= self::LEGACY_REFERENCE_SCAN_MAX_BYTES;
     }
 
     private static function persist(string $kind, string $filename, string $mime, string $bytes, array $metadata): array

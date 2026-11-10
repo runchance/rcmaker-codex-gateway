@@ -457,7 +457,7 @@ A recorded send intent is different from confirmed Web receipt. Compare it with 
 
 ### Clear task records
 
-Use **Clear all idle tasks** in Task center and review its confirmation. Running tasks, executing tools and approval waits are skipped. Cleanup does not target project source files or Codex chats. Referenced checkpoints or attachments may remain. Freed database space is reused by later writes; the running gateway does not automatically compact the entire database. See the [cleanup FAQ](faq.en.md#cleanup).
+Use **Clear all idle tasks** in Task center and review its confirmation. Running tasks, executing tools and approval waits are skipped. Cleanup does not target project source files or Codex chats. Referenced checkpoints or attachments may remain. When the database has over 64 MiB of used pages, cleanup preserves attachments that would require scanning the full legacy history to verify their references. Freed database space is reused by later writes; the running gateway does not automatically compact the entire database. See the [cleanup FAQ](faq.en.md#cleanup).
 
 A separate maintenance process checkpoints database logs; browser and API commits no longer also process an accumulated log backlog. Maintenance uses `PASSIVE` checkpoints, leaving pages blocked by active readers or writers for a later pass without ending their snapshots or waiting for their locks. Commits retain full synchronization to disk. Safely recycled logs retain at most 16 MiB for reuse; this does not cap logs still awaiting a checkpoint. Maintenance and business processes still share the disk, so slow storage or long business write transactions can affect responsiveness.
 
@@ -580,13 +580,14 @@ Use the console for preferences and credentials; ordinary operation does not req
 | `browser_debug_port` | `28912`, private browser control |
 | `native_api_port` | `28913`, internal native API worker |
 | `web_api_port` | `28914`, internal Web API worker |
+| `control_api_port` | `28915`, internal console API worker |
 | `data_directory` | `data`, a directory name beside the program, not an arbitrary absolute path |
 | `default_locale` | `en`, used before a language preference has been saved |
 | `codex_home` | Empty for automatic detection; can target another Codex configuration directory |
 
 Codex configuration is resolved in this order: `.env` → `[gateway] codex_home`, then `CODEX_HOME`, then the current user's `.codex` directory. Windows uses `USERPROFILE` or `HOMEDRIVE` + `HOMEPATH`; Linux/macOS use `HOME`, with the effective user's home as a fallback. The gateway reads `config.toml` from that directory, independently of its own `data/` directory. Browser installation selects the host OS and CPU package; it preserves Unix executable permissions and internal application-bundle links.
 
-All five ports must differ and listen only on the local computer. Codex continues to use `api_port`, which routes requests and relays responses asynchronously. Native forwarding and Web task handling run in separate API processes while sharing the existing business code and data. The two internal ports do not need to be added to Codex configuration. Process isolation reduces mutual blocking; CPU, memory and the database remain shared resources.
+All six ports must differ and listen only on the local computer. Codex and the console continue to use `api_port`, which routes requests and relays responses asynchronously. Native forwarding, Web tasks and console operations each use a separate API process. Leave the internal ports out of Codex configuration. CPU, memory and SQLite remain shared across the processes.
 
 Fully stop and start RCMAKER after deployment changes so the new processes are loaded. If the Codex endpoint changes, preview/save integration again and restart Codex. Changing `data_directory` selects another store; **it does not migrate existing login state or tasks**.
 

@@ -4,6 +4,7 @@ return [
         'gateway' => [support\middleware\GatewayLocal::class],
         'gateway_entry' => [support\middleware\GatewayLocal::class],
         'gateway_native' => [support\middleware\GatewayLocal::class],
+        'gateway_control' => [support\middleware\GatewayLocal::class],
     ],
     'static_middleware' => [support\middleware\GatewayConsole::class],
 ];

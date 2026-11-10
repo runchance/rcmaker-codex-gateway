@@ -9776,14 +9776,26 @@ JS;
     {
         if (empty($surface['document_nonce']) || ($job['surface_id'] ?? null) !== ($surface['id'] ?? null)
             || ($job['task_id'] ?? null) !== ($surface['task_id'] ?? null)) return false;
-        $query = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
-            ->where('task_id', $job['task_id'])->where('surface_id', $surface['id'])
-            ->where('submitted_document_nonce', $surface['document_nonce'])
-            ->where('submit_intent_at', '<>', null)->where('accepted_at', '<>', null);
+        // An accepted source with a nonempty or invalid raw baseline cannot
+        // prove an initial send, regardless of which accepted row is latest.
+        if (!empty($job['submit_intent_at']) && !empty($job['accepted_at']) && array_key_exists('baseline_users_json', $job)
+            && json_decode((string) $job['baseline_users_json']) !== []) return false;
         // Read the original JSON: decoded compatibility defaults cannot distinguish []
         // from missing or malformed legacy metadata and must not grant a first-send proof.
-        $source = $query->order([['rowid', 'DESC']])->limit(1)
-            ->find('id,submit_intent_at,accepted_at,submitted_document_nonce,baseline_users_json');
+        // With both keys present SQLite can choose the task index and read large
+        // historical rows from every page. Keep the full ownership filter but walk
+        // only this surface's index range. SDB cannot express an index constraint.
+        $statement = DB('medoo', 'sqlite')->query(
+            'SELECT id,submit_intent_at,accepted_at,submitted_document_nonce,baseline_users_json
+             FROM gateway_response_jobs INDEXED BY gateway_response_jobs_surface
+             WHERE surface_id=:surface AND task_id=:task AND submitted_document_nonce=:document
+             AND submit_intent_at IS NOT NULL AND accepted_at IS NOT NULL
+             ORDER BY rowid DESC LIMIT 1',
+            [':surface'=>$surface['id'], ':task'=>$job['task_id'], ':document'=>$surface['document_nonce']]
+        );
+        if (!$statement) return false;
+        try { $source = $statement->fetch(\PDO::FETCH_ASSOC); }
+        finally { $statement->closeCursor(); }
         if (!is_array($source) || empty($source['submit_intent_at']) || empty($source['accepted_at'])
             || ($source['submitted_document_nonce'] ?? null) !== $surface['document_nonce']) return false;
         if (!empty($job['submit_intent_at']) && !empty($job['accepted_at']) && $source['id'] !== $job['id']) return false;

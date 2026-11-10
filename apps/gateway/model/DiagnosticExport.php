@@ -341,6 +341,7 @@ final class DiagnosticExport
             'native' => $tunnel . '/native-events.jsonl', 'native_previous' => $tunnel . '/native-events.jsonl.1',
             'api' => $runtime . '/RC_GATEWAY_API.log', 'api_legacy' => $runtime . '/RC_GETWAY_API.log',
             'native_api' => $runtime . '/RC_GATEWAY_NATIVE_API.log', 'web_api' => $runtime . '/RC_GATEWAY_WEB_API.log',
+            'control_api' => $runtime . '/RC_GATEWAY_CONTROL_API.log',
             'storage' => $storage . '/gateway-storage.log', 'storage_previous' => $storage . '/gateway-storage.log.1',
             'browser_runtime' => $browser . '/runtime-errors.log', 'browser_stderr' => $browser . '/stderr.log',
             'chrome' => $browser . '/chrome.log',

@@ -34,6 +34,12 @@ return [
             'route' => false,
             'with_custom_route' => true,
         ],
+        'gateway_control' => [
+            'bind_process' => 'RC_GATEWAY_CONTROL_API',
+            'enable_static_file' => false,
+            'route' => false,
+            'with_custom_route' => true,
+        ],
         'console' => [
             'bind_process' => 'RC_GATEWAY_CONSOLE',
             'document_root' => 'console',

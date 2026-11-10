@@ -4,6 +4,7 @@ $consolePort = (int) rcEnv('gateway.console_port', 28910);
 $apiPort = (int) rcEnv('gateway.api_port', 28911);
 $nativeApiPort = (int) rcEnv('gateway.native_api_port', 28913);
 $webApiPort = (int) rcEnv('gateway.web_api_port', 28914);
+$controlApiPort = (int) rcEnv('gateway.control_api_port', 28915);
 $browserDebugPort = (int) rcEnv('gateway.browser_debug_port', 28912);
 $browserHttpProtocol = (string) rcEnv('gateway.browser_http_protocol', 'auto');
 if (!in_array($browserHttpProtocol, ['auto', 'http1'], true)) {
@@ -28,9 +29,9 @@ $runtimeBoundary = PHP_OS_FAMILY === 'Windows' ? strtolower($runtimeNormalized) 
 $projectBoundary = PHP_OS_FAMILY === 'Windows' ? strtolower($projectRoot) : $projectRoot;
 $configuredCodexHome = trim((string) rcEnv('gateway.codex_home', ''));
 $codexHome = $configuredCodexHome !== '' ? $configuredCodexHome : \support\process\CodexEnvironment::detect();
-$ports = [$consolePort, $apiPort, $nativeApiPort, $webApiPort, $browserDebugPort];
-if (min($ports) < 1024 || max($ports) > 65535 || count(array_unique($ports)) !== 5) {
-    throw new RuntimeException('Gateway requires distinct console, ingress, native-API, Web-API and browser-debug loopback ports between 1024 and 65535.');
+$ports = [$consolePort, $apiPort, $nativeApiPort, $webApiPort, $controlApiPort, $browserDebugPort];
+if (min($ports) < 1024 || max($ports) > 65535 || count(array_unique($ports)) !== count($ports)) {
+    throw new RuntimeException('Gateway requires distinct console, ingress, native-API, Web-API, control-API and browser-debug loopback ports between 1024 and 65535.');
 }
 if (!preg_match('/\A[a-zA-Z0-9_-]+\.sqlite\z/', $databaseName)) {
     throw new RuntimeException('Invalid gateway database filename.');
@@ -57,6 +58,7 @@ return [
     'api_port' => $apiPort,
     'native_api_port' => $nativeApiPort,
     'web_api_port' => $webApiPort,
+    'control_api_port' => $controlApiPort,
     'browser_debug_port' => $browserDebugPort,
     // Opt-in compatibility for diagnosed HTTP/2 stream errors; never changes an active browser.
     'browser_http_protocol' => $browserHttpProtocol,

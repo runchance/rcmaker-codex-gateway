@@ -21,16 +21,22 @@ final class ApiRelay
     /**
      * Forward to a fixed deployment-owned worker while preserving method, query and wire body.
      * @param Request $request Authorized framework request; not retained in callbacks.
-     * @param string $target gateway_native or gateway, selected by GatewayRoute.
+     * @param string $target Native, Web or control backend selected by GatewayRoute.
      * @return mixed Deferred response, or a setup error before any backend request.
      */
     public static function forward(Request $request, string $target)
     {
         $connection = $request->RCresponse?->getConnection();
-        if (!$connection instanceof TcpConnection || !in_array($target, ['gateway_native', 'gateway'], true)) {
+        $portKey = match ($target) {
+            'gateway_native' => 'native_api_port',
+            'gateway' => 'web_api_port',
+            'gateway_control' => 'control_api_port',
+            default => null,
+        };
+        if (!$connection instanceof TcpConnection || $portKey === null) {
             return $request->json(ResponsesProtocol::error('API 转发暂不可用。', 'api_relay_unavailable', null, 'server_error'))->withStatus(503);
         }
-        $port = (int) Config::get('gateway', $target === 'gateway_native' ? 'native_api_port' : 'web_api_port');
+        $port = (int) Config::get('gateway', $portKey);
         $query = (string) $request->queryString();
         $url = 'http://127.0.0.1:' . $port . $request->path() . ($query === '' ? '' : '?' . $query);
         self::start($connection, $url, (string) $request->method(), (array) $request->header(),

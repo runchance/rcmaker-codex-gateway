@@ -19,6 +19,7 @@ final class GatewayLocal
         $portKey = match ($request->app['app'] ?? '') {
             'gateway_native' => 'native_api_port',
             'gateway' => 'web_api_port',
+            'gateway_control' => 'control_api_port',
             default => 'api_port',
         };
         $expectedHost = '127.0.0.1:' . $gateway[$portKey];

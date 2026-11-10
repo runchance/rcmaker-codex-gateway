@@ -8,11 +8,11 @@ use app\gateway\model\GatewayError;
 use app\gateway\model\ResponsesProtocol;
 use app\gateway_entry\http\ApiRelay;
 
-/** Shared route ownership for the ingress and two API applications; no task or database work. */
+/** Shared route ownership for the ingress and its API backends; no task or database work. */
 final class GatewayRoute
 {
     /**
-     * Bind an existing controller action to the framework router in all three applications.
+     * Bind an existing controller action to the framework router in the gateway applications.
      * @param class-string $controller Existing gateway controller from config/route.php.
      * @param string $action Existing action; route arguments retain their original order.
      * @return \Closure Request-scoped handler, after the selected APP's middleware.
@@ -21,7 +21,7 @@ final class GatewayRoute
     {
         return static function (Request $request, ...$arguments) use ($controller, $action) {
             $application = $request->app['app'] ?? '';
-            if (!in_array($application, ['gateway_entry', 'gateway_native', 'gateway'], true)) {
+            if (!in_array($application, ['gateway_entry', 'gateway_native', 'gateway', 'gateway_control'], true)) {
                 return $request->response('404 Not Found', 404);
             }
             $target = self::target($request, $controller, $action);
@@ -42,7 +42,9 @@ final class GatewayRoute
      */
     public static function target(Request $request, string $controller, string $action): string
     {
-        if ($controller !== Responses::class) return 'gateway';
+        if ($controller !== Responses::class) {
+            return str_starts_with($request->path(), '/api/') ? 'gateway_control' : 'gateway';
+        }
         if ($action === 'models') return (string) $request->header('authorization', '') !== '' ? 'gateway_native' : 'gateway';
         if (in_array($action, ['native', 'websocket'], true)) return 'gateway_native';
         try {

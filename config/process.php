@@ -2,7 +2,7 @@
 /** Separate loopback APP groups plus isolated network, maintenance and browser workers. */
 $gateway = RC\Config::get('gateway');
 \support\process\GatewayLaunch::acquire();
-// The two backends share implementation and limits, but never an event loop.
+// Each backend shares the existing framework bootstrap but owns its own event loop.
 $apiProcess = [
     'type' => 'app',
     'count' => 1,
@@ -37,6 +37,11 @@ return [
         'listen' => 'http://127.0.0.1:' . $gateway['web_api_port'],
         'default_app' => 'gateway',
     ],
+    'RC_GATEWAY_CONTROL_API' => array_replace($apiProcess, [
+        'listen' => 'http://127.0.0.1:' . $gateway['control_api_port'],
+        'default_app' => 'gateway_control',
+        'package_max_length' => 32768,
+    ]),
     'RC_GATEWAY_PROBE' => [
         'handler' => support\process\GatewayProbe::class,
         'count' => 1,

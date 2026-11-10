@@ -468,8 +468,18 @@ final class TaskMaintenance
                         ->where('kind', $file['kind'])->where('resource_id', $id)->update(['available_at'=>time()+300]);
                     return true;
                 }
-                $protected = $sql->query('SELECT 1 FROM gateway_response_attachments WHERE attachment_id=:id LIMIT 1', [':id'=>$id])->fetchColumn() !== false
-                    || $sql->query('SELECT 1 FROM gateway_checkpoint_proofs WHERE retained_refs_json LIKE :needle LIMIT 1', [':needle'=>'%'.$id.'%'])->fetchColumn() !== false;
+                $protected = !empty($row['retained_for_history'])
+                    || $sql->query('SELECT 1 FROM gateway_response_attachments WHERE attachment_id=:id LIMIT 1', [':id'=>$id])->fetchColumn() !== false;
+                if (!$protected && !AttachmentStore::canScanLegacyReferences()) {
+                    // Keep the unproven file queued, but don't make this candidate hold
+                    // the exclusive admission lock or revisit it on each timer tick.
+                    self::mustWrite(SDB(null, 'medoo', 'sqlite')->table('gateway_task_cleanup_files')
+                        ->where('cleanup_id', $file['cleanup_id'])->where('kind', $file['kind'])
+                        ->where('resource_id', $id)->update(['available_at'=>time()+86400]));
+                    return true;
+                }
+                $protected = $protected || $sql->query('SELECT 1 FROM gateway_checkpoint_proofs WHERE retained_refs_json LIKE :needle LIMIT 1',
+                    [':needle'=>'%'.$id.'%'])->fetchColumn() !== false;
                 if (!$protected) {
                     $needle = '%' . $id . '%';
                     foreach ([
