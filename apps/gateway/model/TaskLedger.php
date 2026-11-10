@@ -1366,9 +1366,11 @@ final class TaskLedger
                 'updated_at' => $now,
             ])) throw new GatewayError('storage_unavailable', '任务页面租约无法创建。', 503);
             self::transferCheckpointPageUnlocked($spec, $taskId, $currentEpochId, $surfaceId, $now);
-            if (!empty($spec['budget']['regular_chat'])) {
+            $temporarySwitch = TaskWebChat::temporaryModelSwitch($spec);
+            if (!empty($spec['budget']['regular_chat']) || $temporarySwitch !== null) {
                 $targets = (array) \RC\Config::get('gateway', 'probe_targets');
-                TaskWebChat::transferPageUnlocked($taskId, $currentEpochId, $surfaceId, (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'));
+                TaskWebChat::transferPageUnlocked($taskId, $currentEpochId, $surfaceId,
+                    (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'), $temporarySwitch);
             }
             $updated = $db->table('gateway_tasks')->where('id', $taskId)->update([
                 'current_epoch_id' => $epochId, 'status' => 'active', 'updated_at' => $now,
@@ -1509,10 +1511,11 @@ final class TaskLedger
             'created_at' => $now, 'updated_at' => $now,
         ])) throw new GatewayError('storage_unavailable', '中途指令无法创建新网页租约。', 503);
         $newFence = 1;
-        if ($modelSwitch && !empty($spec['budget']['regular_chat'])) {
+        $temporarySwitch = TaskWebChat::temporaryModelSwitch($spec);
+        if ($modelSwitch && (!empty($spec['budget']['regular_chat']) || $temporarySwitch !== null)) {
             $targets = (array) \RC\Config::get('gateway', 'probe_targets');
             TaskWebChat::transferPageUnlocked((string) $task['id'], (string) $epoch['id'], $newSurfaceId,
-                (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'));
+                (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'), $temporarySwitch);
             $transferred = $db->table('gateway_browser_surfaces')->where('id', $newSurfaceId)->find('fencing_version');
             $newFence = (int) $transferred['fencing_version'];
         }

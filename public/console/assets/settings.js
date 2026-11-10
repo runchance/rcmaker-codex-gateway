@@ -9,7 +9,7 @@
     let savedNoticeTimer = null;
     const savedForms = {general: null, contracts: null};
     const generalFields = ['pro-weekly-budget', 'subagent-model', 'subagent-effort', 'subagent-concurrency', 'context-parts', 'skill-transport',
-        'context-extended', 'official-handoff-summary', 'steering-full-context', 'response-timeout', 'stage-timeout',
+        'context-extended', 'official-handoff-summary', 'temporary-chat-reuse-on-model-switch', 'steering-full-context', 'response-timeout', 'stage-timeout',
         'compact-timeout', 'invoke-timeout', 'wait-poll', 'max-tools', 'auto-approve-tools', 'auto-cleanup-inactive-tasks'];
     const contracts = [
         { field: 'web_initial_contract_template', input: 'web-initial-contract', reset: 'reset-web-initial', status: 'web-initial-status' },
@@ -76,6 +76,8 @@
         byId('skill-transport').checked = data.skill_transport === 'file';
         byId('context-extended').checked = !!data.context_extended;
         byId('official-handoff-summary').checked = !!data.official_handoff_summary;
+        byId('temporary-chat-reuse-on-model-switch').checked = data.temporary_chat_reuse_on_model_switch !== false;
+        byId('temporary-chat-reuse-on-model-switch').disabled = !Object.hasOwn(data, 'temporary_chat_reuse_on_model_switch');
         byId('steering-full-context').checked = !!data.steering_full_context;
         byId('auto-cleanup-inactive-tasks').checked = data.auto_cleanup_inactive_tasks !== false && Number(data.auto_cleanup_inactive_tasks ?? 1) !== 0;
         byId('response-timeout').value = data.response_timeout_seconds || 14400;
@@ -182,6 +184,7 @@
                 skill_transport: byId('skill-transport').checked ? 'file' : 'inline',
                 context_extended: byId('context-extended').checked ? 1 : 0,
                 official_handoff_summary: byId('official-handoff-summary').checked ? 1 : 0,
+                temporary_chat_reuse_on_model_switch: byId('temporary-chat-reuse-on-model-switch').checked ? 1 : 0,
                 steering_full_context: byId('steering-full-context').checked ? 1 : 0,
                 auto_cleanup_inactive_tasks: byId('auto-cleanup-inactive-tasks').checked ? 1 : 0,
                 response_timeout_seconds: Number(byId('response-timeout').value),
@@ -199,6 +202,7 @@
             });
             // Source assets can refresh before the owning PHP worker has reloaded after upgrade.
             if (!Object.hasOwn(current, 'subagent_max_concurrency')) delete payload.subagent_max_concurrency;
+            if (!Object.hasOwn(current, 'temporary_chat_reuse_on_model_switch')) delete payload.temporary_chat_reuse_on_model_switch;
             const data = await Gateway.request('/api/settings', payload);
             if (disposed) return;
             const newerDraft = submitted !== formSnapshot(section);

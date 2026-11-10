@@ -3431,6 +3431,7 @@ JS;
                         'response_id' => $responseId,
                         'recovery_command_id' => $recover ? $commandId : 0,
                         'web_chat' => TaskWebChat::state((string) $ledger['turn']['task_id']),
+                        'temporary_model_switch' => TaskWebChat::temporaryModelSwitch($ledger['job']),
                         'main_frame_id' => null,
                         'security_challenge_active' => false,
                         'security_challenge_path' => null,
@@ -3878,7 +3879,8 @@ JS;
             $this->releaseSteeringPreparation($responseId, $sessionId);
             return;
         }
-        if (($savedChat || $initialBinding !== '') && ($owner['account_document_nonce'] ?? '') !== $surface['document_nonce']) {
+        if (($savedChat || $initialBinding !== '' || !empty($owner['temporary_model_switch']))
+            && ($owner['account_document_nonce'] ?? '') !== $surface['document_nonce']) {
             $this->verifyTaskChatAccount($responseId, $commandId, $sessionId, false, $deadline);
             return;
         }
@@ -4088,7 +4090,7 @@ JS;
     {
         $owner = $this->taskSessions[$sessionId] ?? null;
         if (!is_array($owner) || ($owner['response_id'] ?? '') !== $responseId) return;
-        if (($owner['web_chat']['mode'] ?? 'temporary') !== 'regular') {
+        if (($owner['web_chat']['mode'] ?? 'temporary') !== 'regular' && empty($owner['temporary_model_switch'])) {
             $this->startTaskTurn($responseId, $commandId, $sessionId, $recover);
             return;
         }
@@ -4136,7 +4138,7 @@ JS;
                     }
                     return;
                 }
-                $saved = (string) ($owner['web_chat']['account_key'] ?? '');
+                $saved = (string) ($owner['temporary_model_switch']['account_key'] ?? $owner['web_chat']['account_key'] ?? '');
                 if ($saved !== '' && !hash_equals($saved, (string) $account['account_key'])) {
                     $this->taskFailTurn($responseId, 'CHATGPT_CHAT_ACCOUNT_CHANGED', 'The Web chat belongs to another account or workspace.', true);
                     return;
@@ -4448,11 +4450,13 @@ JS;
         $steering = $initialJob !== null ? \app\gateway\model\SteeringContext::isDelta($initialJob) : !empty($phase['steering']);
         $conversationId = (string) ($chat['conversation_id'] ?? '');
         if ($mode === 'temporary') {
-            if (!$steering || preg_match('~^/c/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$~iD',
+            $handoff = $owner['temporary_model_switch'] ?? null;
+            if ((!$steering && $handoff === null) || preg_match('~^/c/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$~iD',
                 (string) parse_url($surface['url'], PHP_URL_PATH), $match) !== 1) return null;
             $conversationId = strtolower($match[1]);
             if ($phase === []) {
-                if (!\app\gateway\model\SteeringContext::retained($initialJob, $surface)) return null;
+                if ($handoff !== null && $handoff['conversation_id'] !== $conversationId) return null;
+                if (!\app\gateway\model\ContextHistory::retainedContext($initialJob, $surface)) return null;
             } elseif (($phase['url'] ?? null) !== $surface['url']) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED',
                     'The retained temporary Web chat changed during history-load recovery; no message was sent.', 409);
@@ -11640,10 +11644,14 @@ JS;
     /** Match only the current task's pinned mode and saved ordinary-chat UUID, including all send/stop/recovery guards. */
     private function taskChatMatches(string $responseId, string $url, bool $start = false): bool
     {
-        $chat = $this->chatGptTurns[$responseId]['web_chat'] ?? null;
-        if (!is_array($chat)) foreach ($this->taskSessions as $session) {
-            if (($session['response_id'] ?? '') === $responseId) { $chat = $session['web_chat'] ?? null; break; }
+        $turn = $this->chatGptTurns[$responseId] ?? [];
+        $session = $this->taskSessions[$turn['session_id'] ?? ''] ?? [];
+        if (!isset($session['response_id'])) foreach ($this->taskSessions as $candidate) {
+            if (($candidate['response_id'] ?? '') === $responseId) { $session = $candidate; break; }
         }
+        $chat = $turn['web_chat'] ?? $session['web_chat'] ?? null;
+        $handoff = $session['temporary_model_switch'] ?? null;
+        if ($handoff !== null && $url !== $handoff['url']) return false;
         // Legacy observer snapshots predate chat modes; they may still match only an explicit Temporary Chat.
         // Missing metadata must never authorize an ordinary conversation.
         if (!is_array($chat)) $chat = ['mode' => 'temporary'];

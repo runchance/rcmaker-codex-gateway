@@ -225,8 +225,10 @@ final class ResponseJob
             $spec = TaskWebChat::prepareModeChangeUnlocked($spec);
             if (empty($spec['web_chat_mode_change'])) $spec = LunaCheckpoint::applyUnlocked($spec);
             $spec = TaskWebChat::prepareContinuationUnlocked($spec);
+            $spec = TaskWebChat::prepareTemporaryModelSwitchUnlocked($spec);
             $spec = ToolBroker::applyFailedRegularAdmissionUnlocked($spec, $replacementHistory);
             if (($spec['operation_kind'] ?? 'response') === 'response' && empty($spec['budget']['regular_chat'])
+                && TaskWebChat::temporaryModelSwitch($spec) === null
                 && !isset($spec['imported_budget_context_json'])) {
                 // A revalidated preplanned import already includes the current requirements.
                 // Restoring its older selection here could discard an earlier human instruction.
@@ -280,7 +282,8 @@ final class ResponseJob
                 ?? ($exactPrefix ? $spec['context_json'] : $logicalContext));
             $spec['transport_context_json'] = $transportContext;
             $budgetContext = (string) ($spec['imported_budget_context_json']
-                ?? (!empty($spec['rolling_source_response_id']) || !empty($spec['budget']['regular_chat']) ? $transportContext : $logicalContext));
+                ?? (!empty($spec['rolling_source_response_id']) || !empty($spec['budget']['regular_chat'])
+                    || TaskWebChat::temporaryModelSwitch($spec) !== null ? $transportContext : $logicalContext));
             // context_json is the context carried by this physical browser message after exact-prefix
             // continuation / rolling compaction. full_context_json remains the durable recovery/budget source.
             // Full logical context still owns the model budget even when exact-prefix continuation
@@ -320,8 +323,10 @@ final class ResponseJob
                     $budget, (string) $spec['prompt'], $compactAttachmentTokens,
                     !empty($spec['verified_compaction_source']) ? null : $transportContext);
             }
-            if (empty($spec['steering_delta']) && empty($spec['budget']['regular_chat'])) $spec = ContextWindow::prepare($spec, $attachmentTokens);
-            if (empty($spec['budget']['regular_chat']) && empty($spec['web_chat_mode_change'])) $spec = ContextCompaction::preparePageResumeUnlocked($spec);
+            if (empty($spec['steering_delta']) && empty($spec['budget']['regular_chat'])
+                && TaskWebChat::temporaryModelSwitch($spec) === null) $spec = ContextWindow::prepare($spec, $attachmentTokens);
+            if (empty($spec['budget']['regular_chat']) && empty($spec['web_chat_mode_change'])
+                && TaskWebChat::temporaryModelSwitch($spec) === null) $spec = ContextCompaction::preparePageResumeUnlocked($spec);
             $budget = $spec['budget'];
             $transportContext = (string)($spec['transport_context_json'] ?? $transportContext);
             $reservation = TaskLedger::reserveTurnUnlocked($spec, $responseId);

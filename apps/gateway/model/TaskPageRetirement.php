@@ -68,6 +68,13 @@ final class TaskPageRetirement
                 ->order([['rowid','DESC']])->limit(1)->find(self::SOURCE_FIELDS);
             if ($physical === false) throw new GatewayError('storage_unavailable', 'Retired page source could not be read.', 503);
         }
+        if ($chatMode === 'temporary' && is_array($physical) && !self::wasSubmitted($physical)) {
+            $handoffSource = self::temporaryHandoffSourceUnlocked($surface, $physical['id']);
+            if ($handoffSource !== null) {
+                $physical = $handoffSource;
+                $sourceSurfaceId = (string) $physical['surface_id'];
+            }
+        }
         $submitted = self::wasSubmitted($physical);
         $empty = !$submitted && is_array($physical) && $saved === null
             && ($url === 'about:blank' || (preg_match('~\Ahttps://chatgpt\.com/?(?:\?[^#]*)?(?:#.*)?\z~i', $url) === 1
@@ -103,6 +110,21 @@ final class TaskPageRetirement
             'surface_id'=>$id, 'task_id'=>$taskId, 'state'=>$empty ? 'stopped' : 'pending',
             'snapshot_json'=>self::encode($snapshot), 'created_at'=>time(), 'updated_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', 'Retired page stop obligation could not be saved.', 503);
+    }
+
+    /** Recover the accepted original submit witness when a transferred temporary page never sent its new turn. */
+    private static function temporaryHandoffSourceUnlocked(array $surface, string $responseId): ?array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find(
+            'task_id,surface_id,request_hash,continuation_source_response_id,budget_json');
+        $proof = is_array($job) ? TaskWebChat::temporaryModelSwitch($job) : null;
+        if ($proof === null || $job['task_id'] !== $surface['task_id']
+            || $job['surface_id'] !== ($surface['origin_surface_id'] ?? $surface['id'])
+            || $proof['target_id'] !== $surface['target_id'] || $proof['url'] !== $surface['url']) return null;
+        $source = $db->table('gateway_response_jobs')->where('id', $proof['physical_response_id'])->find(self::SOURCE_FIELDS);
+        return is_array($source) && $source['task_id'] === $job['task_id'] && $source['surface_id'] === $proof['source_surface_id']
+            && $source['submitted_document_nonce'] === $proof['document_nonce'] && !empty($source['accepted_at']) ? $source : null;
     }
 
     /**

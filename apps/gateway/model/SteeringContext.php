@@ -83,9 +83,13 @@ final class SteeringContext
         $surface = is_array($source) ? $db->table('gateway_browser_surfaces')->where('id', $source['surface_id'])->find() : null;
         $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
         $epoch = is_array($surface) ? $db->table('gateway_task_epochs')->where('id', $surface['epoch_id'])->find() : null;
+        $sameSelection = is_array($source) && $source['model'] === $spec['model']
+            && $source['reasoning_effort'] === ($spec['reasoning_effort'] ?? null);
+        if (!$sameSelection && (empty($spec['receipt_model_switch'])
+            || empty(GatewaySettings::internal()['temporary_chat_reuse_on_model_switch']))) return $spec;
         if (is_array($source) && is_array($surface) && is_array($epoch) && is_array($task)
             && $source['task_id'] === $taskId && $source['operation_kind'] === 'response'
-            && $source['model'] === $spec['model'] && $source['reasoning_effort'] === ($spec['reasoning_effort'] ?? null)
+            && $sameSelection
             && $task['current_epoch_id'] === $epoch['id'] && $source['epoch_id'] === $epoch['id']
             && $epoch['status'] === 'active' && empty($source['submit_intent_at'])) {
             $submitted = $db->table('gateway_response_jobs')->where('surface_id', $surface['id'])
@@ -101,7 +105,6 @@ final class SteeringContext
         }
         if (!is_array($source) || !is_array($surface) || !is_array($epoch) || !is_array($task)
             || $source['task_id'] !== $taskId || $source['operation_kind'] !== 'response'
-            || $source['model'] !== $spec['model'] || $source['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)
             || $surface['task_id'] !== $taskId || $epoch['task_id'] !== $taskId || $epoch['status'] !== 'active'
             || $task['current_epoch_id'] !== $epoch['id'] || $source['epoch_id'] !== $epoch['id']
             || !in_array($surface['status'], ['ready', 'busy'], true) || empty($surface['target_id'])
@@ -119,6 +122,8 @@ final class SteeringContext
             || $anchor['model'] !== $source['model'] || $anchor['task_id'] !== $taskId) {
             return $spec;
         }
+        $temporarySwitch = $sameSelection ? null : TaskWebChat::temporarySwitchProofUnlocked($spec, $source, $surface);
+        if (!$sameSelection && $temporarySwitch === null) return $spec;
         if (!empty($spec['stopped_source_response_id']) && !empty($source['mcp_binding_id'])) {
             $unsettled = $db->table('gateway_tool_invocations')->where('binding_id', $source['mcp_binding_id'])
                 ->where('status', 'IN', ['registered', 'delivered', 'unknown'])->count();
@@ -167,10 +172,11 @@ final class SteeringContext
         $delta['continuation'] = $proof;
         $spec['steering_delta'] = true;
         $spec['budget']['steering_delta'] = $proof;
+        if ($temporarySwitch !== null) $spec['budget']['temporary_model_switch'] = $temporarySwitch;
         $spec['context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($delta);
         $spec['continuation_source_response_id'] = $source['id'];
         $spec['compaction_epoch'] = $epoch['compaction_epoch'];
-        $spec['browser_lease_key'] = $surface['lease_key'];
+        if ($temporarySwitch === null) $spec['browser_lease_key'] = $surface['lease_key'];
         $spec['prompt'] = ContextHistory::plainPrompt($delta);
         return $spec;
     }
@@ -243,7 +249,8 @@ final class SteeringContext
         if (!self::isDelta($job)) return false;
         $budget = $job['budget'] ?? json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
         $proof = $budget['steering_delta'];
-        if (!empty($proof['regular_conversation_id']) && TaskWebChat::retained($job, $surface)) {
+        if ((!empty($proof['regular_conversation_id']) && TaskWebChat::retained($job, $surface))
+            || TaskWebChat::retainedTemporaryModelSwitch($job, $surface)) {
             $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $proof['source_response_id'])->find('task_id,context_json');
             return is_array($source) && $source['task_id'] === $job['task_id']
                 && hash_equals($proof['previous_context_sha256'], hash('sha256', (string) $source['context_json']));

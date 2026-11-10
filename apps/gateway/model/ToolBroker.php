@@ -1041,6 +1041,7 @@ final class ToolBroker
     {
         $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
         if ($newOrdinaryChat) unset($budget['regular_chat'], $budget['steering_delta'], $budget['postcompact_page']);
+        unset($budget['temporary_model_switch']);
         unset($context['continuation']);
         $transport = ContextHistory::canonical($context);
         if ($newOrdinaryChat && $missingSurface && $settledCalls !== null) $budget['recovery_receipt_staging'] = true;
@@ -4341,11 +4342,12 @@ final class ToolBroker
         return "<codex_context_window_notice>\n" . $original['notice'] . "\n</codex_context_window_notice>";
     }
 
-    /** Select a retained saved-chat human request without changing active interjections or checkpoint control. */
+    /** Select a retained-chat human request without changing active interjections or checkpoint control. */
     private static function ordinaryFollowup(array $spec): bool
     {
         $budget = $spec['budget'] ?? json_decode((string) ($spec['budget_json'] ?? '{}'), true);
-        if (($spec['operation_kind'] ?? 'response') !== 'response' || empty($budget['regular_chat'])
+        $temporarySwitch = TaskWebChat::temporaryModelSwitch($spec);
+        if (($spec['operation_kind'] ?? 'response') !== 'response' || (empty($budget['regular_chat']) && $temporarySwitch === null)
             || !empty($spec['steering_restart']) || array_key_exists('postcompact_user_input', $spec)
             || !empty($budget['original_context_required'])
             || !empty($spec['tool_outputs'])) return false;
@@ -4359,6 +4361,7 @@ final class ToolBroker
         if (!empty($context['continuation']['steering']) && empty($spec['stopped_source_response_id'])
             && (!WebContract::hasSteeringNotice((string) ($spec['prompt'] ?? ''))
                 || WebContract::steeringScope((string) $spec['prompt']) !== 'stopped_followup')) return false;
+        if ($temporarySwitch !== null) return ($context['continuation']['mode'] ?? '') === 'exact_prefix';
         return ($context['continuation']['mode'] ?? '') === 'exact_prefix'
             && !empty($context['continuation']['regular_conversation_id'])
             && $context['continuation']['regular_conversation_id'] === ($budget['regular_chat']['conversation_id'] ?? null);

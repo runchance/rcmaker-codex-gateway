@@ -929,14 +929,7 @@ final class ContextHistory
         if ($sameSystem && $samePrefix && $sameLease && $usable) {
             // The retained ChatGPT page already has the previous answer. Codex may replay
             // commentary and final as separate assistant records; omit through the last one.
-            $suffixStart = count($priorRecords);
-            for ($index = count($records) - 1; $index >= $suffixStart; $index--) {
-                if (($records[$index]['role'] ?? null) === 'assistant') {
-                    $suffixStart = $index + 1;
-                    break;
-                }
-            }
-            $suffix = array_slice($records, $suffixStart);
+            $suffix = self::retainedSuffix($records, count($priorRecords));
             if ($suffix === []) throw new GatewayError('empty_context_delta', '请求没有新的用户输入或工具结果。', 400);
             $context['messages'] = $suffix;
             $context['system'] = [];
@@ -1701,6 +1694,12 @@ final class ContextHistory
         }
         $spec['browser_lease_key'] = (string) $surface['lease_key'];
         if (TaskWebChat::retained($spec + ['task_id' => $reservation['task_id']], $surface)) return $spec;
+        if (TaskWebChat::temporaryModelSwitch($spec) !== null) {
+            if (!TaskWebChat::retainedTemporaryModelSwitch($spec, $surface)) {
+                throw new GatewayError('surface_fence_lost', 'The temporary Web chat handoff lost its original document.', 409);
+            }
+            return $spec;
+        }
         if (ContextCompaction::retainedResumePage($spec, $surface)) return $spec;
         if (!empty($spec['tool_outputs'])) {
             $epoch = SDB(null, 'medoo', 'sqlite')->table('gateway_task_epochs')->where('id', $surface['epoch_id'])->find();
@@ -1743,7 +1742,8 @@ final class ContextHistory
      */
     public static function retainedConnector(array $job, array $surface, string $connectorName): bool
     {
-        if (empty($job['mcp_binding_id']) || !self::retainedContext($job, $surface)) return false;
+        if (empty($job['mcp_binding_id']) || TaskWebChat::temporaryModelSwitch($job) !== null
+            || !self::retainedContext($job, $surface)) return false;
         if (SteeringContext::isDelta($job)) {
             $budget = $job['budget'] ?? json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
             return ($budget['steering_delta']['connector_name'] ?? '') === $connectorName;
@@ -1771,6 +1771,7 @@ final class ContextHistory
     {
         if (TaskWebChat::retained($job, $surface)) return true;
         if (SteeringContext::isDelta($job)) return SteeringContext::retained($job, $surface);
+        if (TaskWebChat::temporaryModelSwitch($job) !== null) return TaskWebChat::retainedTemporaryModelSwitch($job, $surface);
         if (ContextCompaction::retainedResumePage($job, $surface)) return true;
         if (empty($job['continuation_source_response_id'])) return false;
         $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
@@ -1780,6 +1781,19 @@ final class ContextHistory
             && $source['epoch_id'] === $surface['epoch_id'] && !empty($surface['target_id'])
             && in_array($surface['status'], ['ready', 'busy'], true)
             && !empty($source['submitted_document_nonce']) && $source['submitted_document_nonce'] === $surface['document_nonce'];
+    }
+
+    /**
+     * Find the new records after the answer that the retained page already shows.
+     * @param array $records Complete native history. @param int $prefixSize Prior request size.
+     * @return array Incremental history for the existing document.
+     */
+    public static function retainedSuffix(array $records, int $prefixSize): array
+    {
+        for ($index = count($records) - 1; $index >= $prefixSize; $index--) {
+            if (($records[$index]['role'] ?? null) === 'assistant') return array_slice($records, $index + 1);
+        }
+        return array_slice($records, $prefixSize);
     }
 
     /** Role-preserving browser-only prompt, also used for read-only checkpoint requests. */

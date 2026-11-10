@@ -450,12 +450,13 @@ final class ContextRecovery
     public static function repairUnsent(string $responseId, string $code): ?array
     {
         $staging = self::stagingError($code);
+        $missingModel = in_array($code, ['CHATGPT_MODEL_UNAVAILABLE','CHATGPT_MODEL_FAMILY_UNAVAILABLE'], true);
         // A transient composer/menu failure is not loss of the conversation. Reconcile it
         // on the same page; rebuilding here discards retained context and repeats staging.
-        if (!$staging && $code !== 'CHATGPT_SURFACE_MISSING') return null;
+        if (!$staging && !$missingModel && $code !== 'CHATGPT_SURFACE_MISSING') return null;
         // Browser dispatch observes the shared cooldown asynchronously. Merely preparing
         // the durable repair must not turn a temporary upstream limit into an API failure.
-        return Schema::transaction(static function () use ($responseId, $code, $staging): ?array {
+        return Schema::transaction(static function () use ($responseId, $code, $staging, $missingModel): ?array {
             $db = SDB(null, 'medoo', 'sqlite');
             $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
             $readOnlyFallback = is_array($job) && $job['operation_kind'] !== 'response' && $code === 'CHATGPT_SURFACE_MISSING';
@@ -463,6 +464,7 @@ final class ContextRecovery
             if (!is_array($job) || !in_array($job['status'], ['queued','running'], true) || (int) $job['repair_count'] > ($readOnlyFallback ? 1 : 0)
                 || $job['submit_intent_at'] !== null || $job['accepted_at'] !== null || (!$staging && (int) $job['transport_stage_sent'] > 0)
                 || $job['output_text'] !== '' || ($job['operation_kind'] !== 'response' && !$readOnlyFallback && !$stagingCompact)) return null;
+            if ($missingModel && TaskWebChat::temporaryModelSwitch($job) === null) return null;
             if ($staging && !self::inertStagingUnlocked($job)) return null;
             $turn = $db->table('gateway_task_turns')->where('id', $job['durable_turn_id'])->find();
             $surface = $db->table('gateway_browser_surfaces')->where('id', $job['surface_id'])->find();
@@ -480,7 +482,7 @@ final class ContextRecovery
             if ($chat['mode'] === 'regular' && empty($chat['conversation_id'])) unset($budget['regular_chat']);
             // Steering's normal delivery preference never disables proven unsent recovery.
             // A replacement document receives durable full history, not the old page's suffix.
-            unset($budget['steering_delta'], $budget['postcompact_page']);
+            unset($budget['steering_delta'], $budget['postcompact_page'], $budget['temporary_model_switch']);
             if ($staging && $code === 'CHATGPT_MESSAGE_TOO_LARGE') {
                 $budget['context_min_parts'] = min((int) $budget['context_max_parts'], (int) $job['transport_parts_total'] + 1);
                 // The observed staging envelope was rejected. Retry with smaller messages,
@@ -585,6 +587,7 @@ final class ContextRecovery
                     AttachmentStore::tokenReserve($attachments));
             }
             $promptJob = $job;
+            if (TaskWebChat::temporaryModelSwitch($job) !== null) $promptJob['budget_json'] = json_encode($budget, JSON_THROW_ON_ERROR);
             if ($importedRestore !== null) {
                 // The existing capability still proves it was never sent or used. Give its
                 // prompt builder the restored transport without replacing its original archive.

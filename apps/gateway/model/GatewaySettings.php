@@ -17,6 +17,7 @@ final class GatewaySettings
             'auto_approve_tool_calls' => (bool) $row['auto_approve_tool_calls'],
             'connector_name' => (string) $row['connector_name'],
             'web_chat_mode' => (string) ($row['web_chat_mode'] ?? 'temporary'),
+            'temporary_chat_reuse_on_model_switch' => (bool) $row['temporary_chat_reuse_on_model_switch'],
             'web_chat_fallback_at' => (int) ($row['web_chat_fallback_at'] ?? 0),
             'subagent_web_model' => (string) $row['subagent_web_model'],
             'subagent_reasoning_effort' => (string) $row['subagent_reasoning_effort'],
@@ -71,6 +72,7 @@ final class GatewaySettings
     {
         $allowed = [
             'ui_locale', 'pro_weekly_budget', 'auto_cleanup_inactive_tasks', 'web_chat_mode',
+            'temporary_chat_reuse_on_model_switch',
             'subagent_web_model', 'subagent_reasoning_effort', 'subagent_max_concurrency',
             'expected_updated_at', 'mcp_enabled', 'auto_approve_tool_calls', 'connector_name', 'mcp_invoke_timeout_ms',
             'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
@@ -89,6 +91,7 @@ final class GatewaySettings
         $input['pro_weekly_budget'] ??= $current['pro_weekly_budget'] ?? 0;
         $input['auto_cleanup_inactive_tasks'] ??= $current['auto_cleanup_inactive_tasks'];
         $input['web_chat_mode'] ??= $current['web_chat_mode'] ?? 'temporary';
+        $input['temporary_chat_reuse_on_model_switch'] ??= $current['temporary_chat_reuse_on_model_switch'];
         $input['subagent_max_concurrency'] ??= $current['subagent_max_concurrency'];
         foreach (['subagent_web_model','subagent_reasoning_effort'] as $field) {
             $input[$field] ??= $current[$field];
@@ -112,6 +115,7 @@ final class GatewaySettings
             $data = validator()->input($input, [
                 'ui_locale' => ['rule' => 'string', 'len' => [2, 5], 'name' => 'Language'],
                 'web_chat_mode' => ['rule' => 'string', 'len' => [7, 9], 'name' => 'Web chat mode'],
+                'temporary_chat_reuse_on_model_switch' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'Reuse Temporary Chat when switching models'],
                 'subagent_web_model' => ['rule'=>'string', 'len'=>[0,128], 'required'=>false, 'name'=>'Subagent Web model'],
                 'subagent_reasoning_effort' => ['rule'=>'string', 'len'=>[3,6], 'name'=>'Subagent reasoning level'],
                 'subagent_max_concurrency' => ['rule'=>'pint', 'range'=>[1,32], 'name'=>'Global Web subagent concurrency'],
@@ -198,7 +202,7 @@ final class GatewaySettings
         foreach (['mcp_invoke_timeout_ms', 'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'context_max_parts', 'context_extended', 'response_timeout_seconds', 'context_stage_timeout_seconds',
             'compaction_timeout_seconds', 'official_handoff_summary', 'steering_full_context', 'pro_weekly_budget',
-            'auto_cleanup_inactive_tasks'] as $field) {
+            'auto_cleanup_inactive_tasks', 'temporary_chat_reuse_on_model_switch'] as $field) {
             $data[$field] = (int) $data[$field];
         }
         $data['protected_runtime_key'] = $protected;

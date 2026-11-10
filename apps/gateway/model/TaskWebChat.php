@@ -379,6 +379,131 @@ final class TaskWebChat
     }
 
     /**
+     * Plan a model handoff on the task's still-owned temporary document. The runtime checks
+     * that this target still exists, still shows the same conversation and uses the same account.
+     * @param array $spec Current routed request with its complete logical history.
+     * @return array Request with a verified incremental transport, or its existing fresh-page plan.
+     * @throws GatewayError On unavailable task storage.
+     */
+    public static function prepareTemporaryModelSwitchUnlocked(array $spec): array
+    {
+        if (($spec['operation_kind'] ?? 'response') !== 'response' || !empty($spec['tool_outputs'])
+            || !empty($spec['steering_restart']) || !empty($spec['stopped_source_response_id'])
+            || !empty($spec['mailbox_context_restart']) || !empty($spec['web_chat_mode_change'])
+            || !empty($spec['budget']['regular_chat']) || !empty($spec['rolling_source_response_id'])
+            || !empty($spec['postcompact_user_input']) || !empty($spec['continuation_source_response_id'])) return $spec;
+
+        $taskId = 'task_' . substr((string) $spec['task_key'], 0, 24);
+        $latest = ResponseJob::latestForTaskUnlocked($taskId, true);
+        if (!is_array($latest) || $latest['operation_kind'] !== 'response' || $latest['status'] !== 'completed'
+            || $latest['round_kind'] !== 'text' || ($latest['model'] === $spec['model']
+                && $latest['reasoning_effort'] === ($spec['reasoning_effort'] ?? null))
+            || (!empty($spec['previous_response_id']) && $spec['previous_response_id'] !== $latest['id'])) return $spec;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $source = $db->table('gateway_response_jobs')->where('id', $latest['id'])->find(
+            'id,task_id,context_json,output_text,durable_turn_id,surface_id,epoch_id,compaction_epoch,submitted_document_nonce');
+        if (!is_array($source)) return $spec;
+        $surface = $db->table('gateway_browser_surfaces')->where('id', $source['surface_id'])->find();
+        $task = $db->table('gateway_tasks')->where('id', $taskId)->find('status,current_epoch_id');
+        if (!is_array($surface) || !is_array($task) || $task['status'] !== 'active'
+            || $task['current_epoch_id'] !== $source['epoch_id'] || $surface['task_id'] !== $taskId
+            || $surface['epoch_id'] !== $source['epoch_id'] || $surface['status'] !== 'ready' || empty($surface['target_id'])
+            || $source['compaction_epoch'] !== $spec['compaction_epoch'] || empty($source['submitted_document_nonce'])
+            || $source['submitted_document_nonce'] !== $surface['document_nonce']) return $spec;
+
+        $proof = self::temporarySwitchProofUnlocked($spec, $source, $surface);
+        if ($proof === null) return $spec;
+        $full = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        $prior = json_decode((string) $source['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        $prefix = array_slice($full['messages'], 0, count($prior['messages']));
+        if (ContextHistory::nativeMessageHistoryCanonical($prefix) !== ContextHistory::nativeMessageHistoryCanonical($prior['messages'])
+            || ContextHistory::canonical($full['system']) !== ContextHistory::canonical($prior['system'])) return $spec;
+        $messages = ContextHistory::retainedSuffix($full['messages'], count($prior['messages']));
+        if ($messages === [] || !in_array('user', array_column($messages, 'role'), true)) return $spec;
+        $priorAnswer = array_slice($full['messages'], count($prior['messages']),
+            count($full['messages']) - count($prior['messages']) - count($messages));
+        if ($priorAnswer !== []) {
+            $last = $priorAnswer[array_key_last($priorAnswer)];
+            if (ContextHistory::text($last['content'] ?? '') !== (string) $source['output_text']) return $spec;
+            foreach ($priorAnswer as $record) {
+                if (($record['role'] ?? $record['type'] ?? '') !== 'assistant'
+                    && ($record['type'] ?? '') !== 'reasoning_summary') return $spec;
+            }
+        }
+
+        $delta = ['version'=>$full['version'], 'system'=>[], 'messages'=>$messages,
+            'continuation'=>['mode'=>'exact_prefix', 'source_response_id'=>$source['id'],
+                'source_surface_id'=>$surface['id'], 'source_epoch_id'=>$surface['epoch_id'],
+                'source_document_nonce'=>$surface['document_nonce'],
+                'previous_context_sha256'=>hash('sha256', ContextHistory::canonical($prior)),
+                'current_tool_environment_sha256'=>$spec['tool_environment_hash']]];
+        $spec['budget']['temporary_model_switch'] = $proof;
+        $spec['continuation_source_response_id'] = $source['id'];
+        $spec['context_json'] = $spec['transport_context_json'] = ContextHistory::canonical($delta);
+        $spec['prompt'] = ContextHistory::plainPrompt($delta);
+        return $spec;
+    }
+
+    /**
+     * Capture the stable temporary route and the account on its most recent accepted physical commit.
+     * @param array $spec New model request. @param array $source Source response.
+     * @param array $surface Exact previously submitted browser document.
+     * @return array|null Transfer proof, or null when the source is not a reusable temporary chat.
+     */
+    public static function temporarySwitchProofUnlocked(array $spec, array $source, array $surface): ?array
+    {
+        if (!empty($spec['web_chat_mode_change']) || empty(GatewaySettings::internal()['temporary_chat_reuse_on_model_switch'])
+            || self::state((string) $source['task_id'])['mode'] !== 'temporary') return null;
+        $url = (string) $surface['url'];
+        $targets = (array) \RC\Config::get('gateway', 'probe_targets');
+        if (!WebModelPage::isTaskChatUrl($url, (string) ($targets['model_site']['url'] ?? 'https://chatgpt.com/'), 'temporary')
+            || preg_match('~^/c/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$~iD', (string) parse_url($url, PHP_URL_PATH), $match) !== 1) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $commit = $db->table('gateway_web_messages')->where('turn_id', $source['durable_turn_id'])
+            ->where('task_id', $source['task_id'])->where('direction', 'outbound')->where('status', 'accepted')
+            ->where('kind', 'commit')->order([['id','DESC']])->limit(1)->find('account_key,response_id');
+        $account = $commit['account_key'] ?? null;
+        if (!is_string($account) || preg_match('/\A[a-f0-9]{64}\z/', $account) !== 1) return null;
+        $physical = $db->table('gateway_response_jobs')->where('id', $commit['response_id'])->find(
+            'task_id,epoch_id,surface_id,submitted_document_nonce,accepted_at');
+        if (!is_array($physical) || $physical['task_id'] !== $source['task_id'] || $physical['epoch_id'] !== $surface['epoch_id']
+            || $physical['surface_id'] !== $surface['id'] || $physical['submitted_document_nonce'] !== $surface['document_nonce']
+            || empty($physical['accepted_at'])) return null;
+        return ['request_hash'=>$spec['request_hash'], 'task_id'=>$source['task_id'], 'source_response_id'=>$source['id'],
+            'source_surface_id'=>$surface['id'], 'source_epoch_id'=>$surface['epoch_id'], 'target_id'=>$surface['target_id'],
+            'document_nonce'=>$surface['document_nonce'], 'url'=>$url, 'conversation_id'=>strtolower($match[1]),
+            'physical_response_id'=>$commit['response_id'], 'account_key'=>$account];
+    }
+
+    /**
+     * Read the proof for this response alone. Inherited tool-round budgets do not authorize a new send.
+     * @param array $job Prepared spec or persisted response. @return array|null Pinned physical handoff.
+     */
+    public static function temporaryModelSwitch(array $job): ?array
+    {
+        $budget = $job['budget'] ?? json_decode((string) ($job['budget_json'] ?? '{}'), true);
+        $proof = $budget['temporary_model_switch'] ?? null;
+        return is_array($proof) && ($proof['request_hash'] ?? null) === ($job['request_hash'] ?? null)
+            && ($proof['source_response_id'] ?? null) === ($job['continuation_source_response_id'] ?? null) ? $proof : null;
+    }
+
+    /**
+     * Verify the transferred temporary document before using its planned incremental context.
+     * @param array $job Current request or response. @param array $surface Reserved destination.
+     * @return bool Whether the same temporary document still owns this request.
+     */
+    public static function retainedTemporaryModelSwitch(array $job, array $surface): bool
+    {
+        $proof = self::temporaryModelSwitch($job);
+        return $proof !== null && $proof['task_id'] === $surface['task_id']
+            && ($job['surface_id'] ?? $surface['id']) === $surface['id'] && ($job['epoch_id'] ?? $surface['epoch_id']) === $surface['epoch_id']
+            && $proof['source_epoch_id'] !== $surface['epoch_id'] && $proof['source_surface_id'] !== $surface['id']
+            && $proof['target_id'] === $surface['target_id'] && $proof['document_nonce'] === $surface['document_nonce']
+            && $proof['url'] === $surface['url'] && in_array($surface['status'], ['ready','busy'], true);
+    }
+
+    /**
      * Prove that an unsent checkpoint still observes its exact completed tool source in a saved chat.
      * This permits only reattachment, never a new message, capability or tool execution.
      * @param array $ledger Fresh job/turn/surface rows; callers mutating ownership hold Schema's transaction.
@@ -537,22 +662,28 @@ final class TaskWebChat
     }
 
     /**
-     * Transfer only this task's exact saved-chat tab across epochs, fencing old observers and cleanup.
+     * Transfer this task's saved chat or proven live temporary document across model epochs.
      * Release the old surface's Stop obligation atomically; the physical page remains owned and open.
      * @param string $taskId Owning task. @param string $oldEpoch Retired source epoch.
      * @param string $surfaceId Reserved destination surface. @param string $modelUrl Configured origin.
+     * @param array|null $temporarySwitch Exact same-document proof for a temporary model handoff.
      * @return void No transfer occurs if the disposable target cannot be proven reusable.
      * @throws GatewayError On identity storage or conditional-write failure; caller owns the transaction.
      */
-    public static function transferPageUnlocked(string $taskId, string $oldEpoch, string $surfaceId, string $modelUrl): void
+    public static function transferPageUnlocked(string $taskId, string $oldEpoch, string $surfaceId, string $modelUrl,
+        ?array $temporarySwitch = null): void
     {
         $chat = self::state($taskId);
-        if ($chat['mode'] !== 'regular' || empty($chat['conversation_id']) || $oldEpoch === '') return;
+        if ($oldEpoch === '' || ($temporarySwitch === null && ($chat['mode'] !== 'regular' || empty($chat['conversation_id'])))) return;
         $db = SDB(null, 'medoo', 'sqlite');
         $old = $db->table('gateway_browser_surfaces')->where('task_id', $taskId)->where('epoch_id', $oldEpoch)->find();
         $new = $db->table('gateway_browser_surfaces')->where('id', $surfaceId)->where('task_id', $taskId)->find();
         if (!is_array($old) || !is_array($new) || $old['status'] !== 'retired' || empty($old['target_id'])
-            || !empty($new['target_id']) || !WebModelPage::isTaskChatUrl((string) $old['url'], $modelUrl, 'regular', $chat['conversation_id'])) return;
+            || !empty($new['target_id']) || !WebModelPage::isTaskChatUrl((string) $old['url'], $modelUrl, $chat['mode'], $chat['conversation_id'])) return;
+        if ($temporarySwitch !== null && ($chat['mode'] !== 'temporary' || $temporarySwitch['task_id'] !== $taskId
+            || $temporarySwitch['source_epoch_id'] !== $oldEpoch || $temporarySwitch['source_surface_id'] !== $old['id']
+            || $temporarySwitch['target_id'] !== $old['target_id'] || $temporarySwitch['url'] !== $old['url']
+            || $temporarySwitch['document_nonce'] !== $old['document_nonce'])) return;
         $fence = (int) $old['fencing_version'] + 1;
         $released = $db->table('gateway_browser_surfaces')->where('id', $old['id'])->where('fencing_version', $old['fencing_version'])
             ->update(['target_id' => null, 'session_id' => null, 'fencing_version' => $fence]);
