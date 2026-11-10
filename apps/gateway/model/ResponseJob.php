@@ -374,7 +374,10 @@ final class ResponseJob
                 $prompt = WebContract::withCheckpointProgressNotice($prompt,
                     json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR));
             }
-            if (!$bridge['is_continuation']) $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $reservation['task_id']);
+            if (!$bridge['is_continuation']) {
+                $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $reservation['task_id'],
+                    ($spec['operation_kind'] ?? 'response') === 'response');
+            }
             [$prompt, $transportContext, $budget, $inputTokens] = NativeAgentAssignment::projectUnlocked(
                 $spec, $prompt, $transportContext, $budget, $inputTokens, $contextTokens, $attachmentTokens, $budgetContext);
             $roundInfo = $bridge;

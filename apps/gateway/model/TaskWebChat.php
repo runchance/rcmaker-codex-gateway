@@ -210,18 +210,22 @@ final class TaskWebChat
     }
 
     /**
-     * Add the first ordinary submission's unique message witness, also on proven-unsent rebuilds.
+     * Add a physical submission witness to an unbound ordinary chat or a temporary response.
      * @param string $prompt Rendered physical message.
      * @param string $responseId Physical browser submission ID.
      * @param string $taskId Owning task.
+     * @param bool $temporaryResponse Include the witness on an executable temporary response.
      * @return string Original message or one prefixed with its exact witness.
      * @throws GatewayError On unavailable identity storage.
      */
-    public static function withInitialBindingMarker(string $prompt, string $responseId, string $taskId): string
+    public static function withInitialBindingMarker(string $prompt, string $responseId, string $taskId,
+        bool $temporaryResponse = false): string
     {
         $chat = self::state($taskId);
         $marker = '<rcmaker_chat_binding>' . $responseId . '</rcmaker_chat_binding>';
-        return $chat['mode'] === 'regular' && empty($chat['conversation_id']) && !str_contains($prompt, $marker)
+        $needsWitness = ($chat['mode'] === 'regular' && empty($chat['conversation_id']))
+            || ($temporaryResponse && $chat['mode'] === 'temporary');
+        return $needsWitness && !str_contains($prompt, $marker)
             ? $marker . "\n" . $prompt : $prompt;
     }
 

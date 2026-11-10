@@ -1347,11 +1347,13 @@ JS));
      * @param bool $legacyCitations Preserve bytes when resuming a generation with already published old citation markup.
      * @param bool $regularRecovery Accept an owned native stream-error Retry card in ordinary mode only.
      * @param string $temporarySubmission Current physical temporary response ID, scoped to this document.
+     * @param bool $acceptedTemporarySubmission Ledger confirms this physical send on the current document.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false,
-        string $initialBindingMarker = '', bool $regularRecovery = false, string $temporarySubmission = ''): string
+        string $initialBindingMarker = '', bool $regularRecovery = false, string $temporarySubmission = '',
+        bool $acceptedTemporarySubmission = false): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1415,7 +1417,8 @@ const boundMatches=boundResponseId?assistants.filter(entry=>entry.id===boundResp
 const promoted=boundMatches.length===0
     ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
         ||remountedInitialAssistant(assistants,beforeAssistants,boundResponseId,expectedInitialBinding,beforeUsers,users)
-        ||(initialTemporary&&boundResponseId?observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer):null):null;
+        ||(initialTemporary&&boundResponseId
+            ?observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer,__ACCEPTED_TEMPORARY_SUBMISSION__):null):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
 if(initialTemporary&&(!boundResponseId||boundMatches.length===1)){
     observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer);
@@ -1707,8 +1710,10 @@ else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]
 return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,error};
 JS;
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__', '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__'],
-            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound, $initialBinding, $regularRecovery ? 'true' : 'false', $temporary],
+            ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__',
+                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__'],
+            [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound,
+                $initialBinding, $regularRecovery ? 'true' : 'false', $temporary, $acceptedTemporarySubmission ? 'true' : 'false'],
             $body
         ), $legacyCitations);
     }
@@ -2037,7 +2042,7 @@ const temporaryChatPage=(path,search)=>{
 // A first temporary answer can change from one UUID group to another while the
 // renderer keeps the native local conversation. Keep the witness in this document
 // only. A new conversation, submission, or different user bubble cannot borrow it.
-const observeTemporaryInitialGroup=(source,bound,entry)=>{
+const observeTemporaryInitialGroup=(source,bound,entry,acceptedSubmission=false)=>{
     const uuid=/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
     const group=entry?.el;
     const id=group?.getAttribute('data-turn-key')||'';
@@ -2053,11 +2058,26 @@ const observeTemporaryInitialGroup=(source,bound,entry)=>{
     if(!text)return null;
     const key=Symbol.for('rcmaker.temporary.initial.group');
     const prior=globalThis[key],path=location.pathname;
-    if(prior?.source!==source){
+    const sameSource=prior?.source===source;
+    const sameWitness=sameSource&&prior.bound===(bound||entry.id)
+        &&prior.conversation===conversation&&prior.text===text;
+    if(bound&&bound!==entry.id&&!sameWitness){
+        // The optimistic group may bind before its native conversation wrapper exists.
+        // Recover from the accepted submission itself, using the exact marker in the
+        // sole native user bubble. Assistant-authored text cannot supply this witness.
+        const marker='<rcmaker_chat_binding>'+source+'</rcmaker_chat_binding>';
+        const markerAt=text.indexOf(marker);
+        if(!acceptedSubmission||!uuid.test(path.slice(3))||!bound.startsWith('group:assistant:')
+            ||!uuid.test(bound.slice('group:assistant:'.length))||markerAt<0||markerAt>256
+            ||(sameSource&&uuid.test(prior.path.slice(3))&&prior.path!==path))return null;
+        globalThis[key]={source,bound,path,conversation,text};
+        return {...entry,id:bound};
+    }
+    if(!sameSource){
         if(!bound||bound===entry.id)globalThis[key]={source,bound:entry.id,path,conversation,text};
         return null;
     }
-    if(prior.bound!==(bound||entry.id)||prior.conversation!==conversation||prior.text!==text)return null;
+    if(!sameWitness)return null;
     const localPath='/c/'+encodeURIComponent(conversation).toLowerCase();
     const localToStable=prior.path.toLowerCase()===localPath&&uuid.test(path.slice(3));
     const rootToChat=prior.path==='/'&&(path.toLowerCase()===localPath||uuid.test(path.slice(3)));

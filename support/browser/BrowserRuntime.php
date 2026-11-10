@@ -7698,6 +7698,10 @@ JS;
             $this->checkTaskToolConfirmation($responseId);
             return;
         }
+        $temporarySubmission = ($turn['web_chat']['mode'] ?? 'temporary') === 'temporary' ? $responseId : '';
+        $acceptedTemporarySubmission = $temporarySubmission !== '' && $logicalResponseId === $responseId
+            && ($ledger['job']['operation_kind'] ?? '') === 'response'
+            && self::acceptedTemporaryStopSource($ledger['job'], $ledger['surface'], 'temporary') === $responseId;
         $expression = WebModelPage::responseExpression((array) $turn['baseline_users'], (array) $turn['baseline_assistants'],
             (string)($turn['continuation_marker'] ?? ''), (string)($turn['bound_assistant_id'] ?? ''),
             self::hasLegacyCitationPrefix($turn),
@@ -7706,7 +7710,7 @@ JS;
             // pre-submit baseline plus the exact rendered marker or fenced POST witness.
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular',
-            ($turn['web_chat']['mode'] ?? 'temporary') === 'temporary' ? $responseId : '');
+            $temporarySubmission, $acceptedTemporarySubmission);
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;

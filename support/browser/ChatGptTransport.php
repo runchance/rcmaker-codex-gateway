@@ -1297,7 +1297,7 @@ final class ChatGptTransport
         // ChatGPT truncates very long user bubbles in the DOM. Keep this trusted
         // initial-chat witness in the short commit header, before the large final
         // JSON part, rather than hiding it below that part in the execution contract.
-        // Other contracts, including Temporary Chat, keep their exact byte layout.
+        // Older staged contracts without a binding header keep their exact byte layout.
         $bindingHeader = [];
         if (preg_match('/\A(<rcmaker_chat_binding>resp_[a-f0-9]{24}<\/rcmaker_chat_binding>)\r?\n/', $contract, $match) === 1) {
             $bindingHeader[] = $match[1];

@@ -614,7 +614,8 @@ final class ContextRecovery
                     : ToolBroker::rebuildUnsentPromptUnlocked($promptJob));
             }
             if ($prompt === null) return null;
-            $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $job['task_id']);
+            $prompt = TaskWebChat::withInitialBindingMarker($prompt, $responseId, (string) $job['task_id'],
+                $job['operation_kind'] === 'response');
             if ($job['operation_kind'] === 'response') {
                 $prompt = WebContract::withCheckpointProgressNotice($prompt, $context);
             }

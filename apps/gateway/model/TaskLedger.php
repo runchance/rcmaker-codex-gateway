@@ -2306,7 +2306,10 @@ final class TaskLedger
                 if (!$released || $released->rowCount() !== 1) {
                     throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
                 }
-                $rotated['prompt'] = TaskWebChat::withInitialBindingMarker($rotated['prompt'], $responseId, $turn['task_id']);
+            }
+            if ($regularRecovery || $job['operation_kind'] === 'response') {
+                $rotated['prompt'] = TaskWebChat::withInitialBindingMarker($rotated['prompt'], $responseId, $turn['task_id'],
+                    $job['operation_kind'] === 'response');
             }
 
             $epoch = $db->table('gateway_task_epochs')->where('id', (string) $turn['epoch_id'])->find();
