@@ -10875,7 +10875,8 @@ JS;
         $this->chatGptTurns[$responseId]['artifact_expected'] = $candidate;
         $this->evaluateTask($responseId, WebModelPage::focusArtifactDownloadExpression(
             (array) $turn['baseline_users'], (array) $turn['baseline_assistants'], $href, $filename,
-            (string) ($turn['bound_assistant_id'] ?? '')
+            (string) ($turn['bound_assistant_id'] ?? ''),
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'temporary' ? $responseId : ''
         ), function ($error, $focused) use ($responseId, $index): void {
             if (!isset($this->chatGptTurns[$responseId])) return;
             if ($error !== null || !is_array($focused) || empty($focused['ok'])) {

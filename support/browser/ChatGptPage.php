@@ -1338,6 +1338,8 @@ JS));
      * message anchor, but never through another user's group or model-authored markup.
      * The first ordinary submission can also retain its identity through ChatGPT's
      * optimistic local-conversation remount, using same-document native conversation/message evidence.
+     * A first Temporary Chat can promote an optimistic UUID group inside its native
+     * local conversation. The original user bubble's visible start must still match.
      * @param array $baselineUserIds User identities captured before submitting this generation.
      * @param array $baselineAssistantIds Historical assistants excluded from the current answer.
      * @param string $continuationMarker Exact current continuation marker, or empty for initial work.
@@ -1405,12 +1407,19 @@ const sameGroupAnswers=sameGroupResponseId?assistants.filter(entry=>entry.id===s
 const unboundAnswer=sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAnswers[0]:null)
     :answerCandidates.length===1?answerCandidates[0]
         :((newUser||users.length===0)&&identityAssistants.length===1?identityAssistants[0]:null);
+const temporarySubmission=__TEMPORARY_SUBMISSION__;
+const initialTemporary=temporarySubmission&&!expectedContinuationMarker&&beforeUsers.size===0&&beforeAssistants.size===0
+    &&users.length===1&&assistants.length===1&&unboundAnswer?.el===newUser?.el
+    &&temporaryChatPage(location.pathname,location.search);
 const boundMatches=boundResponseId?assistants.filter(entry=>entry.id===boundResponseId):[];
 const promoted=boundMatches.length===0
     ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
-        ||remountedInitialAssistant(assistants,beforeAssistants,boundResponseId,expectedInitialBinding,beforeUsers,users):null;
+        ||remountedInitialAssistant(assistants,beforeAssistants,boundResponseId,expectedInitialBinding,beforeUsers,users)
+        ||(initialTemporary&&boundResponseId?observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer):null):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
-const temporarySubmission=__TEMPORARY_SUBMISSION__;
+if(initialTemporary&&(!boundResponseId||boundMatches.length===1)){
+    observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer);
+}
 // Cache only a native group actually observed with both roles after submission.
 // The same response may not adopt a different conversation or answer later.
 if(temporarySubmission&&temporaryChatPage(location.pathname,location.search)
@@ -1748,19 +1757,21 @@ JS));
      * @param string $href Observed URL, or empty for a file card without a public href.
      * @param string $filename Exact observed artifact name.
      * @param string $boundResponseId Stable assistant identity bound to the submitted message.
+     * @param string $temporarySubmission Physical Temporary Chat response identity, if present.
      * @return string CDP expression returning ok/code/count/kind; activation uses native keyboard input.
      */
     public static function focusArtifactDownloadExpression(array $baselineUserIds, array $baselineAssistantIds,
-        string $href, string $filename, string $boundResponseId = ''): string
+        string $href, string $filename, string $boundResponseId = '', string $temporarySubmission = ''): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $expectedHref = json_encode($href, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $expectedFilename = json_encode($filename, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $bound = json_encode($boundResponseId, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $temporary = json_encode($temporarySubmission, JSON_THROW_ON_ERROR);
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__HREF__', '__FILENAME__', '__BOUND__'],
-            [$users, $assistants, $expectedHref, $expectedFilename, $bound],
+            ['__USERS__', '__ASSISTANTS__', '__HREF__', '__FILENAME__', '__BOUND__', '__TEMPORARY_SUBMISSION__'],
+            [$users, $assistants, $expectedHref, $expectedFilename, $bound, $temporary],
             <<<'JS'
 const beforeUsers=new Set(__USERS__);const beforeAssistants=new Set(__ASSISTANTS__);const expectedHref=__HREF__,expectedFilename=__FILENAME__,boundResponseId=__BOUND__;
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
@@ -1786,8 +1797,13 @@ const answerCandidates=newUser?assistants.filter(entry=>after(newUser.el,entry.e
 const sameGroupResponseId=newUser?.id.startsWith('group:user:')
     ?'group:assistant:'+newUser.id.slice('group:user:'.length):null;
 const sameGroupAnswers=sameGroupResponseId?assistants.filter(entry=>entry.id===sameGroupResponseId&&!beforeAssistants.has(entry.id)):[];
+const temporarySubmission=__TEMPORARY_SUBMISSION__;
+const initialTemporary=temporarySubmission&&beforeUsers.size===0&&beforeAssistants.size===0&&users.length===1
+    &&assistants.length===1&&sameGroupAnswers.length===1&&sameGroupAnswers[0].el===newUser?.el
+    &&temporaryChatPage(location.pathname,location.search);
 const promoted=boundMatches.length===0
-    ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId):null;
+    ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
+        ||(initialTemporary&&boundResponseId?observeTemporaryInitialGroup(temporarySubmission,boundResponseId,sameGroupAnswers[0]):null):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted)
     :sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAnswers[0]:null)
     :answerCandidates.length===1?answerCandidates[0]
@@ -2017,6 +2033,38 @@ const temporaryChatPage=(path,search)=>{
     const flags=new URLSearchParams(search||'').getAll('temporary-chat');
     return flags.length===1&&flags[0]==='true'
         &&(path==='/'||/^\/c\/(?:local-chatgpt%3a)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(path));
+};
+// A first temporary answer can change from one UUID group to another while the
+// renderer keeps the native local conversation. Keep the witness in this document
+// only. A new conversation, submission, or different user bubble cannot borrow it.
+const observeTemporaryInitialGroup=(source,bound,entry)=>{
+    const uuid=/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+    const group=entry?.el;
+    const id=group?.getAttribute('data-turn-key')||'';
+    if(!uuid.test(id)||entry.id!=='group:assistant:'+id)return null;
+    const container=group.closest('[data-chatgpt-conversation-selection-target]');
+    const conversation=container?.getAttribute('data-chatgpt-conversation-selection-target')||'';
+    if(!conversation.startsWith('local-chatgpt:')||!uuid.test(conversation.slice('local-chatgpt:'.length)))return null;
+    const bubbles=[...group.querySelectorAll('[data-user-message-bubble]')].filter(node=>
+        node.closest('[data-turn-key]')===group&&!node.closest('[data-content-search-unit-key$=":assistant"],[data-markdown-text-style="assistant-message"],blockquote,pre'));
+    // ChatGPT can truncate a long user bubble on remount. Compare its bounded,
+    // unchanged start within the exact native conversation and physical submission.
+    const text=bubbles.length===1?bubbles[0].textContent.slice(0,2048):'';
+    if(!text)return null;
+    const key=Symbol.for('rcmaker.temporary.initial.group');
+    const prior=globalThis[key],path=location.pathname;
+    if(prior?.source!==source){
+        if(!bound||bound===entry.id)globalThis[key]={source,bound:entry.id,path,conversation,text};
+        return null;
+    }
+    if(prior.bound!==(bound||entry.id)||prior.conversation!==conversation||prior.text!==text)return null;
+    const localPath='/c/'+encodeURIComponent(conversation).toLowerCase();
+    const localToStable=prior.path.toLowerCase()===localPath&&uuid.test(path.slice(3));
+    const rootToChat=prior.path==='/'&&(path.toLowerCase()===localPath||uuid.test(path.slice(3)));
+    if(prior.path!==path&&!localToStable&&!rootToChat)return null;
+    // Once the route is stable, prevent a later same-document move to another UUID.
+    if(uuid.test(path.slice(3)))prior.path=path;
+    return bound&&bound!==entry.id?{...entry,id:bound}:null;
 };
 const composerSendButtons=editor=>{
     const form=editor.closest('form');
