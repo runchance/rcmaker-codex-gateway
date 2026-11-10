@@ -17,7 +17,7 @@ final class TaskLedger
 
     /**
      * List owned turns for explicit-stop observation, including a host timeout after a missed stop.
-     * @return list<array> Internal execution rows; never exposed through the console API.
+     * @return list<array> Internal execution metadata without prompts or conversation history.
      * @throws GatewayError If the active ledger cannot be read.
      */
     public static function cancellableExecutions(): array
@@ -38,7 +38,7 @@ final class TaskLedger
         $executions = [];
         foreach ($rows as $row) {
             if (empty($row['response_id'])) continue;
-            $execution = self::execution((string) $row['response_id']);
+            $execution = self::pollExecution((string) $row['response_id']);
             if (self::ownsCurrentGeneration($execution['job'], $execution['turn'])
                 && self::userStopEligible($execution['job'], $execution['turn'], $execution['surface'])) $executions[] = $execution;
         }
@@ -174,7 +174,7 @@ final class TaskLedger
     public static function requestUserStop(string $responseId, array $evidence): bool
     {
         return Schema::transaction(static function () use ($responseId, $evidence): bool {
-            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            ['job'=>$job, 'turn'=>$turn, 'surface'=>$surface] = self::pollExecution($responseId);
             if (!self::ownsCurrentGeneration($job, $turn) || !self::userStopEligible($job, $turn, $surface)) return false;
             $nativeTurn = self::cancellationNativeTurn(['job' => $job, 'turn' => $turn]);
             if ($nativeTurn === null || ($evidence['turn_id'] ?? '') !== $nativeTurn
@@ -182,7 +182,8 @@ final class TaskLedger
                 || $evidence['interrupted_at'] < (int) $turn['created_at'] || $evidence['interrupted_at'] > time() + 5) return false;
             if (($turn['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') return true;
             $superseded = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $turn['id'])
-                ->where('event_type', 'codex_user_stop_superseded')->order([['id', 'DESC']])->limit(1)->find();
+                ->where('task_id', $turn['task_id'])->where('event_type', 'codex_user_stop_superseded')
+                ->order([['id', 'DESC']])->limit(1)->find('data_json');
             if (is_array($superseded)) {
                 $handled = json_decode((string) $superseded['data_json'], true);
                 $sameEvent = isset($evidence['event_id'], $handled['event_id'])
@@ -192,7 +193,8 @@ final class TaskLedger
             }
             if (!empty($job['mcp_binding_id']) && ToolBroker::hasUnsettledCallsUnlocked((string) $job['mcp_binding_id'])) {
                 $last = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('turn_id', $turn['id'])
-                    ->where('event_type', 'codex_user_stop_waiting_tools')->order([['id', 'DESC']])->limit(1)->find();
+                    ->where('task_id', $turn['task_id'])->where('event_type', 'codex_user_stop_waiting_tools')
+                    ->order([['id', 'DESC']])->limit(1)->find('data_json');
                 $waiting = is_array($last) ? json_decode((string) $last['data_json'], true) : [];
                 if (($turn['error_code'] ?? '') !== 'CODEX_USER_STOP_WAITING_TOOLS'
                     || ($waiting['event_id'] ?? null) !== ($evidence['event_id'] ?? null)
@@ -250,7 +252,8 @@ final class TaskLedger
     public static function userStopPagePaused(array $expected): bool
     {
         $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
-            ->where('turn_id', $expected['turn']['id'])->where('event_type', 'codex_user_stop_page_paused')
+            ->where('task_id', $expected['turn']['task_id'])->where('turn_id', $expected['turn']['id'])
+            ->where('event_type', 'codex_user_stop_page_paused')
             ->order([['id', 'DESC']])->limit(1)->find('data_json');
         $data = is_array($event) ? json_decode((string) $event['data_json'], true) : null;
         if (!is_array($data) || ($data['generation_id'] ?? null) !== $expected['turn']['generation_id']) return false;

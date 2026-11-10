@@ -397,6 +397,24 @@ final class DiagnosticExport
     /** Extract known error signatures and whitelisted receipt shapes; never export free-form log text. */
     private static function logSignals(string $line): array
     {
+        if (preg_match('/\A(20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d) (\{.*\})\s*$/D', $line, $match)) {
+            $timing = json_decode($match[2], true);
+            $phases = match ($timing['event'] ?? '') {
+                'browser_loop_timing' => ['tick', 'tick_gap', 'capture'],
+                'codex_user_stop_timing' => ['waiting_for_cdp', 'target_inventory_unavailable', 'target_attach_unavailable',
+                    'stop_readback_timeout', 'stop_readback_unavailable', 'stop_witness_unconfirmed',
+                    'stop_confirmation_pending', 'generation_running', 'composer_unavailable', 'stop_confirmed'],
+                default => [],
+            };
+            if (in_array($timing['phase'] ?? null, $phases, true)) {
+                $safe = ['event'=>$timing['event'], 'phase'=>$timing['phase'], 'at'=>(int)strtotime($match[1])];
+                foreach (['elapsed_ms', 'command_id', 'pid'] as $key) {
+                    if (is_int($timing[$key] ?? null) && $timing[$key] >= 0) $safe[$key] = $timing[$key];
+                }
+                if (is_bool($timing['clicked'] ?? null)) $safe['clicked'] = $timing['clicked'];
+                return $safe;
+            }
+        }
         if (preg_match('/\[storage-transaction\] (\{.*\})\s*$/D', $line, $match)) {
             $timing = json_decode($match[1], true);
             if (is_array($timing) && ($timing['event'] ?? '') === 'storage_transaction_slow') {

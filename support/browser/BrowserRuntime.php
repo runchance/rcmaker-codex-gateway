@@ -395,7 +395,7 @@ final class BrowserRuntime
                 $evidence ??= TaskLedger::deferredUserStopEvidence($execution);
                 if ($evidence === null) continue;
                 $settled = TaskLedger::requestUserStop($id, $evidence);
-                $execution = TaskLedger::execution($id);
+                $execution = TaskLedger::pollExecution($id);
                 if (!$settled && ($execution['turn']['error_code'] ?? '') !== 'CODEX_USER_STOP_WAITING_TOOLS') continue;
             }
             if (($execution['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_WAITING_TOOLS'
@@ -407,7 +407,7 @@ final class BrowserRuntime
             unset($this->pendingResumes[$id]);
             if (!isset($this->codexUserStops[$id])) {
                 $this->codexUserStops[$id] = ['execution' => $execution, 'session_id' => null,
-                    'busy' => false, 'clicked' => false, 'idle_since' => null];
+                    'busy' => false, 'clicked' => false, 'idle_since' => null, 'started_at'=>microtime(true)];
             }
         }
         foreach (array_keys($this->codexUserStops) as $id) $this->pollCodexUserStop($id);
@@ -430,13 +430,20 @@ final class BrowserRuntime
             $this->releaseCodexStopObserver($responseId);
             return;
         }
-        if (!$this->taskCdp->ready()) return;
-        $this->codexUserStops[$responseId]['busy'] = true;
+        if (!$this->taskCdp->ready()) {
+            $this->recordCodexStopTiming($responseId, 'waiting_for_cdp');
+            return;
+        }
         if ($stop['session_id'] === null) {
+            $this->codexUserStops[$responseId]['busy'] = true;
             $this->taskCdp->send('Target.getTargets', [], null, function ($error, $result) use ($responseId, $expected, $targetId): void {
                 if (!isset($this->codexUserStops[$responseId])) return;
                 $this->codexUserStops[$responseId]['busy'] = false;
-                if ($error !== null || !is_array($result['targetInfos'] ?? null) || !TaskLedger::userStopOwns($expected)) return;
+                if ($error !== null || !is_array($result['targetInfos'] ?? null)) {
+                    $this->recordCodexStopTiming($responseId, 'target_inventory_unavailable');
+                    return;
+                }
+                if (!TaskLedger::userStopOwns($expected)) return;
                 $matches = array_values(array_filter($result['targetInfos'], static fn($row) => is_array($row) && ($row['targetId'] ?? '') === $targetId));
                 if ($matches === []) {
                     TaskLedger::confirmUserStop($expected, true);
@@ -452,7 +459,10 @@ final class BrowserRuntime
                             return;
                         }
                         $this->codexUserStops[$responseId]['busy'] = false;
-                        if ($attachError !== null || $sessionId === '') return;
+                        if ($attachError !== null || $sessionId === '') {
+                            $this->recordCodexStopTiming($responseId, 'target_attach_unavailable');
+                            return;
+                        }
                         $this->codexUserStops[$responseId]['session_id'] = $sessionId;
                         $this->pollCodexUserStop($responseId);
                     }, 3.0);
@@ -460,13 +470,8 @@ final class BrowserRuntime
             return;
         }
         $chat = TaskWebChat::state((string) $expected['turn']['task_id']);
-        // Tool receipt rounds share a browser command but do not submit a user message.
-        // Resolve once within this fenced stop observer; keep the original physical witness.
-        $source = $expected['job'];
-        if ($chat['mode'] === 'regular') {
-            $source = $stop['physical_source'] ?? self::manualStopSource($source, $expected['surface']);
-            $this->codexUserStops[$responseId]['physical_source'] = $source;
-        }
+        // A physical submission may acquire its acceptance marker while Stop is pending.
+        $source = self::manualStopSource($expected['job'], $expected['surface'], $chat['mode']);
         preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/', (string) $source['prompt'], $tokens);
         $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [];
         if (!empty($source['transport_transaction_id']) && (int) ($source['transport_stage_sent'] ?? 0) > 0) {
@@ -480,12 +485,15 @@ final class BrowserRuntime
             self::acceptedInitialUser($source, $expected['surface']), $chat['mode'], false,
             empty($stop['verify_only']), self::submittedChatBindingMarker($source, $expected['surface'], $chat['mode']));
         $sessionId = (string) $stop['session_id'];
+        $this->codexUserStops[$responseId]['busy'] = true;
         $this->evaluateTaskSession($sessionId, $expression,
             function ($error, $result) use ($responseId, $expected, $sessionId): void {
                 if (($this->codexUserStops[$responseId]['session_id'] ?? null) !== $sessionId) return;
                 $this->codexUserStops[$responseId]['busy'] = false;
                 if (!TaskLedger::userStopOwns($expected)) { $this->releaseCodexStopObserver($responseId); return; }
                 if ($error !== null || !is_array($result)) {
+                    $this->recordCodexStopTiming($responseId, ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT'
+                        ? 'stop_readback_timeout' : 'stop_readback_unavailable');
                     $this->codexUserStops[$responseId]['idle_since'] = null;
                     $this->codexUserStops[$responseId]['verify_only'] = true;
                     // A timeout says nothing about session validity or whether Stop was clicked.
@@ -501,19 +509,37 @@ final class BrowserRuntime
                     $this->releaseCodexStopObserver($responseId);
                     return;
                 }
-                if (empty($result['owned'])) return;
+                if (empty($result['owned'])) {
+                    $this->recordCodexStopTiming($responseId, 'stop_witness_unconfirmed');
+                    return;
+                }
                 $this->codexUserStops[$responseId]['verify_only'] = false;
                 if (!empty($result['stopped'])) $this->codexUserStops[$responseId]['clicked'] = true;
                 if (!empty($result['generation_running']) || empty($result['editor_ready'])) {
+                    $this->recordCodexStopTiming($responseId, !empty($result['confirmation_pending']) ? 'stop_confirmation_pending'
+                        : (!empty($result['generation_running']) ? 'generation_running' : 'composer_unavailable'));
                     $this->codexUserStops[$responseId]['idle_since'] = null;
                     return;
                 }
                 $since = $this->codexUserStops[$responseId]['idle_since'];
                 if ($since === null) { $this->codexUserStops[$responseId]['idle_since'] = microtime(true); return; }
                 if (microtime(true) - $since < 1.0) return;
-                TaskLedger::confirmUserStop($expected);
+                if (TaskLedger::confirmUserStop($expected)) $this->recordCodexStopTiming($responseId, 'stop_confirmed', true);
                 $this->releaseCodexStopObserver($responseId);
             }, 15.0);
+    }
+
+    /** Write a bounded phase sample for a delayed Stop without taking a SQLite writer lock. */
+    private function recordCodexStopTiming(string $responseId, string $phase, bool $terminal = false): void
+    {
+        $stop = $this->codexUserStops[$responseId] ?? [];
+        if (!isset($stop['started_at'])) return;
+        $now = microtime(true);
+        if ($now - $stop['started_at'] < 5.0 || (!$terminal && $now - ($stop['timing_at'] ?? 0.0) < 10.0)) return;
+        $this->codexUserStops[$responseId]['timing_at'] = $now;
+        self::writeBrowserDiagnostic(['event'=>'codex_user_stop_timing', 'phase'=>$phase,
+            'command_id'=>(int)($stop['execution']['job']['command_id'] ?? 0),
+            'elapsed_ms'=>(int)(($now - $stop['started_at']) * 1000), 'clicked'=>(bool)$stop['clicked']]);
     }
 
     /** Release only the stop observer; the Chrome tab remains available for the user's next turn. */
@@ -935,8 +961,14 @@ final class BrowserRuntime
     /** Persist bounded browser diagnostics in the already exported file without polluting stdout. */
     private static function recordQuietBrowserFailure(string $event, \Throwable $failure): void
     {
-        $payload = json_encode(['event'=>$event, 'error'=>get_class($failure),
-            'file'=>basename($failure->getFile()), 'line'=>$failure->getLine()], JSON_UNESCAPED_UNICODE);
+        self::writeBrowserDiagnostic(['event'=>$event, 'error'=>get_class($failure),
+            'file'=>basename($failure->getFile()), 'line'=>$failure->getLine()]);
+    }
+
+    /** Append whitelisted timing or failure metadata to the existing local diagnostic file. */
+    private static function writeBrowserDiagnostic(array $fields): void
+    {
+        $payload = json_encode($fields, JSON_UNESCAPED_UNICODE);
         if (!is_string($payload)) return;
         $directory = (string) Config::get('gateway', 'browser_log_dir');
         // A heartbeat can fail before the first browser launch has created its log directory.
@@ -952,6 +984,22 @@ final class BrowserRuntime
         if ($now - ($this->loopFailureLoggedAt[$event] ?? 0.0) < 30.0) return;
         $this->loopFailureLoggedAt[$event] = $now;
         self::recordQuietBrowserFailure('browser_loop_' . $event, $failure);
+    }
+
+    /**
+     * Record a slow callback or timer gap without touching the shared database.
+     * @param string $phase Timer name (tick, tick_gap or capture).
+     * @param int $elapsedMs Monotonic duration in milliseconds.
+     */
+    public function recordLoopTiming(string $phase, int $elapsedMs): void
+    {
+        if ($elapsedMs < 1500) return;
+        $key = 'timing_' . $phase;
+        $now = microtime(true);
+        if ($now - ($this->loopFailureLoggedAt[$key] ?? 0.0) < 30.0) return;
+        $this->loopFailureLoggedAt[$key] = $now;
+        self::writeBrowserDiagnostic(['event'=>'browser_loop_timing', 'phase'=>$phase,
+            'pid'=>getmypid(), 'elapsed_ms'=>$elapsedMs]);
     }
 
     /** Observe the logged-in account controls without sending a message or changing its chosen model. */
@@ -9694,19 +9742,26 @@ JS;
      * A unique accepted job must share the current task, surface, document and browser command.
      * Missing or ambiguous legacy evidence keeps the existing logical witness, without a guess.
      * @param array $job Fenced logical response job. @param array $surface Current owned document.
+     * @param string $mode Pinned chat mode. Only saved chats use receipt ancestry here.
      * @return array Physical submission, or the original job when no exact source is available.
      */
-    private static function manualStopSource(array $job, array $surface): array
+    private static function manualStopSource(array $job, array $surface, string $mode = 'regular'): array
     {
-        if (!empty($job['submit_intent_at']) && !empty($job['accepted_at'])) return $job;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $fields = 'id,task_id,surface_id,prompt,submit_intent_at,accepted_at,submitted_document_nonce,'
+            . 'baseline_users_json,transport_transaction_id,transport_stage_sent';
+        $current = $db->table('gateway_response_jobs')->where('id', $job['id'])->find($fields);
+        if (!is_array($current)) throw new GatewayError('storage_unavailable', 'The browser Stop source could not be read.', 503);
+        if ($mode !== 'regular' || (!empty($current['submit_intent_at']) && !empty($current['accepted_at']))) return $current;
         if (empty($surface['document_nonce']) || empty($job['command_id'])
             || ($job['surface_id'] ?? null) !== ($surface['id'] ?? null)
-            || ($job['task_id'] ?? null) !== ($surface['task_id'] ?? null)) return $job;
-        $sources = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')
+            || ($job['task_id'] ?? null) !== ($surface['task_id'] ?? null)) return $current;
+        $sources = $db->table('gateway_response_jobs')
             ->where('task_id', $job['task_id'])->where('surface_id', $surface['id'])
             ->where('command_id', $job['command_id'])->where('submitted_document_nonce', $surface['document_nonce'])
-            ->where('submit_intent_at', '<>', null)->where('accepted_at', '<>', null)->limit(2)->select();
-        return count($sources) === 1 ? $sources[0] : $job;
+            ->where('submit_intent_at', '<>', null)->where('accepted_at', '<>', null)->limit(2)->select($fields);
+        if (!is_array($sources)) throw new GatewayError('storage_unavailable', 'The browser Stop source could not be read.', 503);
+        return count($sources) === 1 ? $sources[0] : $current;
     }
 
     /**

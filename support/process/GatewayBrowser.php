@@ -31,20 +31,29 @@ final class GatewayBrowser
                 if (is_callable($previousOnWorkerStop)) $previousOnWorkerStop($stoppedWorker);
             };
         }
-        $timer::add(0.1, function (): void {
+        $lastTick = hrtime(true);
+        $timer::add(0.1, function () use (&$lastTick): void {
+            $started = hrtime(true);
+            $this->runtime->recordLoopTiming('tick_gap', (int) (($started - $lastTick) / 1000000));
+            $lastTick = $started;
             try {
                 $this->runtime->tick();
             } catch (\Throwable $error) {
                 // Keep the worker alive and retain a bounded, exportable diagnostic. The log
                 // contains only exception type/source location, never browser or conversation data.
                 $this->runtime->recordLoopFailure('tick', $error);
+            } finally {
+                $this->runtime->recordLoopTiming('tick', (int) ((hrtime(true) - $started) / 1000000));
             }
         });
         $timer::add(0.65, function (): void {
+            $started = hrtime(true);
             try {
                 $this->runtime->capture();
             } catch (\Throwable $error) {
                 $this->runtime->recordLoopFailure('capture', $error);
+            } finally {
+                $this->runtime->recordLoopTiming('capture', (int) ((hrtime(true) - $started) / 1000000));
             }
         });
         // Only this count=1 browser worker reports startup progress. Bootstrap/API workers

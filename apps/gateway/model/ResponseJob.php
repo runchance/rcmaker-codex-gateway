@@ -662,7 +662,7 @@ final class ResponseJob
         $row = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)->find(
             'id,status,operation_kind,round_kind,previous_response_id,checkpoint_marker,'
             . 'durable_turn_id,surface_id,generation_id,task_id,epoch_id,mcp_binding_id,command_id,submit_intent_at,submitted_document_nonce,'
-            . 'accepted_at,transport_transaction_id,transport_parts_total,transport_stage_sent,transport_stage_acked');
+            . 'accepted_at,transport_transaction_id,transport_parts_total,transport_stage_sent,transport_stage_acked,turn_id,compaction_epoch');
         if (!is_array($row)) throw new GatewayError('response_not_found', 'Responses 请求不存在。', 404);
         return $row;
     }
@@ -1375,7 +1375,9 @@ final class ResponseJob
      */
     public static function failSupersededUnlocked(string $responseId, ?string $message = null, string $code = 'response_superseded'): void
     {
-        $job = self::row($responseId);
+        $job = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)
+            ->find('id,item_id,status,sequence_next');
+        if (!is_array($job)) throw new GatewayError('response_not_found', 'Responses 请求不存在。', 404);
         if (!in_array((string) $job['status'], ['queued', 'running'], true)) return;
         if ((int) $job['sequence_next'] === 0) {
             self::appendEventsUnlocked($job, ResponsesProtocol::initialEvents($responseId));
