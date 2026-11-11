@@ -847,6 +847,7 @@ final class BrowserRuntime
         return true;
     }
 
+    /** Dispatch one claimed browser command and persist any startup failure before releasing the slot. */
     private function execute(array $command): void
     {
         $action = (string) $command['action'];
@@ -881,13 +882,19 @@ final class BrowserRuntime
                 'chatgpt_text' => $this->chatGptText((int) $command['id'], $payload),
                 default => $this->failCommand((int) $command['id'], 'BROWSER_ACTION_UNSUPPORTED', '浏览器操作不受支持。'),
             };
-        } catch (GatewayError $error) {
-            $this->failCommand((int) $command['id'], $error->errorCode, $error->getMessage());
         } catch (\Throwable $error) {
-            error_log('[browser-command] ' . get_class($error) . ' at ' . basename($error->getFile()) . ':' . $error->getLine());
-            @file_put_contents((string) Config::get('gateway', 'browser_log_dir') . '/runtime-errors.log',
-                date('c') . ' ' . get_class($error) . ' ' . basename($error->getFile()) . ':' . $error->getLine() . PHP_EOL, FILE_APPEND);
-            $this->failCommand((int) $command['id'], 'BROWSER_COMMAND_FAILED', '浏览器操作未能完成。');
+            if ($error instanceof GatewayError) {
+                $code = $error->errorCode;
+                $message = $error->getMessage();
+            } else {
+                error_log('[browser-command] ' . get_class($error) . ' at ' . basename($error->getFile()) . ':' . $error->getLine());
+                @file_put_contents((string) Config::get('gateway', 'browser_log_dir') . '/runtime-errors.log',
+                    date('c') . ' ' . get_class($error) . ' ' . basename($error->getFile()) . ':' . $error->getLine() . PHP_EOL, FILE_APPEND);
+                $code = 'BROWSER_COMMAND_FAILED';
+                $message = '浏览器操作未能完成。';
+            }
+            $this->failCommand((int) $command['id'], $code, $message,
+                reportStartupFailure: in_array($action, ['start', 'restart'], true));
         }
     }
 
@@ -11710,11 +11717,22 @@ JS;
         $this->commandBusy = false;
     }
 
-    /** Persist a command failure and optional sanitized details, then release its worker slot. */
-    private function failCommand(int $id, string $code, string $message, array $details = []): void
+    /** Persist a command failure and expose startup errors even when Chrome never launched. */
+    private function failCommand(int $id, string $code, string $message, array $details = [], bool $reportStartupFailure = false): void
     {
         unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id], $this->connectorProbeAccounts[$id]);
-        BrowserState::finish($id, false, ['code' => $code, 'message' => $message] + $details);
+        $result = ['code' => $code, 'message' => $message] + $details;
+        if ($reportStartupFailure) {
+            Schema::transaction(static function () use ($id, $code, $result): void {
+                BrowserState::finish($id, false, $result);
+                // A rejected restart can leave a healthy browser running.
+                if (BrowserState::state()['status'] === 'stopped') {
+                    BrowserState::write(['last_error' => $code]);
+                }
+            });
+        } else {
+            BrowserState::finish($id, false, $result);
+        }
         $this->commandBusy = false;
     }
 

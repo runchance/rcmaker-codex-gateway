@@ -42,9 +42,11 @@ final class StartupProgress
                 'network_ready' => (int) ($network['applied_php_revision'] ?? 0) === (int) $saved['id'],
                 'network_error' => !empty($network['last_apply_error']),
                 'browser_status' => (string) $browser['status'],
-                'browser_ready' => (string) $browser['status'] === 'ready' && BrowserState::isWorkerReady($browser)
+                'browser_ready' => (string) $browser['status'] === 'ready' && empty($browser['profile_reset_required'])
+                    && BrowserState::isWorkerReady($browser)
                     && (int) ($browser['network_revision'] ?? 0) === (int) $saved['id'],
-                'browser_error' => !empty($browser['last_error']),
+                'browser_error' => (string) ($browser['last_error'] ?? ''),
+                'browser_profile_reset_required' => (int) ($browser['profile_reset_required'] ?? 0) === 1,
                 'account_ready' => ResponseJob::accountReady($browser, $page)
                     && (int) $page['observed_at'] >= $this->startedAt,
                 'login_required' => !empty($page['fresh']) && !empty($page['login_required']),
@@ -69,7 +71,7 @@ final class StartupProgress
 
     /**
      * Project a safe startup snapshot into ordered, deduplicated progress lines.
-     * @param array $state Whitelisted booleans/status/count from poll(); no prompts or credentials.
+     * @param array $state Whitelisted status, error codes and counts from poll().
      * @return array Banner line descriptors. A new instance starts a new reporting sequence.
      */
     public function advance(array $state): array
@@ -172,7 +174,18 @@ final class StartupProgress
             return ['checking', '正在加载并应用网络配置…', 'Loading and applying network configuration…'];
         }
         if ($step === 'browser') {
-            if (!empty($state['browser_error']) || ($state['browser_status'] ?? '') === 'error') return ['error', '浏览器尚未就绪，请在“运行准备”中检查浏览器组件。', 'Browser is not ready. Check the browser component in Runtime preparation.'];
+            if (!empty($state['browser_profile_reset_required'])) {
+                return ['profile_reset', '浏览器登录资料清理尚未完成。请在“运行准备”中查看或继续清理。',
+                    'Browser sign-in data cleanup is incomplete. Open Runtime preparation to review or resume it.'];
+            }
+            if (($state['browser_error'] ?? '') === 'BROWSER_TIMEZONE_LOOKUP_FAILED') {
+                return ['timezone_lookup_failed', '浏览器启动失败，无法通过代理查询出口时区。请在“网络与代理”中检查代理，或手动选择代理所在地时区后重试。',
+                    'Browser startup failed because the proxy exit timezone could not be determined. Check the proxy in Network & proxy, or set the timezone of its exit location and try again.'];
+            }
+            if (!empty($state['browser_error']) || ($state['browser_status'] ?? '') === 'error') {
+                return ['error', '浏览器启动或连接失败。请在“运行准备”中检查浏览器状态并重试。',
+                    'Browser startup or connection failed. Check the browser status in Runtime preparation and try again.'];
+            }
             if (($state['browser_status'] ?? '') === 'stopped') return ['stopped', '等待内置浏览器启动；可在“运行准备”中安装或启动浏览器。', 'Waiting for the built-in browser. Install or start it in Runtime preparation.'];
             return ['checking', '正在启动并连接内置浏览器…', 'Starting and connecting the built-in browser…'];
         }
