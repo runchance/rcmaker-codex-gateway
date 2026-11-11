@@ -2971,10 +2971,10 @@ final class TaskLedger
     public static function regularStreamRecoveryState(string $responseId): array
     {
         $db = SDB(null, 'medoo', 'sqlite');
-        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('durable_turn_id,generation_id');
+        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('task_id,durable_turn_id,generation_id');
         if ($job === false) throw new GatewayError('storage_unavailable', 'Web recovery state is temporarily unavailable.', 503);
         if (!is_array($job) || empty($job['durable_turn_id'])) return [];
-        $row = $db->table('gateway_task_events')->where('turn_id', $job['durable_turn_id'])
+        $row = $db->table('gateway_task_events')->where('task_id', $job['task_id'])->where('turn_id', $job['durable_turn_id'])
             ->where('event_type', 'regular_stream_recovery_intent')->order([['id','DESC']])->limit(1)->find('data_json');
         if ($row === false) throw new GatewayError('storage_unavailable', 'Web recovery state is temporarily unavailable.', 503);
         $state = is_array($row) ? json_decode((string) $row['data_json'], true, 32, JSON_THROW_ON_ERROR) : [];
@@ -3047,6 +3047,15 @@ final class TaskLedger
             && preg_match('/\A[a-f0-9]{64}\z/D', (string)($facts['rate_limit_key'] ?? '')) === 1;
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
         $refreshObserved = ($facts['action'] ?? '') === 'refresh_observed';
+        $reattachedEmpty = ($facts['action'] ?? '') === 'reattached_empty';
+        if ($reattachedEmpty && (($state['stage'] ?? '') !== 'reattached'
+            || ($state['document_nonce'] ?? '') !== $surface['document_nonce']
+            || ($state['document_id'] ?? '') !== $facts['document_id']
+            || ($state['user_id'] ?? '') !== $facts['user_id'] || ($state['assistant_id'] ?? '') !== $facts['assistant_id']
+            || $nativeControl || $hostCalls < 1 || $hostCalls !== (int)($state['host_calls'] ?? 0)
+            || empty($facts['terminal']))) {
+            return array_replace($idle, ['waiting'=>true]);
+        }
         if (($facts['action'] ?? '') === 'catalog_refresh') {
             $continuation = self::continuationStateUnlocked($turn['id']);
             $source = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')

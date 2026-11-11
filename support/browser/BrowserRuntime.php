@@ -7643,9 +7643,10 @@ JS;
             $deadline = (float) $ledger['turn']['deadline_at'];
             $this->chatGptTurns[$responseId]['deadline'] = $deadline;
             $surface = $ledger['surface'];
-            if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+            $regularRecoveryState = ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
                 && ($ledger['job']['operation_kind'] ?? '') === 'response'
-                && (TaskLedger::regularStreamRecoveryState($logicalResponseId)['stage'] ?? '') === 'refresh') {
+                ? TaskLedger::regularStreamRecoveryState($logicalResponseId) : [];
+            if (($regularRecoveryState['stage'] ?? '') === 'refresh') {
                 $this->waitRegularStreamRefresh($responseId);
                 return;
             }
@@ -7763,7 +7764,7 @@ JS;
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular',
             $temporarySubmission, $acceptedTemporarySubmission);
-        $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId): void {
+        $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId, $regularRecoveryState): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
             if ($error !== null || !is_array($snapshot)) {
@@ -8432,10 +8433,14 @@ JS;
                         'allow_regular_idle'=>$regularEmptyIdle,
                     ], $now);
                 $this->chatGptTurns[$responseId]['empty_response_ui_observation'] = $emptyUiTransition['observation'];
+                $reattachedEmpty = $regularEmptyIdle && $toolCapable && $deliveredAtUs !== null && $deliverySignature !== ''
+                    && ($regularRecoveryState['stage'] ?? '') === 'reattached'
+                    && $roundMarkdown === '' && !$hasArtifacts && self::emptyRegularRecoverySnapshot($snapshot)
+                    && self::matchesEmptyReattachment($regularRecoveryState, $turn, $snapshot, $deliveredAtUs);
                 $emptyUiReceiptsSettled = $toolCapable && $deliveredAt !== null
                     && $deliverySignature !== '' && ChatGptTransport::idleComposerVisible($snapshot, $regularEmptyIdle)
                     && ($snapshot['generation_running'] ?? null) === false
-                    && ($stoppedCompactSource || $emptyUiTransition['settled']);
+                    && ($stoppedCompactSource || $emptyUiTransition['settled'] || $reattachedEmpty);
                 if ($this->observeEmptyResponseSettlement($responseId, $logicalResponseId, $snapshot, [
                     'response_id' => $logicalResponseId,
                     'session_id' => (string) $turn['session_id'],
@@ -8452,6 +8457,7 @@ JS;
                     'transport_failed' => !empty($emptySession['submission_failed'])
                         && ($emptySession['submission_canceled'] ?? null) !== true,
                     'ui_receipts_settled' => $emptyUiReceiptsSettled,
+                    'reattached_empty' => $reattachedEmpty,
                     'allow_regular_idle' => $regularEmptyIdle,
                     'checkpoint_source_stopped' => $stoppedCompactSource,
                     'round_markdown' => $roundMarkdown,
@@ -8944,6 +8950,38 @@ JS;
      * @param bool $activeCompact Whether this is the stopped failed or reattached checkpoint source.
      * @return bool True after terminal failure or transition into the one-shot summary handoff.
      */
+    private static function emptyRegularRecoverySnapshot(array $snapshot): bool
+    {
+        return ($snapshot['temporary_chat'] ?? null) === false
+            && ChatGptTransport::hasTerminalAnswer($snapshot, true, true)
+            && ChatGptTransport::idleComposerVisible($snapshot, true)
+            && ($snapshot['new_user'] ?? null) === true
+            && ($snapshot['content_present'] ?? null) === false
+            && ($snapshot['markdown'] ?? null) === '' && ($snapshot['visible_text'] ?? null) === ''
+            && empty($snapshot['artifact_candidates']) && empty($snapshot['network_retry'])
+            && empty($snapshot['conversation_replacement']) && empty($snapshot['transport_recovery_visible'])
+            && empty($snapshot['stop_confirmation_pending']);
+    }
+
+    /** A verified reload can lose the original Stop observation without losing the exact reply. */
+    private static function matchesEmptyReattachment(array $state, array $turn, array $snapshot, int $receiptAtUs): bool
+    {
+        $anchor = $snapshot['recovery_anchor'] ?? [];
+        $document = $anchor['document_id'] ?? '';
+        return ($state['stage'] ?? '') === 'reattached'
+            && (int)($state['host_calls'] ?? 0) > 0
+            && ($state['surface_id'] ?? '') === ($turn['surface_id'] ?? null)
+            && ($state['document_nonce'] ?? '') === ($turn['document_nonce'] ?? null)
+            && ($state['conversation_id'] ?? '') === ($turn['web_chat']['conversation_id'] ?? null)
+            && is_numeric($document) && (float)$document * 1000 > $receiptAtUs
+            && ($state['document_id'] ?? '') === $document
+            && !empty($anchor['user_id']) && ($state['user_id'] ?? '') === $anchor['user_id']
+            && ($snapshot['new_user_id'] ?? '') === $anchor['user_id']
+            && !empty($anchor['assistant_id']) && ($state['assistant_id'] ?? '') === $anchor['assistant_id']
+            && ($snapshot['response_id'] ?? '') === $anchor['assistant_id']
+            && ($turn['bound_assistant_id'] ?? '') === $anchor['assistant_id'];
+    }
+
     private function observeEmptyResponseSettlement(string $responseId, string $logicalResponseId,
         array $snapshot, array $evidence, float $now, bool $activeCompact = false): bool
     {
@@ -8997,6 +9035,14 @@ JS;
                 return false;
             }
             $this->beginRetainedCompactionHandoff($responseId, $logicalResponseId, '');
+            return true;
+        }
+        if (!empty($evidence['reattached_empty'])) {
+            // Use the existing saved-chat continuation fence, never Retry or a new page
+            // on this empty observation. The second DOM read can still discover a real final.
+            if (!$this->recoverRegularTaskStream($responseId, $snapshot, true, true)) {
+                $this->scheduleTaskPoll($responseId, 1.0);
+            }
             return true;
         }
         if ($health['error_code'] === 'CHATGPT_EMPTY_RESPONSE' && $toolCapable
@@ -10251,7 +10297,8 @@ JS;
      *     has passed observeEmptyResponseSettlement; permits ordinary Voice idle under those proofs.
      * @return bool Whether ordinary recovery owns this poll; temporary and compact paths are unchanged.
      */
-    private function recoverRegularTaskStream(string $responseId, array $snapshot, bool $settledEmptyStream = false): bool
+    private function recoverRegularTaskStream(string $responseId, array $snapshot, bool $settledEmptyStream = false,
+        bool $reattachedEmpty = false): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || ($turn['web_chat']['mode'] ?? 'temporary') !== 'regular'
@@ -10266,7 +10313,9 @@ JS;
             ? (string)($session['submission_rate_limit_key'] ?? '') : '';
         $state = TaskLedger::regularStreamRecoveryState($logicalId);
         $stoppedThinking = ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING';
-        $failed = $stoppedThinking || in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true);
+        if ($reattachedEmpty && ($state['stage'] ?? '') !== 'reattached') return false;
+        $failed = $reattachedEmpty || $stoppedThinking
+            || in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true);
         if (!$failed && ($state['stage'] ?? '') !== 'retry') return false;
         // Absence of a recognized Stop alone is not a stopped-page proof.
         $retry = $snapshot['network_retry'] ?? [];
@@ -10286,6 +10335,7 @@ JS;
         }
         $identity = [$snapshot['new_user_id'], $snapshot['response_id'],
             $snapshot['error']['code'] ?? '', $retry['failure_id'] ?? '', $retry['fingerprint'] ?? ''];
+        if ($reattachedEmpty) $identity[] = ['reattached_empty', $snapshot['recovery_anchor']['document_id']];
         if ($rateLimitKey !== '') $identity[] = $rateLimitKey;
         $key = hash('sha256', json_encode($identity, JSON_THROW_ON_ERROR));
         $observed = $turn['regular_stopped_observation'] ?? [];
@@ -10302,8 +10352,12 @@ JS;
             $this->scheduleTaskPoll($responseId, 1.0);
             return true;
         }
-        $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression(),
-            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed, $stoppedThinking, $rateLimitKey): void {
+        $responseExpression = $reattachedEmpty ? WebModelPage::responseExpression(
+            (array)$turn['baseline_users'], (array)$turn['baseline_assistants'],
+            (string)($turn['continuation_marker'] ?? ''), (string)$turn['bound_assistant_id'],
+            self::hasLegacyCitationPrefix($turn), '', true) : null;
+        $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression($responseExpression),
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed, $stoppedThinking, $rateLimitKey, $reattachedEmpty): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || ($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
@@ -10314,6 +10368,20 @@ JS;
                     $this->scheduleTaskPoll($responseId, 1.0);
                     return;
                 }
+                if ($reattachedEmpty) {
+                    $fresh = $baseline['recovery_response'] ?? [];
+                    if (!self::emptyRegularRecoverySnapshot($fresh)
+                        || ($fresh['recovery_anchor'] ?? null) !== $snapshot['recovery_anchor']
+                        || ($fresh['new_user_id'] ?? '') !== $snapshot['new_user_id']
+                        || ($fresh['response_id'] ?? '') !== $snapshot['response_id']
+                        || $baseline['document_id'] !== $snapshot['recovery_anchor']['document_id']) {
+                        $this->chatGptTurns[$responseId]['regular_stopped_observation'] = null;
+                        $this->chatGptTurns[$responseId]['empty_response_health'] = null;
+                        $this->scheduleTaskPoll($responseId, 0.5);
+                        return;
+                    }
+                    unset($baseline['recovery_response']);
+                }
                 try {
                     if (ModelCooldown::dispatchDelay() > 0) { $this->scheduleTaskPoll($responseId, 5.0); return; }
                     $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId, $turn['owner_incarnation'],
@@ -10322,10 +10390,16 @@ JS;
                             'document_id'=>(string) $baseline['document_id'],
                             'terminal'=>$failed || !empty($snapshot['completion_action_visible']),
                             'rate_limit_key'=>$rateLimitKey,
-                            'action'=>$rateLimitKey !== '' ? 'rate_limit' : ($stoppedThinking ? 'stopped_thinking'
-                                : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : '')),
+                            'action'=>$reattachedEmpty ? 'reattached_empty'
+                                : ($rateLimitKey !== '' ? 'rate_limit' : ($stoppedThinking ? 'stopped_thinking'
+                                : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : ''))),
                             'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']]);
                     if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 1.0); return; }
+                    if ($reattachedEmpty && !empty($reservation['exhausted'])) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
+                            'The saved Web chat stopped without a final answer and reached the recovery limit. Tool results and conversation history were preserved.', true);
+                        return;
+                    }
                     if (!empty($reservation['published'])) {
                         $this->taskFailTurn($responseId, 'CHATGPT_STREAM_RECOVERY_COMMITTED',
                             'The reply was partially delivered before the stream failed; its text and tool results are preserved without regeneration.', true);
@@ -10355,11 +10429,14 @@ JS;
         return true;
     }
 
-    /** Read normal baseline plus immutable document time origin; never inspect message text. */
-    private static function regularRecoveryBaselineExpression(): string
+    /** Read baseline and document time origin, optionally rechecking the owned reply in the same DOM read. */
+    private static function regularRecoveryBaselineExpression(?string $responseExpression = null): string
     {
         return '(()=>{const baseline=eval(' . json_encode(WebModelPage::baselineExpression(), JSON_THROW_ON_ERROR)
-            . ');baseline.document_id=String(performance.timeOrigin);return baseline;})()';
+            . ');baseline.document_id=String(performance.timeOrigin);'
+            . ($responseExpression === null ? '' : 'baseline.recovery_response=eval('
+                . json_encode($responseExpression, JSON_THROW_ON_ERROR) . ');')
+            . 'return baseline;})()';
     }
 
     /**
