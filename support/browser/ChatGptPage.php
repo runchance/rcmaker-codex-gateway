@@ -1413,15 +1413,20 @@ const temporarySubmission=__TEMPORARY_SUBMISSION__;
 const initialTemporary=temporarySubmission&&!expectedContinuationMarker&&beforeUsers.size===0&&beforeAssistants.size===0
     &&users.length===1&&assistants.length===1&&unboundAnswer?.el===newUser?.el
     &&temporaryChatPage(location.pathname,location.search);
+const initialRegular=expectedInitialBinding&&!expectedContinuationMarker&&beforeUsers.size===0&&beforeAssistants.size===0
+    &&users.length===1&&assistants.length===1&&unboundAnswer?.el===newUser?.el
+    &&!temporaryChatPage(location.pathname,location.search);
 const boundMatches=boundResponseId?assistants.filter(entry=>entry.id===boundResponseId):[];
 const promoted=boundMatches.length===0
     ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
         ||remountedInitialAssistant(assistants,beforeAssistants,boundResponseId,expectedInitialBinding,beforeUsers,users)
         ||(initialTemporary&&boundResponseId
-            ?observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer,__ACCEPTED_TEMPORARY_SUBMISSION__):null):null;
+            ?observeNativeInitialGroup(temporarySubmission,boundResponseId,unboundAnswer,__ACCEPTED_TEMPORARY_SUBMISSION__):null)
+        ||(initialRegular&&boundResponseId
+            ?observeNativeInitialGroup(expectedInitialBinding,boundResponseId,unboundAnswer,false,true):null):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
 if(initialTemporary&&(!boundResponseId||boundMatches.length===1)){
-    observeTemporaryInitialGroup(temporarySubmission,boundResponseId,unboundAnswer);
+    observeNativeInitialGroup(temporarySubmission,boundResponseId,unboundAnswer);
 }
 // Cache only a native group actually observed with both roles after submission.
 // The same response may not adopt a different conversation or answer later.
@@ -1447,6 +1452,9 @@ if(expectedInitialBinding&&beforeUsers.size===0&&beforeAssistants.size===0&&answ
     if(!prior)globalThis[key]={source:expectedInitialBinding,url,assistant:nativeId};
     else if(prior.source===expectedInitialBinding&&initialResponseUrlMatches(prior.url,url)){
         prior.url=url;prior.assistant=nativeId;
+    }
+    if(initialRegular&&(!boundResponseId||boundMatches.length===1)){
+        observeNativeInitialGroup(expectedInitialBinding,boundResponseId,unboundAnswer,false,true);
     }
 }
 const running=!!generationStop();
@@ -1765,10 +1773,12 @@ JS));
      * @param string $filename Exact observed artifact name.
      * @param string $boundResponseId Stable assistant identity bound to the submitted message.
      * @param string $temporarySubmission Physical Temporary Chat response identity, if present.
+     * @param string $initialBindingMarker Physical first saved-chat submission identity, if present.
      * @return string CDP expression returning ok/code/count/kind; activation uses native keyboard input.
      */
     public static function focusArtifactDownloadExpression(array $baselineUserIds, array $baselineAssistantIds,
-        string $href, string $filename, string $boundResponseId = '', string $temporarySubmission = ''): string
+        string $href, string $filename, string $boundResponseId = '', string $temporarySubmission = '',
+        string $initialBindingMarker = ''): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1776,9 +1786,10 @@ JS));
         $expectedFilename = json_encode($filename, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $bound = json_encode($boundResponseId, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $temporary = json_encode($temporarySubmission, JSON_THROW_ON_ERROR);
+        $initialBinding = json_encode($initialBindingMarker, JSON_THROW_ON_ERROR);
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__HREF__', '__FILENAME__', '__BOUND__', '__TEMPORARY_SUBMISSION__'],
-            [$users, $assistants, $expectedHref, $expectedFilename, $bound, $temporary],
+            ['__USERS__', '__ASSISTANTS__', '__HREF__', '__FILENAME__', '__BOUND__', '__TEMPORARY_SUBMISSION__', '__INITIAL_BINDING__'],
+            [$users, $assistants, $expectedHref, $expectedFilename, $bound, $temporary, $initialBinding],
             <<<'JS'
 const beforeUsers=new Set(__USERS__);const beforeAssistants=new Set(__ASSISTANTS__);const expectedHref=__HREF__,expectedFilename=__FILENAME__,boundResponseId=__BOUND__;
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
@@ -1808,9 +1819,14 @@ const temporarySubmission=__TEMPORARY_SUBMISSION__;
 const initialTemporary=temporarySubmission&&beforeUsers.size===0&&beforeAssistants.size===0&&users.length===1
     &&assistants.length===1&&sameGroupAnswers.length===1&&sameGroupAnswers[0].el===newUser?.el
     &&temporaryChatPage(location.pathname,location.search);
+const initialBindingMarker=__INITIAL_BINDING__;
+const initialRegular=initialBindingMarker&&beforeUsers.size===0&&beforeAssistants.size===0&&users.length===1
+    &&assistants.length===1&&sameGroupAnswers.length===1&&sameGroupAnswers[0].el===newUser?.el
+    &&!temporaryChatPage(location.pathname,location.search);
 const promoted=boundMatches.length===0
     ?promotedAssistant(assistants,beforeAssistants,boundResponseId,sameGroupResponseId)
-        ||(initialTemporary&&boundResponseId?observeTemporaryInitialGroup(temporarySubmission,boundResponseId,sameGroupAnswers[0]):null):null;
+        ||(initialTemporary&&boundResponseId?observeNativeInitialGroup(temporarySubmission,boundResponseId,sameGroupAnswers[0]):null)
+        ||(initialRegular&&boundResponseId?observeNativeInitialGroup(initialBindingMarker,boundResponseId,sameGroupAnswers[0],false,true):null):null;
 const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted)
     :sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAnswers[0]:null)
     :answerCandidates.length===1?answerCandidates[0]
@@ -2041,10 +2057,12 @@ const temporaryChatPage=(path,search)=>{
     return flags.length===1&&flags[0]==='true'
         &&(path==='/'||/^\/c\/(?:local-chatgpt%3a)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(path));
 };
-// A first temporary answer can change from one UUID group to another while the
+// A first native answer can change from one UUID group to another while the
 // renderer keeps the native local conversation. Keep the witness in this document
 // only. A new conversation, submission, or different user bubble cannot borrow it.
-const observeTemporaryInitialGroup=(source,bound,entry,acceptedSubmission=false)=>{
+// Saved chats also require the observed initial source, pinned route and exact
+// binding marker in the sole user bubble; temporary acceptance keeps its own gate.
+const observeNativeInitialGroup=(source,bound,entry,acceptedSubmission=false,savedChat=false)=>{
     const uuid=/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
     const group=entry?.el;
     const id=group?.getAttribute('data-turn-key')||'';
@@ -2058,11 +2076,33 @@ const observeTemporaryInitialGroup=(source,bound,entry,acceptedSubmission=false)
     // unchanged start within the exact native conversation and physical submission.
     const text=bubbles.length===1?bubbles[0].textContent.slice(0,2048):'';
     if(!text)return null;
-    const key=Symbol.for('rcmaker.temporary.initial.group');
+    const key=Symbol.for(savedChat?'rcmaker.regular.initial.group':'rcmaker.temporary.initial.group');
     const prior=globalThis[key],path=location.pathname;
     const sameSource=prior?.source===source;
+    let initial=null;
+    if(savedChat){
+        initial=globalThis[Symbol.for('rcmaker.initial.response')];
+        const marker='<rcmaker_chat_binding>'+source+'</rcmaker_chat_binding>',markerAt=text.indexOf(marker);
+        if(initial?.source!==source||temporaryChatPage(path,location.search)||markerAt<0||markerAt>256
+            ||(bound&&initial.assistant!==bound&&(!sameSource||prior.bound!==bound))
+            ||(sameSource&&prior.conversation!==conversation))return null;
+        let sameRoute=false;
+        try{
+            const from=new URL(initial.url),to=new URL(location.href);
+            const localPath='/c/'+encodeURIComponent(conversation).toLowerCase();
+            sameRoute=initialResponseUrlMatches(initial.url,String(location.href))
+                ||(from.origin===to.origin&&!from.searchParams.has('temporary-chat')
+                    &&from.pathname.toLowerCase()===localPath&&uuid.test(to.pathname.slice(3)));
+        }catch(_){return null;}
+        if(!sameRoute)return null;
+        acceptedSubmission=true;
+    }
     const sameWitness=sameSource&&prior.bound===(bound||entry.id)
         &&prior.conversation===conversation&&prior.text===text;
+    const reattach=()=>{
+        if(initial){initial.url=String(location.href);initial.assistant=entry.id;}
+        return {...entry,id:bound};
+    };
     if(bound&&bound!==entry.id&&!sameWitness){
         // The optimistic group may bind before its native conversation wrapper exists.
         // Recover from the accepted submission itself, using the exact marker in the
@@ -2073,7 +2113,7 @@ const observeTemporaryInitialGroup=(source,bound,entry,acceptedSubmission=false)
             ||!uuid.test(bound.slice('group:assistant:'.length))||markerAt<0||markerAt>256
             ||(sameSource&&uuid.test(prior.path.slice(3))&&prior.path!==path))return null;
         globalThis[key]={source,bound,path,conversation,text};
-        return {...entry,id:bound};
+        return reattach();
     }
     if(!sameSource){
         if(!bound||bound===entry.id)globalThis[key]={source,bound:entry.id,path,conversation,text};
@@ -2086,7 +2126,7 @@ const observeTemporaryInitialGroup=(source,bound,entry,acceptedSubmission=false)
     if(prior.path!==path&&!localToStable&&!rootToChat)return null;
     // Once the route is stable, prevent a later same-document move to another UUID.
     if(uuid.test(path.slice(3)))prior.path=path;
-    return bound&&bound!==entry.id?{...entry,id:bound}:null;
+    return bound&&bound!==entry.id?reattach():null;
 };
 const composerSendButtons=editor=>{
     const form=editor.closest('form');
