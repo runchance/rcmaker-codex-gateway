@@ -429,7 +429,7 @@ const pro_supported=max-min+1>=5||family_options.filter(option=>/^Pro(?:$|[\s,ï¼
 const quota_labels=pro?[...new Set([String(pro.innerText||pro.textContent||'').replace(/\s+/g,' ').trim().slice(0,500),...described(pro)])].filter(Boolean):[];
 const ticks=[...containers[0].querySelectorAll('[data-selected]')];
 const effort_locks=ticks.length===max-min+1?ticks.map(el=>el.getAttribute('data-locked')==='true'?true:el.getAttribute('data-locked')==='false'?false:null):[];
-return {ok:true,open:true,owner_focused:document.activeElement===owner,account_plan:accountPlan(),min,max,value,option_count:max-min+1,extra_high_available:max-min+1>=4,pro_available:max-min+1>=5,pro_supported,family_options,descriptions,
+return {ok:true,open:true,owner_focused:document.activeElement===owner,generation_running:!!generationStop(),account_plan:accountPlan(),min,max,value,option_count:max-min+1,extra_high_available:max-min+1>=4,pro_available:max-min+1>=5,pro_supported,family_options,descriptions,
     value_text:String(slider.getAttribute('aria-valuetext')||'').trim().slice(0,500),selected_disabled:slider.getAttribute('aria-disabled')==='true'||owner?.getAttribute('aria-disabled')==='true',
     pro_disabled:pro?.getAttribute('aria-disabled')==='true',pro_detail:quota_labels.join(' | '),quota_labels,effort_locks};
 JS));

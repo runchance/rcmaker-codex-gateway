@@ -5159,10 +5159,16 @@ JS;
             });
     }
 
-    /** Move only to an available effort; focusConfirmed requires a fresh, focused slider readback. */
+    /** Move only to an available effort. A final recovery read owns its original deadline and picker. */
     private function moveTaskEffort(string $responseId, array $mode, array $slider, callable $after, bool $recover,
-        bool $focusConfirmed = false): void
+        bool $focusConfirmed = false, ?callable $recoveryCurrent = null): void
     {
+        if ($recoveryCurrent !== null && !$recoveryCurrent()) return;
+        if ($recoveryCurrent !== null && (($slider['generation_running'] ?? null) !== false || !empty($slider['selected_disabled']))) {
+            $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
+                'The original reasoning control is no longer available for recovery.');
+            return;
+        }
         if (is_string($mode['family'] ?? null) && !ChatGptTransport::familyChecked($slider, $mode['family'])) {
             $this->failModelSelection($responseId, 'CHATGPT_MODEL_FAMILY_DRIFT', 'ChatGPT 模型家族在切换档位时发生变化，未发送任务。', $recover);
             return;
@@ -5175,12 +5181,15 @@ JS;
         $target = (int) ($slider['min'] ?? 0) + (int) $mode['ui_index'];
         $current = (int) ($slider['value'] ?? -1);
         if ($current === $target) {
+            if ($recoveryCurrent !== null) { $after(); return; } // The final readback closes this menu.
             $this->closeTaskEffortMenu($responseId, $after, $recover);
             return;
         }
-        $move = function () use ($responseId, $mode, $after, $recover, $target, $current): void {
+        $move = function () use ($responseId, $mode, $after, $recover, $target, $current, $recoveryCurrent): void {
+            if ($recoveryCurrent !== null && !$recoveryCurrent()) return;
             $key = $target > $current ? 'ArrowRight' : 'ArrowLeft';
-            $this->dispatchModelSelectionKey($responseId, $key, function ($keyError) use ($responseId, $mode, $after, $recover, $current, $key): void {
+            $this->dispatchModelSelectionKey($responseId, $key, function ($keyError) use ($responseId, $mode, $after, $recover, $current, $key, $recoveryCurrent): void {
+                if ($recoveryCurrent !== null && !$recoveryCurrent()) return;
                 if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                     $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位无法切换。', $recover);
                     return;
@@ -5188,69 +5197,71 @@ JS;
                 // Observe the exact effect of the relative key, including quota-driven range changes.
                 $expected = $current + ($key === 'ArrowRight' ? 1 : -1);
                 Timer::add(0.08, fn() => $this->observeTaskEffortMove($responseId, $mode, $current, $expected,
-                    $after, $recover, microtime(true) + 4.0), null, false);
+                    $after, $recover, microtime(true) + 4.0, $recoveryCurrent), null, false);
             });
         };
         if ($focusConfirmed) { $move(); return; }
         $this->evaluateModelSelection($responseId, WebModelPage::focusEffortSliderOwnerExpression(),
-            function ($error, $focused) use ($responseId, $mode, $after, $recover, $move): void {
-                if ($error === null && is_array($focused) && !empty($focused['ok'])) { $move(); return; }
+            function ($error, $focused) use ($responseId, $mode, $after, $recover, $move, $recoveryCurrent): void {
+                if ($recoveryCurrent !== null && !$recoveryCurrent()) return;
+                if ($recoveryCurrent === null && $error === null && is_array($focused) && !empty($focused['ok'])) { $move(); return; }
                 // A lost CDP reply or a remounted Radix owner is not evidence that focus failed.
                 // Read the current owner and value before authorizing any relative key.
                 $deadline = min(microtime(true) + 15.0,
                     (float)($this->chatGptTurns[$responseId]['deadline'] ?? INF));
-                $this->observeTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+                $this->observeTaskEffortFocus($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent);
             });
     }
 
     /** Reconcile uncertain slider focus on the same owned page; retries never emit a model key or message. */
     private function observeTaskEffortFocus(string $responseId, array $mode, callable $after, bool $recover,
-        float $deadline): void
+        float $deadline, ?callable $recoveryCurrent = null): void
     {
-        if (!$this->modelSelectionActive($responseId)) return;
+        if (!$this->modelSelectionActive($responseId) || ($recoveryCurrent !== null && !$recoveryCurrent())) return;
         $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
-            function ($error, $slider) use ($responseId, $mode, $after, $recover, $deadline): void {
-                if (!$this->modelSelectionActive($responseId)) return;
+            function ($error, $slider) use ($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent): void {
+                if (!$this->modelSelectionActive($responseId) || ($recoveryCurrent !== null && !$recoveryCurrent())) return;
                 if (microtime(true) >= $deadline) {
-                    $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+                    $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent);
                     return;
                 }
                 if ($error === null && is_array($slider) && !empty($slider['ok'])
                     && !empty($slider['owner_focused']) && empty($slider['selected_disabled'])) {
-                    $this->moveTaskEffort($responseId, $mode, $slider, $after, $recover, true);
+                    $this->moveTaskEffort($responseId, $mode, $slider, $after, $recover, true, $recoveryCurrent);
                     return;
                 }
-                $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+                $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent);
             });
     }
 
     /** Refocus only the unique slider owner within one preparation deadline; stale tasks cannot dispatch keys. */
     private function retryTaskEffortFocus(string $responseId, array $mode, callable $after, bool $recover,
-        float $deadline): void
+        float $deadline, ?callable $recoveryCurrent = null): void
     {
-        if (!$this->modelSelectionActive($responseId)) return;
+        if (!$this->modelSelectionActive($responseId) || ($recoveryCurrent !== null && !$recoveryCurrent())) return;
         if (microtime(true) >= $deadline) {
             $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位滑块无法获得焦点。', $recover);
             return;
         }
-        Timer::add(0.15, function () use ($responseId, $mode, $after, $recover, $deadline): void {
-            if (!$this->modelSelectionActive($responseId)) return;
+        Timer::add(0.15, function () use ($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent): void {
+            if (!$this->modelSelectionActive($responseId) || ($recoveryCurrent !== null && !$recoveryCurrent())) return;
             if (microtime(true) >= $deadline) {
-                $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline);
+                $this->retryTaskEffortFocus($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent);
                 return;
             }
             $this->evaluateModelSelection($responseId, WebModelPage::focusEffortSliderOwnerExpression(),
-                fn() => $this->observeTaskEffortFocus($responseId, $mode, $after, $recover, $deadline));
+                fn() => $this->observeTaskEffortFocus($responseId, $mode, $after, $recover, $deadline, $recoveryCurrent));
         }, null, false);
     }
 
     /** Read back one relative key's exact effect, allowing delayed rendering but never blind replay. */
-    private function observeTaskEffortMove(string $responseId, array $mode, int $before, int $expected, callable $after, bool $recover, float $deadline): void
+    private function observeTaskEffortMove(string $responseId, array $mode, int $before, int $expected, callable $after, bool $recover,
+        float $deadline, ?callable $recoveryCurrent = null): void
     {
-        if (!$this->modelSelectionActive($responseId)) return;
+        if (!$this->modelSelectionActive($responseId) || ($recoveryCurrent !== null && !$recoveryCurrent())) return;
         $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
-            function ($error, $slider) use ($responseId, $mode, $before, $expected, $after, $recover, $deadline): void {
-                if (!$this->modelSelectionActive($responseId)) return;
+            function ($error, $slider) use ($responseId, $mode, $before, $expected, $after, $recover, $deadline, $recoveryCurrent): void {
+                if (!$this->modelSelectionActive($responseId) || ($recoveryCurrent !== null && !$recoveryCurrent())) return;
                 if ($error === null && is_array($slider) && !empty($slider['ok'])) {
                     if (!is_string($mode['family'] ?? null) || ChatGptTransport::familyChecked($slider, $mode['family'])) {
                         $availability = ChatGptTransport::availabilityError($slider, $mode);
@@ -5261,7 +5272,7 @@ JS;
                     }
                     $actual = (int) ($slider['value'] ?? -99);
                     if ($actual === $expected) {
-                        $this->moveTaskEffort($responseId, $mode, $slider, $after, $recover);
+                        $this->moveTaskEffort($responseId, $mode, $slider, $after, $recover, false, $recoveryCurrent);
                         return;
                     }
                     if ($actual !== $before) {
@@ -5270,7 +5281,8 @@ JS;
                     }
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.12, fn() => $this->observeTaskEffortMove($responseId, $mode, $before, $expected, $after, $recover, $deadline), null, false);
+                    Timer::add(0.12, fn() => $this->observeTaskEffortMove(
+                        $responseId, $mode, $before, $expected, $after, $recover, $deadline, $recoveryCurrent), null, false);
                     return;
                 }
                 $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', '未能确认 ChatGPT 推理档位切换结果，未发送任务。', $recover);
@@ -7197,6 +7209,7 @@ JS;
         return array_intersect_key($this->chatGptTurns[$responseId], array_flip([
             'surface_id','target_id','session_id','document_nonce','owner_incarnation','fencing_version',
             'logical_response_id','transport_transaction_id','transport_stage_sent','transport_stage_acked',
+            'generation_id','continuation_marker','continuation_pending','continuation_sending',
         ]));
     }
 
@@ -7258,23 +7271,27 @@ JS;
             }, min(10.0, max(0.1, $deadline - microtime(true))));
     }
 
-    /** Wait for readback to settle within the original bound; restriction is distinct from identity drift. */
+    /** Verify final effort, allowing one selection repair for an owned unsent stream continuation. */
     private function verifyTaskFinalEffortSlider(string $responseId, array $mode, callable $after, float $deadline,
-        ?array $owner = null): void
+        ?array $owner = null, bool $restored = false): void
     {
         $owner ??= $this->modelReadbackOwner($responseId);
         if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
         $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
-            function ($error, $slider) use ($responseId, $mode, $after, $deadline, $owner): void {
+            function ($error, $slider) use ($responseId, $mode, $after, $deadline, $owner, $restored): void {
                 if ($this->modelReadbackOwner($responseId) !== $owner) return;
                 if (microtime(true) >= $deadline) {
+                    $detail = !empty($slider['ok'])
+                        ? ' [selected_index=' . ((int)$slider['value'] - (int)$slider['min'])
+                            . ', requested_index=' . (int)$mode['ui_index'] . ']'
+                        : ' [slider=' . ($error !== null ? 'cdp_error' : (!empty($slider['open']) ? 'unready' : 'missing')) . ']';
                     $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
-                        'ChatGPT reasoning control did not become verifiable within the model preparation deadline.');
+                        'ChatGPT reasoning control did not become verifiable within the model preparation deadline.' . $detail);
                     return;
                 }
                 if ($error === null && is_array($slider) && !empty($slider['ok'])) {
-                    $familyMatches = !is_string($mode['family'] ?? null)
-                        || ChatGptTransport::familyChecked($slider, $mode['family']);
+                    $hasRequestedFamily = is_string($mode['family'] ?? null);
+                    $familyMatches = !$hasRequestedFamily || ChatGptTransport::familyChecked($slider, $mode['family']);
                     $availability = $familyMatches ? ChatGptTransport::availabilityError($slider, $mode) : null;
                     if ($availability !== null) {
                         $this->dispatchModelSelectionKey($responseId, 'Escape', static function (): void {});
@@ -7282,32 +7299,36 @@ JS;
                         return;
                     }
                     $target = (int) ($slider['min'] ?? 0) + (int) $mode['ui_index'];
-                    $matches = (int) ($slider['value'] ?? -1) === $target
-                        && (!is_string($mode['family'] ?? null)
-                            || (ChatGptTransport::familyChecked($slider, $mode['family'])
-                                && ChatGptTransport::descriptionMatches($slider, $mode['family'], (string) $mode['effort'])));
-                    if ($matches) {
+                    $current = (int) ($slider['value'] ?? -1);
+                    $matches = $current === $target && $familyMatches && (!$hasRequestedFamily
+                        || ChatGptTransport::descriptionMatches($slider, $mode['family'], (string) $mode['effort']));
+                    if ($matches && (!$restored || ($slider['generation_running'] ?? null) === false)) {
                         $this->closeTaskEffortMenu($responseId, $after, false);
                         return;
                     }
-                    // Slider position and its live description can hydrate separately.
-                    // Only read again: no key replay, model downgrade, send or deadline extension.
-                    if (microtime(true) < $deadline) {
-                        Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline, $owner), null, false);
+                    $turn = $this->chatGptTurns[$responseId] ?? [];
+                    if (!$restored && ($turn['operation_kind'] ?? '') === 'response'
+                        && !empty($turn['continuation_sending']) && !empty($turn['continuation_pending'])
+                        && !empty($turn['continuation_marker']) && $hasRequestedFamily && $familyMatches && $current !== $target
+                        && ($slider['generation_running'] ?? null) === false && empty($slider['selected_disabled'])) {
+                        // A recovered page can retain the selected family at a different effort.
+                        // Reuse the normal focus/move/readback sequence under this continuation's scope.
+                        $recoveryCurrent = function () use ($responseId, $owner, $deadline): bool {
+                            if ($this->modelReadbackOwner($responseId) !== $owner) return false;
+                            if (microtime(true) < $deadline) return true;
+                            $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN',
+                                'ChatGPT reasoning control recovery exceeded the model preparation deadline.');
+                            return false;
+                        };
+                        $this->moveTaskEffort($responseId, $mode, $slider,
+                            fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline, $owner, true),
+                            false, false, $recoveryCurrent);
                         return;
                     }
-                    $this->dispatchModelSelectionKey($responseId, 'Escape', static function (): void {});
-                    $detail = implode(' | ', array_filter((array) ($slider['descriptions'] ?? []), 'is_string'));
-                    $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_DRIFT',
-                        '发送前 ChatGPT 模型家族、推理档位或模型说明已经变化。'
-                        . '网页档位：' . (int) ($slider['value'] ?? -1) . '；说明：' . mb_substr($detail, 0, 240));
-                    return;
                 }
-                if (microtime(true) < $deadline) {
-                    Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider($responseId, $mode, $after, $deadline, $owner), null, false);
-                    return;
-                }
-                $this->failModelSelection($responseId, 'CHATGPT_MODEL_SELECTION_UNPROVEN', '发送前无法读取 ChatGPT 推理档位。');
+                // Position and description can render independently. Wait for the exact final state.
+                Timer::add(0.08, fn() => $this->verifyTaskFinalEffortSlider(
+                    $responseId, $mode, $after, $deadline, $owner, $restored), null, false);
             });
     }
     /** Re-check Connector identity and prompt integrity after the UI settle window. */
