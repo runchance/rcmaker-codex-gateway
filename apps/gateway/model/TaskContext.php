@@ -34,9 +34,17 @@ final class TaskContext
             ],'additionalProperties'=>false]];
     }
 
-    /** Return a verbatim UTF-8 record page and explicit cursor; never silently summarize history. */
-    public static function page(string $contextJson, mixed $arguments): array
+    /**
+     * Return a verbatim UTF-8 record page and an explicit cursor.
+     * @param string $contextJson Exact original context owned by the caller's task.
+     * @param mixed $arguments Validated search or pagination request.
+     * @param string|null $receiptCallId Internal evidence identifying a returned tool-result record.
+     * @return array Page content and its next cursor.
+     * @throws GatewayError If the search or pagination arguments are invalid.
+     */
+    public static function page(string $contextJson, mixed $arguments, ?string &$receiptCallId = null): array
     {
+        $receiptCallId = null;
         if ($arguments instanceof \stdClass) $arguments=get_object_vars($arguments);
         if (!is_array($arguments)) throw new GatewayError('context_read_arguments_invalid','历史查询参数必须是对象。',400);
         try {
@@ -69,6 +77,11 @@ final class TaskContext
             while (ContextBudget::tokens($content)>4096) $content=mb_substr($content,0,max(1,(int)(mb_strlen($content)*0.75)));
             $end=$offset+mb_strlen($content);
             $next=$end<$length?['record'=>$i+1,'char_offset'=>$end+1]:($i+1<count($records)?['record'=>$i+2,'char_offset'=>1]:null);
+            $message = $records[$i]['message'] ?? [];
+            if (in_array($message['type'] ?? '', ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)
+                && is_string($message['call_id'] ?? null)) {
+                $receiptCallId = $message['call_id'];
+            }
             return $base+['found'=>true,'record'=>$i+1,'kind'=>$records[$i]['kind'],
                 'message_role'=>$records[$i]['message']['role']??null,'message_phase'=>$records[$i]['message']['phase']??null,
                 'char_offset'=>$offset+1,'record_chars'=>$length,

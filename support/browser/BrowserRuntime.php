@@ -10204,9 +10204,7 @@ JS;
             'request_fingerprint'=>$descriptorHash, 'response_fingerprint'=>$failureHash,
         ]);
         try {
-            $prepared = ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
-                ? ToolBroker::prepareRegularRetryContext($logicalId)
-                : ToolBroker::prepareTemporaryRetryContext($logicalId);
+            $prepared = ToolBroker::prepareCapacityRetryContext($logicalId);
         } catch (GatewayError $error) {
             unset($this->chatGptTurns[$responseId]['capacity_planning_pending']);
             if ($error->errorCode === 'STORAGE_BUSY') $this->scheduleTaskPoll($responseId, 0.5);

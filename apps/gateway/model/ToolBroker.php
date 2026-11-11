@@ -680,6 +680,24 @@ final class ToolBroker
     public static function prepareTemporaryRetryContext(string $responseId): ?array
     {
         $prepared = self::prepareFreshPageRetryContext($responseId, false);
+        return self::validateTemporaryRetryWindow($prepared);
+    }
+
+    /**
+     * Plan a verified conversation-capacity replacement from canonical history in either chat mode.
+     * @param string $responseId Current response whose owned page showed the capacity limit.
+     * @return array|null A read-only plan to revalidate before changing page or capability.
+     * @throws GatewayError When instructions cannot fit or the history cannot be read safely.
+     */
+    public static function prepareCapacityRetryContext(string $responseId): ?array
+    {
+        $prepared = self::prepareFreshPageRetryContext($responseId, null, true);
+        return ($prepared['chat_mode'] ?? null) === 'temporary' ? self::validateTemporaryRetryWindow($prepared) : $prepared;
+    }
+
+    /** Check the temporary replacement's logical budget before the old page can be retired. */
+    private static function validateTemporaryRetryWindow(?array $prepared): ?array
+    {
         if ($prepared === null) return null;
         $spec = $prepared['spec'];
         $transport = $spec['transport_context_json'];
@@ -727,23 +745,24 @@ final class ToolBroker
         return $count;
     }
 
-    private static function prepareFreshPageRetryContext(string $responseId, bool $regular): ?array
+    private static function prepareFreshPageRetryContext(string $responseId, ?bool $regular, bool $capacity = false): ?array
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
-        $mode = $regular ? 'regular' : 'temporary';
-        if (!is_array($job) || !in_array($job['status'], $regular ? ['running'] : ['queued','running'], true)
-            || $job['operation_kind'] !== 'response' || empty($job['mcp_binding_id'])
-            || TaskWebChat::state((string)$job['task_id'])['mode'] !== $mode) return null;
+        if (!is_array($job) || $job['operation_kind'] !== 'response' || empty($job['mcp_binding_id'])) return null;
+        $mode = TaskWebChat::state((string)$job['task_id'])['mode'];
+        $regular ??= $mode === 'regular';
+        if ($mode !== ($regular ? 'regular' : 'temporary')
+            || !in_array($job['status'], $regular ? ['running'] : ['queued','running'], true)) return null;
         $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
         if (!is_array($binding) || $binding['current_response_id'] !== $responseId
             || $binding['task_id'] !== $job['task_id'] || $binding['turn_id'] !== $job['durable_turn_id']
             || !in_array($binding['status'], ['awaiting_start','running'], true)
             || self::activeCountUnlocked((string)$binding['id']) !== 0) return null;
-        $context = self::retryContextSource($job, $regular);
+        $context = self::retryContextSource($job, $regular || $capacity);
         if (!self::hasCompleteReceiptHistory($binding, $job, $callIds, $context)) return null;
         return ['source_hash'=>self::retryContextFingerprint($job, $binding), 'chat_mode'=>$mode,
-            'spec'=>self::retryContextSpec($job, $binding, $context, $regular, true, $callIds)];
+            'capacity'=>$capacity, 'spec'=>self::retryContextSpec($job, $binding, $context, $regular, true, $callIds, $capacity)];
     }
 
     /**
@@ -1033,18 +1052,21 @@ final class ToolBroker
 
     /**
      * Build one fresh-page transport, preserving complete canonical history outside its working view.
-     * @param list<string>|null $settledCalls Exact delivered receipt IDs; only regular recovery may select history.
+     * @param list<string>|null $settledCalls Exact delivered receipt IDs used for history selection.
+     * @param bool $capacity An owned capacity replacement may retrieve oversized receipts from its archive.
      * @return array Prepared context and pinned budget; no database state is changed.
      */
     private static function retryContextSpec(array $job, array $binding, array $context, bool $newOrdinaryChat,
-        bool $missingSurface, ?array $settledCalls = null): array
+        bool $missingSurface, ?array $settledCalls = null, bool $capacity = false): array
     {
         $budget = json_decode($job['budget_json'], true, 128, JSON_THROW_ON_ERROR);
         if ($newOrdinaryChat) unset($budget['regular_chat'], $budget['steering_delta'], $budget['postcompact_page']);
         unset($budget['temporary_model_switch']);
         unset($context['continuation']);
         $transport = ContextHistory::canonical($context);
-        if ($newOrdinaryChat && $missingSurface && $settledCalls !== null) $budget['recovery_receipt_staging'] = true;
+        if (($newOrdinaryChat || $capacity) && $missingSurface && $settledCalls !== null) {
+            $budget['recovery_receipt_staging'] = true;
+        }
         $environment = json_decode($binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
         $spec = [
             'budget'=>$budget, 'context_json'=>$transport, 'transport_context_json'=>$transport,
@@ -1055,10 +1077,10 @@ final class ToolBroker
             'checkpoint_marker'=>$job['checkpoint_marker'] ?? null,
             'parallel_tool_calls'=>!empty($binding['parallel_tool_calls']),
         ];
-        if ($newOrdinaryChat && $missingSurface && $job['operation_kind'] === 'response' && $settledCalls !== null) {
+        if (($newOrdinaryChat || $capacity) && $missingSurface && $job['operation_kind'] === 'response' && $settledCalls !== null) {
             $spec['recovery_preview_prefix'] = '<rcmaker_chat_binding>'.$job['id']."</rcmaker_chat_binding>\n";
             $spec['recovery_preview_suffix'] = self::recoveryResumeNotice();
-            $spec = ContextWindow::selectImportedHistory($spec, false, null, false, $settledCalls);
+            $spec = ContextWindow::selectImportedHistory($spec, false, null, false, $settledCalls, $capacity);
         }
         $logical = (string)($spec['imported_budget_context_json'] ?? $transport);
         $attachments = AttachmentStore::tokenReserve(AttachmentStore::selectForContext([], $logical, false));
@@ -1106,7 +1128,7 @@ final class ToolBroker
         $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find();
         if (!is_array($job)) throw new GatewayError('response_not_found', '任务恢复源记录不存在。', 404);
         $environment = json_decode($binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
-        $context = self::retryContextSource($job, $newOrdinaryChat);
+        $context = self::retryContextSource($job, $newOrdinaryChat || !empty($preparedRetryContext['capacity']));
         if ($missingSurface && ($binding['id'] !== $job['mcp_binding_id'] || $binding['task_id'] !== $job['task_id']
             || $binding['turn_id'] !== $job['durable_turn_id']
             || !self::hasCompleteReceiptHistory($binding, $job, context: $context))) return null;
@@ -1169,6 +1191,13 @@ final class ToolBroker
             'mcp_no_start_retry_token_rotated',
             ['binding_id' => (string) $binding['id']]
         );
+        if (!empty($budget['capacity_receipt_archive'])) {
+            $event = $db->table('gateway_task_events')->where('task_id', $job['task_id'])->where('turn_id', $job['durable_turn_id'])
+                ->where('response_id', $responseId)->where('event_type', 'mcp_no_start_retry_token_rotated')
+                ->order([['id','DESC']])->limit(1)->find('id');
+            if (!is_array($event)) throw new GatewayError('storage_unavailable', 'The replacement archive read could not be fenced.', 503);
+            $budget['original_context_read_after_event_id'] = (int) $event['id'];
+        }
         $fields = ['transport_context_json'=>$transport, 'budget_json'=>json_encode($budget, JSON_THROW_ON_ERROR)];
         if (isset($retrySpec['imported_budget_context_json'])) {
             $fields['input_tokens'] = (int)$retrySpec['recovery_input_tokens'];
@@ -1456,11 +1485,21 @@ final class ToolBroker
         self::assertLiveUnlocked($binding,true);
         $job=self::contextReaderJob($binding);
         if ($job===null) return null;
-        $page=TaskContext::page((string)$job['context_json'],$arguments??[]);
+        $page=TaskContext::page((string)$job['context_json'],$arguments??[],$receiptCallId);
         $budget = json_decode($job['budget_json'], true);
+        $readScope = null;
+        if (!empty($budget['capacity_receipt_archive']) && $receiptCallId !== null) {
+            $receipt = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
+                ->where('task_id', $binding['task_id'])->where('turn_id', $binding['turn_id'])
+                ->where('call_id', $receiptCallId)->where('binding_id', $binding['id'])->where('status', 'completed')
+                ->find('id');
+            if ($receipt === false) throw new GatewayError('storage_unavailable', 'The archived tool receipt could not be verified.', 503);
+            if (is_array($receipt)) $readScope = self::capacityArchiveReadScope($binding);
+        }
         self::eventUnlocked((string)$binding['task_id'],(string)$binding['turn_id'],(string)$binding['current_response_id'],
             'original_context_read',['record'=>$page['record']??null,'found'=>$page['found'],'context_sha256'=>$page['context_sha256'],
-                'archive_sha256'=>$budget['original_context_sha256'] ?? $page['context_sha256']]);
+                'archive_sha256'=>$budget['original_context_sha256'] ?? $page['context_sha256']]
+                + ($readScope === null ? [] : ['capacity_read_scope'=>$readScope]));
         return $page;
     }
 
@@ -1623,6 +1662,11 @@ final class ToolBroker
             if (!is_array($job) || (!in_array((string) $job['status'], ['queued', 'running'], true) && !$closedToolRound)
                 || (string) ($job['mcp_binding_id'] ?? '') !== (string) $binding['id']) {
                 throw new GatewayError('tool_round_closed', '当前 Responses 工具批次已关闭，不能登记新的宿主调用。', 409);
+            }
+            $budget = json_decode((string)$job['budget_json'], true);
+            if (!empty($budget['capacity_receipt_archive']) && self::originalReadPending($binding, $budget)) {
+                return ['ok'=>true, 'paused'=>true,
+                    'instruction'=>'This new host action was not registered. Read a relevant completed tool result from this interrupted turn through rcmaker.context_read first, then continue only remaining work.'];
             }
             if ($freeform && ($tool['name'] ?? null) === 'exec'
                 && in_array($tool['namespace'] ?? null, [null, 'functions'], true)
@@ -3905,12 +3949,14 @@ final class ToolBroker
     }
 
     /** Check bounded-window retrieval using metadata only; polling never loads the full archive. */
-    private static function originalReadPending(array $binding): bool
+    private static function originalReadPending(array $binding, ?array $budget = null): bool
     {
         $responseId = (string)($binding['current_response_id'] ?? '');
         $db = SDB(null, 'medoo', 'sqlite');
-        $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('budget_json');
-        $budget = is_array($job) ? json_decode((string)($job['budget_json'] ?? ''), true) : [];
+        if ($budget === null) {
+            $job = $db->table('gateway_response_jobs')->where('id', $responseId)->find('budget_json');
+            $budget = is_array($job) ? json_decode((string)($job['budget_json'] ?? ''), true) : [];
+        }
         if (empty($budget['original_context_required'])) return false;
         $archiveHash = (string)($budget['original_context_sha256'] ?? '');
         if ($archiveHash === '') return true;
@@ -3919,6 +3965,7 @@ final class ToolBroker
         // Ordinary same-page receipt rounds reuse prior reads. A new read-only recovery
         // page must inspect its archive again; its dedicated capability sets this cursor.
         $cursor = max(0, (int) ($budget['original_context_read_after_event_id'] ?? 0));
+        $readScope = empty($budget['capacity_receipt_archive']) ? null : self::capacityArchiveReadScope($binding);
         do {
             // task_id uses the existing (task_id,id) timeline index. Without it a long-lived
             // installation can scan every task's event history on each completion poll.
@@ -3930,10 +3977,17 @@ final class ToolBroker
             foreach ($events as $event) {
                 $cursor = (int)$event['id'];
                 $data = json_decode($event['data_json'], true);
-                if (hash_equals($archiveHash, (string)($data['archive_sha256'] ?? $data['context_sha256'] ?? ''))) return false;
+                if (hash_equals($archiveHash, (string)($data['archive_sha256'] ?? $data['context_sha256'] ?? ''))
+                    && ($readScope === null || hash_equals($readScope, (string)($data['capacity_read_scope'] ?? '')))) return false;
             }
         } while (count($events) === 128);
         return true;
+    }
+
+    /** A late read from the retired capability cannot unlock a replacement page. */
+    private static function capacityArchiveReadScope(array $binding): string
+    {
+        return hash('sha256', 'capacity-archive-read|' . $binding['token_hash']);
     }
 
     private static function humanMessageText(mixed $content): string

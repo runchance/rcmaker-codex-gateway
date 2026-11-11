@@ -2167,7 +2167,9 @@ final class TaskLedger
         // Plan and count the fresh-page context outside the SQLite writer. The
         // transaction revalidates the exact source and all receipts before rotation.
         if ($preparedRetryContext === null && $missingSurface && $maxRetries > 0) {
-            if (in_array($retryCause, ['conversation_capacity_exhausted','regular_stream_recovery_exhausted'], true)) {
+            if ($retryCause === 'conversation_capacity_exhausted') {
+                $preparedRetryContext = ToolBroker::prepareCapacityRetryContext($responseId);
+            } elseif ($retryCause === 'regular_stream_recovery_exhausted') {
                 $preparedRetryContext = ToolBroker::prepareRegularRetryContext($responseId);
             } elseif ($streamReplacement) {
                 $preparedRetryContext = ToolBroker::prepareTemporaryRetryContext($responseId);
@@ -2267,6 +2269,10 @@ final class TaskLedger
                 && ToolBroker::retireCapacityUndeliveredCallsUnlocked($job) > 0) {
                 // Re-plan outside the writer using the updated receipt and capability state.
                 return ['retry'=>false, 'exhausted'=>false, 'attempt'=>(int)$attempts, 'waiting'=>true];
+            }
+            if ($conversationCapacity && $job['operation_kind'] === 'response'
+                && !empty($job['mcp_binding_id']) && empty($preparedRetryContext['capacity'])) {
+                $preparedRetryContext = [];
             }
             // A missing source page changes only the checkpoint transport: no historical
             // host permission may be replayed on the new page. Provenance remains pinned.

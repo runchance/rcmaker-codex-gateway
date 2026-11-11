@@ -182,11 +182,12 @@ final class ContextWindow
      * @param ?array $prior Owned local response carrying the persisted selection and original archive.
      * @param bool $verifiedInertRecovery ContextRecovery proved no executable commit/tool effects before this new import.
      * @param list<string>|null $verifiedRecoveryCalls Caller proved these completed receipts were delivered before replacing a regular page.
+     * @param bool $allowReceiptArchive A capacity replacement can use the required original reader if its verified receipts cannot fit.
      * @return array Request with selected transport and imported_budget_context_json for logical usage.
      * @throws GatewayError If the current request/instructions or their atomic tool block cannot fit.
      */
     public static function selectImportedHistory(array $spec, bool $noGatewayHistory, ?array $prior = null,
-        bool $verifiedInertRecovery = false, ?array $verifiedRecoveryCalls = null): array
+        bool $verifiedInertRecovery = false, ?array $verifiedRecoveryCalls = null, bool $allowReceiptArchive = false): array
     {
         $budget = (array) ($spec['budget'] ?? []);
         if ((int) ($budget['version'] ?? 0) < 5 || ($spec['operation_kind'] ?? 'response') !== 'response'
@@ -237,7 +238,8 @@ final class ContextWindow
             if (count($messages) > $selection['source_message_count']) {
                 $indices = array_merge($indices, range($selection['source_message_count'], count($messages) - 1));
             }
-            $projected = self::importProjection($context, $indices, hash('sha256', $original), $reader);
+            $projected = self::importProjection($context, $indices, hash('sha256', $original), $reader,
+                !empty($budget['capacity_receipt_archive']));
             $spec['imported_budget_context_json'] = ContextHistory::canonical($projected);
             // A real host receipt already extends its proven selected transport. Restore usage
             // only; changing this prompt, source or budget would invalidate the active capability.
@@ -283,6 +285,7 @@ final class ContextWindow
                 if (($message['role'] ?? null) === 'user') $protected[$index] = true;
             }
         }
+        $requiredInstructions = $protected;
         if ($settledRecovery) {
             // Current binding receipts stay in the physical working view, together with their
             // complete atomic call blocks. Older epochs remain in the same task's exact archive.
@@ -302,11 +305,14 @@ final class ContextWindow
         if ($protected === []) return $spec;
         [$blocks, $unsafe] = self::importAtomicBlocks($messages);
         $mandatory = [];
+        $instructionBlocks = [];
         $firstSafeSuffix = 0;
         foreach ($blocks as $number => [$start, $end]) {
             $required = false;
+            $containsInstruction = false;
             for ($index = $start; $index <= $end; $index++) {
                 $required = $required || isset($protected[$index]);
+                $containsInstruction = $containsInstruction || isset($requiredInstructions[$index]);
                 if (isset($unsafe[$index])) $firstSafeSuffix = $number + 1;
             }
             if (!$required) continue;
@@ -315,15 +321,18 @@ final class ContextWindow
                     throw new GatewayError('context_length_exceeded', '当前需求关联的工具记录缺少完整调用或回执，无法安全选择历史。', 400);
                 }
                 $mandatory[$index] = true;
+                if ($containsInstruction) $instructionBlocks[$index] = true;
             }
         }
-        $project = static function (int $suffix) use ($context, $blocks, $mandatory, $original, $reader): array {
+        $archivedReceipts = false;
+        $archiveHash = hash('sha256', $original);
+        $project = static function (int $suffix) use ($context, $blocks, &$mandatory, $archiveHash, $reader, &$archivedReceipts): array {
             $kept = $mandatory;
             for ($block = $suffix, $total = count($blocks); $block < $total; $block++) {
                 for ($index = $blocks[$block][0]; $index <= $blocks[$block][1]; $index++) $kept[$index] = true;
             }
             ksort($kept);
-            return self::importProjection($context, array_keys($kept), hash('sha256', $original), $reader);
+            return self::importProjection($context, array_keys($kept), $archiveHash, $reader, $archivedReceipts);
         };
         if ($sizeRecovery) {
             // The observed envelope is a recovery preference, not permission to
@@ -346,7 +355,7 @@ final class ContextWindow
         $previewSpec['budget']['imported_transport_transaction_id'] = 'ctx_' . bin2hex(random_bytes(16));
         $previewToken = ToolBroker::previewPromptForBudget($previewSpec,
             ContextHistory::canonical($project(count($blocks))))['turn_token'];
-        $fits = static function (array $projection) use ($capacity, $spec, $previewSpec, $previewToken): bool {
+        $fits = static function (array $projection) use ($capacity, $spec, &$previewSpec, $previewToken): bool {
             $json = ContextHistory::canonical($projection);
             if (ContextBudget::tokens($json, $spec['budget']) + AttachmentStore::tokenReserve(
                 AttachmentStore::selectForContext((array) ($spec['attachments'] ?? []), $json, false), $spec['budget']) > $capacity) return false;
@@ -364,14 +373,25 @@ final class ContextWindow
                 return false;
             }
         };
-        if (!$fits($project(count($blocks)))) {
-            throw new GatewayError($sizeRecovery ? 'CHATGPT_CONTEXT_TOO_LARGE' : 'context_length_exceeded',
-                '当前需求、附件和系统/开发者指令本身已超过预算；未截断正文或移除指令。', 400);
+        $lastBlock = count($blocks);
+        if (!$fits($project($lastBlock))) {
+            if ($allowReceiptArchive && $settledRecovery && $verifiedRecoveryCalls !== []
+                && $instructionBlocks !== [] && $instructionBlocks !== $mandatory) {
+                $mandatory = $instructionBlocks;
+                $archivedReceipts = true;
+                $previewSpec['budget']['original_context_required'] = true;
+                $previewSpec['budget']['original_context_sha256'] = $archiveHash;
+            }
+            if (!$archivedReceipts || !$fits($project($lastBlock))) {
+                throw new GatewayError($sizeRecovery || $allowReceiptArchive ? 'CHATGPT_CONTEXT_TOO_LARGE' : 'context_length_exceeded',
+                    '当前需求、附件和系统/开发者指令本身已超过预算；未截断正文或移除指令。', 400);
+            }
         }
         // Find the earliest fitting atomic boundary, including the existing physical planner,
         // instead of recounting every historical prefix or changing the account's stage modes.
-        $low = $firstSafeSuffix;
-        $high = count($blocks);
+        // Give the archive-based recovery room to read receipts and continue working.
+        $low = $archivedReceipts ? $lastBlock : $firstSafeSuffix;
+        $high = $lastBlock;
         while ($low < $high) {
             $middle = intdiv($low + $high, 2);
             if ($fits($project($middle))) $high = $middle;
@@ -383,10 +403,11 @@ final class ContextWindow
             'selected_message_indices' => $projected['original_context']['working_message_indices']];
         $spec['budget']['imported_history_selection'] = $selection;
         $spec['budget']['imported_original_context_available'] = $reader;
-        if ($sizeRecovery) {
+        if ($sizeRecovery || $archivedReceipts) {
             $spec['budget']['original_context_required'] = true;
-            $spec['budget']['original_context_sha256'] = hash('sha256', $original);
+            $spec['budget']['original_context_sha256'] = $archiveHash;
         }
+        if ($archivedReceipts) $spec['budget']['capacity_receipt_archive'] = true;
         $spec['budget']['imported_transport_transaction_id'] = $previewSpec['budget']['imported_transport_transaction_id'];
         if ($previewToken !== null) $spec['imported_prompt_turn_token'] = $previewToken;
         $spec['full_context_json'] = $original;
@@ -442,7 +463,8 @@ final class ContextWindow
     }
 
     /** Select complete records in source order and disclose omitted history without inventing a summary. */
-    private static function importProjection(array $context, array $indices, string $originalHash, bool $reader): array
+    private static function importProjection(array $context, array $indices, string $originalHash, bool $reader,
+        bool $archivedReceipts = false): array
     {
         sort($indices, SORT_NUMERIC);
         $indices = array_values(array_unique($indices));
@@ -456,6 +478,11 @@ final class ContextWindow
                 . ($reader ? ' Original records remain available through the optional ' . TaskContext::WIRE_NAME . ' reader when relevant.'
                     : ' Omitted records are not part of this working context; report missing facts when they matter.')];
         if ($reader) $context['original_context']['reader'] = TaskContext::WIRE_NAME;
+        if ($archivedReceipts) {
+            $context['original_context']['notice'] .= ' This replacement page omits confirmed tool receipts from the interrupted turn. '
+                . 'Find and read the relevant completed tool results using rcmaker.context_read before any new host action or final answer. '
+                . 'Continue only remaining work and never repeat completed effects.';
+        }
         return $context;
     }
 
