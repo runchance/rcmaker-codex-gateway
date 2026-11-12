@@ -61,9 +61,8 @@ final class RetiredTaskPageStop
                         $this->finishClosed($id, $snapshot);
                     } elseif (!empty($snapshot['empty_page'])) {
                         if (TaskPageRetirement::confirmStopped($snapshot)) $this->finishClosed($id, $snapshot);
-                    } elseif (TaskPageRetirement::closeMissingInertStage($snapshot)) {
-                        $this->finishClosed($id, $snapshot, true);
-                    } elseif (!$sameChatVisible && (TaskPageRetirement::closeMissingPendingCheckpointPage($snapshot)
+                    } elseif (!$sameChatVisible && (TaskPageRetirement::closeMissingInertStage($snapshot)
+                        || TaskPageRetirement::closeMissingPendingCheckpointPage($snapshot)
                         || TaskPageRetirement::closeMissingCompletedPage($snapshot))) {
                         $this->finishClosed($id, $snapshot, true);
                     } else {

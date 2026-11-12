@@ -298,6 +298,50 @@ final class TaskPageRetirement
     }
 
     /**
+     * Persist the first wait for this replacement so a reconnect or worker restart cannot
+     * extend the preparation budget. A later, separately fenced page repair gets its own wait.
+     * @param array $turn Current durable task turn.
+     * @param int $repairCount Current response's physical page repair counter.
+     * @return int Unix time of the first replacement-page wait.
+     * @throws GatewayError If the task advanced or its wait could not be persisted.
+     */
+    public static function replacementWaitStarted(array $turn, int $repairCount): int
+    {
+        $identity = ['generation_id'=>$turn['generation_id'], 'repair_count'=>$repairCount];
+        $read = static function () use ($turn, $identity): ?int {
+            $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')->where('task_id', $turn['task_id'])
+                ->where('turn_id', $turn['id'])->where('response_id', $turn['response_id'])
+                ->where('surface_id', $turn['surface_id'])->where('event_type', 'replacement_page_wait_started')
+                ->order([['id','DESC']])->limit(1)->find('created_at,data_json');
+            if ($event === false) throw new GatewayError('storage_unavailable', 'Previous page wait could not be read.', 503);
+            return is_array($event) && json_decode($event['data_json'], true) === $identity ? (int)$event['created_at'] : null;
+        };
+        $startedAt = $read();
+        if ($startedAt !== null) return $startedAt;
+        return Schema::transaction(static function () use ($turn, $repairCount, $identity, $read): int {
+            $db = SDB(null, 'medoo', 'sqlite');
+            $current = $db->table('gateway_task_turns')->where('id', $turn['id'])->where('task_id', $turn['task_id'])
+                ->where('response_id', $turn['response_id'])->where('generation_id', $turn['generation_id'])
+                ->where('status', 'IN', ['queued', 'submit_intent', 'submitted', 'running'])->find('id,error_code');
+            $job = $db->table('gateway_response_jobs')->where('id', $turn['response_id'])->where('surface_id', $turn['surface_id'])
+                ->where('generation_id', $turn['generation_id'])->where('repair_count', $repairCount)
+                ->where('status', 'IN', ['queued', 'running', 'completed'])->find('id');
+            if (!is_array($current) || !is_array($job) || ($current['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
+                throw new GatewayError('surface_fence_lost', 'Task ownership changed while waiting for its previous page.', 409);
+            }
+            $startedAt = $read();
+            if ($startedAt !== null) return $startedAt;
+            $startedAt = time();
+            if (!$db->table('gateway_task_events')->add([
+                'task_id'=>$turn['task_id'], 'turn_id'=>$turn['id'], 'response_id'=>$turn['response_id'],
+                'surface_id'=>$turn['surface_id'], 'event_type'=>'replacement_page_wait_started',
+                'data_json'=>self::encode($identity), 'created_at'=>$startedAt,
+            ])) throw new GatewayError('storage_unavailable', 'Previous page wait could not be saved.', 503);
+            return $startedAt;
+        });
+    }
+
+    /**
      * Reconcile old releases before another epoch transition can obscure their exact handoff.
      * Epoch retirement uses the same transfer proof as the browser's retirement poll.
      * @param string|null $taskId Exact transitioning task, or the browser's bounded pending batch.
@@ -499,8 +543,8 @@ final class TaskPageRetirement
     }
 
     /**
-     * Reconcile an absent temporary staging page that never acquired executable authority.
-     * The browser caller must first confirm this exact target absent in a successful inventory.
+     * Reconcile an absent staging page that never acquired executable authority.
+     * The browser caller must first confirm the target and any known matching chat are absent.
      * This records physical absence plus inert-submission proof, never a fabricated Stop ACK.
      * @param array $snapshot Exact owned retirement with its original source/token witnesses.
      * @return bool Whether the inert obligation was atomically closed; uncertain/executed pages stay pending.
@@ -508,47 +552,134 @@ final class TaskPageRetirement
      */
     public static function closeMissingInertStage(array $snapshot): bool
     {
-        if (($snapshot['chat_mode'] ?? '') !== 'temporary' || empty($snapshot['transaction_hashes'])
-            || empty($snapshot['source_response_id'])) return false;
+        if (self::inertStageAbsenceProof($snapshot) === null) return false;
         return Schema::transaction(static function () use ($snapshot): bool {
-            if (!self::owns($snapshot)) return false;
+            $proof = self::inertStageAbsenceProof($snapshot);
+            if ($proof === null) return false;
             $db = SDB(null,'medoo','sqlite');
-            $job = $db->table('gateway_response_jobs')->where('id',$snapshot['source_response_id'])->find(
-                'id,task_id,surface_id,status,operation_kind,durable_turn_id,mcp_binding_id,submit_intent_at,accepted_at,output_started,output_text');
-            if (!is_array($job) || $job['task_id'] !== $snapshot['task_id'] || $job['operation_kind'] !== 'response'
-                || $job['surface_id'] !== ($snapshot['origin_surface_id'] ?? $snapshot['surface_id'])
-                || $job['status'] !== 'failed' || $job['submit_intent_at'] !== null || $job['accepted_at'] !== null
-                || (int)$job['output_started'] !== 0 || $job['output_text'] !== '' || empty($job['mcp_binding_id'])) return false;
-            $turn = $db->table('gateway_task_turns')->where('id',$job['durable_turn_id'])->find();
-            $binding = $db->table('gateway_mcp_bindings')->where('id',$job['mcp_binding_id'])->find();
-            if (!is_array($turn) || !is_array($binding) || $turn['task_id'] !== $snapshot['task_id']
-                || $turn['surface_id'] !== $job['surface_id'] || !in_array($turn['status'],['failed','cancelled'],true)
-                || $turn['submit_intent_at'] !== null || $turn['submitted_at'] !== null || $turn['committed_at'] !== null
-                || $binding['task_id'] !== $snapshot['task_id'] || $binding['turn_id'] !== $turn['id']
-                || $binding['current_response_id'] !== $job['id'] || !in_array($binding['status'],['awaiting_start','revoked'],true)
-                || $binding['sent_at'] !== null || $binding['started_at'] !== null || (int)$binding['activity_revision'] !== 0
-                || !in_array($binding['token_hash'],$snapshot['turn_token_hashes'] ?? [],true)) return false;
-            $counts = [
-                $db->table('gateway_tool_invocations')->where('turn_id',$turn['id'])->count(),
-                $db->table('gateway_mcp_activities')->where('binding_id',$binding['id'])->count(),
-                $db->table('gateway_web_messages')->where('response_id',$job['id'])
-                    ->where('kind','NOT IN',['stage','stage_ack','stage_ack_repair'])->count(),
-                $db->table('gateway_web_messages')->where('response_id',$job['id'])->where('direction','outbound')->where('kind','stage')->count(),
-            ];
-            foreach ($counts as $count) if (!is_numeric($count)) throw new GatewayError('storage_unavailable','Inert staging evidence could not be read.',503);
-            if ((int)$counts[0] !== 0 || (int)$counts[1] !== 0 || (int)$counts[2] !== 0 || (int)$counts[3] < 1) return false;
             $changed = $db->table('gateway_surface_retirements')->where('surface_id',$snapshot['surface_id'])
                 ->where('state','pending')->where('snapshot_json',self::encode(self::persistedSnapshot($snapshot)))
                 ->update(['state'=>'closed','updated_at'=>time()]);
             if (!$changed || $changed->rowCount() !== 1) return false;
             TaskLedger::targetClosed($snapshot['surface_id']);
-            if (!$db->table('gateway_task_events')->add(['task_id'=>$snapshot['task_id'],'turn_id'=>$turn['id'],
-                'response_id'=>$job['id'],'surface_id'=>$snapshot['surface_id'],'event_type'=>'retired_inert_stage_absent',
-                'data_json'=>self::encode(['reason'=>'temporary_staging_without_executable_commit']),'created_at'=>time()])) {
+            if (!$db->table('gateway_task_events')->add(['task_id'=>$snapshot['task_id'],'turn_id'=>$proof['turn_id'],
+                'response_id'=>$snapshot['source_response_id'],'surface_id'=>$snapshot['surface_id'],'event_type'=>'retired_inert_stage_absent',
+                'data_json'=>self::encode(['reason'=>$proof['reason']]),'created_at'=>time()])) {
                 throw new GatewayError('storage_unavailable','Inert staging closure could not be saved.',503);
             }
             return true;
         });
+    }
+
+    /**
+     * Verify this absent page only staged context. A saved-chat staging page must also
+     * have been independently observed empty, and inherited receipts must predate its token.
+     * @return array{turn_id:string,reason:string}|null
+     */
+    private static function inertStageAbsenceProof(array $snapshot): ?array
+    {
+        $mode = $snapshot['chat_mode'] ?? '';
+        if (!in_array($mode, ['regular', 'temporary'], true) || empty($snapshot['transaction_hashes'])
+            || empty($snapshot['source_response_id']) || !self::owns($snapshot)) return null;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $job = $db->table('gateway_response_jobs')->where('id', $snapshot['source_response_id'])->find(
+            'id,task_id,surface_id,status,operation_kind,durable_turn_id,mcp_binding_id,submit_intent_at,accepted_at,output_started,output_text');
+        if (!is_array($job) || $job['task_id'] !== $snapshot['task_id'] || $job['operation_kind'] !== 'response'
+            || $job['surface_id'] !== ($snapshot['origin_surface_id'] ?? $snapshot['surface_id'])
+            || $job['status'] !== 'failed' || $job['submit_intent_at'] !== null || $job['accepted_at'] !== null
+            || (int)$job['output_started'] !== 0 || $job['output_text'] !== '' || empty($job['mcp_binding_id'])) return null;
+        $turn = $db->table('gateway_task_turns')->where('id', $job['durable_turn_id'])->find();
+        $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])
+            ->find('id,task_id,turn_id,current_response_id,status,sent_at,started_at,activity_revision,token_hash');
+        if (!is_array($turn) || !is_array($binding) || $turn['task_id'] !== $snapshot['task_id']
+            || $turn['response_id'] !== $job['id'] || $turn['surface_id'] !== $job['surface_id']
+            || !in_array($turn['status'], ['failed', 'cancelled'], true)
+            || $turn['submit_intent_at'] !== null || $turn['submitted_at'] !== null || $turn['committed_at'] !== null
+            || $binding['task_id'] !== $snapshot['task_id'] || $binding['turn_id'] !== $turn['id']
+            || $binding['current_response_id'] !== $job['id'] || !in_array($binding['status'], ['awaiting_start', 'revoked'], true)
+            || $binding['sent_at'] !== null || $binding['started_at'] !== null
+            || !in_array($binding['token_hash'], $snapshot['turn_token_hashes'] ?? [], true)) return null;
+
+        $unexpected = $db->table('gateway_web_messages')->where('response_id', $job['id'])
+            ->where('kind', 'NOT IN', ['stage', 'stage_ack', 'stage_ack_repair'])->count();
+        $stages = $db->table('gateway_web_messages')->where('response_id', $job['id'])
+            ->where('direction', 'outbound')->where('kind', 'stage')->count();
+        $calls = $db->table('gateway_tool_invocations')->where('turn_id', $turn['id'])->count();
+        $activities = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])->count();
+        foreach ([$unexpected, $stages, $calls, $activities] as $count) {
+            if (!is_numeric($count)) throw new GatewayError('storage_unavailable', 'Inert staging evidence could not be read.', 503);
+        }
+        if ((int)$unexpected !== 0 || (int)$stages < 1) return null;
+        $hasActivity = (int)$calls > 0 || (int)$activities > 0 || (int)$binding['activity_revision'] > 0;
+        if ($mode === 'temporary' && !$hasActivity) {
+            return ['turn_id'=>$turn['id'], 'reason'=>'temporary_staging_without_executable_commit'];
+        }
+
+        // For the wider case require a single response on the staged physical page and
+        // accepted context-only sends. An unacknowledged stage cannot prove settled.
+        if ($job['surface_id'] !== $snapshot['surface_id']) return null;
+        $pageJobs = $db->table('gateway_response_jobs')->where('surface_id', $snapshot['surface_id'])->count();
+        $accepted = $db->table('gateway_web_messages')->where('response_id', $job['id'])->where('direction', 'outbound')
+            ->where('kind', 'stage')->where('status', 'accepted')->where('purpose', 'context_stage')->count();
+        $unconfirmedRepairs = $db->table('gateway_web_messages')->where('response_id', $job['id'])->where('direction', 'outbound')
+            ->where('kind', 'stage_ack_repair')->where('status', '<>', 'accepted')->count();
+        if (!is_numeric($pageJobs) || !is_numeric($accepted) || !is_numeric($unconfirmedRepairs)) {
+            throw new GatewayError('storage_unavailable', 'Staged page provenance could not be read.', 503);
+        }
+        if ((int)$pageJobs !== 1 || (int)$accepted !== (int)$stages || (int)$unconfirmedRepairs !== 0) return null;
+        if ($mode === 'regular') {
+            $empty = $db->table('gateway_task_events')->where('task_id', $job['task_id'])->where('response_id', $job['id'])
+                ->where('surface_id', $job['surface_id'])->where('turn_id', $turn['id'])
+                ->where('event_type', 'initial_regular_chat_empty_observed')->find('data_json');
+            $data = is_array($empty) ? json_decode($empty['data_json'], true) : null;
+            if (($data['generation_id'] ?? null) !== $turn['generation_id']
+                || ($data['document_nonce_sha256'] ?? null) !== hash('sha256', $snapshot['document_nonce'])) return null;
+        }
+        if ($hasActivity && !self::stagingOnlyInheritedClosedReceipts($snapshot, $job, $turn, $binding, (int)$calls, (int)$activities)) return null;
+        return ['turn_id'=>$turn['id'], 'reason'=>'staging_without_executable_commit'];
+    }
+
+    /**
+     * Prove that a rotated capability kept only settled history from its closed predecessor.
+     * @return bool False if any call or MCP activity could belong to this staged page.
+     */
+    private static function stagingOnlyInheritedClosedReceipts(
+        array $snapshot, array $job, array $turn, array $binding, int $calls, int $activities
+    ): bool
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $retry = $db->table('gateway_task_events')->where('task_id', $job['task_id'])->where('turn_id', $turn['id'])
+            ->where('response_id', $job['id'])->where('surface_id', $job['surface_id'])
+            ->where('event_type', 'connector_no_start_retry_prepared')->order([['id', 'DESC']])->limit(1)->find('id,data_json');
+        $data = is_array($retry) ? json_decode($retry['data_json'], true) : null;
+        if (($data['new_surface_id'] ?? null) !== $job['surface_id'] || ($data['generation_id'] ?? null) !== $turn['generation_id']
+            || ($data['binding_id'] ?? null) !== $binding['id'] || empty($data['old_surface_id'])
+            || $data['old_surface_id'] === $job['surface_id']) return false;
+        $closed = $db->table('gateway_surface_retirements')->where('surface_id', $data['old_surface_id'])
+            ->where('task_id', $job['task_id'])->where('state', 'closed')->find('snapshot_json');
+        $old = is_array($closed) ? json_decode($closed['snapshot_json'], true) : null;
+        if (empty($old['target_id']) || $old['target_id'] === $snapshot['target_id']) return false;
+        $transferred = $db->table('gateway_task_events')->where('task_id', $job['task_id'])->where('surface_id', $data['old_surface_id'])
+            ->where('event_type', 'retired_page_transferred')->find('id');
+        if ($transferred !== null) return false;
+        $rotation = $db->table('gateway_task_events')->where('task_id', $job['task_id'])->where('turn_id', $turn['id'])
+            ->where('response_id', $job['id'])->where('id', '<', $retry['id'])->where('event_type', 'mcp_no_start_retry_token_rotated')
+            ->order([['id', 'DESC']])->limit(1)->find('created_at,data_json');
+        $rotationData = is_array($rotation) ? json_decode($rotation['data_json'], true) : null;
+        if (($rotationData['binding_id'] ?? null) !== $binding['id']) return false;
+        $rotatedAt = (int)$rotation['created_at'];
+        $settledCalls = $db->table('gateway_tool_invocations AS i')
+            ->join('gateway_response_jobs AS j', 'j.id', 'i.response_id')
+            ->where('i.task_id', $job['task_id'])->where('i.turn_id', $turn['id'])->where('i.binding_id', $binding['id'])
+            ->where('j.task_id', $job['task_id'])->where('j.durable_turn_id', $turn['id'])->where('j.surface_id', $data['old_surface_id'])
+            ->where('j.status', 'completed')->where('j.round_kind', 'tool_call')
+            ->where('i.status', 'completed')->where('i.result_json', '<>', null)->where('i.result_delivered_at', '<=', $rotatedAt)->count();
+        $settledActivities = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+            ->where('status', 'completed')->where('updated_at', '<=', $rotatedAt)->count();
+        if (!is_numeric($settledCalls) || !is_numeric($settledActivities)) {
+            throw new GatewayError('storage_unavailable', 'Inherited staging receipts could not be read.', 503);
+        }
+        return (int)$settledCalls === $calls && (int)$settledActivities === $activities;
     }
 
     /**

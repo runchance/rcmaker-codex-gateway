@@ -20,6 +20,7 @@ use app\gateway\model\NetworkSettings;
 use app\gateway\model\ModelCooldown;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\TaskLedger;
+use app\gateway\model\TaskPageRetirement;
 use app\gateway\model\TaskWebChat;
 use app\gateway\model\ToolBroker;
 use app\gateway\model\WebMessageAudit;
@@ -51,6 +52,8 @@ final class BrowserRuntime
     private const TASK_SEND_READY_SECONDS = 60.0;
     /** App catalog loading and native selection rendering are asynchronous, within the turn deadline. */
     private const TASK_CONNECTOR_READY_SECONDS = 60.0;
+    /** Allow for CDP inspection, page reload and Stop confirmation within preparation. */
+    private const TASK_PREVIOUS_PAGE_STOP_SECONDS = 90;
     /** First-profile recovery requires a continuous absence of initialization progress. */
     private const COLD_PROFILE_IDLE_RETRY_SECONDS = 45.0;
 
@@ -129,6 +132,8 @@ final class BrowserRuntime
     private array $codexUserStops = [];
     /** Independent per-retired-page stop/close observers; never borrow an active task session. */
     private ?RetiredTaskPageStop $retiredTaskPageStop = null;
+    /** @var array<int,array{phase:string,started_at:int}> Wait clock for each active command and physical attempt. */
+    private array $previousPageWaitStarted = [];
     /** @var array<int,int> Browser command id => submitted no-side-effect Connector probe attempts. */
     private array $connectorProbeAttempts = [];
     /** Runtime fences live only for the current asynchronous connector commands. */
@@ -2983,22 +2988,18 @@ JS;
             $this->failCommand($commandId, 'CHATGPT_RESPONSE_STATE_INVALID', 'Responses 请求缺少持久响应标识。');
             return;
         }
-        if (!$this->taskCdp->ready()) {
-            try { $this->deferCommand($commandId); }
-            catch (\Throwable) { $this->failCommand($commandId, 'CHATGPT_BROWSER_NOT_READY', '任务浏览器控制连接尚未就绪。'); }
-            $this->commandBusy = false;
-            return;
-        }
         try {
             $ledger = TaskLedger::execution($responseId);
-            $job = ResponseJob::execution($responseId);
+            $job = $ledger['job'];
             if (!in_array((string) ($job['status'] ?? ''), ['queued', 'running'], true)) {
                 throw new GatewayError('CHATGPT_RESPONSE_STATE_INVALID', 'Responses 请求状态已变化，未重复发送网页消息。', 409);
             }
-            if (!$this->settleSupersededTaskSurface($responseId, $job, $ledger)) {
-                if (time() >= (int) ($ledger['turn']['deadline_at'] ?? 0)) {
-                    throw new GatewayError('steering_page_retire_timeout', '中途指令等待旧网页退出超时，未发送新消息。', 504);
-                }
+            if (!$this->settleSupersededTaskSurface($responseId, $job, $ledger, $commandId)) {
+                $this->deferCommand($commandId);
+                $this->commandBusy = false;
+                return;
+            }
+            if (!$this->taskCdp->ready()) {
                 $this->deferCommand($commandId);
                 $this->commandBusy = false;
                 return;
@@ -3031,7 +3032,7 @@ JS;
     }
 
     /** Release superseded observers, then require remote Stop acknowledgement before replacement. */
-    private function settleSupersededTaskSurface(string $responseId, array $job, array $ledger): bool
+    private function settleSupersededTaskSurface(string $responseId, array $job, array $ledger, int $commandId): bool
     {
         if (\app\gateway\model\SteeringContext::isDelta($job)) {
             // Retire old observers, not the page. Their capabilities and ledger fence were
@@ -3049,8 +3050,10 @@ JS;
         // A replacement may have no previous_response_id after admission recovery.
         // Stop every retired predecessor of this task, not only that optional parent.
         $retired = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_surfaces')
-            ->where('task_id', (string) $job['task_id'])->where('status', 'retired')->select();
-        if (!is_array($retired)) return false;
+            ->where('task_id', (string) $job['task_id'])->where('status', 'retired')->select('id');
+        if (!is_array($retired)) {
+            throw new GatewayError('storage_unavailable', 'Previous task pages could not be read.', 503);
+        }
         $retiredIds = array_fill_keys(array_map(static fn(array $row): string => (string) $row['id'], $retired), true);
         foreach ($this->chatGptTurns as $oldResponseId => $turn) {
             if (!isset($retiredIds[(string) ($turn['surface_id'] ?? '')])) continue;
@@ -3061,7 +3064,28 @@ JS;
                 catch (\Throwable) {}
             }
         }
-        return $this->retiredPageStops()->settled((string)$job['task_id']);
+        return $this->awaitPreviousPageStop($ledger, $commandId);
+    }
+
+    /** Poll the same stop obligation from queue admission and asynchronous page preparation. */
+    private function awaitPreviousPageStop(array $ledger, int $commandId): bool
+    {
+        $turn = $ledger['turn'];
+        if ($this->retiredPageStops()->settled((string)$turn['task_id'])) {
+            unset($this->previousPageWaitStarted[$commandId]);
+            return true;
+        }
+        $repairCount = (int)$ledger['job']['repair_count'];
+        $phase = $turn['surface_id'] . ':' . $turn['generation_id'] . ':' . $repairCount;
+        if (($this->previousPageWaitStarted[$commandId]['phase'] ?? null) !== $phase) {
+            $this->previousPageWaitStarted[$commandId] = [
+                'phase'=>$phase, 'started_at'=>TaskPageRetirement::replacementWaitStarted($turn, $repairCount),
+            ];
+        }
+        $startedAt = $this->previousPageWaitStarted[$commandId]['started_at'];
+        if (time() < min((int)$turn['deadline_at'], $startedAt + self::TASK_PREVIOUS_PAGE_STOP_SECONDS)) return false;
+        throw new GatewayError('CHATGPT_PREVIOUS_PAGE_STOP_UNCONFIRMED',
+            'Could not confirm that the previous ChatGPT page stopped. No message was sent to a replacement page.', 504);
     }
 
     /** Share one asynchronous retirement controller across cleanup and every replacement entry. */
@@ -3343,37 +3367,48 @@ JS;
 
     private function prepareTaskSurface(string $responseId, int $commandId, bool $recover): void
     {
-        if ((TaskLedger::execution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
+        if ((TaskLedger::pollExecution($responseId)['turn']['error_code'] ?? '') === 'CODEX_USER_STOP_PENDING') {
             $this->finishCommand($commandId, ['status' => 'user_stop_pending']);
             return;
         }
         if (!$recover && $this->deferTaskCooldown($responseId,
             fn() => $this->prepareTaskSurface($responseId, $commandId, $recover), true)) return;
+        $ledger = TaskLedger::pollExecution($responseId);
+        $turn = $ledger['turn'];
+        if (($turn['response_id'] ?? '') !== $responseId
+            || !in_array($turn['status'], ['queued', 'submit_intent', 'submitted', 'running'], true)) return;
+        try {
+            $previousPageStopped = $this->awaitPreviousPageStop($ledger, $commandId);
+        } catch (GatewayError $error) {
+            unset($this->previousPageWaitStarted[$commandId]);
+            if ($error->errorCode !== 'surface_fence_lost') {
+                $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage());
+            }
+            return;
+        }
+        if (!$previousPageStopped) {
+            $generation = $turn['generation_id'];
+            $repairCount = $ledger['job']['repair_count'];
+            Timer::add(0.5, function () use ($responseId, $commandId, $recover, $generation, $repairCount): void {
+                try {
+                    $fresh = TaskLedger::pollExecution($responseId);
+                    if ($fresh['turn']['response_id'] !== $responseId || $fresh['turn']['generation_id'] !== $generation
+                        || $fresh['job']['repair_count'] !== $repairCount
+                        || !in_array($fresh['turn']['status'], ['queued','submit_intent','submitted','running'], true)) {
+                        unset($this->previousPageWaitStarted[$commandId]);
+                        return;
+                    }
+                    $this->prepareTaskSurface($responseId, $commandId, $recover);
+                } catch (GatewayError) {}
+            }, null, false);
+            return;
+        }
         if (!$this->taskCdp->ready()) {
             if ($recover) $this->pendingResumes[$responseId] = true;
             else {
                 $this->deferCommand($commandId);
                 $this->commandBusy = false;
             }
-            return;
-        }
-        $ledger = TaskLedger::execution($responseId);
-        $turn = $ledger['turn'];
-        if (!$this->retiredPageStops()->settled((string)$turn['task_id'])) {
-            if (time() >= (int)$turn['deadline_at']) {
-                $this->taskFailTurn($responseId, 'CHATGPT_PREVIOUS_PAGE_STOP_UNCONFIRMED',
-                    'The previous task page has not confirmed that generation stopped. No message was sent to the replacement page.');
-                return;
-            }
-            $generation = $turn['generation_id'];
-            Timer::add(0.5, function () use ($responseId, $commandId, $recover, $generation): void {
-                try {
-                    $fresh = TaskLedger::execution($responseId);
-                    if ($fresh['turn']['response_id'] !== $responseId || $fresh['turn']['generation_id'] !== $generation
-                        || !in_array($fresh['turn']['status'], ['queued','submit_intent','submitted','running'], true)) return;
-                    $this->prepareTaskSurface($responseId, $commandId, $recover);
-                } catch (GatewayError) {}
-            }, null, false);
             return;
         }
         if (!SubagentCapacity::acquire($responseId)) {
@@ -11844,6 +11879,7 @@ JS;
 
     private function finishCommand(int $id, array $result): void
     {
+        unset($this->previousPageWaitStarted[$id]);
         unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id], $this->connectorProbeAccounts[$id]);
         BrowserState::finish($id, true, $result);
         $this->commandBusy = false;
@@ -11852,6 +11888,7 @@ JS;
     /** Persist a command failure and expose startup errors even when Chrome never launched. */
     private function failCommand(int $id, string $code, string $message, array $details = [], bool $reportStartupFailure = false): void
     {
+        unset($this->previousPageWaitStarted[$id]);
         unset($this->connectorProbeAttempts[$id], $this->connectorProbeGenerations[$id], $this->connectorProbeCdpWaitSince[$id], $this->connectorProbeAccounts[$id]);
         $result = ['code' => $code, 'message' => $message] + $details;
         if ($reportStartupFailure) {
