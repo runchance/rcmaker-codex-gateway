@@ -186,15 +186,16 @@ final class NativeBrowserWindow
                         self::request($client, $browser, 'Browser.setWindowBounds', ['windowId' => $record['window_id'], 'bounds' => ['windowState' => 'normal']],
                             function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
                                 if ($error !== null) { $done($error, []); return; }
+                                $deadline = microtime(true) + 30.0;
                                 // macOS acknowledges leaving fullscreen before the native window finishes its transition.
                                 self::waitForBounds($client, $browser, $record['window_id'],
                                     static fn(array $bounds): bool => ($bounds['windowState'] ?? '') === 'normal',
-                                    function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
+                                    function ($error) use ($client, $browser, $record, $visible, $url, $done, $deadline): void {
                                         if ($error !== null) { $done($error, []); return; }
                                         self::request($client, $browser, 'Browser.setWindowBounds', ['windowId' => $record['window_id'],
                                             'bounds' => $visible ? ['left' => 80, 'top' => 80, 'width' => 1280, 'height' => 900]
                                                 : ['left' => -32000, 'top' => -32000]],
-                                            function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
+                                            function ($error) use ($client, $browser, $record, $visible, $url, $done, $deadline): void {
                                                 if ($error !== null) { $done($error, []); return; }
                                                 self::waitForBounds($client, $browser, $record['window_id'],
                                                     static fn(array $bounds): bool => ($bounds['windowState'] ?? '') === 'normal'
@@ -202,9 +203,9 @@ final class NativeBrowserWindow
                                                     function ($error) use ($client, $browser, $record, $visible, $url, $done): void {
                                                         if ($error !== null) { $done($error, []); return; }
                                                         self::publishVisibility($client, $browser, $record, $visible, $url, $done);
-                                                    }, microtime(true) + 5.0);
+                                                    }, $deadline);
                                             });
-                                    }, microtime(true) + 5.0);
+                                    }, $deadline);
                             });
                     });
             });
@@ -229,9 +230,9 @@ final class NativeBrowserWindow
     {
         self::request($client, $browser, 'Browser.getWindowBounds', ['windowId' => $windowId],
             function ($error, $result) use ($client, $browser, $windowId, $matches, $done, $deadline): void {
-                if ($error !== null) { $done($error); return; }
-                if (!is_array($result['bounds'] ?? null)) { $done(self::windowError()); return; }
-                if ($matches($result['bounds'])) { $done(null); return; }
+                if ($error !== null && $error->errorCode !== 'NATIVE_WINDOW_OBSERVATION_TIMEOUT') { $done($error); return; }
+                if ($error === null && !is_array($result['bounds'] ?? null)) { $done(self::windowError()); return; }
+                if ($error === null && $matches($result['bounds'])) { $done(null); return; }
                 if (microtime(true) >= $deadline) { $done(self::windowError()); return; }
                 Timer::add(0.1, static function () use ($client, $browser, $windowId, $matches, $done, $deadline): void {
                     self::waitForBounds($client, $browser, $windowId, $matches, $done, $deadline);
@@ -251,7 +252,7 @@ final class NativeBrowserWindow
                 $client->send('Page.navigate', ['url' => $url], $session, function ($error) use ($client, $session, $done): void {
                     $client->send('Target.detachFromTarget', ['sessionId' => $session], null, static function (): void {});
                     $done($error === null ? null : new GatewayError('NATIVE_WINDOW_NAVIGATION', '原生窗口已经打开，请在地址栏打开 ChatGPT。', 503), ['visible' => true]);
-                }, 5.0);
+                }, 30.0);
             });
     }
 
@@ -259,7 +260,12 @@ final class NativeBrowserWindow
     private static function request(CdpClient $client, array $browser, string $method, array $parameters, callable $done): void
     {
         if (!self::sameBrowser($browser)) { $done(self::windowError(), []); return; }
-        $client->send($method, $parameters, null, static function ($error, $result) use ($browser, $done): void {
+        $client->send($method, $parameters, null, static function ($error, $result) use ($browser, $method, $done): void {
+            if ($method === 'Browser.getWindowBounds' && ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT'
+                && self::sameBrowser($browser)) {
+                $done(new GatewayError('NATIVE_WINDOW_OBSERVATION_TIMEOUT', '原生窗口状态读取超时。', 503), []);
+                return;
+            }
             if ($error !== null || !self::sameBrowser($browser)) {
                 $done(self::windowError(), []); return;
             }

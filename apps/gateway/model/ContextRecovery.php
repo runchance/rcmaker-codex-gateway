@@ -449,6 +449,10 @@ final class ContextRecovery
      */
     public static function repairUnsent(string $responseId, string $code): ?array
     {
+        // A pre-send readiness or draft check says nothing about page loss. Leave the
+        // existing staged ACKs and unsent draft on that page instead of staging them again.
+        if (in_array($code, ['CHATGPT_MULTIPART_SEND_NOT_READY', 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_NOT_READY',
+            'CHATGPT_MULTIPART_DRAFT_UNPROVEN'], true)) return null;
         $staging = self::stagingError($code);
         $missingModel = in_array($code, ['CHATGPT_MODEL_UNAVAILABLE','CHATGPT_MODEL_FAMILY_UNAVAILABLE'], true);
         // A transient composer/menu failure is not loss of the conversation. Reconcile it

@@ -231,8 +231,14 @@ final class ConnectorState
         });
     }
 
-    /** Issue a short-lived probe; optional generation fences an asynchronous browser operation. */
-    public static function beginProbe(string $connectorName, ?string $expectedGeneration = null): string
+    /**
+     * Issue a token for one no-host-effect probe through browser preparation and MCP receipt.
+     * @param string $connectorName Exact name of the connector to prove.
+     * @param string|null $expectedGeneration Required runtime generation for asynchronous callers.
+     * @param int $preparationSeconds Additional bounded time to prepare the browser submission.
+     * @return string Short-lived probe token. @throws GatewayError If the runtime generation changed.
+     */
+    public static function beginProbe(string $connectorName, ?string $expectedGeneration = null, int $preparationSeconds = 0): string
     {
         Schema::initialize();
         $token = 'probe_' . rtrim(strtr(base64_encode(random_bytes(24)), '+/', '-_'), '=');
@@ -246,7 +252,7 @@ final class ConnectorState
             'last_error' => null,
             'probe_token_hash' => hash('sha256', $token),
             // Keep the token valid through input insertion, sending and the configured wait.
-            'probe_expires_at' => $now + self::probeTimeoutSeconds() + 15,
+            'probe_expires_at' => $now + self::probeTimeoutSeconds() + 15 + max(0, min(120, $preparationSeconds)),
             'probe_started_at' => null,
             'probe_generation' => $generation,
             'updated_at' => $now,

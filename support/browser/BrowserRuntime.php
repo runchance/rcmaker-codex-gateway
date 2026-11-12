@@ -48,6 +48,7 @@ final class BrowserRuntime
     private const IDLE_CAPABILITY_REFRESH_SECONDS = BrowserState::IDLE_CAPABILITY_REFRESH_SECONDS;
     /** Fresh Temporary Chat pages can expose the composer before the model picker hydrates. */
     private const TASK_MODEL_CONTROL_READY_SECONDS = 30.0;
+    private const TASK_SEND_READY_SECONDS = 60.0;
     /** App catalog loading and native selection rendering are asynchronous, within the turn deadline. */
     private const TASK_CONNECTOR_READY_SECONDS = 60.0;
     /** First-profile recovery requires a continuous absence of initialization progress. */
@@ -1307,9 +1308,9 @@ final class BrowserRuntime
                                             return;
                                         }
                                         $this->navigateConnectorProbe($commandId, $connectorName);
-                                    }, 5.0);
-                            }, 5.0);
-                    }, 5.0);
+                                    }, 15.0);
+                            }, 15.0);
+                    }, 15.0);
             }, 15.0);
     }
 
@@ -1377,9 +1378,10 @@ final class BrowserRuntime
                                 'key_index'=>(int) ($insertError['mention_key_index'] ?? 0)]);
                         return;
                     }
-                    $this->waitConnectorProbeMenu($commandId, $connectorName, $attempt, microtime(true) + 2.5);
-                }, 5.0, $connectorName);
-        });
+                    $this->waitConnectorProbeMenu($commandId, $connectorName, $attempt,
+                        microtime(true) + self::TASK_CONNECTOR_READY_SECONDS);
+                }, self::TASK_MODEL_CONTROL_READY_SECONDS, $connectorName);
+        }, 15.0);
     }
 
     private function waitConnectorProbeMenu(int $commandId, string $connectorName, int $attempt, float $deadline): void
@@ -1398,11 +1400,8 @@ final class BrowserRuntime
                     }
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.1, fn() => $this->waitConnectorProbeMenu($commandId, $connectorName, $attempt, $deadline), null, false);
-                    return;
-                }
-                if ($attempt < 3) {
-                    $this->beginConnectorProbe($commandId, $connectorName, $attempt + 1);
+                    $this->scheduleConnectorProbeObservation(fn() => $this->waitConnectorProbeMenu(
+                        $commandId, $connectorName, $attempt, $deadline));
                     return;
                 }
                 if ($error === null && is_array($menu) && isset($menu['exact_count']) && (int) $menu['exact_count'] === 0
@@ -1434,8 +1433,9 @@ final class BrowserRuntime
                 if (!empty($menu['exact_highlighted'])) {
                     $this->dispatchConnectorProbeKey('Enter', function ($keyError) use ($commandId, $connectorName): void {
                         // The renderer may select the App before the CDP key acknowledgement is lost.
-                        // Inspect the composer once rather than pressing Enter again or failing early.
-                        $this->waitConnectorProbeSelected($commandId, $connectorName, microtime(true) + 3.0);
+                        // Observe the selection on the same page without pressing Enter again.
+                        $this->waitConnectorProbeSelected($commandId, $connectorName,
+                            microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS);
                     });
                     return;
                 }
@@ -1474,7 +1474,8 @@ final class BrowserRuntime
                     return;
                 }
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.1, fn() => $this->waitConnectorProbeSelected($commandId, $connectorName, $deadline), null, false);
+                    $this->scheduleConnectorProbeObservation(fn() => $this->waitConnectorProbeSelected(
+                        $commandId, $connectorName, $deadline));
                     return;
                 }
                 $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_SELECTION_FAILED', 'ChatGPT 没有确认连接器已经选中。');
@@ -1562,7 +1563,8 @@ final class BrowserRuntime
         $attempt = (int) ($this->connectorProbeAttempts[$commandId] ?? 0) + 1;
         $this->connectorProbeAttempts[$commandId] = $attempt;
         try {
-            $token = ConnectorState::beginProbe($connectorName, $this->connectorProbeGenerations[$commandId] ?? null);
+            $token = ConnectorState::beginProbe($connectorName, $this->connectorProbeGenerations[$commandId] ?? null,
+                (int) (self::TASK_SEND_READY_SECONDS + 2 * self::TASK_MODEL_CONTROL_READY_SECONDS));
         } catch (GatewayError $error) {
             $this->closeConnectorProbeSurface();
             $this->failCommand($commandId, $error->errorCode, $error->getMessage());
@@ -1573,35 +1575,36 @@ final class BrowserRuntime
             . ', cmd RCMAKER_PERMISSION_PROBE, and omit all optional arguments. Do not call any other Connector tool. '
             . 'The local MCP intercepts this exact probe before host execution, so it has no host side effect. '
             . 'After codex_exec returns successfully, reply exactly RCMAKER_CONNECTOR_READY.';
+        $readyDeadline = microtime(true) + self::TASK_SEND_READY_SECONDS;
         $this->evaluateConnectorProbe(WebModelPage::insertPlainTextExpression(' ' . $prompt),
-            function ($insertError, $inserted) use ($commandId, $connectorName, $token, $prompt): void {
+            function ($insertError, $inserted) use ($commandId, $connectorName, $token, $prompt, $readyDeadline): void {
                 if ($insertError !== null || !is_array($inserted) || empty($inserted['ok'])) {
                     $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_PROBE_INPUT_FAILED', '连接器已选中，但运行时探针无法写入 ChatGPT。');
                     return;
                 }
                 $this->evaluateConnectorProbe(WebModelPage::promptTextExpression(),
-                    function ($readError, $draft) use ($commandId, $connectorName, $token, $prompt): void {
+                    function ($readError, $draft) use ($commandId, $connectorName, $token, $prompt, $readyDeadline): void {
                         if ($readError !== null || !is_array($draft) || empty($draft['ok']) || (string) ($draft['text'] ?? '') !== $prompt) {
                             $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_PROBE_VERIFY_FAILED', '连接器运行时探针写入后内容不一致，已停止发送。');
                             return;
                         }
                         $this->evaluateConnectorProbe(WebModelPage::connectorSelectedExpression($connectorName),
-                            function ($connectorError, $selected) use ($commandId, $connectorName, $token): void {
+                            function ($connectorError, $selected) use ($commandId, $connectorName, $token, $readyDeadline): void {
                                 if ($connectorError !== null || !is_array($selected) || empty($selected['selected']) || (int) ($selected['count'] ?? 0) !== 1) {
                                     $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_SELECTION_LOST', '写入运行时探针后连接器选择状态发生变化。');
                                     return;
                                 }
-                                $this->waitConnectorProbeSendReady($commandId, $connectorName, $token, microtime(true) + 3.0);
-                            });
-                    });
-            });
+                                $this->waitConnectorProbeSendReady($commandId, $connectorName, $token, $readyDeadline);
+                            }, 15.0);
+                    }, 15.0);
+            }, 15.0);
     }
 
     private function waitConnectorProbeSendReady(int $commandId, string $connectorName, string $token, float $deadline, string $lastReadinessCode = ''): void
     {
         $this->evaluateConnectorProbe(WebModelPage::sendReadinessExpression(),
             function ($error, $state) use ($commandId, $connectorName, $token, $deadline, $lastReadinessCode): void {
-                if ($error === null && is_array($state) && !empty($state['ready'])) {
+                if ($error === null && is_array($state) && !empty($state['ready']) && microtime(true) < $deadline) {
                     $this->verifyConnectorProbeModel($commandId, $connectorName, function () use ($commandId, $connectorName, $token): void {
                     $this->evaluateConnectorProbe(WebModelPage::focusSendExpression(),
                         function ($focusError, $focused) use ($commandId, $connectorName, $token): void {
@@ -1611,7 +1614,7 @@ final class BrowserRuntime
                             }
                             \app\gateway\model\GatewayUsage::probeIntent($token, (array) ($this->connectorProbeModes[$commandId] ?? []));
                             $this->dispatchConnectorProbeKey('Enter', function ($keyError) use ($commandId, $connectorName, $token): void {
-                                if ($keyError !== null) {
+                                if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                                     $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_PROBE_SEND_FAILED', '连接器运行时探针未能发送。');
                                     return;
                                 }
@@ -1630,7 +1633,8 @@ final class BrowserRuntime
                     ['CHATGPT_EDITOR_MISSING', 'CHATGPT_SEND_BUTTON_MISSING', 'CHATGPT_SEND_BUTTON_AMBIGUOUS', 'CHATGPT_SEND_DISABLED'], true)
                     ? (string) $state['code'] : $lastReadinessCode;
                 if (microtime(true) < $deadline) {
-                    Timer::add(0.08, fn() => $this->waitConnectorProbeSendReady($commandId, $connectorName, $token, $deadline, $code), null, false);
+                    $this->scheduleConnectorProbeObservation(fn() => $this->waitConnectorProbeSendReady(
+                        $commandId, $connectorName, $token, $deadline, $code));
                     return;
                 }
                 $this->connectorVerifyFail($commandId, $connectorName, 'CHATGPT_CONNECTOR_PROBE_SEND_FAILED',
@@ -1869,9 +1873,19 @@ final class BrowserRuntime
             return;
         }
         $this->taskCdp->send('Runtime.evaluate', ['expression' => $expression, 'returnByValue' => true, 'awaitPromise'=>$awaitPromise], $sessionId,
-            static function ($error, $result) use ($callback): void {
+            function ($error, $result) use ($sessionId, $callback): void {
+                if ($this->connectorProbeSessionId !== $sessionId) return;
                 $callback(is_array($error) ? $error : null, $result['result']['value'] ?? null);
             }, $timeout);
+    }
+
+    /** A delayed read of one setup tab cannot inspect or advance a replacement probe. */
+    private function scheduleConnectorProbeObservation(callable $observe): void
+    {
+        $sessionId = $this->connectorProbeSessionId;
+        Timer::add(0.25, function () use ($sessionId, $observe): void {
+            if ($sessionId !== null && $this->connectorProbeSessionId === $sessionId) $observe();
+        }, null, false);
     }
 
     /** Send one keyboard event only to the isolated probe session. */
@@ -1923,6 +1937,13 @@ final class BrowserRuntime
         return is_array($owner) && $owner['session_id'] !== null
             && $owner['session_id'] === $this->connectorProbeSessionId
             && $owner['target_id'] === $this->connectorProbeTargetId;
+    }
+
+    /** Bound one model control observation by the existing preparation window and owning turn. */
+    private function modelPreparationDeadline(string $selectionId): float
+    {
+        return min(microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS,
+            (float) ($this->chatGptTurns[$selectionId]['deadline'] ?? INF));
     }
 
     /** Route a picker read only to its owned session; stale probe callbacks cannot reach a task tab. */
@@ -2692,7 +2713,7 @@ JS;
      * Preserve the old query for existing non-RCMAKER connector names accepted by settings migration.
      * @param callable():bool|null $isCurrent Optional saved-chat fence checked before every key.
      */
-    private function typeConnectorMention(CdpClient $client, ?string $sessionId, callable $callback, float $timeout = 5.0,
+    private function typeConnectorMention(CdpClient $client, ?string $sessionId, callable $callback, float $timeout = self::TASK_MODEL_CONTROL_READY_SECONDS,
         string $connectorName = 'RCMAKER Codex', ?callable $isCurrent = null): void
     {
         $query = str_starts_with($connectorName, 'RCMAKER ') ? '@RCMAKER' : '@codex';
@@ -3571,7 +3592,7 @@ JS;
                     return;
                 }
                 $this->taskCdp->send('Page.enable', [], $sessionId, $pageEnabled, $pageWait);
-            }, 5.0);
+            }, 15.0);
     }
 
     /**
@@ -4415,11 +4436,14 @@ JS;
         }
     }
 
-    /** Wait briefly for an unsent temporary chat's composer to settle after navigation. */
-    private function confirmTaskEditor(string $responseId, int $attempt = 0): void
+    /** Wait for the original unsent chat's composer to settle after navigation. */
+    private function confirmTaskEditor(string $responseId, ?float $deadline = null, ?array $owner = null): void
     {
-        if (!isset($this->chatGptTurns[$responseId])) return;
-        $this->evaluateTask($responseId, WebModelPage::baselineExpression(), function ($error, $baseline) use ($responseId, $attempt): void {
+        $owner ??= $this->modelReadbackOwner($responseId);
+        if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
+        $deadline ??= min((float) $this->chatGptTurns[$responseId]['deadline'], microtime(true) + self::TASK_SEND_READY_SECONDS);
+        $this->evaluateTask($responseId, WebModelPage::baselineExpression(), function ($error, $baseline) use ($responseId, $deadline, $owner): void {
+            if ($this->modelReadbackOwner($responseId) !== $owner) return;
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
             $ready = $error === null && is_array($baseline)
@@ -4431,9 +4455,9 @@ JS;
                 && !empty($baseline['editor_ready']) && empty($baseline['generation_running']);
             if (!$ready) {
                 if ($this->deferSavedChatLoad($responseId, (string) $turn['session_id'],
-                    fn() => $this->confirmTaskEditor($responseId, $attempt + 1))) return;
-                if ($attempt < 5 && empty($turn['sent_at']) && microtime(true) + 1.0 < (float) $turn['deadline']) {
-                    Timer::add(1.0, fn() => $this->confirmTaskEditor($responseId, $attempt + 1), null, false);
+                    fn() => $this->confirmTaskEditor($responseId))) return;
+                if (empty($turn['sent_at']) && microtime(true) < $deadline) {
+                    Timer::add(0.5, fn() => $this->confirmTaskEditor($responseId, $deadline, $owner), null, false);
                     return;
                 }
                 $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_NOT_READY', 'ChatGPT 编辑器不可用或页面已有生成任务。');
@@ -4458,7 +4482,7 @@ JS;
             $this->chatGptTurns[$responseId]['baseline_assistants'] = is_array($baseline['assistant_ids'] ?? null) ? $baseline['assistant_ids'] : [];
             $this->chatGptTurns[$responseId]['bound_assistant_id'] = null;
             $this->prepareTaskModel($responseId, false);
-        });
+        }, min(10.0, max(0.1, $deadline - microtime(true))));
     }
 
     /**
@@ -5035,7 +5059,7 @@ JS;
             $this->moveTaskEffort($responseId, $mode, $slider, $after, $recover);
             return;
         }
-        $this->selectTaskFamily($responseId, $mode, $after, $recover, microtime(true) + 4.0);
+        $this->selectTaskFamily($responseId, $mode, $after, $recover, $this->modelPreparationDeadline($responseId));
     }
 
     /**
@@ -5053,7 +5077,7 @@ JS;
                     // A click may close the Radix picker asynchronously; read its actual
                     // state before any further focus or relative slider key.
                     Timer::add(0.15, fn() => $this->readTaskEffortForSelection(
-                        $responseId, $mode, $after, $recover, microtime(true) + 4.0, true), null, false);
+                        $responseId, $mode, $after, $recover, $deadline, true), null, false);
                     return;
                 }
                 if (microtime(true) >= $deadline) {
@@ -5095,15 +5119,23 @@ JS;
     }
 
     /** Open the effort picker; reopening is bounded and requires a separate closed-state readback. */
-    private function openTaskEffortMenuForSelection(string $responseId, array $mode, callable $after, bool $recover, bool $familySelected = false, int $reopenAttempts = 0): void
+    private function openTaskEffortMenuForSelection(string $responseId, array $mode, callable $after, bool $recover,
+        bool $familySelected = false, int $reopenAttempts = 0, ?float $deadline = null): void
     {
+        if (!$this->modelSelectionActive($responseId)) return;
+        $deadline ??= $this->modelPreparationDeadline($responseId);
         $this->evaluateModelSelection($responseId, WebModelPage::focusEffortControlExpression(),
-            function ($error, $focused) use ($responseId, $mode, $after, $recover, $familySelected, $reopenAttempts): void {
+            function ($error, $focused) use ($responseId, $mode, $after, $recover, $familySelected, $reopenAttempts, $deadline): void {
+                if (microtime(true) < $deadline && ($error !== null || !is_array($focused) || empty($focused['ok']))) {
+                    Timer::add(0.25, fn() => $this->openTaskEffortMenuForSelection(
+                        $responseId, $mode, $after, $recover, $familySelected, $reopenAttempts, $deadline), null, false);
+                    return;
+                }
                 if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
                     $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', '无法重新打开 ChatGPT 推理档位菜单。', $recover);
                     return;
                 }
-                $read = fn() => $this->readTaskEffortForSelection($responseId, $mode, $after, $recover, microtime(true) + 4.0, $familySelected, $reopenAttempts);
+                $read = fn() => $this->readTaskEffortForSelection($responseId, $mode, $after, $recover, $deadline, $familySelected, $reopenAttempts);
                 if (!empty($focused['expanded'])) { $read(); return; }
                 $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $recover, $read): void {
                     if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
@@ -5142,7 +5174,7 @@ JS;
                     function ($stateError, $state) use ($responseId, $mode, $after, $recover, $deadline, $familySelected, $reopenAttempts, $slider): void {
                         $expanded = $stateError === null && is_array($state) ? ($state['effort_menu_expanded'] ?? null) : null;
                         if ($reopenAttempts < 2 && $expanded === false && microtime(true) < $deadline) {
-                            $this->openTaskEffortMenuForSelection($responseId, $mode, $after, $recover, $familySelected, $reopenAttempts + 1);
+                            $this->openTaskEffortMenuForSelection($responseId, $mode, $after, $recover, $familySelected, $reopenAttempts + 1, $deadline);
                             return;
                         }
                         if (microtime(true) < $deadline) {
@@ -5197,7 +5229,7 @@ JS;
                 // Observe the exact effect of the relative key, including quota-driven range changes.
                 $expected = $current + ($key === 'ArrowRight' ? 1 : -1);
                 Timer::add(0.08, fn() => $this->observeTaskEffortMove($responseId, $mode, $current, $expected,
-                    $after, $recover, microtime(true) + 4.0, $recoveryCurrent), null, false);
+                    $after, $recover, $this->modelPreparationDeadline($responseId), $recoveryCurrent), null, false);
             });
         };
         if ($focusConfirmed) { $move(); return; }
@@ -5297,7 +5329,7 @@ JS;
                 $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 模型菜单无法关闭。', $recover);
                 return;
             }
-            $this->waitTaskEffortMenuClosed($responseId, $after, $recover, microtime(true) + 4.0);
+            $this->waitTaskEffortMenuClosed($responseId, $after, $recover, $this->modelPreparationDeadline($responseId));
         });
     }
 
@@ -5352,7 +5384,7 @@ JS;
                                     $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法输入 Think 命令。', $recover);
                                     return;
                                 }
-                                $this->waitTaskThinkMenu($responseId, $enabled, $after, $recover, microtime(true) + 5.0);
+                                $this->waitTaskThinkMenu($responseId, $enabled, $after, $recover, $this->modelPreparationDeadline($responseId));
                             });
                     });
             });
@@ -5365,11 +5397,11 @@ JS;
                 if ($error === null && is_array($menu) && !empty($menu['ok'])) {
                     $activate = function () use ($responseId, $enabled, $after, $recover): void {
                         $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $enabled, $after, $recover): void {
-                            if ($keyError !== null) {
+                            if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                                 $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', 'Think 命令无法执行。', $recover);
                                 return;
                             }
-                            $this->waitTaskThinkState($responseId, $enabled, $after, $recover, microtime(true) + 5.0);
+                            $this->waitTaskThinkState($responseId, $enabled, $after, $recover, $this->modelPreparationDeadline($responseId));
                         });
                     };
                     if (!empty($menu['highlighted'])) { $activate(); return; }
@@ -5402,11 +5434,11 @@ JS;
                 if (($focused['pressed'] ?? null) === $enabled) { $after(); return; }
                 $this->dispatchModelSelectionKey($responseId, 'Enter',
                     function ($keyError) use ($responseId, $enabled, $after, $recover): void {
-                        if ($keyError !== null) {
+                        if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                             $this->failModelSelection($responseId, 'CHATGPT_THINK_CHANGE_FAILED', '无法切换 ChatGPT Think 按钮。', $recover);
                             return;
                         }
-                        $this->waitTaskThinkState($responseId, $enabled, $after, $recover, microtime(true) + 5.0, false);
+                        $this->waitTaskThinkState($responseId, $enabled, $after, $recover, $this->modelPreparationDeadline($responseId), false);
                     });
             });
     }
@@ -5487,7 +5519,9 @@ JS;
                                     $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_EDITOR_VERIFY_FAILED', 'Multipart 分段写入后内容校验失败。');
                                     return;
                                 }
-                                $this->waitMultipartStageSendReady($responseId, $index, microtime(true) + 5.0, $text);
+                                $this->waitMultipartStageSendReady($responseId, $index, min(
+                                    (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF),
+                                    microtime(true) + self::TASK_SEND_READY_SECONDS), $text);
                             }, 10.0);
                     }, 15.0);
             });
@@ -5495,11 +5529,15 @@ JS;
 
     /** A completed staging reply can briefly remount its editor. Never submit until an empty draft is observed. */
     private function clearTaskMultipartComposer(string $responseId, string $code, string $message,
-        callable $after, int $attempt = 0, string $detail = ''): void
+        callable $after, int $attempt = 0, ?float $deadline = null, ?array $owner = null): void
     {
-        if (!isset($this->chatGptTurns[$responseId])) return;
+        $owner ??= $this->modelReadbackOwner($responseId);
+        if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
+        $deadline ??= min((float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF),
+            microtime(true) + self::TASK_SEND_READY_SECONDS);
         $this->evaluateTask($responseId, WebModelPage::focusAndClearExpression(),
-            function ($error, $cleared) use ($responseId, $code, $message, $after, $attempt, $detail): void {
+            function ($error, $cleared) use ($responseId, $code, $message, $after, $attempt, $deadline, $owner): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
                 if ($error === null && is_array($cleared) && !empty($cleared['ok'])
                     && (string) ($cleared['text'] ?? '') === '') {
                     $after();
@@ -5509,9 +5547,18 @@ JS;
                 if ($reason === '') $reason = is_array($error) ? 'CDP_' . (int) ($error['code'] ?? 0) : 'NOT_EMPTY';
                 $detail = $reason . (is_array($cleared) ? '_TEXT_' . mb_strlen((string) ($cleared['text'] ?? ''))
                     . '_PILLS_' . (int) ($cleared['connector_count'] ?? 0) : '');
+                if ($reason === 'CHATGPT_EDITOR_MISSING' || ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT') {
+                    if (microtime(true) < $deadline) {
+                        $this->scheduleMultipartOperation($responseId, fn() => $this->clearTaskMultipartComposer(
+                            $responseId, $code, $message, $after, $attempt, $deadline, $owner), 0.25);
+                    } else {
+                        $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_DRAFT_UNPROVEN', $message . ' [' . $detail . ']');
+                    }
+                    return;
+                }
                 if ($attempt < 2) {
                     $this->scheduleMultipartOperation($responseId, fn() => $this->clearTaskMultipartComposer(
-                        $responseId, $code, $message, $after, $attempt + 1, $detail), 0.25);
+                        $responseId, $code, $message, $after, $attempt + 1, $deadline, $owner), 0.25);
                     return;
                 }
                 // ChatGPT's controlled editor can reject a DOM selection after a remount.
@@ -5539,7 +5586,7 @@ JS;
                                     });
                             });
                     }, 5.0);
-            }, 8.0);
+            }, min(10.0, max(0.1, $deadline - microtime(true))));
     }
 
     private function verifyTaskMultipartComposerCleared(string $responseId, string $code, string $message,
@@ -5558,45 +5605,30 @@ JS;
             }, 8.0);
     }
 
+    /** Wait for a verified inert stage to become sendable on its original page and transaction. */
     private function waitMultipartStageSendReady(string $responseId, int $stage, float $deadline, string $text): void
     {
-        if ($this->deferTaskCooldown($responseId,
-            fn() => $this->waitMultipartStageSendReady($responseId, $stage,
-                min((float)($this->chatGptTurns[$responseId]['deadline'] ?? $deadline), microtime(true) + 120), $text))) return;
-        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(), function ($error, $ready) use ($responseId, $stage, $deadline, $text): void {
-            if ($error === null && is_array($ready) && !empty($ready['ready'])) {
-                if ($this->deferTaskCooldown($responseId, fn() => $this->waitMultipartStageSendReady($responseId, $stage,
-                    min((float)($this->chatGptTurns[$responseId]['deadline'] ?? $deadline), microtime(true) + 120), $text), true)) return;
-                $mode = (array) ($this->chatGptTurns[$responseId]['staging_mode'] ?? []);
-                $this->verifyModelSelection($responseId, $mode, function () use ($responseId, $stage, $text, $mode): void {
-                    try {
-                        ResponseJob::recordTransportSelection($responseId, $mode);
-                        ResponseJob::multipartStageIntent($responseId, $stage, $text);
-                    } catch (GatewayError $gatewayError) {
-                        $this->taskFailTurn($responseId, $gatewayError->errorCode, $gatewayError->getMessage());
+        $this->waitMultipartSendControl($responseId, $stage, $deadline, $text,
+            function (array $mode) use ($responseId, $stage, $text): void {
+                try {
+                    ResponseJob::recordTransportSelection($responseId, $mode);
+                    ResponseJob::multipartStageIntent($responseId, $stage, $text);
+                } catch (GatewayError $gatewayError) {
+                    $this->taskFailTurn($responseId, $gatewayError->errorCode, $gatewayError->getMessage());
+                    return;
+                }
+                if (isset($this->chatGptTurns[$responseId])) $this->chatGptTurns[$responseId]['transport_stage_sent'] = $stage;
+                $this->evaluateTask($responseId, WebModelPage::focusSendExpression(), function ($focusError, $focused) use ($responseId, $stage): void {
+                    if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_SEND_UNKNOWN', 'Multipart 分段发送意图已保存，但发送控件无法确认；不会自动重发。', true);
                         return;
                     }
-                    if (isset($this->chatGptTurns[$responseId])) $this->chatGptTurns[$responseId]['transport_stage_sent'] = $stage;
-                    $this->evaluateTask($responseId, WebModelPage::focusSendExpression(), function ($focusError, $focused) use ($responseId, $stage): void {
-                        if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
-                            $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_SEND_UNKNOWN', 'Multipart 分段发送意图已保存，但发送控件无法确认；不会自动重发。', true);
-                            return;
-                        }
-                        $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $stage): void {
-                            // Observe the exact page ACK; a lost key ACK never authorizes another Enter.
-                            $this->waitMultipartStageAcknowledgement($responseId, $stage, microtime(true) + $this->multipartStageTimeoutSeconds($responseId), false);
-                        });
+                    $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $stage): void {
+                        // Observe the exact page ACK; a lost key ACK never authorizes another Enter.
+                        $this->waitMultipartStageAcknowledgement($responseId, $stage, microtime(true) + $this->multipartStageTimeoutSeconds($responseId), false);
                     });
                 });
-                return;
-            }
-            if (microtime(true) < $deadline) {
-                $this->scheduleMultipartOperation($responseId,
-                    fn() => $this->waitMultipartStageSendReady($responseId, $stage, $deadline, $text), 0.08);
-                return;
-            }
-            $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_SEND_NOT_READY', 'Multipart 分段发送控件未进入可发送状态。');
-        });
+            });
     }
 
     /**
@@ -5738,51 +5770,97 @@ JS;
                                     $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_EDITOR_FAILED', 'Multipart ACK 修正内容写入后校验失败。');
                                     return;
                                 }
-                                $this->waitMultipartAckRepairSendReady($responseId, $stage, $deadline, microtime(true) + 5.0, $text);
-                            });
-                    });
-            });
+                                $this->waitMultipartAckRepairSendReady($responseId, $stage, $deadline, min($deadline,
+                                    (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF),
+                                    microtime(true) + self::TASK_SEND_READY_SECONDS), $text);
+                            }, 10.0);
+                    }, 15.0);
+            }, 0, min($deadline, (float) ($turn['deadline'] ?? INF), microtime(true) + self::TASK_SEND_READY_SECONDS));
     }
 
+    /** Submit the checksum-only repair within the original ACK deadline. */
     private function waitMultipartAckRepairSendReady(string $responseId, int $stage, float $deadline, float $readyDeadline,
         string $text): void
     {
-        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(),
-            function ($error, $ready) use ($responseId, $stage, $deadline, $readyDeadline, $text): void {
-                if ($error === null && is_array($ready) && !empty($ready['ready'])) {
-                    $mode = (array) ($this->chatGptTurns[$responseId]['staging_mode'] ?? []);
-                    $this->verifyModelSelection($responseId, $mode, function () use ($responseId, $stage, $deadline, $text, $mode): void {
-                        try {
-                            ResponseJob::recordTransportSelection($responseId, $mode);
-                            WebMessageAudit::recordOutgoing($responseId, 'stage_ack_repair', $text, $stage);
-                        } catch (GatewayError $gatewayError) {
-                            $this->taskFailTurn($responseId, $gatewayError->errorCode, $gatewayError->getMessage());
+        $this->waitMultipartSendControl($responseId, $stage, $readyDeadline, $text,
+            function (array $mode) use ($responseId, $stage, $deadline, $text): void {
+                try {
+                    ResponseJob::recordTransportSelection($responseId, $mode);
+                    WebMessageAudit::recordOutgoing($responseId, 'stage_ack_repair', $text, $stage);
+                } catch (GatewayError $gatewayError) {
+                    $this->taskFailTurn($responseId, $gatewayError->errorCode, $gatewayError->getMessage());
+                    return;
+                }
+                $this->evaluateTask($responseId, WebModelPage::focusSendExpression(),
+                    function ($focusError, $focused) use ($responseId, $stage, $deadline): void {
+                        if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
+                            $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_UNKNOWN', 'Multipart ACK 修正发送控件无法确认；不会重发原分段。', true);
                             return;
                         }
-                        $this->evaluateTask($responseId, WebModelPage::focusSendExpression(),
-                            function ($focusError, $focused) use ($responseId, $stage, $deadline): void {
-                                if ($focusError !== null || !is_array($focused) || empty($focused['ok'])) {
-                                    $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_UNKNOWN', 'Multipart ACK 修正发送控件无法确认；不会重发原分段。', true);
+                        $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $stage, $deadline): void {
+                            if ($keyError !== null) {
+                                $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_UNKNOWN', 'Multipart ACK 修正发送结果无法确认；不会重发原分段。', true);
+                                return;
+                            }
+                            $this->waitMultipartStageAcknowledgement($responseId, $stage, $deadline, false);
+                        });
+                    });
+            }, true);
+    }
+
+    /** Let the controlled editor settle, then recheck the same draft after verifying the staging model. */
+    private function waitMultipartSendControl(string $responseId, int $stage, float $deadline, string $text,
+        callable $after, bool $repair = false, ?array $owner = null): void
+    {
+        $owner ??= $this->modelReadbackOwner($responseId);
+        if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
+        $acked = (int) ($owner['transport_stage_acked'] ?? 0);
+        $sent = (int) ($owner['transport_stage_sent'] ?? 0);
+        if ($stage !== $acked + 1 || $sent !== ($repair ? $stage : $acked)) return;
+        $retry = fn() => $this->waitMultipartSendControl($responseId, $stage, $deadline, $text, $after, $repair, $owner);
+        // A paced stage can resume after the shared cooldown; an ACK repair keeps its original deadline.
+        $resume = fn() => $this->waitMultipartSendControl($responseId, $stage, min(
+            (float) ($this->chatGptTurns[$responseId]['deadline'] ?? $deadline), microtime(true) + 120.0),
+            $text, $after, false, $owner);
+        if (!$repair && $this->deferTaskCooldown($responseId, $resume)) return;
+        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(),
+            function ($error, $ready) use ($responseId, $stage, $deadline, $text, $after, $repair, $owner, $retry, $resume): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                if (microtime(true) >= $deadline) {
+                    $reason = $error !== null ? 'CDP_' . (int) ($error['code'] ?? 0)
+                        : (string) ($ready['code'] ?? 'PREPARATION_DEADLINE');
+                    $code = $repair ? 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_NOT_READY' : 'CHATGPT_MULTIPART_SEND_NOT_READY';
+                    $message = $repair ? 'Multipart ACK 修正发送控件未进入可发送状态。' : 'Multipart 分段发送控件未进入可发送状态。';
+                    $this->taskFailTurn($responseId, $code, $message . ' [stage=' . $stage . ', reason=' . $reason . ']');
+                    return;
+                }
+                if ($error !== null || !is_array($ready) || empty($ready['ready'])) {
+                    $this->scheduleMultipartOperation($responseId, $retry, 0.25);
+                    return;
+                }
+                if (!$repair && $this->deferTaskCooldown($responseId, $resume, true)) return;
+                $mode = (array) ($this->chatGptTurns[$responseId]['staging_mode'] ?? []);
+                $this->verifyModelSelection($responseId, $mode,
+                    function () use ($responseId, $text, $mode, $after, $repair, $deadline, $owner): void {
+                        if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                        $this->evaluateTask($responseId, WebModelPage::composerTextExpression(),
+                            function ($error, $draft) use ($responseId, $text, $mode, $after, $repair, $deadline, $owner): void {
+                                if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                                $turnDeadline = (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF);
+                                if (microtime(true) >= ($repair ? min($deadline, $turnDeadline) : $turnDeadline)) {
+                                    $code = $repair ? 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_NOT_READY' : 'CHATGPT_MULTIPART_SEND_NOT_READY';
+                                    $this->taskFailTurn($responseId, $code, 'Multipart 尚未发送，原准备或任务期限已到。');
                                     return;
                                 }
-                                $this->dispatchTaskKey($responseId, 'Enter', function ($keyError) use ($responseId, $stage, $deadline): void {
-                                    if ($keyError !== null) {
-                                        $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_UNKNOWN', 'Multipart ACK 修正发送结果无法确认；不会重发原分段。', true);
-                                        return;
-                                    }
-                                    $this->waitMultipartStageAcknowledgement($responseId, $stage, $deadline, false);
-                                });
-                            });
+                                $actual = is_array($draft) ? str_replace("\u{00A0}", ' ', (string) ($draft['text'] ?? '')) : '';
+                                if ($error !== null || $actual !== str_replace("\u{00A0}", ' ', $text)) {
+                                    $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_DRAFT_UNPROVEN', 'Multipart 发送前无法复核原分段草稿。');
+                                    return;
+                                }
+                                $after($mode);
+                            }, 10.0);
                     });
-                    return;
-                }
-                if (microtime(true) < $readyDeadline && microtime(true) < $deadline) {
-                    $this->scheduleMultipartOperation($responseId,
-                        fn() => $this->waitMultipartAckRepairSendReady($responseId, $stage, $deadline, $readyDeadline, $text), 0.08);
-                    return;
-                }
-                $this->taskFailTurn($responseId, 'CHATGPT_MULTIPART_ACK_REPAIR_SEND_NOT_READY', 'Multipart ACK 修正发送控件未进入可发送状态。');
-            });
+            }, min(10.0, max(0.1, $deadline - microtime(true))));
     }
 
     /**
@@ -5915,7 +5993,7 @@ JS;
                     $this->taskFailTurn($responseId, $code, $message);
                     return;
                 }
-                $this->waitTaskPersonalizationMenu($responseId, $connectorName, $mode, microtime(true) + 3.0);
+                $this->waitTaskPersonalizationMenu($responseId, $connectorName, $mode, $this->modelPreparationDeadline($responseId));
             });
     }
 
@@ -5949,7 +6027,7 @@ JS;
                                 return;
                             }
                             if ($mode === 'enable') {
-                                $this->waitTaskPersonalizationEnabled($responseId, $connectorName, microtime(true) + 3.0);
+                                $this->waitTaskPersonalizationEnabled($responseId, $connectorName, $this->modelPreparationDeadline($responseId));
                                 return;
                             }
                             if ($mode === 'fallback') {
@@ -6082,14 +6160,12 @@ JS;
                                 // Read the current menu before deciding to clear/retry the draft.
                                 $turn = $this->chatGptTurns[$responseId] ?? null;
                                 if (!is_array($turn) || ($turn['document_nonce'] ?? '') !== $documentNonce) return;
-                                // A retained checkpoint needs the App catalog again. Keep its query
-                                // while network results/rendering settle, as saved-chat preparation does.
+                                // A complete query stays in place throughout the catalog wait in either chat mode.
+                                $deadline = min((float)$turn['deadline'], microtime(true) + self::TASK_CONNECTOR_READY_SECONDS);
                                 $checkpoint = ($turn['compaction_phase'] ?? null) === 'preparing';
-                                $deadline = min((float)$turn['deadline'],
-                                    microtime(true) + ($checkpoint ? self::TASK_CONNECTOR_READY_SECONDS : 2.5));
-                                $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt,
+                                $this->waitTaskConnectorMenu($responseId, $connectorName, !$checkpoint && $insertError === null ? 3 : $attempt,
                                     $deadline, $documentNonce, $checkpointCurrent);
-                            }, 5.0, $connectorName, $checkpointCurrent);
+                            }, self::TASK_MODEL_CONTROL_READY_SECONDS, $connectorName, $checkpointCurrent);
                     });
             });
     }
@@ -6339,13 +6415,13 @@ JS;
                     }
                 }
                 if (microtime(true) < $deadline) {
-                    $delay = ($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular' ? 0.5 : 0.1;
+                    $delay = ($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular' ? 0.5 : 0.25;
                     Timer::add($delay, fn() => $this->waitTaskConnectorMenu($responseId, $connectorName, $attempt, $deadline, $expectedNonce, $isCurrent), null, false);
                     return;
                 }
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 $checkpoint = is_array($turn) && ($turn['compaction_phase'] ?? null) === 'preparing';
-                if ($attempt < 3 && (!$checkpoint || microtime(true) < (float) $turn['deadline'])) {
+                if ($attempt < 3 && is_array($turn) && microtime(true) < (float) $turn['deadline']) {
                     // A checkpoint has not been sent yet. Retry only its autocomplete search,
                     // after the full catalog wait and any shared cooldown, never its message/tools.
                     $retry = function () use ($responseId, $connectorName, $attempt, $isCurrent): void {
@@ -6727,9 +6803,9 @@ JS;
                         // Enter may have selected the item even if its acknowledgement was lost.
                         $turn = $this->chatGptTurns[$responseId] ?? null;
                         if (!is_array($turn)) return;
-                        $checkpoint = ($turn['compaction_phase'] ?? null) === 'preparing';
-                        $deadline = min((float)$turn['deadline'],
-                            microtime(true) + ($checkpoint ? self::TASK_CONNECTOR_READY_SECONDS : ($isCurrent === null ? 3.0 : 30.0)));
+                        $deadline = ($turn['compaction_phase'] ?? null) === 'preparing'
+                            ? min((float) $turn['deadline'], microtime(true) + self::TASK_CONNECTOR_READY_SECONDS)
+                            : $this->modelPreparationDeadline($responseId);
                         $this->waitTaskConnectorSelected($responseId, $connectorName, $deadline, $isCurrent);
                     });
                     return;
@@ -6939,13 +7015,15 @@ JS;
     }
 
     /** Attach private files only on the final commit, using the task's pinned mode and one input-discovery deadline. */
-    private function prepareTaskAttachments(string $responseId, ?float $deadline = null): void
+    private function prepareTaskAttachments(string $responseId, ?float $deadline = null, ?array $owner = null): void
     {
+        $owner ??= $this->modelReadbackOwner($responseId);
+        if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
         $attachments = (array) ($turn['attachments'] ?? []);
         if ($attachments === []) {
-            $this->waitTaskSendReady($responseId, min((float) $turn['deadline'], microtime(true) + 60.0));
+            $this->waitTaskSendReady($responseId, min((float) $turn['deadline'], microtime(true) + self::TASK_SEND_READY_SECONDS));
             return;
         }
         $expected = [];
@@ -6962,13 +7040,14 @@ JS;
             $mimeTypes[] = (string) ($attachment['mime_type'] ?? '');
             if (($attachment['kind'] ?? null) !== 'image') $imageOnly = false;
         }
-        $deadline ??= min((float) $turn['deadline'], microtime(true) + 20.0);
+        $deadline ??= min((float) $turn['deadline'], microtime(true) + self::TASK_SEND_READY_SECONDS);
         $this->evaluateTask($responseId, WebModelPage::attachmentStateExpression($expected, $imageOnly, $mimeTypes,
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular'),
-            function ($stateError, $state) use ($responseId, $expected, $files, $imageOnly, $deadline): void {
-                if (!isset($this->chatGptTurns[$responseId])) return;
+            function ($stateError, $state) use ($responseId, $expected, $files, $imageOnly, $deadline, $owner): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
                 if ($stateError === null && is_array($state) && !empty($state['ok'])) {
-                    $this->waitTaskSendReady($responseId, min((float)$this->chatGptTurns[$responseId]['deadline'], microtime(true) + 60.0));
+                    $this->waitTaskSendReady($responseId, min((float)$this->chatGptTurns[$responseId]['deadline'],
+                        microtime(true) + self::TASK_SEND_READY_SECONDS));
                     return;
                 }
                 // An existing or pending upload must be observed, never assigned again.
@@ -6982,7 +7061,7 @@ JS;
                 if ($stateError !== null || !is_array($state) || (int) ($state['input_count'] ?? 0) !== 1
                     || !is_string($state['input_selector'] ?? null) || $state['input_selector'] === '') {
                     if (microtime(true) < $deadline) {
-                        Timer::add(0.10, fn() => $this->prepareTaskAttachments($responseId, $deadline), null, false);
+                        Timer::add(0.25, fn() => $this->prepareTaskAttachments($responseId, $deadline, $owner), null, false);
                         return;
                     }
                     $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', 'ChatGPT 没有提供唯一可验证的附件输入控件。'
@@ -6992,47 +7071,63 @@ JS;
                         . ', attachments=' . count($expected) . ']');
                     return;
                 }
-                $this->setTaskAttachmentFiles($responseId, $files, $expected, $imageOnly, (string) $state['input_selector']);
+                $this->setTaskAttachmentFiles($responseId, $files, $expected, $imageOnly, (string) $state['input_selector'], $deadline);
             });
     }
 
     /** Resolve the owned file input and assign local paths using native CDP. */
     private function setTaskAttachmentFiles(string $responseId, array $files, array $expected,
-        bool $imageOnly, string $selector): void
+        bool $imageOnly, string $selector, float $deadline): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
         $sessionId = (string) $turn['session_id'];
+        $owner = $this->modelReadbackOwner($responseId);
+        $current = fn(): bool => $owner !== null && $this->modelReadbackOwner($responseId) === $owner;
+        $retry = function () use ($responseId, $deadline, $current): void {
+            if (microtime(true) >= $deadline) {
+                $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', 'ChatGPT 附件输入节点未能在准备期限内确认。');
+                return;
+            }
+            Timer::add(0.25, function () use ($responseId, $deadline, $current): void {
+                if ($current()) $this->prepareTaskAttachments($responseId, $deadline);
+            }, null, false);
+        };
         $this->taskCdp->send('DOM.getDocument', ['depth' => 1, 'pierce' => true], $sessionId,
-            function ($documentError, $document) use ($responseId, $sessionId, $files, $expected, $imageOnly, $selector): void {
+            function ($documentError, $document) use ($responseId, $sessionId, $files, $expected, $imageOnly,
+                $selector, $deadline, $current, $retry): void {
+                if (!$current()) return;
                 $rootId = is_array($document) ? (int) ($document['root']['nodeId'] ?? 0) : 0;
                 if ($documentError !== null || $rootId < 1) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', '无法读取 ChatGPT 附件输入节点。');
+                    $retry();
                     return;
                 }
                 $this->taskCdp->send('DOM.querySelectorAll', [
                     'nodeId' => $rootId,
                     'selector' => $selector,
-                ], $sessionId, function ($queryError, $query) use ($responseId, $sessionId, $files, $expected, $imageOnly): void {
+                ], $sessionId, function ($queryError, $query) use ($responseId, $sessionId, $files, $expected,
+                    $imageOnly, $deadline, $current, $retry): void {
+                    if (!$current()) return;
                     $nodes = is_array($query) && is_array($query['nodeIds'] ?? null) ? $query['nodeIds'] : [];
                     $nodeId = count($nodes) === 1 ? (int) $nodes[0] : 0;
-                    if ($queryError !== null || $nodeId < 1) {
-                        $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_INPUT_MISSING', 'ChatGPT 附件输入节点已经失效。');
+                    if ($queryError !== null || $nodeId < 1 || microtime(true) >= $deadline) {
+                        $retry();
                         return;
                     }
                     if (!isset($this->chatGptTurns[$responseId])) return;
-                    $deadline = $this->taskAttachmentDeadline($responseId);
+                    $uploadDeadline = $this->taskAttachmentDeadline($responseId);
                     $this->taskCdp->send('DOM.setFileInputFiles', ['files' => array_values($files), 'nodeId' => $nodeId], $sessionId,
-                        function ($setError) use ($responseId, $expected, $imageOnly, $deadline): void {
+                        function ($setError) use ($responseId, $expected, $imageOnly, $uploadDeadline, $current): void {
+                            if (!$current()) return;
                             if ($setError !== null && ($setError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
                                 $this->taskFailTurn($responseId, 'CHATGPT_ATTACHMENT_UPLOAD_FAILED', 'ChatGPT 未接受本地附件输入。');
                                 return;
                             }
                             if (!isset($this->chatGptTurns[$responseId])) return;
-                            $this->waitTaskAttachmentsAccepted($responseId, $expected, $imageOnly, $deadline);
+                            $this->waitTaskAttachmentsAccepted($responseId, $expected, $imageOnly, $uploadDeadline);
                         }, 10.0);
-                }, 5.0);
-            }, 5.0);
+                }, min(10.0, max(0.1, $deadline - microtime(true))));
+            }, min(10.0, max(0.1, $deadline - microtime(true))));
     }
 
     /** Start one upload budget per physical turn; callbacks and partial chips never renew it. */
@@ -7196,8 +7291,7 @@ JS;
         }
         $owner = $this->modelReadbackOwner($responseId);
         if ($owner === null) return;
-        $deadline = min(microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS,
-            (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF));
+        $deadline = $this->modelPreparationDeadline($responseId);
         $this->verifyFinalEffortFocus($responseId, $mode, $after, $deadline, $owner);
     }
 
