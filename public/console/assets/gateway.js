@@ -229,7 +229,9 @@
         if (Date.now() - modelProbe.at < 5000) return modelProbe;
         try {
             const models = await request('/v1/models', undefined, 8000);
-            modelProbe = {at: Date.now(), ready: Array.isArray(models) && models.length > 0, error: ''};
+            // The compatibility route exists before the current browser's model catalog is observed.
+            modelProbe = {at: Date.now(), ready: Array.isArray(models) && models.some(model =>
+                typeof model?.id === 'string' && model.id.startsWith('chatgpt-web/') && model.id !== 'chatgpt-web/current'), error: ''};
             if (!modelProbe.ready) modelProbe.error = I18n.t('模型目录暂未返回可用模型。');
         } catch (error) {
             modelProbe = {at: Date.now(), ready: false, error: error.originalMessage || error.message || I18n.t('模型连接检查失败。'), errorCode: error.code || ''};

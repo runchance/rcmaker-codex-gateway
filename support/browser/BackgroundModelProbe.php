@@ -50,12 +50,13 @@ final class BackgroundModelProbe
                             function ($error) use ($url): void {
                                 if ($error !== null) { $this->finish(); return; }
                                 $this->client->send('Page.navigate', ['url'=>$url], $this->session, function ($error): void {
-                                    if ($error !== null) { $this->finish(); return; }
+                                    if ($error !== null && ($error['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') { $this->finish(); return; }
+                                    // The page can load after a lost navigation reply. Observe the same probe tab.
                                     $this->poll();
-                                }, 5.0);
-                            }, 3.0);
-                    }, 5.0);
-            }, 5.0);
+                                }, min(15.0, max(0.1, $this->deadline - microtime(true))));
+                            }, min(15.0, max(0.1, $this->deadline - microtime(true))));
+                    }, min(15.0, max(0.1, $this->deadline - microtime(true))));
+            }, min(15.0, max(0.1, $this->deadline - microtime(true))));
     }
 
     /** Retry control hydration within the pinned deadline, always on the isolated session. */

@@ -3511,35 +3511,44 @@ final class TaskLedger
     {
         $live = array_fill_keys(array_values(array_filter($liveTargetIds,
             static fn(mixed $id): bool => is_string($id) && $id !== '')), true);
-        return Schema::transaction(static function () use ($live): array {
-            $db = SDB(null, 'medoo', 'sqlite');
-            $rows = $db->table('gateway_browser_surfaces')->where('status', '<>', 'retired')
-                ->where('target_id', '<>', null)->select();
-            if (!is_array($rows)) {
-                throw new GatewayError('storage_unavailable', '任务页面物理状态无法读取。', 503);
+        $db = SDB(null, 'medoo', 'sqlite');
+        $rows = $db->table('gateway_browser_surfaces')->where('status', '<>', 'retired')
+            ->where('target_id', '<>', null)->select('id,target_id,owner_incarnation,fencing_version,document_nonce');
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '任务页面物理状态无法读取。', 503);
+        $result = ['retired'=>0, 'skipped_active'=>0, 'bindings_revoked'=>0];
+        foreach ($rows as $surface) {
+            if ($surface['target_id'] === '' || isset($live[$surface['target_id']])) continue;
+            $active = $db->table('gateway_task_turns')->where('surface_id', $surface['id'])
+                ->where('status', 'IN', self::ACTIVE_TURNS)->find('id');
+            if ($active === false) throw new GatewayError('storage_unavailable', '任务页面活动状态无法读取。', 503);
+            if ($active !== null) {
+                $result['skipped_active']++;
+                continue;
             }
-            $retired = 0;
-            $skippedActive = 0;
-            $bindingsRevoked = 0;
-            $handledEpochs = [];
-            foreach ($rows as $surface) {
-                $targetId = (string) ($surface['target_id'] ?? '');
-                $epochId = (string) ($surface['epoch_id'] ?? '');
-                if ($targetId === '' || isset($live[$targetId]) || isset($handledEpochs[$epochId])) continue;
-                $active = $db->table('gateway_task_turns')->where('surface_id', (string) $surface['id'])
-                    ->where('status', 'IN', self::ACTIVE_TURNS)->find();
-                if (is_array($active)) {
-                    $skippedActive++;
-                    continue;
+            // Retire each independently owned page atomically. Empty or live polls never
+            // acquire the global writer, and one historical page cannot hold a batch lock.
+            $retired = Schema::transaction(static function () use ($db, $surface): ?int {
+                $current = $db->table('gateway_browser_surfaces')->where('id', $surface['id'])
+                    ->where('status', '<>', 'retired')->find();
+                if ($current === false) throw new GatewayError('storage_unavailable', '任务页面物理状态无法读取。', 503);
+                if ($current === null) return null;
+                foreach ($surface as $field => $value) {
+                    if (($current[$field] ?? null) !== $value) return null;
                 }
-                $taskId = (string) $surface['task_id'];
-                $bindingsRevoked += ToolBroker::revokeTaskBindingsForMissingSurfaceUnlocked($taskId);
-                self::retireEpochUnlocked($taskId, $epochId, 'physical_target_missing');
-                $handledEpochs[$epochId] = true;
-                $retired++;
+                $active = $db->table('gateway_task_turns')->where('surface_id', $surface['id'])
+                    ->where('status', 'IN', self::ACTIVE_TURNS)->find('id');
+                if ($active === false) throw new GatewayError('storage_unavailable', '任务页面活动状态无法读取。', 503);
+                if ($active !== null) return null;
+                $revoked = ToolBroker::revokeTaskBindingsForMissingSurfaceUnlocked($current['task_id']);
+                self::retireEpochUnlocked($current['task_id'], $current['epoch_id'], 'physical_target_missing');
+                return $revoked;
+            });
+            if ($retired !== null) {
+                $result['retired']++;
+                $result['bindings_revoked'] += $retired;
             }
-            return ['retired'=>$retired, 'skipped_active'=>$skippedActive, 'bindings_revoked'=>$bindingsRevoked];
-        });
+        }
+        return $result;
     }
 
     /** Mark the entire task cancelled and retire its surfaces; caller publishes response terminals. */

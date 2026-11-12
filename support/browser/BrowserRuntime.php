@@ -2888,9 +2888,10 @@ JS;
                 });
                 if (!$accepted) return;
                 if (!empty($value['on_chatgpt']) && empty($value['login_required']) && !empty($value['editor_ready'])) {
-                    if (!$this->commandBusy && empty($value['generation_running'])
-                        && !self::observerActive(self::screenshotObserverPath(), self::SETUP_VIEWER_AUTOMATION_PAUSE_SECONDS)) {
-                        \app\gateway\model\ModelCatalog::refreshIfChanged((string) ($value['account_plan'] ?? 'unknown'));
+                    if (!$this->commandBusy) {
+                        $backgroundOnly = !empty($value['generation_running'])
+                            || self::observerActive(self::screenshotObserverPath(), self::SETUP_VIEWER_AUTOMATION_PAUSE_SECONDS);
+                        \app\gateway\model\ModelCatalog::refreshIfChanged((string) ($value['account_plan'] ?? 'unknown'), $backgroundOnly);
                     }
                 }
             } catch (\Throwable) {}

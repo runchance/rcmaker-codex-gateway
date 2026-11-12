@@ -87,6 +87,12 @@ final class BrowserState
         return Schema::transaction(fn(): int => self::enqueueUnlocked($action, $payload, $documentBound, $requiredLease));
     }
 
+    /** Reserve an automatic model probe in the caller's catalog transaction. */
+    public static function enqueueModelProbeUnlocked(bool $background): int
+    {
+        return self::enqueueUnlocked('probe_models', $background ? ['background'=>true] : [], !$background);
+    }
+
     /** Enqueue within the caller's existing writer transaction; never call outside Schema::transaction.
      * @param string $action Existing worker command. @param array $payload Immutable command data.
      * @param bool $documentBound Bind to the manual document. @param string $requiredLease Required owner.

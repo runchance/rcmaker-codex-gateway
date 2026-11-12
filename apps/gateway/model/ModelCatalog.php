@@ -12,12 +12,13 @@ final class ModelCatalog
         'business'=>'Business', 'team'=>'Team', 'enterprise'=>'Enterprise', 'unknown'=>'尚未识别'];
 
     /**
-     * Discover account changes when idle and refresh Pro availability periodically on an isolated page.
-     * Failed probes retry at most once a minute; periodic probes never use task/user menus.
+     * Discover account changes and refresh Pro availability without borrowing an active task's page.
+     * Failed probes retry at most once a minute. A stale catalog can refresh during an active task.
      * @param string $plan Whitelisted plan read from the account badge, never inferred from models.
+     * @param bool $backgroundOnly Keep a viewed or generating setup page untouched.
      * @return void
      */
-    public static function refreshIfChanged(string $plan): void
+    public static function refreshIfChanged(string $plan, bool $backgroundOnly = false): void
     {
         Schema::initialize();
         $plan = isset(self::PLAN_LABELS[$plan]) ? $plan : 'unknown';
@@ -38,18 +39,26 @@ final class ModelCatalog
         if (!$changed && !$stale && empty($caps['refresh_required']) && !$availabilityExpired) return;
         if ((int) ($caps['probe_attempted_at'] ?? 0) > time() - 60) return;
         $availabilityOnly = !$changed && !$stale && empty($caps['refresh_required']) && $availabilityExpired;
-        $commands = $db->table('gateway_browser_commands')->where('status', 'IN', ['queued','running']);
-        if ($availabilityOnly) $commands->where('action', '<>', 'chatgpt_text');
-        if ($commands->find()) return;
-        if (!$availabilityOnly && $db->table('gateway_response_jobs')->where('status', 'IN', ['queued','running'])->find()) return;
-        BrowserState::enqueue('probe_models', $availabilityOnly ? ['background'=>true] : [], !$availabilityOnly);
-        // Refreshing quota evidence must not remove usable routes or change a running turn's pinned budget.
-        if (!$availabilityOnly) $caps['refresh_required'] = true;
-        $caps['pending_account_plan'] = $plan;
-        $caps['probe_attempted_at'] = time();
-        $db->table('gateway_model_catalog')->where('id', 1)->update([
-            'capabilities_json'=>json_encode($caps, JSON_THROW_ON_ERROR),
-        ]);
+        $commands = static fn() => $db->table('gateway_browser_commands')->where('status', 'IN', ['queued','running']);
+        if ($commands()->where('action', '<>', 'chatgpt_text')->find('id') !== null) return;
+        Schema::transaction(static function () use ($db, $commands, $row, $state, $caps, $plan, $availabilityOnly, $backgroundOnly): void {
+            $current = $db->table('gateway_model_catalog')->where('id', 1)->find();
+            $browser = BrowserState::state();
+            if ($current !== $row || $browser['status'] !== 'ready'
+                || $browser['surface_generation'] !== $state['surface_generation']
+                || $commands()->where('action', '<>', 'chatgpt_text')->find('id') !== null) return;
+            $background = $backgroundOnly || $availabilityOnly || $commands()->where('action', 'chatgpt_text')->find('id') !== null
+                || $db->table('gateway_response_jobs')->where('status', 'IN', ['queued','running'])->find('id') !== null;
+            BrowserState::enqueueModelProbeUnlocked($background);
+            // Quota refresh leaves valid routes published. Stale capability evidence needs a new proof.
+            if (!$availabilityOnly) $caps['refresh_required'] = true;
+            $caps['pending_account_plan'] = $plan;
+            $caps['probe_attempted_at'] = time();
+            $updated = $db->table('gateway_model_catalog')->where('id', 1)->update([
+                'capabilities_json'=>json_encode($caps, JSON_THROW_ON_ERROR),
+            ]);
+            if ($updated === false) throw new GatewayError('storage_unavailable', '模型检测状态无法保存。', 503);
+        });
     }
 
     /**

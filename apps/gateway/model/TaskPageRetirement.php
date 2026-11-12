@@ -51,11 +51,8 @@ final class TaskPageRetirement
             foreach (['submit_intent_at','accepted_at','transport_stage_sent'] as $field) {
                 $candidate = $field === 'submit_intent_at' ? self::journaledSubmitSource($taskId, $sourceSurfaceId) : null;
                 if ($candidate === null) {
-                    $candidate = $db->table('gateway_response_jobs')->where('task_id', $taskId)
-                        ->where('surface_id', $sourceSurfaceId)->where($field, '>', 0)
-                        ->order([['rowid','DESC']])->limit(1)->find(self::SOURCE_FIELDS);
+                    $candidate = self::latestSurfaceSource($taskId, $sourceSurfaceId, $field);
                 }
-                if ($candidate === false) throw new GatewayError('storage_unavailable', 'Retired page submission could not be read.', 503);
                 if (is_array($candidate) && self::wasSubmitted($candidate)
                     && ($source === null || $candidate['id'] !== $source['id'])) {
                     $physical = $candidate;
@@ -64,9 +61,7 @@ final class TaskPageRetirement
             }
         }
         if (!is_array($physical)) {
-            $physical = $db->table('gateway_response_jobs')->where('task_id', $taskId)->where('surface_id', $sourceSurfaceId)
-                ->order([['rowid','DESC']])->limit(1)->find(self::SOURCE_FIELDS);
-            if ($physical === false) throw new GatewayError('storage_unavailable', 'Retired page source could not be read.', 503);
+            $physical = self::latestSurfaceSource($taskId, $sourceSurfaceId);
         }
         if ($chatMode === 'temporary' && is_array($physical) && !self::wasSubmitted($physical)) {
             $handoffSource = self::temporaryHandoffSourceUnlocked($surface, $physical['id']);
@@ -110,6 +105,29 @@ final class TaskPageRetirement
             'surface_id'=>$id, 'task_id'=>$taskId, 'state'=>$empty ? 'stopped' : 'pending',
             'snapshot_json'=>self::encode($snapshot), 'created_at'=>time(), 'updated_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', 'Retired page stop obligation could not be saved.', 503);
+    }
+
+    /** Find the latest row for one physical surface, reading the selected prompt only once. */
+    private static function latestSurfaceSource(string $taskId, string $surfaceId, ?string $field = null): ?array
+    {
+        // SDB cannot pin the access path or express this aggregate subquery. The existing
+        // surface index avoids reading the task's history when the page has few or no rows.
+        $predicate = match ($field) {
+            'submit_intent_at' => ' AND submit_intent_at > 0',
+            'accepted_at' => ' AND accepted_at > 0',
+            'transport_stage_sent' => ' AND transport_stage_sent > 0',
+            null => '',
+        };
+        $statement = DB('medoo', 'sqlite')->query('SELECT ' . self::SOURCE_FIELDS . ' FROM gateway_response_jobs
+            WHERE rowid = (SELECT MAX(rowid) FROM gateway_response_jobs INDEXED BY gateway_response_jobs_surface
+                WHERE surface_id = :surface AND task_id = :task' . $predicate . ')', [':surface'=>$surfaceId, ':task'=>$taskId]);
+        if (!$statement) throw new GatewayError('storage_unavailable', 'Retired page submission could not be read.', 503);
+        try {
+            $row = $statement->fetch(\PDO::FETCH_ASSOC);
+            return is_array($row) ? $row : null;
+        } finally {
+            $statement->closeCursor();
+        }
     }
 
     /** Recover the accepted original submit witness when a transferred temporary page never sent its new turn. */
