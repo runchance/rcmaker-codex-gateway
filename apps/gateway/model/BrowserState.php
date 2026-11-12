@@ -263,34 +263,37 @@ final class BrowserState
      * unrelated console-tab or browser-generation change must not strand an unsent response.
      * Empty ticks use a read-only preflight; any candidate is reselected and fenced inside the
      * original writer transaction. An enqueue racing an empty sample is picked up next tick.
+     * @param list<int> $deferredIds Commands temporarily awaiting a prerequisite on this worker.
      * @return array|null Claimed command, or null when no command is ready.
      * @throws GatewayError When durable queue state cannot be read or updated.
      */
-    public static function claim(): ?array
+    public static function claim(array $deferredIds = []): ?array
     {
-        $candidate = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')
-            ->where('status', 'queued')->limit(1)->find('id');
+        $queued = static function () use ($deferredIds) {
+            $query = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('status', 'queued');
+            return $deferredIds === [] ? $query : $query->where('id', 'NOT IN', $deferredIds);
+        };
+        $candidate = $queued()->limit(1)->find('id');
         if ($candidate === false) {
             throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作队列暂不可读取。', 503);
         }
         if ($candidate === null) return null;
         $rejected = null;
-        $claimedCommand = Schema::transaction(function () use (&$rejected): ?array {
+        $claimedCommand = Schema::transaction(function () use (&$rejected, $queued): ?array {
             $db = SDB(null, 'medoo', 'sqlite');
             $state = self::state();
             if ((int) ($state['profile_reset_required'] ?? 0) === 1) {
-                $row = $db->table('gateway_browser_commands')->where('action', 'reset_profile')
-                    ->where('status', 'queued')->order([['id', 'ASC']])->find();
+                $row = $queued()->where('action', 'reset_profile')->order([['id', 'ASC']])->find();
                 if ($row === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作队列暂不可读取。', 503);
                 if (!is_array($row)) return null;
             } else {
                 // A fresh tool task may already be queued while the tunnel reconnects. Its deferred
                 // command must not starve the one no-side-effect check needed before it can send.
                 $row = $state['status'] === 'ready' && ConnectorState::runtimeCheckPending()
-                    ? $db->table('gateway_browser_commands')->where('action', 'verify_connector')->where('status', 'queued')->order([['id', 'ASC']])->find()
+                    ? $queued()->where('action', 'verify_connector')->order([['id', 'ASC']])->find()
                     : null;
                 if ($row === null) {
-                    $query = $db->table('gateway_browser_commands')->where('status', 'queued');
+                    $query = $queued();
                     // Deferred model work must not repeatedly reclaim the head of the queue ahead
                     // of the start/install command that makes its own execution possible.
                     if ($state['status'] !== 'ready') {

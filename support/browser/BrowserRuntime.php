@@ -65,6 +65,8 @@ final class BrowserRuntime
     private bool $recovered = false;
     private bool $responsesRecovered = false;
     private bool $commandBusy = false;
+    /** @var array<int,float> Local retry times for commands waiting on a prerequisite. */
+    private array $deferredCommands = [];
     private bool $screenshotBusy = false;
     private bool $taskScreenshotBusy = false;
     private ?string $lastMonitorCapturedSurface = null;
@@ -234,7 +236,7 @@ final class BrowserRuntime
         $state = BrowserState::state();
         if ((int) ($state['profile_reset_required'] ?? 0) === 1) {
             if (!$this->commandBusy) {
-                $command = BrowserState::claim();
+                $command = $this->claimReadyCommand();
                 if ($command !== null) {
                     $this->commandBusy = true;
                     $this->execute($command);
@@ -340,12 +342,27 @@ final class BrowserRuntime
             ]);
         }
         if (!$this->commandBusy) {
-            $command = BrowserState::claim();
+            $command = $this->claimReadyCommand();
             if ($command !== null) {
                 $this->commandBusy = true;
                 $this->execute($command);
             }
         }
+    }
+
+    /** Let other queued commands run while a deferred command waits for its prerequisite. */
+    private function claimReadyCommand(): ?array
+    {
+        $now = microtime(true);
+        $this->deferredCommands = array_filter($this->deferredCommands, static fn(float $retryAt): bool => $retryAt > $now);
+        return BrowserState::claim(array_keys($this->deferredCommands));
+    }
+
+    /** Return an unsent command to the durable queue and yield before trying it again. */
+    private function deferCommand(int $commandId): void
+    {
+        BrowserState::defer($commandId);
+        $this->deferredCommands[$commandId] = microtime(true) + 1.0;
     }
 
     /** Recover task work only after browser startup; queue insertion requires a running browser. */
@@ -911,7 +928,7 @@ final class BrowserRuntime
                 $this->failCommand($commandId, 'BROWSER_NOT_READY', '浏览器控制连接尚未就绪。');
                 return;
             }
-            BrowserState::defer($commandId);
+            $this->deferCommand($commandId);
             $this->commandBusy = false;
             return;
         }
@@ -1264,7 +1281,7 @@ final class BrowserRuntime
                 return;
             }
             try {
-                BrowserState::defer($commandId);
+                $this->deferCommand($commandId);
                 $this->commandBusy = false;
             } catch (\Throwable) {
                 $this->failCommand($commandId, 'BROWSER_NOT_READY', '连接器检查未能等待浏览器控制连接。');
@@ -2967,7 +2984,7 @@ JS;
             return;
         }
         if (!$this->taskCdp->ready()) {
-            try { BrowserState::defer($commandId); }
+            try { $this->deferCommand($commandId); }
             catch (\Throwable) { $this->failCommand($commandId, 'CHATGPT_BROWSER_NOT_READY', '任务浏览器控制连接尚未就绪。'); }
             $this->commandBusy = false;
             return;
@@ -2982,7 +2999,7 @@ JS;
                 if (time() >= (int) ($ledger['turn']['deadline_at'] ?? 0)) {
                     throw new GatewayError('steering_page_retire_timeout', '中途指令等待旧网页退出超时，未发送新消息。', 504);
                 }
-                BrowserState::defer($commandId);
+                $this->deferCommand($commandId);
                 $this->commandBusy = false;
                 return;
             }
@@ -2995,7 +3012,7 @@ JS;
             $currentConnector = $bindingConnector !== ''
                 && hash_equals((string) GatewaySettings::internal()['connector_name'], $bindingConnector);
             if (!$recover && $currentConnector && ConnectorState::runtimeCheckPending()) {
-                BrowserState::defer($commandId);
+                $this->deferCommand($commandId);
                 $this->commandBusy = false;
                 return;
             }
@@ -3335,7 +3352,7 @@ JS;
         if (!$this->taskCdp->ready()) {
             if ($recover) $this->pendingResumes[$responseId] = true;
             else {
-                BrowserState::defer($commandId);
+                $this->deferCommand($commandId);
                 $this->commandBusy = false;
             }
             return;
