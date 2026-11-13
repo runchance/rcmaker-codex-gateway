@@ -993,7 +993,7 @@ final class ResponsesProtocol
      * Human input does not end a parallel receipt batch; the preceding assistant/call or
      * compaction record remains the boundary. Task ownership and issued call IDs are then
      * verified by ContextHistory and ToolBroker before any result can be accepted.
-     * Configuration updates and native Page snapshots do not split that batch.
+     * Configuration updates and native desktop context records do not split that batch.
      */
     private static function toolOutputs(mixed $input): array
     {
@@ -1027,7 +1027,7 @@ final class ResponsesProtocol
                 if ($item['name'] === 'send_message_to_thread') continue;
                 break;
             }
-            if ($type === 'function_call_output' && self::isCodexPageSnapshot($item)) continue;
+            if ($type === 'function_call_output' && self::isCodexDesktopContext($item)) continue;
             if (!in_array($type, ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)) break;
             $afterOutputs = false;
             $callId = $item['call_id'] ?? null;
@@ -1062,18 +1062,18 @@ final class ResponsesProtocol
     }
 
     /**
-     * Recognize Codex desktop Page context carried in a function-output envelope.
+     * Recognize Codex desktop Page or browser context in a function-output envelope.
      * These sidecar records have no call ID and remain in history as untrusted
      * context. Only their receipt classification changes; all actual calls still
      * require their original call_id and the normal ownership checks.
      */
-    private static function isCodexPageSnapshot(array $item): bool
+    private static function isCodexDesktopContext(array $item): bool
     {
         if (($item['namespace'] ?? null) !== 'agent' || array_key_exists('call_id', $item)
             || !is_string($item['name'] ?? null) || !is_string($item['output'] ?? null)) return false;
         $name = $item['name'];
         $output = $item['output'];
-        if ($name !== 'codex_apps_open_page'
+        if ($name !== 'browser_tabs' && $name !== 'codex_apps_open_page'
             && preg_match('/\Acodex_apps_selected_page_part_([1-9][0-9]{0,3})_of_([1-9][0-9]{0,3})\z/D', $name, $part) !== 1) return false;
         $metadata = $item['internal_chat_message_metadata_passthrough'] ?? null;
         if ($metadata instanceof \stdClass) $metadata = get_object_vars($metadata);
@@ -1082,6 +1082,16 @@ final class ResponsesProtocol
         $createdAt = $metadata['create_time'] ?? null;
         if (!is_string($turnId) || !CodexCancellation::uuid($turnId)
             || (!is_int($createdAt) && !is_float($createdAt)) || !is_finite($createdAt) || $createdAt <= 0) return false;
+        if ($name === 'browser_tabs') {
+            $output = trim($output);
+            $open = '<in-app-browser-context source="ambient-ui-state">';
+            $close = '</in-app-browser-context>';
+            if (!str_starts_with($output, $open) || !str_ends_with($output, $close)) return false;
+            $body = substr($output, strlen($open), -strlen($close));
+            // The envelope identifies the context. Its tab titles and prose can vary with locale.
+            return str_contains($body, "\n") && trim($body) !== ''
+                && !str_contains($body, '<in-app-browser-context') && !str_contains($body, $close);
+        }
         if ($name !== 'codex_apps_open_page') {
             if ((int)$part[1] > (int)$part[2]) return false;
             $header = "Companion Page snapshot part {$part[1]} of {$part[2]}:";
