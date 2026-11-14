@@ -14,9 +14,10 @@ final class ContextPortability
     }
 
     /**
-     * Replace bridge-owned compaction with its summary and retained user/image input before native responses/compact.
+     * Replay bridge checkpoints with their summaries and retained user/image input for native responses and compaction.
      * Complete inline records keep roles and call_id; provider-local item IDs are not references.
-     * Native-only requests are returned byte for byte, including official encrypted content.
+     * Retire standalone search declarations from the Web portions of mixed Codex history.
+     * Native-only requests are returned byte for byte. Official encrypted content remains intact.
      * @param string $raw Decoded JSON request, never compressed HTTP bytes.
      * @return string Normalized JSON only when a known bridge artifact is present.
      * @throws GatewayError On damaged bridge checkpoints or missing content behind a local reference.
@@ -32,16 +33,18 @@ final class ContextPortability
         }
         $crossed = false;
         $hasCheckpoint = false;
-        foreach ($body->input as $item) {
+        $latestToolSnapshot = null;
+        $webToolSnapshots = [];
+        foreach ($body->input as $index => $item) {
             if (!$item instanceof \stdClass) continue;
-            if (($item->type ?? '') === 'compaction' && self::readableEnvelope((string) ($item->encrypted_content ?? ''))) $crossed = $hasCheckpoint = true;
-            if (($item->type ?? '') === 'reasoning' && str_starts_with((string) ($item->encrypted_content ?? ''), 'ocxr1:')) $crossed = true;
-            if (($item->type ?? '') === 'reasoning' && preg_match('/\Ars_[a-f0-9]{32}\z/i', (string) ($item->id ?? ''))
-                && !isset($item->encrypted_content) && (is_array($item->summary ?? null) || is_array($item->content ?? null))) $crossed = true;
-            // RCMAKER generates 12-byte IDs, including legacy fc_ custom calls;
-            // native records use their own longer identity format.
-            if (preg_match('/\A(?:msg_|fc_|ctc_|tsc_)[a-f0-9]{24}\z/', (string) ($item->id ?? ''))
-                || preg_match('/\Amsg_c_[a-f0-9]{32}\z/', (string) ($item->id ?? ''))) $crossed = true;
+            if (self::isCodexToolSnapshot($item)) $latestToolSnapshot = $index;
+            $type = $item->type ?? '';
+            $checkpoint = $type === 'compaction' && self::readableEnvelope((string) ($item->encrypted_content ?? ''));
+            $hasCheckpoint = $hasCheckpoint || $checkpoint;
+            if ($checkpoint || self::isWebOutput($item, $type)) {
+                $crossed = true;
+                if ($latestToolSnapshot !== null) $webToolSnapshots[$latestToolSnapshot] = true;
+            }
         }
         if ($localReference) {
             if (!$hasCheckpoint) throw new GatewayError('cross_model_history_required', '切换模型需要可读历史检查点，不能丢弃网页模型 response_id 所指向的旧历史。', 400);
@@ -49,7 +52,7 @@ final class ContextPortability
         }
         if (!$crossed) return $raw;
         $input = [];
-        foreach ($body->input as $item) {
+        foreach ($body->input as $index => $item) {
             if (!$item instanceof \stdClass) { $input[] = $item; continue; }
             $type = $item->type ?? 'message';
             if ($type === 'item_reference') {
@@ -58,6 +61,13 @@ final class ContextPortability
             if ($type === 'compaction' && self::readableEnvelope((string) ($item->encrypted_content ?? ''))) {
                 $input = array_merge($input, ContextCompaction::replay($item->encrypted_content));
                 continue;
+            }
+            // Classic requests supply current tools at the root. Lite requests keep
+            // the latest snapshot, even if the current user turn has no search tool.
+            if (isset($webToolSnapshots[$index]) && ($index !== $latestToolSnapshot || is_array($body->tools ?? null))) {
+                $tools = self::withoutStandaloneSearch($item->tools);
+                if ($tools === [] && $item->tools !== []) continue;
+                $item->tools = $tools;
             }
             // Only inline, complete items lose their backend-scoped IDs. Real ciphertext stays intact.
             unset($item->id);
@@ -72,6 +82,53 @@ final class ContextPortability
         // a local handle covered by a readable checkpoint is safe to remove.
         if ($localReference) unset($body->previous_response_id);
         return json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    }
+
+    /** Recognize developer tool snapshots authored by Codex, including a known empty inventory. */
+    private static function isCodexToolSnapshot(\stdClass $item): bool
+    {
+        return ($item->type ?? null) === 'additional_tools' && ($item->role ?? null) === 'developer'
+            && is_array($item->tools ?? null) && is_string($item->id ?? null)
+            && preg_match('/\Aat_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\z/i', $item->id) === 1;
+    }
+
+    /** Recognize output IDs and reasoning formats emitted by the Web bridge. */
+    private static function isWebOutput(\stdClass $item, mixed $type): bool
+    {
+        // Includes legacy fc_ custom calls. Official output uses longer IDs.
+        return preg_match('/\A(?:(?:msg_|fc_|ctc_|tsc_)[a-f0-9]{24}|msg_c_[a-f0-9]{32})\z/', (string) ($item->id ?? '')) === 1
+            || ($type === 'reasoning' && (str_starts_with((string) ($item->encrypted_content ?? ''), 'ocxr1:')
+                || (preg_match('/\Ars_[a-f0-9]{32}\z/i', (string) ($item->id ?? ''))
+                    && !isset($item->encrypted_content) && (is_array($item->summary ?? null) || is_array($item->content ?? null)))));
+    }
+
+    /** Remove Codex's standalone web.run declaration from a Web snapshot, retaining other tools in order. */
+    private static function withoutStandaloneSearch(array $inventory): array
+    {
+        $tools = [];
+        foreach ($inventory as $namespace) {
+            if ($namespace instanceof \stdClass && ($namespace->type ?? null) === 'namespace'
+                && ($namespace->name ?? null) === 'web' && is_array($namespace->tools ?? null)) {
+                $members = array_values(array_filter($namespace->tools, static fn($tool): bool => !self::isStandaloneSearch($tool)));
+                if ($members !== $namespace->tools) {
+                    if ($members === []) continue;
+                    $namespace->tools = $members;
+                }
+            }
+            $tools[] = $namespace;
+        }
+        return $tools;
+    }
+
+    /** Match the standalone search signature, including versions with extra search commands. */
+    private static function isStandaloneSearch(mixed $tool): bool
+    {
+        return $tool instanceof \stdClass && ($tool->type ?? null) === 'function' && ($tool->name ?? null) === 'run'
+            && ($tool->strict ?? null) === false && ($tool->parameters->type ?? null) === 'object'
+            && ($tool->parameters->properties->search_query->type ?? null) === 'array'
+            && ($tool->parameters->properties->open->type ?? null) === 'array'
+            && is_string($tool->description ?? null)
+            && str_starts_with($tool->description, 'Tool for accessing the internet.');
     }
 
     /** Replace only unreadable official checkpoints with an explicit gap marker. No native request is made. */
