@@ -186,7 +186,12 @@ Task-center cleanup targets the gateway's eligible task records, not the project
 
 ### Why does the SQLite file remain large after cleanup?
 
-Deleted records free space inside SQLite for later writes; the database file need not shrink immediately. The running gateway does not automatically compact the entire database or perform blocking file reclamation, which could hold the write lock and stall startup and the console. Legacy cleanup records waiting for compaction finish normally once their items have settled. Use the console's size/reusable-space/cleanup progress, not file size alone. Do not remove `-wal` or `-shm` sidecars while the application is running.
+New databases return free pages to disk in background batches. Task center shows the current database size and the space still awaiting release. Active database reads and writes can delay the size change. Continuing a Codex chat can rebuild a deleted gateway task from the full local history or a readable checkpoint supplied by Codex.
+
+If Task center shows “Reclaimable with gateway stopped,” the database uses the legacy format. Fully exit RCMAKER, then run the following command from its installation directory. It preserves remaining records and settings, reclaims existing free space, and enables background reclamation for future cleanup. Large databases need time and temporary disk space. The command reports the actual size before and after.
+
+- Binary install: add `--compact-database` to the executable, for example `./rcmaker-codex-gateway.exe --compact-database`. Use your installed filename.
+- Source install: run `php index.php --compact-database`.
 
 ### What should I preserve during an upgrade or machine change?
 

@@ -5,7 +5,7 @@ namespace app\gateway\model;
 use app\gateway\database\Schema;
 use RC\Config;
 
-/** Task-only deletion with reusable SQLite space, consumed by the dedicated maintenance worker. */
+/** Task-only deletion consumed by the dedicated maintenance worker. */
 final class TaskMaintenance
 {
     /** Continue the cleanup rotation across timer ticks; durable progress stays in each item. */
@@ -150,10 +150,11 @@ final class TaskMaintenance
         $row = $id === null ? $query->order([['id','DESC']])->limit(1)->find() : $query->where('id', $id)->find();
         if (is_array($row)) $row['pending_count'] = (int) DB('medoo', 'sqlite')->query("SELECT COUNT(*) FROM gateway_task_cleanup_items
             WHERE cleanup_id=:id AND status IN ('pending','waiting_surface','deleting_rows')", [':id'=>$row['id']])->fetchColumn();
-        $pageSize = (int) DB('medoo', 'sqlite')->query('PRAGMA page_size')->fetchColumn();
-        $free = (int) DB('medoo', 'sqlite')->query('PRAGMA freelist_count')->fetchColumn();
+        $storage = DB('medoo', 'sqlite')->query('SELECT page_size,freelist_count,auto_vacuum
+            FROM pragma_page_size(),pragma_freelist_count(),pragma_auto_vacuum()')->fetchAll(\PDO::FETCH_ASSOC)[0];
         return ['job'=>is_array($row) ? $row : null, 'database_bytes'=>self::databaseBytes(),
-            'reusable_bytes'=>$free * $pageSize];
+            'reusable_bytes'=>(int) $storage['freelist_count'] * (int) $storage['page_size'],
+            'incremental_reclaim'=>(int) $storage['auto_vacuum'] === 2];
     }
 
     /**
@@ -403,9 +404,8 @@ final class TaskMaintenance
 
     /**
      * Finish a batch after every item settles, including legacy compacting/waiting_idle records.
-     * Freed pages remain reusable. Live VACUUM or a blocking checkpoint can monopolize the
-     * shared database even in this dedicated worker, starving browser startup and the console.
-     * Preserve vacuum_done as historical evidence; do not claim a file rewrite happened.
+     * Record logical deletion independently of physical reclamation. The maintenance timer
+     * reclaims free pages outside the deletion/admission lock on supported databases.
      */
     private static function completeCleanup(int $cleanupId): void
     {

@@ -61,12 +61,15 @@
     /** Poll small cleanup metadata; progress never reloads or replaces the open task transcript. */
     function renderCleanup(result) {
         const format = bytes => (Number(bytes || 0) / (1024 * 1024)).toLocaleString(I18n.locale, {maximumFractionDigits: 1}) + ' MB';
-        byId('task-storage-size').textContent = I18n.t('任务数据库：') + format(result.database_bytes)
-            + ' · ' + I18n.t('可复用空间：') + format(result.reusable_bytes);
+        const storage = [I18n.t('任务数据库：') + format(result.database_bytes)];
+        if (Number(result.reusable_bytes) > 0) {
+            storage.push(I18n.t(result.incremental_reclaim ? '待释放到磁盘：' : '停机整理可释放：') + format(result.reusable_bytes));
+        }
+        byId('task-storage-size').textContent = storage.join(' · ');
         const job = result.job;
         const labels = {queued: I18n.t('清理已登记'), deleting: I18n.t('正在删除任务及释放网页标签'),
             waiting_idle: I18n.t('清理正在等待资源释放。'),
-            compacting: I18n.t('正在完成清理，释放的数据库空间将供后续复用'), completed: I18n.t('清理完成')};
+            compacting: I18n.t('正在完成记录清理'), completed: I18n.t('任务记录已删除')};
         byId('task-cleanup-progress').textContent = job ? (labels[job.status] || I18n.t('等待清理'))
             + ' · ' + I18n.t('已删除：') + job.deleted_count + ' · ' + I18n.t('跳过工作中任务：') + job.skipped_count : '';
         byId('clear-idle-tasks').disabled = state.mutationBusy || !!(job && ['queued','deleting','compacting'].includes(job.status));

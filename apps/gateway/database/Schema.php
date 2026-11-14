@@ -14,6 +14,7 @@ final class Schema
     private const WRITER_WAIT_MILLISECONDS = 5000;
     private const WRITER_LOCK_ATTEMPTS = 3;
     private const RECYCLED_WAL_BYTES = 16777216;
+    private const RECLAIM_PAGES_PER_TICK = 1024;
 
     /** @return array<int,string> Immutable migration SQL; hashes cover logical SQL, not package bytes. */
     public static function migrationOne(): array
@@ -598,6 +599,11 @@ final class Schema
             // the transaction body or its potentially external effects after an error.
             $db->query('PRAGMA busy_timeout=' . self::WRITER_WAIT_MILLISECONDS);
             $db->query('PRAGMA foreign_keys=ON');
+            // Enable pointer maps before the first table. Existing populated databases
+            // retain their format until the operator runs offline compaction.
+            if ((int) $db->query('PRAGMA page_count')->fetchAll(\PDO::FETCH_COLUMN)[0] === 0) {
+                $db->query('PRAGMA auto_vacuum=INCREMENTAL');
+            }
             $journalMode = strtolower((string) $db->query('PRAGMA journal_mode')->fetchColumn());
             if ($journalMode !== 'wal'
                 && strtolower((string) $db->query('PRAGMA journal_mode=WAL')->fetchColumn()) !== 'wal') {
@@ -746,6 +752,63 @@ final class Schema
             throw new GatewayError('STORAGE_UNAVAILABLE', '本地数据库不可用，请检查磁盘空间、写入权限或文件占用。', 503);
         }
         return ['busy' => (int) $rows[0][0], 'frames' => (int) $rows[0][1], 'checkpointed' => (int) $rows[0][2]];
+    }
+
+    /**
+     * Release a bounded range of free pages. Call only from the independent maintenance
+     * worker after PASSIVE has copied the outstanding WAL frames. SQLite skips competing
+     * writers immediately. A subsequent PASSIVE checkpoint applies the size to the file.
+     * @throws \Throwable If storage becomes unavailable or a concurrent writer wins.
+     */
+    public static function reclaimFreePages(): void
+    {
+        $db = DB('medoo', 'sqlite');
+        if ((int) $db->query('PRAGMA auto_vacuum')->fetchAll(\PDO::FETCH_COLUMN)[0] !== 2
+            || (int) $db->query('PRAGMA freelist_count')->fetchAll(\PDO::FETCH_COLUMN)[0] === 0) return;
+        $db->query('PRAGMA busy_timeout=0')->fetchAll();
+        try {
+            // This PRAGMA yields a row for each step. Exhaust it to commit the batch.
+            $db->query('PRAGMA incremental_vacuum(' . self::RECLAIM_PAGES_PER_TICK . ')')->fetchAll();
+        } finally {
+            $db->query('PRAGMA busy_timeout=' . self::WRITER_WAIT_MILLISECONDS)->fetchAll();
+        }
+    }
+
+    /**
+     * Rebuild the stopped installation's database and enable incremental reclamation.
+     * The exclusive SQLite lock is held across VACUUM and TRUNCATE, preventing both
+     * a concurrent compactor and a running gateway from sharing the rebuild connection.
+     * @param callable(int):void $onStart Receives the original physical byte count once the lock is held.
+     * @return array{before:int,after:int} Main database plus WAL sizes before and after.
+     * @throws \Throwable If the file is open elsewhere, space is insufficient, or SQLite fails.
+     */
+    public static function compactOffline(callable $onStart): array
+    {
+        $path = (string) Config::get('gateway', 'database_file');
+        if (!is_file($path)) throw new GatewayError('DATABASE_MISSING', 'The gateway database does not exist.', 404);
+        $bytes = static function () use ($path): int {
+            clearstatcache();
+            return (int) filesize($path) + (is_file($path . '-wal') ? (int) filesize($path . '-wal') : 0);
+        };
+        $db = DB('medoo', 'sqlite');
+        $db->query('PRAGMA busy_timeout=0')->fetchAll();
+        $db->query('PRAGMA locking_mode=EXCLUSIVE')->fetchAll();
+        // In rollback-journal mode as well, the exclusive lock must be held before VACUUM.
+        $db->query('BEGIN EXCLUSIVE')->closeCursor();
+        $db->query('COMMIT')->closeCursor();
+        self::validatedVersion($db, self::migrations());
+        self::validateInitializedState($db);
+        $before = $bytes();
+        $onStart($before);
+        $db->query('PRAGMA synchronous=FULL')->fetchAll();
+        $db->query('PRAGMA auto_vacuum=INCREMENTAL')->fetchAll();
+        $db->query('VACUUM')->closeCursor();
+        $checkpoint = $db->query('PRAGMA wal_checkpoint(TRUNCATE)')->fetchAll(\PDO::FETCH_NUM);
+        if (($checkpoint[0][0] ?? null) !== 0
+            || (int) $db->query('PRAGMA auto_vacuum')->fetchAll(\PDO::FETCH_COLUMN)[0] !== 2) {
+            throw new GatewayError('COMPACT_DATABASE_INCOMPLETE', 'Database reclamation could not be verified.', 503);
+        }
+        return ['before' => $before, 'after' => $bytes()];
     }
 
     /**

@@ -20,6 +20,11 @@ if (in_array($argv[1] ?? '', ['--version', '--build-info'], true)) {
     }
     exit;
 }
+if (($argv[1] ?? '') === '--compact-database') {
+    define('IS_SCRIPT', true);
+    require_once ROOT_PATH . '/vendor/autoload.php';
+    exit(\support\process\GatewayLaunch::compactDatabase());
+}
 // Child entries ship inside the code archive; a clean installation needs no data/scripts.
 if (($argv[1] ?? '') === '--gateway-runtime-guard') {
     require ROOT_PATH . '/support/process/runtime-guard.php';

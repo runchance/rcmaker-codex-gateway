@@ -29,7 +29,10 @@ final class GatewayMaintenance
             try {
                 // No writer transaction or cleanup admission lock surrounds this work.
                 // PASSIVE skips contended pages; never switch to FULL/RESTART/TRUNCATE.
-                Schema::checkpointWal();
+                $checkpoint = Schema::checkpointWal();
+                if ($checkpoint['busy'] === 0 && $checkpoint['frames'] === $checkpoint['checkpointed']) {
+                    Schema::reclaimFreePages();
+                }
             } catch (\Throwable) {
                 // Keep durable WAL records for the next tick or worker restart.
             }
