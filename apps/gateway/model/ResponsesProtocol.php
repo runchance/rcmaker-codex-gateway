@@ -993,7 +993,7 @@ final class ResponsesProtocol
      * Human input does not end a parallel receipt batch; the preceding assistant/call or
      * compaction record remains the boundary. Task ownership and issued call IDs are then
      * verified by ContextHistory and ToolBroker before any result can be accepted.
-     * Configuration updates and native desktop context records do not split that batch.
+     * Configuration updates and native context records do not split that batch.
      */
     private static function toolOutputs(mixed $input): array
     {
@@ -1027,7 +1027,7 @@ final class ResponsesProtocol
                 if ($item['name'] === 'send_message_to_thread') continue;
                 break;
             }
-            if ($type === 'function_call_output' && self::isCodexDesktopContext($item)) continue;
+            if ($type === 'function_call_output' && self::isCodexContextOutput($item)) continue;
             if (!in_array($type, ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)) break;
             $afterOutputs = false;
             $callId = $item['call_id'] ?? null;
@@ -1062,18 +1062,19 @@ final class ResponsesProtocol
     }
 
     /**
-     * Recognize Codex desktop Page or browser context in a function-output envelope.
-     * These sidecar records have no call ID and remain in history as untrusted
-     * context. Only their receipt classification changes; all actual calls still
-     * require their original call_id and the normal ownership checks.
+     * Recognize structured Codex Page, browser and goal context in a function-output envelope.
+     * Preserve these records in history, outside the host-receipt batch. Each
+     * supported envelope has its own shape check after validating the turn and timestamp fields.
+     * @param array $item A function_call_output record from the native input history.
+     * @return bool Whether the record is an identified context envelope without a call ID.
      */
-    private static function isCodexDesktopContext(array $item): bool
+    private static function isCodexContextOutput(array $item): bool
     {
         if (($item['namespace'] ?? null) !== 'agent' || array_key_exists('call_id', $item)
             || !is_string($item['name'] ?? null) || !is_string($item['output'] ?? null)) return false;
         $name = $item['name'];
         $output = $item['output'];
-        if ($name !== 'browser_tabs' && $name !== 'codex_apps_open_page'
+        if (!in_array($name, ['browser_tabs', 'codex_apps_open_page', 'goal_objective'], true)
             && preg_match('/\Acodex_apps_selected_page_part_([1-9][0-9]{0,3})_of_([1-9][0-9]{0,3})\z/D', $name, $part) !== 1) return false;
         $metadata = $item['internal_chat_message_metadata_passthrough'] ?? null;
         if ($metadata instanceof \stdClass) $metadata = get_object_vars($metadata);
@@ -1082,6 +1083,13 @@ final class ResponsesProtocol
         $createdAt = $metadata['create_time'] ?? null;
         if (!is_string($turnId) || !CodexCancellation::uuid($turnId)
             || (!is_int($createdAt) && !is_float($createdAt)) || !is_finite($createdAt) || $createdAt <= 0) return false;
+        if ($name === 'goal_objective') {
+            // Both Codex Responses formats identify the plain-text objective by its
+            // native fco item ID. Objective text can be any language.
+            $id = $item['id'] ?? null;
+            return is_string($id) && str_starts_with($id, 'fco_')
+                && CodexCancellation::uuid(substr($id, 4)) && trim($output) !== '';
+        }
         if ($name === 'browser_tabs') {
             $output = trim($output);
             $open = '<in-app-browser-context source="ambient-ui-state">';
