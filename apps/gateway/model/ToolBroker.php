@@ -20,6 +20,9 @@ final class ToolBroker
     /** A receipt worker gets one full RPC slice plus scheduling grace before it can be proven orphaned. */
     private const RECEIPT_ORPHAN_GRACE_SECONDS = 15;
     private const CLOSED_WAIT_TRANSPORT_CODES = ['tool_wait_scope_changed', 'tool_receipt_transport_lost', 'tool_receipt_wait_closed'];
+    private const CAPACITY_CANCELLATION = '{"conversation_capacity_interrupted":true}';
+    private const INVOCATION_DELIVERY_FIELDS = 'status,response_id,delivery_count,delivered_at,completed_at,'
+        . 'result_delivered_at,result_delivered_at_us,result_hash';
 
     private const BRIDGE_NAMES = [
         'codex_turn_start', 'codex_exec', 'codex_write_stdin', 'codex_apply_patch', 'codex_view_image',
@@ -733,7 +736,7 @@ final class ToolBroker
             ->where('task_id', $job['task_id'])->where('turn_id', $job['durable_turn_id'])->where('response_id', $job['id'])
             ->where('status', 'registered')->where('delivery_count', 0)->where('delivered_at', null)
             ->where('completed_at', null)->where('result_delivered_at', null)->where('result_json', null)->where('result_hash', null)
-            ->update(['status'=>'cancelled', 'result_json'=>json_encode(['conversation_capacity_interrupted'=>true], JSON_THROW_ON_ERROR),
+            ->update(['status'=>'cancelled', 'result_json'=>self::CAPACITY_CANCELLATION,
                 'updated_at'=>time()]);
         if (!$updated) throw new GatewayError('storage_unavailable', 'The terminal tool queue could not be retired.', 503);
         $count = $updated->rowCount();
@@ -1801,7 +1804,50 @@ final class ToolBroker
         return $invocations;
     }
 
-    /** Last confirmed MCP delivery for a completed source tool batch; null until every result is returned. */
+    /**
+     * A verified capacity replacement can keep its logical response ID while replacing
+     * the page and its unpublished queue. Publication, delivery metadata and native
+     * output are committed together. Keep the cancelled row as execution-history evidence.
+     * @param array $call Durable invocation with its delivery fields and cancellation marker.
+     * @return bool Whether this capacity cancellation could never have produced a native receipt.
+     */
+    private static function cancelledBeforeCapacityDelivery(array $call): bool
+    {
+        return $call['status'] === 'cancelled' && $call['response_id'] !== null
+            && (int) $call['delivery_count'] === 0 && $call['delivered_at'] === null
+            && $call['completed_at'] === null && $call['result_delivered_at'] === null
+            && $call['result_delivered_at_us'] === null && $call['result_hash'] === null
+            && $call['result_json'] === self::CAPACITY_CANCELLATION;
+    }
+
+    /**
+     * Read a response's receipt obligations without loading any completed tool payloads.
+     * Admission and browser polling use the same view of the published batch.
+     * @param string $responseId Owning response.
+     * @param ?string $bindingId Exact capability for receipt admission, when available.
+     * @return list<array> Invocation metadata, including any ambiguous or unfinished calls.
+     * @throws GatewayError If the current batch cannot be read.
+     */
+    private static function receiptBatchForResponse(string $responseId, ?string $bindingId = null): array
+    {
+        $parameters = [':response'=>$responseId];
+        $scope = '';
+        if ($bindingId !== null) {
+            $scope = ' AND binding_id=:binding';
+            $parameters[':binding'] = $bindingId;
+        }
+        try {
+            $rows = DB('medoo', 'sqlite')->query('SELECT call_id,' . self::INVOCATION_DELIVERY_FIELDS
+                . ",CASE WHEN status='cancelled' THEN result_json END AS result_json"
+                . ' FROM gateway_tool_invocations WHERE response_id=:response' . $scope, $parameters)
+                ->fetchAll(\PDO::FETCH_ASSOC);
+        } catch (\Throwable) {
+            throw new GatewayError('storage_unavailable', '源工具回执状态暂不可读取。', 503);
+        }
+        return array_values(array_filter($rows, static fn(array $call): bool => !self::cancelledBeforeCapacityDelivery($call)));
+    }
+
+    /** Last confirmed MCP delivery for a completed source tool batch; null until every issued result is returned. */
     public static function allResultsDeliveredAtForResponse(string $responseId): ?int
     {
         return self::allResultsDeliveryForResponse($responseId)['latest_at'] ?? null;
@@ -1811,9 +1857,7 @@ final class ToolBroker
     public static function allResultsDeliveryForResponse(string $responseId): ?array
     {
         Schema::initialize();
-        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
-            ->where('response_id', $responseId)->select('status,result_delivered_at,result_delivered_at_us');
-        if (!is_array($rows)) throw new GatewayError('storage_unavailable', '源工具回执状态暂不可读取。', 503);
+        $rows = self::receiptBatchForResponse($responseId);
         if ($rows === []) return null;
         $latest = 0;
         $latestUs = null;
@@ -2924,9 +2968,10 @@ final class ToolBroker
         if (!is_numeric($pending) || !is_numeric($missing)) throw new GatewayError('storage_unavailable', '摘要源工具状态暂不可读取。', 503);
         if ((int)$pending !== 0 || (int)$missing !== 0) return null;
         $cancelled = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
-            ->where('status','cancelled')->select('response_id,result_json');
+            ->where('status','cancelled')->select(self::INVOCATION_DELIVERY_FIELDS . ',result_json');
         if (!is_array($cancelled)) throw new GatewayError('storage_unavailable', '摘要源工具状态暂不可读取。', 503);
         foreach ($cancelled as $call) {
+            if (self::cancelledBeforeCapacityDelivery($call)) continue;
             if ($call['response_id'] !== null || empty(json_decode((string)$call['result_json'],true)['compaction_interrupted'])) return null;
         }
         $calls = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
@@ -3106,14 +3151,11 @@ final class ToolBroker
         return $checkpoint;
     }
 
-    /** Reject partial, repeated, or foreign Codex results before a new browser round is reserved. */
-    /** Verify the complete issued batch; unknown status is allowed only by the separately proved late-receipt path. */
+    /** Verify every issued result and reject duplicates or extra call IDs. Late receipts have their own ownership proof. */
     private static function assertCompleteOutputBatchUnlocked(array $binding, string $previousResponseId, array $outputs, bool $lateReceipt = false): void
     {
-        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
-            ->where('binding_id', (string) $binding['id'])
-            ->where('response_id', $previousResponseId)->select('call_id,status');
-        if (!is_array($rows) || $rows === []) {
+        $rows = self::receiptBatchForResponse($previousResponseId, (string) $binding['id']);
+        if ($rows === []) {
             throw new GatewayError('tool_output_without_call', 'previous_response_id 没有待接收的工具批次。', 409);
         }
         $expected = [];
