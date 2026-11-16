@@ -55,6 +55,25 @@ final class WebMessageAudit
         if ($updated === false) throw new GatewayError('storage_unavailable', '网页消息接收记录无法保存。', 503);
     }
 
+    /**
+     * Read the exact text hashes of attempted stages for an older multipart transaction.
+     * Each hash includes its transaction ID, stage number and payload.
+     * @param string $responseId Exact durable response.
+     * @param int $sent Highest stage with durable submit intent.
+     * @return array<int,array<string,true>> Outbound witness hashes indexed by stage.
+     * @throws GatewayError When stage evidence cannot be read.
+     */
+    public static function multipartStageHashes(string $responseId, int $sent): array
+    {
+        $rows = SDB(null, 'medoo', 'sqlite')->table('gateway_web_messages')
+            ->where('response_id', $responseId)->where('direction', 'outbound')->where('kind', 'stage')
+            ->where('stage_no', '>', 0)->where('stage_no', '<=', $sent)->select('stage_no,sha256');
+        if (!is_array($rows)) throw new GatewayError('storage_unavailable', 'Multipart stage evidence could not be read.', 503);
+        $hashes = [];
+        foreach ($rows as $row) $hashes[(int) $row['stage_no']][(string) $row['sha256']] = true;
+        return $hashes;
+    }
+
     /** Metadata stays small; the exact body is fetched only when the user opens it. */
     public static function forTask(string $taskId): array
     {

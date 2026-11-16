@@ -645,6 +645,7 @@ final class ResponseJob
             'transport_final_effort' => $row['transport_final_effort'] === null ? null : (string) $row['transport_final_effort'],
             'transport_budget' => $row['transport_budget_json'] === null ? null
                 : json_decode((string) $row['transport_budget_json'], true, 32, JSON_THROW_ON_ERROR),
+            'transport_decision' => json_decode((string) ($row['transport_decision_json'] ?? ''), true) ?: [],
             'attachments' => AttachmentStore::forResponse($responseId),
         ];
     }
@@ -749,7 +750,7 @@ final class ResponseJob
      * @param string $responseId Running response. @param string $transactionId Stable transport identity.
      * @param int $partsTotal Two to six physical messages, including the final commit.
      * @param string $stageEffort Inert stage effort. @param string $finalEffort Final generation effort.
-     * @param ?array $transportBudget Checkpoint composer envelope, separate from its logical source budget.
+     * @param ?array $transportBudget Exact multipart partition budget, including the final attachment reserve.
      * @return void @throws GatewayError If the transaction or generation no longer matches.
      */
     public static function configureMultipart(string $responseId, string $transactionId, int $partsTotal, string $stageEffort, string $finalEffort, ?array $transportBudget = null): void
@@ -761,7 +762,7 @@ final class ResponseJob
             $row = self::row($responseId);
             if ((string) $row['status'] !== 'running') throw new GatewayError('response_state_invalid', 'Multipart 事务只能绑定到运行中的 Responses。', 409);
             $compact = in_array((string) ($row['operation_kind'] ?? 'response'), ['compact_v1', 'compact_v2'], true);
-            $transportJson = $compact && $transportBudget !== null ? json_encode($transportBudget, JSON_THROW_ON_ERROR) : null;
+            $transportJson = $transportBudget === null ? null : json_encode($transportBudget, JSON_THROW_ON_ERROR);
             if ($row['transport_transaction_id'] !== null) {
                 // A legacy checkpoint may have staged history on Medium but not yet sent its
                 // Pro commit. Adopt High only before that commit's durable send intent, while
@@ -776,7 +777,7 @@ final class ResponseJob
                         && !hash_equals((string) $row['transport_budget_json'], $transportJson))) {
                     throw new GatewayError('multipart_state_conflict', 'Multipart 恢复参数与已保存事务不一致。', 409);
                 }
-                if ($adoptHigh || ($compact && $row['transport_budget_json'] === null && $transportJson !== null)) {
+                if ($adoptHigh || ($row['transport_budget_json'] === null && $transportJson !== null)) {
                     $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_response_jobs')->where('id', $responseId)
                         ->where('status', 'running')->where('transport_final_effort', $row['transport_final_effort'])
                         ->update(['transport_final_effort'=>$finalEffort, 'transport_budget_json'=>$transportJson ?? $row['transport_budget_json']]);

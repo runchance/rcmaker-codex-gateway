@@ -856,7 +856,7 @@ final class ChatGptTransport
      *
      * @param array|null $budget Pinned message envelopes; null preserves legacy partitioning.
      * @param int $totalParts Two through six parts, including the exact count pinned by a saved job.
-     * @return array{transaction_id:string,total_parts:int,parts:list<string>,hashes:list<string>,stages:list<array{text:string,ack:string,index:int}>,final_text:string,max_stage_chars:int,max_stage_tokens:int}
+     * @return array{transaction_id:string,total_parts:int,parts:list<string>,hashes:list<string>,stages:list<array{text:string,ack:string,index:int}>,final_text:string,max_stage_chars:int,max_stage_tokens:int,staging_context_tokens:int,transport_budget:?array}
      */
     public static function multipart(string $controlPrompt, ?string $transactionId = null, int $totalParts = 3, ?array $budget = null): array
     {
@@ -929,6 +929,7 @@ final class ChatGptTransport
             'max_stage_chars' => $maxStageChars,
             'max_stage_tokens' => $maxStageTokens,
             'staging_context_tokens' => $stagingContextTokens,
+            'transport_budget' => $budget,
         ];
     }
 

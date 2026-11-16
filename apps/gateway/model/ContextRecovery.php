@@ -652,6 +652,7 @@ final class ContextRecovery
                 'repair_count'=>(int)$job['repair_count']+1,'prompt'=>$prompt,'transport_transaction_id'=>null,'transport_parts_total'=>0,
                 'continuation_source_response_id'=>null,
                 'transport_stage_acked'=>0,'transport_stage_sent'=>0,'transport_stage_effort'=>null,'transport_final_effort'=>null,
+                'transport_budget_json'=>null,'transport_decision_json'=>null,
                 'budget_json'=>json_encode($budget, JSON_THROW_ON_ERROR),
                 'mcp_binding_id'=>$newBindingId, 'transport_context_json'=>$canonicalContext,
             ]);

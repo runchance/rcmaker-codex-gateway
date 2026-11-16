@@ -2481,6 +2481,8 @@ final class TaskLedger
                 'transport_stage_acked' => 0,
                 'transport_stage_effort' => null,
                 'transport_final_effort' => null,
+                'transport_budget_json' => null,
+                'transport_decision_json' => null,
             ] + ($rotated['job_fields'] ?? []));
             if (!$jobUpdate || $jobUpdate->rowCount() !== 1) {
                 throw new GatewayError('storage_unavailable', 'Connector 安全重试无法重置 Responses 传输状态。', 503);

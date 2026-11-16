@@ -4763,6 +4763,51 @@ JS;
             }, 15.0);
     }
 
+    /**
+     * Rebuild a multipart transaction from its pinned budget, or prove an older partition
+     * using the recorded send intents before carrying that budget forward.
+     * @param array $job Owned Responses execution snapshot with transport identity.
+     * @param string $prompt Original inline envelope to partition.
+     * @return array Exact plan for this transaction.
+     * @throws GatewayError When an already attempted stage cannot be reconstructed.
+     */
+    private function rebuildTaskMultipart(array $job, string $prompt): array
+    {
+        $parts = (int) $job['transport_parts_total'];
+        $transaction = (string) $job['transport_transaction_id'];
+        $build = static fn(array $budget): array => ChatGptTransport::multipart($prompt, $transaction, $parts, $budget);
+        if (is_array($job['transport_budget'])) return $build($job['transport_budget']);
+
+        $sent = (int) $job['transport_stage_sent'];
+        $hashes = $sent === 0 ? [] : WebMessageAudit::multipartStageHashes((string) $job['id'], $sent);
+        $legacy = $job['budget'];
+        $decision = $job['transport_decision'];
+        $candidates = [];
+        if (count($hashes) === $sent && ($decision['parts'] ?? null) === $parts
+            && ($decision['prompt_chars'] ?? null) === mb_strlen($prompt) && !empty($decision['attachment_tokens'])) {
+            $candidates[] = array_replace($legacy, [
+                'final_attachment_tokens'=>(int) $decision['attachment_tokens'],
+                'message_tokens'=>(int) ($decision['message_tokens'] ?? $legacy['message_tokens']),
+                'message_chars'=>(int) ($decision['message_chars'] ?? $legacy['message_chars']),
+            ]);
+        }
+        $candidates[] = $legacy;
+        foreach ($candidates as $budget) {
+            try { $plan = $build($budget); }
+            catch (GatewayError $error) {
+                if ($budget === $legacy || $error->errorCode !== 'CHATGPT_CONTEXT_TOO_LARGE') throw $error;
+                continue;
+            }
+            foreach ($hashes as $stage => $witnesses) {
+                $text = $plan['stages'][$stage - 1]['text'] ?? null;
+                if (!is_string($text) || !isset($witnesses[hash('sha256', $text)])) continue 2;
+            }
+            return $plan;
+        }
+        throw new GatewayError('CHATGPT_MULTIPART_STATE_INVALID',
+            'The saved multipart stages could not be reconstructed. Their receipts and original context are preserved.', 409);
+    }
+
     /** Reconstruct the saved transaction and reconcile the exact in-flight ACK before doing anything else. */
     private function resumeTaskMultipart(string $responseId): void
     {
@@ -4775,8 +4820,7 @@ JS;
         }
         try {
             $job = ResponseJob::execution($responseId);
-            $plan = ChatGptTransport::multipart((string) $turn['prompt'], $transactionId, (int) $job['transport_parts_total'],
-                $job['transport_budget'] ?? $job['budget']);
+            $plan = $this->rebuildTaskMultipart($job, (string) $turn['prompt']);
         } catch (\Throwable $error) {
             $this->taskFailTurn($responseId, 'RECOVERY_OUTCOME_UNKNOWN', 'Multipart 恢复无法重建原事务；不会自动重发。', true);
             return;
@@ -4976,18 +5020,14 @@ JS;
             $toolCapable = !empty($turn['tool_capable']);
             $hasContext = str_contains((string) $turn['prompt'], '<codex_context_json>')
                 && str_contains((string) $turn['prompt'], '</codex_context_json>');
-            $jobBudget = ResponseJob::execution($responseId)['budget'];
+            $jobBudget = $job['budget'];
             $effectiveBudget = $jobBudget ?: \app\gateway\model\ContextBudget::snapshot('chatgpt-web/current', $requested['effort'], $capabilities);
             $effectiveBudget = ChatGptTransport::physicalBudget($effectiveBudget, $requested, $capabilities);
             $attachmentTokens = AttachmentStore::tokenReserve((array) ($turn['attachments'] ?? []), $effectiveBudget);
-            $compact = in_array((string) ($job['operation_kind'] ?? 'response'), ['compact_v1','compact_v2'], true);
-            $transportBudget = $compact ? array_replace($effectiveBudget, ['final_attachment_tokens'=>$attachmentTokens]) : null;
             $decisionEvidence = null;
             if (!$hasContext) ChatGptTransport::assertFinalMessageFits((string) $turn['prompt'], $effectiveBudget, $attachmentTokens);
             if ($hasContext && !empty($turn['transport_transaction_id'])) {
-                $transportBudget = $job['transport_budget'] ?? $jobBudget;
-                $plan = ChatGptTransport::multipart((string) $turn['prompt'], (string) $turn['transport_transaction_id'],
-                    (int) $job['transport_parts_total'], $transportBudget);
+                $plan = $this->rebuildTaskMultipart($job, (string) $turn['prompt']);
                 ChatGptTransport::assertFinalMessageFits((string) $plan['final_text'], $effectiveBudget, $attachmentTokens);
             } else $plan = $hasContext ? ChatGptTransport::plan(
                     (string) $turn['prompt'],
@@ -5006,7 +5046,7 @@ JS;
                 $remainingChars = 0; $remainingTokens = 0;
                 foreach ($remaining as $stage) {
                     $remainingChars = max($remainingChars, mb_strlen((string)$stage['text']));
-                    $remainingTokens = max($remainingTokens, \app\gateway\model\ContextBudget::tokens((string)$stage['text'], $transportBudget ?? $effectiveBudget));
+                    $remainingTokens = max($remainingTokens, \app\gateway\model\ContextBudget::tokens((string)$stage['text'], $plan['transport_budget']));
                 }
                 $staging = ChatGptTransport::stagingMode($capabilities, $remainingChars,
                     $remainingTokens, (int) $plan['staging_context_tokens'], $requested['family'] ?? null);
@@ -5024,7 +5064,7 @@ JS;
                     (int) $plan['total_parts'],
                     (string) $staging['effort'],
                     (string) $requested['effort'],
-                    $transportBudget
+                    $plan['transport_budget']
                 );
                 $job = ResponseJob::execution($responseId);
                 if (in_array((string) ($job['operation_kind'] ?? 'response'), ['compact_v1', 'compact_v2'], true)) {
