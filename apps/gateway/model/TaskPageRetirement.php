@@ -664,7 +664,8 @@ final class TaskPageRetirement
     }
 
     /**
-     * Prove that a rotated capability kept only settled history from its closed predecessor.
+     * Prove that a rotated capability kept only settled history and unpublished capacity cancellations
+     * from its closed predecessor.
      * @return bool False if any call or MCP activity could belong to this staged page.
      */
     private static function stagingOnlyInheritedClosedReceipts(
@@ -703,7 +704,20 @@ final class TaskPageRetirement
         if (!is_numeric($settledCalls) || !is_numeric($settledActivities)) {
             throw new GatewayError('storage_unavailable', 'Inherited staging receipts could not be read.', 503);
         }
-        return (int)$settledCalls === $calls && (int)$settledActivities === $activities;
+        if ((int)$settledActivities !== $activities) return false;
+        if ((int)$settledCalls === $calls) return true;
+
+        // Capacity rotation preserves the unpublished queue as cancelled rows on
+        // the response that moved. They could never have produced a native receipt.
+        $cancelled = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
+            ->where('task_id', $job['task_id'])->where('turn_id', $turn['id'])->where('response_id', $job['id'])
+            ->where('status', 'cancelled')->where('created_at', '<=', $rotatedAt)->where('updated_at', '<=', $rotatedAt)
+            ->select('status,response_id,delivery_count,delivered_at,completed_at,result_delivered_at,result_delivered_at_us,result_hash,result_json');
+        if (!is_array($cancelled)) {
+            throw new GatewayError('storage_unavailable', 'Unpublished capacity cancellations could not be read.', 503);
+        }
+        $unpublished = array_filter($cancelled, [ToolBroker::class, 'cancelledBeforeCapacityDelivery']);
+        return (int)$settledCalls + count($unpublished) === $calls;
     }
 
     /**
