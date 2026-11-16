@@ -344,7 +344,7 @@ final class ToolBroker
      * @param array $spec Validated request and its exact native tool environment.
      * @param array $reservation TaskLedger reservation belonging to this request.
      * @param string $responseId Newly reserved response identity.
-     * @return array{binding_id:?string,token:?string,control_prompt:string,is_continuation:bool,mailbox_context_restart?:bool,recovery_receipt_staging?:bool}
+     * @return array{binding_id:?string,token:?string,control_prompt:string,is_continuation:bool,host_tool_names?:list<string>,mailbox_context_restart?:bool,recovery_receipt_staging?:bool}
      * @throws GatewayError When tool ownership, exact receipts or persisted execution evidence disagree.
      */
     public static function prepareRoundUnlocked(array $spec, array $reservation, string $responseId): array
@@ -449,6 +449,8 @@ final class ToolBroker
         if (!(bool) GatewaySettings::internal()['mcp_enabled']) {
             throw new GatewayError('mcp_disabled', '本机工具连接器已在设置中关闭。', 409);
         }
+        $environment = json_decode((string) $spec['tool_environment_json'], true) ?: [];
+        $hostToolNames = array_column((array) ($environment['tools'] ?? []), 'wire_name');
         $existing = $db->table('gateway_mcp_bindings')->where('turn_id', $turnId)->find();
         if (is_array($existing)) {
             self::assertEnvironmentUnlocked($existing, $spec);
@@ -486,10 +488,11 @@ final class ToolBroker
                 ]);
                 return [
                     'binding_id' => (string) $existing['id'], 'token' => $token,
+                    'host_tool_names' => $hostToolNames,
                     'control_prompt' => self::controlPrompt($token, (string) ($spec['context_json'] ?? ''), $spec['checkpoint_marker'] ?? null,
-                         TaskContext::enabled($spec['budget'] ?? [], json_decode((string) $spec['tool_environment_json'], true) ?: []),
+                         TaskContext::enabled($spec['budget'] ?? [], $environment),
                          (string) ($spec['operation_kind'] ?? 'response'), $contextOnly, $archive,
-                         array_column(json_decode((string) $spec['tool_environment_json'], true)['tools'] ?? [], 'wire_name'),
+                         $hostToolNames,
                          !empty($spec['parallel_tool_calls']),
                          self::hostShellFromContext((string)($spec['full_context_json'] ?? $spec['context_json'] ?? '')),
                          (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
@@ -547,10 +550,11 @@ final class ToolBroker
         return [
             'binding_id' => $bindingId,
             'token' => $token,
+            'host_tool_names' => $hostToolNames,
             'control_prompt' => self::controlPrompt($token, (string) ($spec['context_json'] ?? ''), $spec['checkpoint_marker'] ?? null,
-                 TaskContext::enabled($spec['budget']??[],json_decode((string)$spec['tool_environment_json'],true)?:[]),
+                 TaskContext::enabled($spec['budget'] ?? [], $environment),
                  (string)($spec['operation_kind'] ?? 'response'), $contextOnly, $archive,
-                 array_column(json_decode((string)$spec['tool_environment_json'], true)['tools'] ?? [], 'wire_name'),
+                 $hostToolNames,
                  !empty($spec['parallel_tool_calls']),
                  self::hostShellFromContext((string)($spec['full_context_json'] ?? $spec['context_json'] ?? '')),
                  (array)($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec)),
@@ -3430,6 +3434,7 @@ final class ToolBroker
         self::bumpRevisionUnlocked((string) $binding['id']);
         $fresh = self::bindingByIdUnlocked((string) $binding['id']);
         $environment = json_decode((string) $fresh['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
+        $hostToolNames = array_column((array) ($environment['tools'] ?? []), 'wire_name');
         self::eventUnlocked((string) $binding['task_id'], (string) $binding['turn_id'], $newResponseId,
             $mailbox ? 'mcp_mailbox_context_restart_prepared' : 'mcp_steering_restart_prepared', [
                 'binding_id' => (string) $binding['id'], 'previous_response_id' => $previousResponseId,
@@ -3442,7 +3447,7 @@ final class ToolBroker
             (string) ($spec['operation_kind'] ?? 'response'),
             (array) ($environment['tools'] ?? []) === [] || ($spec['tool_choice'] ?? null) === 'none',
             !empty($spec['budget']['original_context_required']),
-            array_column((array) ($environment['tools'] ?? []), 'wire_name'), $parallel,
+            $hostToolNames, $parallel,
             self::hostShellFromContext((string) ($spec['full_context_json'] ?? $transport)),
             (array) ($spec['budget']['output_control'] ?? []), self::ordinaryFollowup($spec));
         if (is_array($expiredRegistered) && $expiredRegistered !== []) {
@@ -3454,6 +3459,7 @@ final class ToolBroker
         }
         return [
             'binding_id' => (string) $binding['id'], 'token' => $newToken,
+            'host_tool_names' => $hostToolNames,
             'control_prompt' => $controlPrompt,
             'is_continuation' => false, 'steering_restart' => !$mailbox, 'mailbox_context_restart' => $mailbox,
         ];
@@ -4518,6 +4524,24 @@ final class ToolBroker
     }
 
     /**
+     * Explain how command callers should use the current Codex permissions.
+     * @param list<string> $hostToolNames Exact wire names available to this turn.
+     * @return string Command guidance, or an empty string for a turn without a command entry.
+     */
+    public static function commandPermissionNotice(array $hostToolNames): string
+    {
+        if (!array_intersect($hostToolNames, ['exec_command', 'functions__exec_command',
+            'shell_command', 'functions__shell_command', 'exec', 'functions__exec'])) return '';
+
+        return 'For authorized shell commands, omit sandbox_permissions to use the current native permissions. '
+            . 'If the current tool and Codex policy allow this argument, use use_default to keep the same permissions. '
+            . 'This also applies to exec_command inside Code Mode. Request require_escalated only if the action actually needs additional permissions and the current Codex policy allows an approval request. '
+            . 'With Full Access and approval policy Never, run authorized commands under the current permissions. '
+            . 'If the native receipt says approval policy Never rejected the explicit escalation before the command started, and the current permissions already cover the action, submit that unstarted command once with the default permissions and omit approval-only arguments. '
+            . 'Check the new result separately. Preserve other tool results and honor any actual command, network or safety denial from Codex.';
+    }
+
+    /**
      * Explain native internal concurrency without overriding the outer serial-call contract.
      * Only the current task's advertised exec tool supplies execution, approvals and receipts.
      * @param string $execName Exact current outer registry name, never inferred from task history.
@@ -4560,6 +4584,8 @@ final class ToolBroker
             . 'When needed evidence already exists in this page or exact tool receipts, use it; query archived history only for missing facts or a required recovery check. '
             . 'These are efficiency rules, not permission to skip required checks, public progress replies, approvals or unresolved results.'
             . "\n</codex_tool_efficiency>";
+        $commandNotice = self::commandPermissionNotice($hostToolNames);
+        if ($commandNotice !== '') $notice .= "\n" . $commandNotice;
         if (in_array('collaboration__spawn_agent', $hostToolNames, true)) {
             $notice .= "\n<codex_web_subagents>RCMAKER applies the console's Web child model and reasoning selection. "
                 . 'New native agents must inherit this Web transport; omit model and reasoning_effort overrides. '
@@ -4858,6 +4884,8 @@ final class ToolBroker
         }
         $tokens = array_values($tokens);
         if (count($tokens) !== 1) throw new GatewayError('continuation_token_missing', '无法核对当前工具令牌，已停止网页续做。', 409);
+        $environment = json_decode((string) $binding['tool_environment_json'], true);
+        $commandNotice = self::commandPermissionNotice(array_column((array)($environment['tools'] ?? []), 'wire_name'));
         $regularResume = $streamRecovery && TaskWebChat::state((string)$job['task_id'])['mode'] === 'regular';
         $purpose = $streamRecovery
             ? 'The prior webpage response stopped before this Codex task was settled. All accepted host calls and their exact results have now settled. Check the actual latest human goal, including steering instructions, and the confirmed receipts; continue only the remaining authorized work. If the work is already complete, give its verified final answer. If the human paused or cancelled it, acknowledge that and do not resume development. '
@@ -4869,6 +4897,7 @@ final class ToolBroker
                 : '')
             . 'Use the attached RCMAKER Connector and current verified native tools; '
             . 'use turn_token ' . $tokens[0] . ' for every Connector call. Inspect prior successful tool receipts before editing; do not repeat already completed or uncertain host effects. '
+            . ($commandNotice === '' ? '' : $commandNotice . ' ')
             . ($streamRecovery ? ($regularResume
                 ? 'When prior details or receipts are missing from this page, discover the same-task reader with codex_tool_inventory(query="rcmaker.context_read", exact=true), then invoke that returned wire_name through codex_tool_call. Use its actual records, not promises; an empty unrelated catalog search is not evidence that the connection is unavailable. '
                 : 'Use codex_tool_inventory/codex_tool_call to read rcmaker.context_read when prior details or receipts are missing from this page; do not infer missing results from promises. ') : '')

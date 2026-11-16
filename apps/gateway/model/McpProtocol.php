@@ -1402,7 +1402,9 @@ AWK;
                         'sandbox_permissions' => [
                             'type' => 'string',
                             'enum' => ['use_default', 'require_escalated'],
-                            'description' => 'Native Codex sandbox request, only when the current command tool supports it. Codex decides whether to approve.',
+                            'description' => 'Omit to use the current native permissions, including Full Access. '
+                                . 'Set this field only when the current command tool supports it and Codex policy allows it. '
+                                . 'Use use_default for the current permissions. Request require_escalated only when additional access is needed and Codex allows an approval request.',
                         ],
                         'justification' => [
                             'type' => 'string',

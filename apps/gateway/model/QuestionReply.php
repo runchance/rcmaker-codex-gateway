@@ -153,7 +153,7 @@ final class QuestionReply
     /**
      * Render an answer-only message only after the existing same-page proof has survived reservation.
      * @param array $spec Prepared request with exact transport suffix and canonical recovery history.
-     * @param array $bridge Newly prepared capability; receipt continuations never submit a prompt.
+     * @param array $bridge Newly prepared capability and its effective host tool names.
      * @return string|null Short prompt, custom-template-preserving variant, or normal-path fallback.
      * @throws GatewayError On unavailable question ownership evidence.
      */
@@ -185,6 +185,9 @@ final class QuestionReply
             . "Use codex_tool_inventory for a needed tool schema and codex_tool_call for its invocation. "
             . "Missing history or receipts may be read through the scoped context/result tools; never borrow another task's capability.\n"
             . ToolBroker::outputControlPrompt((array) ($spec['budget']['output_control'] ?? []));
+        // The native answer may omit tools while the new token keeps the original binding's catalog.
+        $commandNotice = ToolBroker::commandPermissionNotice($bridge['host_tool_names'] ?? []);
+        if ($commandNotice !== '') $prompt .= "\n" . $commandNotice;
         if (!empty($spec['checkpoint_marker'])) $prompt .= "\n" . LunaCheckpoint::instructions($spec['checkpoint_marker']);
         return $prompt . "\n<codex_context_json>\n"
             . WebContract::contextJson(AttachmentStore::transportJson(ContextHistory::canonical($context)))
