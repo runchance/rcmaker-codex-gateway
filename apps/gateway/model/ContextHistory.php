@@ -1056,7 +1056,12 @@ final class ContextHistory
                 $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
                 // Keep candidates privately for strict timeout reconciliation, while preserving
                 // the existing historical-output demotion for other new user conversations.
-                if (is_array($task) && $task['status'] === 'needs_attention') $spec['late_tool_outputs'] = $outputs;
+                if (is_array($task) && $task['status'] === 'needs_attention') {
+                    // Compact v2 must prove the complete terminal batch even when Codex
+                    // appends goal or user context after its receipts.
+                    if (($spec['operation_kind'] ?? 'response') === 'compact_v2') return $spec;
+                    $spec['late_tool_outputs'] = $outputs;
+                }
             }
         }
         $spec['tool_outputs'] = [];

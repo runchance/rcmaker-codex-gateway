@@ -1811,7 +1811,7 @@ final class ToolBroker
      * @param array $call Durable invocation with its delivery fields and cancellation marker.
      * @return bool Whether this capacity cancellation could never have produced a native receipt.
      */
-    private static function cancelledBeforeCapacityDelivery(array $call): bool
+    public static function cancelledBeforeCapacityDelivery(array $call): bool
     {
         return $call['status'] === 'cancelled' && $call['response_id'] !== null
             && (int) $call['delivery_count'] === 0 && $call['delivered_at'] === null

@@ -500,8 +500,9 @@ final class TaskLedger
             $spec['tool_outputs'] = [];
             $hasToolOutputs = false;
         }
+        $savedCheckpointRecovery = null;
         if (is_array($task) && $hasToolOutputs
-            && self::terminalCompactionHistoryCompleteUnlocked($spec, $task, $messages)) {
+            && self::terminalCompactionHistoryCompleteUnlocked($spec, $task, $incoming, $savedCheckpointRecovery)) {
             // Native pre-turn compaction runs before the next user message is recorded.
             // A stopped source's complete client transcript is read-only import data;
             // it cannot revive its revoked capability or confirm its unknown host result.
@@ -621,17 +622,18 @@ final class TaskLedger
         TaskWebChat::createUnlocked($newTaskId, $taskId, $errorRebuild);
         $newChat = TaskWebChat::state($newTaskId);
         if ($newChat['mode'] === 'regular' && !empty($newChat['conversation_id'])) {
-            $sourceJob = ResponseJob::latestForTaskUnlocked($taskId);
+            $sourceJob = ResponseJob::latestForTaskUnlocked($taskId, true);
             if (is_array($sourceJob)) {
                 $spec['regular_recovery_source_response_id'] = $sourceJob['id'];
                 $spec['regular_recovery_source_task_id'] = $taskId;
-                if (($sourceWaitingSuperseded || $failedHandoffRecovered) && $newCheckpoint) {
-                    // The same transaction proved every source receipt and revoked its
-                    // capability, or verified the stopped source of a failed handoff.
-                    // The saved chat still holds that source without a successful checkpoint.
+                if ($newCheckpoint && ($sourceWaitingSuperseded || $failedHandoffRecovered
+                    || ($savedCheckpointRecovery['source_response_id'] ?? null) === $sourceJob['id'])) {
+                    // The same transaction verified this source's inert capability and
+                    // complete receipts. The saved chat still holds its original history.
                     $spec['regular_compaction_recovery'] = ['source_response_id' => $sourceJob['id'],
                         'context_sha256' => hash('sha256', (string) $spec['full_context_json']),
-                        'expanded_receipt_ids'=>$expandedReceiptIds];
+                        'expanded_receipt_ids'=>$savedCheckpointRecovery['expanded_receipt_ids'] ?? $expandedReceiptIds,
+                        'source_prefix_length'=>$savedCheckpointRecovery['source_prefix_length'] ?? null];
                 }
             }
         }
@@ -1003,10 +1005,13 @@ final class TaskLedger
      * sources and unresolved checkpoint generations retain their existing compaction fences.
      * @param array $spec Normalized read-only compact request on the resolved conversation task.
      * @param array $task Existing task selected by the durable conversation mapping.
-     * @param array $messages Complete compiled client history, including the trailing tool batch.
+     * @param array $incoming Compiled client history, including the trailing tool batch.
+     * @param array|null $savedRecovery Receives the stopped saved-chat proof and receipts missing from that page.
      * @return bool Whether the trailing outputs may be treated only as historical import data.
+     * @throws GatewayError If the owned saved chat still has a pending Stop obligation or storage is unavailable.
      */
-    private static function terminalCompactionHistoryCompleteUnlocked(array $spec, array $task, array $messages): bool
+    private static function terminalCompactionHistoryCompleteUnlocked(array $spec, array $task, array $incoming,
+        ?array &$savedRecovery): bool
     {
         if (($spec['operation_kind'] ?? '') !== 'compact_v2'
             || !in_array($task['status'], ['cancelled', 'needs_attention'], true)
@@ -1014,7 +1019,8 @@ final class TaskLedger
             || ($spec['tool_choice'] ?? null) !== 'none'
             || $task['client_id'] !== ($spec['client_id'] ?? 'responses')
             || $task['thread_id'] !== ($spec['thread_id'] ?? null)
-            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')) return false;
+            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main')
+            || $task['owner_key'] !== ($spec['browser_owner_key'] ?? null)) return false;
         $db = SDB(null, 'medoo', 'sqlite');
         $taskId = (string)$task['id'];
         foreach (['gateway_response_jobs'=>['queued', 'running'],
@@ -1038,7 +1044,7 @@ final class TaskLedger
             if (in_array($call['status'], ['registered', 'delivered'], true)) return false;
             $byCallId[(string)$call['call_id']] = $call;
         }
-        $outputs = (array)($spec['tool_outputs'] ?? []);
+        $outputs = (array) ($spec['tool_outputs'] ?? []);
         $sourceId = null;
         $received = [];
         foreach ($outputs as $output) {
@@ -1072,14 +1078,14 @@ final class TaskLedger
         }
         if (!is_array($sourceBinding) || $sourceBinding['current_response_id'] !== $sourceId
             || $sourceBinding['turn_id'] !== $source['durable_turn_id']) return false;
-        $batch = array_filter($calls, static fn(array $call): bool => $call['response_id'] === $sourceId);
+        $batch = array_filter($calls, static fn(array $call): bool =>
+            $call['response_id'] === $sourceId && !ToolBroker::cancelledBeforeCapacityDelivery($call));
         if (count($batch) !== count($received)) return false;
         foreach ($batch as $call) {
             if (!isset($received[$call['call_id']]) || $call['binding_id'] !== $sourceBinding['id']
                 || $call['turn_id'] !== $source['durable_turn_id']) return false;
         }
         $prior = json_decode((string)$source['context_json'], true, 128, JSON_THROW_ON_ERROR);
-        $incoming = json_decode((string)$spec['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $response = json_decode((string)$source['response_json'], true, 128, JSON_THROW_ON_ERROR);
         $round = ContextHistory::compile((array)($response['output'] ?? []), '');
         $callTypes = [];
@@ -1106,10 +1112,49 @@ final class TaskLedger
         }
         unset($output);
         $receiptContext = ContextHistory::compile($nativeOutputs, '');
-        $expected = array_merge((array)($prior['messages'] ?? []), $round['messages'], $receiptContext['messages']);
-        return !empty($prior['messages']) && ContextHistory::matchesCompactionSource(
-            ['system'=>(array)($prior['system'] ?? []), 'messages'=>$expected], $incoming,
-            (bool)($spec['native_responses_lite'] ?? false), true);
+        if (empty($prior['messages'])) return false;
+        $expected = $prior;
+        $expected['messages'] = array_merge($prior['messages'], $round['messages'], $receiptContext['messages']);
+        $lostTarget = self::terminalCheckpointTargetLostUnlocked($task, $source, $sourceBinding);
+        $lite = (bool) ($spec['native_responses_lite'] ?? false);
+        $prefixLength = null;
+        if (!ContextHistory::matchesCompactionSource($expected, $incoming, $lite, true)
+            && (!$lostTarget || !ContextCompaction::hasCompleteSourcePrefix($expected, $incoming, $lite, $prefixLength))) {
+            return false;
+        }
+        if ($lostTarget) {
+            $chat = TaskWebChat::state($taskId);
+            if ($chat['mode'] === 'regular' && !empty($chat['conversation_id'])) {
+                TaskPageRetirement::assertStoppedSavedCheckpointSourceUnlocked($source, $chat);
+                $unconfirmedOnPage = array_filter($received, static fn(array $call): bool => $call['result_delivered_at'] === null);
+                $savedRecovery = ['source_response_id'=>$sourceId, 'expanded_receipt_ids'=>array_keys($unconfirmedOnPage),
+                    'source_prefix_length'=>$prefixLength];
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Identify the latest completed tool batch whose browser target was lost after a restart.
+     * Its revoked capability remains inert and any supplied receipts are eligible only for read-only history.
+     * @param array $task Routed old task. @param array $source Completed response. @param array $binding Its capability.
+     * @return bool Whether the current turn and surface carry durable missing-target evidence.
+     * @throws GatewayError If the task timeline cannot be read.
+     */
+    private static function terminalCheckpointTargetLostUnlocked(array $task, array $source, array $binding): bool
+    {
+        if ($task['status'] !== 'needs_attention' || $task['current_epoch_id'] !== $source['epoch_id']
+            || $binding['status'] !== 'revoked'
+            || (ResponseJob::latestForTaskUnlocked($task['id'], true)['id'] ?? null) !== $source['id']) return false;
+        $db = SDB(null, 'medoo', 'sqlite');
+        $turn = $db->table('gateway_task_turns')->where('id', $source['durable_turn_id'])
+            ->where('response_id', $source['id'])->where('task_id', $task['id'])->find('status,error_code,surface_id');
+        if (!is_array($turn) || $turn['status'] !== 'needs_attention' || $turn['error_code'] !== 'RECOVERY_OUTCOME_UNKNOWN'
+            || $turn['surface_id'] !== $source['surface_id']) return false;
+        $retired = $db->table('gateway_task_events')->where('task_id', $task['id'])->where('surface_id', $source['surface_id'])
+            ->where('event_type', 'surface_retired')->order([['id', 'DESC']])->limit(1)->find('data_json');
+        if ($retired === false) throw new GatewayError('storage_unavailable', 'The lost checkpoint page could not be verified.', 503);
+        return is_array($retired) && (json_decode((string) $retired['data_json'], true)['reason'] ?? null) === 'physical_target_missing';
     }
 
     /**

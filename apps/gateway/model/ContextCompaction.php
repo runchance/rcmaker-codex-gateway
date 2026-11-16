@@ -2068,10 +2068,13 @@ final class ContextCompaction
      * @param array $before Complete persisted source context, including every tool receipt.
      * @param array $after Compiled current native context; the original prefix stays exact.
      * @param bool $responsesLite Allow only the established Lite preamble/image-hint changes.
+     * @param int|null $prefixLength Receives the number of incoming records proved to belong to the source.
      * @return bool Exact ordered source plus supported appended instructions, with unique user IDs.
      */
-    private static function hasCompleteSourcePrefix(array $before, array $after, bool $responsesLite): bool
+    public static function hasCompleteSourcePrefix(array $before, array $after, bool $responsesLite,
+        ?int &$prefixLength = null): bool
     {
+        $prefixLength = null;
         $known = $before['messages'] ?? null; $records = $after['messages'] ?? null;
         if (!is_array($known) || !is_array($records) || !array_is_list($known) || !array_is_list($records)) return false;
         $base = $before['system'][0] ?? null;
@@ -2093,6 +2096,7 @@ final class ContextCompaction
                 || isset($ids[$record['id']])) return false;
             $ids[$record['id']] = true;
         }
+        $prefixLength = count($known) + $offset;
         return true;
     }
     /** Preserve the whole old envelope and ordered history; appended operational context is not a human turn. */
@@ -2385,9 +2389,14 @@ final class ContextCompaction
                 $restoredIds = array_fill_keys($recovery['expanded_receipt_ids'], true);
                 $restored = array_values(array_filter((array)$requested['messages'], static fn(array $record): bool =>
                     isset($restoredIds[$record['call_id'] ?? '']) && array_key_exists('output', $record)));
-                $spec['prompt'] .= "\nThe native host restored these completed results after its earlier context truncation. "
+                $spec['prompt'] .= "\nThe native host supplied these results for calls already issued in the saved source. "
                     . "Use them in the checkpoint; they are historical results, not new tool requests. Do not repeat their execution.\n"
                     . '<restored_native_results>' . ContextHistory::canonical($restored) . '</restored_native_results>';
+            }
+            if ($recoveredSourceId !== null && isset($recovery['source_prefix_length'])) {
+                $updates = array_slice((array) $requested['messages'], (int) $recovery['source_prefix_length']);
+                $spec['prompt'] .= "\nPreserve any new human requirements from these native context updates. "
+                    . '<native_checkpoint_updates>' . ContextHistory::canonical($updates) . '</native_checkpoint_updates>';
             }
             $spec['verified_compaction_source'] = true;
             $spec['continuation_source_response_id'] = $recoveredSourceId ?? $last['id'];

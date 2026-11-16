@@ -543,6 +543,30 @@ final class TaskPageRetirement
     }
 
     /**
+     * Verify Stop and the original account and saved URL before handing a lost page to a checkpoint.
+     * @param array $source Current terminal response owned by the old task.
+     * @param array $chat Its pinned ordinary conversation before ownership transfer.
+     * @return void
+     * @throws GatewayError If Stop is pending, storage is unavailable or the page identity differs.
+     */
+    public static function assertStoppedSavedCheckpointSourceUnlocked(array $source, array $chat): void
+    {
+        $row = SDB(null, 'medoo', 'sqlite')->table('gateway_surface_retirements')
+            ->where('surface_id', $source['surface_id'])->where('task_id', $source['task_id'])->find('state,snapshot_json');
+        if ($row === false) throw new GatewayError('storage_unavailable', 'The saved Web chat Stop status could not be read.', 503);
+        $snapshot = is_array($row) ? json_decode((string) $row['snapshot_json'], true, 128, JSON_THROW_ON_ERROR) : null;
+        if (!is_array($snapshot) || ($snapshot['epoch_id'] ?? null) !== $source['epoch_id']
+            || ($snapshot['chat_mode'] ?? null) !== 'regular' || empty($chat['account_key'])
+            || ($snapshot['account_key'] ?? null) !== $chat['account_key']
+            || self::savedUrl((string) ($snapshot['url'] ?? '')) !== 'https://chatgpt.com/c/' . $chat['conversation_id']) {
+            throw new GatewayError('compaction_source_unavailable', 'The retired saved Web chat does not match the checkpoint source.', 409);
+        }
+        if ($row['state'] !== 'closed') {
+            throw new GatewayError('compaction_busy', 'The saved Web chat is still waiting for Stop confirmation.', 409);
+        }
+    }
+
+    /**
      * Reconcile an absent staging page that never acquired executable authority.
      * The browser caller must first confirm the target and any known matching chat are absent.
      * This records physical absence plus inert-submission proof, never a fabricated Stop ACK.
