@@ -908,8 +908,8 @@ final class ResponseJob
     /**
      * Stream a stable snapshot of still-growing public prose as provisional commentary.
      * Each source retains its exact delivered prefix across native receipt rounds. Only
-     * the new suffix is appended; closed Responses items are never reopened. A rewrite
-     * starts a separate progress item rather than changing already delivered events.
+     * the new suffix is appended. Renderer-only inline code styling leaves delivered
+     * text intact. A substantive rewrite starts a separate progress item.
      * @param string $responseId Running ordinary round; checkpoints cannot accept progress.
      * @param string $text Exact visible, settled Markdown supplied by the owned adapter.
      * @param string $sourceKey Physical assistant/block identity, without a content hash.
@@ -960,6 +960,10 @@ final class ResponseJob
             if ($prefix === $text) return false;
             // A temporarily shortened DOM observation is not a new model-authored revision.
             if ($text !== '' && str_starts_with($prefix, $text)) return false;
+            if (!str_starts_with($text, $prefix)) {
+                $text = self::alignProgressInlineCodeStyle($prefix, $text);
+                if ($text === $prefix) return false;
+            }
             $events = [];
             if (!str_starts_with($text, $prefix)) {
                 if ($open !== null) {
@@ -989,6 +993,39 @@ final class ResponseJob
         });
         if ($published) TaskLedger::renewOnVisibleProgress($responseId);
         return $published !== null;
+    }
+
+    /**
+     * Align the same assistant block after a renderer change to simple inline code styling.
+     * Code blocks, escaped literals and link targets can contain meaningful backticks.
+     * Preserve the published prefix and any exact unseen suffix. Unsupported changes
+     * retain the existing revision path.
+     */
+    private static function alignProgressInlineCodeStyle(string $previous, string $current): string
+    {
+        if ($previous === '' || (!str_contains($previous, '`') && !str_contains($current, '`'))) return $current;
+        foreach ([$previous, $current] as $markdown) {
+            if (str_contains($markdown, '``') || str_contains($markdown, '](')
+                || preg_match('/^(?:[ \t]|>|~{3,}|[-+*][ \t]|\d+[.)][ \t]|-{3,}[ \t]*$)/m', $markdown) === 1) {
+                return $current;
+            }
+        }
+        $simpleCode = '~(?<![`\\\\])`([\p{L}\p{N}./:@%+-]+(?: [\p{L}\p{N}./:@%+-]+)*)`(?!`)~u';
+        $before = preg_replace($simpleCode, '$1', $previous);
+        $after = preg_replace($simpleCode, '$1', $current);
+        if (!is_string($before) || !is_string($after) || !str_starts_with($after, $before)) return $current;
+        if ($before === $after) return $previous;
+        $offset = strlen($before);
+        preg_match_all($simpleCode, $current, $spans, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
+        foreach ($spans as $span) {
+            if ($span[0][1] >= $offset) break;
+            $offset++;
+            $contentEnd = $span[1][1] + strlen($span[1][0]);
+            if ($offset < $contentEnd) return $current;
+            $offset++;
+        }
+        $suffix = substr($current, $offset);
+        return preg_match('/^\s/u', $suffix) === 1 ? $previous . $suffix : $current;
     }
 
     /**
