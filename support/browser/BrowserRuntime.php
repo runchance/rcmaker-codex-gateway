@@ -39,6 +39,8 @@ final class BrowserRuntime
     /** A terminal DOM must remain unchanged before completion. */
     private const COMPLETION_SETTLE_SECONDS = 2.0;
     private const TOOL_POST_ANSWER_GRACE_SECONDS = 60.0;
+    private const STOPPED_RECOVERY_NOTICE_GRACE_SECONDS = 60.0;
+    private const STOPPED_RECOVERY_NOTICE_MAX_GAP_SECONDS = 15.0;
     /** Console screenshot endpoints refresh these tiny runtime markers while a surface is visible. */
     private const OBSERVER_TTL_SECONDS = 4;
     private const MONITOR_CAPTURE_INTERVAL_SECONDS = 1.25;
@@ -7979,12 +7981,13 @@ JS;
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular',
             $temporarySubmission, $acceptedTemporarySubmission);
-        $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId, $regularRecoveryState): void {
+        $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId, $regularRecoveryState, $expression): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
             if ($error !== null || !is_array($snapshot)) {
                 $this->chatGptTurns[$responseId]['empty_response_health'] = null;
                 $this->chatGptTurns[$responseId]['post_receipt_ui_observation'] = null;
+                unset($this->chatGptTurns[$responseId]['stopped_recovery_notice']);
                 $errors = (int) ($turn['poll_errors'] ?? 0) + 1;
                 $this->chatGptTurns[$responseId]['poll_errors'] = $errors;
                 if ($errors >= 2) {
@@ -8627,6 +8630,15 @@ JS;
                 $emptyTransportSettled = !empty($emptySession['submission_request_id'])
                     && !empty($emptySession['submission_finished']) && empty($emptySession['submission_failed'])
                     && (!is_string($postToolBaseline) || $sourceTransportSettled);
+                $failedRecoveryNotice = !$activeCompact && $toolCapable && !$hasArtifacts
+                    && ($logicalJob['operation_kind'] ?? '') === 'response'
+                    && $deliverySignature !== '' && $roundMarkdown === ''
+                    && !empty($emptySession['submission_request_id']) && !empty($emptySession['submission_finished'])
+                    && !empty($emptySession['submission_failed']) && ($emptySession['submission_canceled'] ?? null) === false
+                    && $regularRecoveryState === []
+                    && (!$regularEmptyIdle || !empty($turn['web_chat']['conversation_id']))
+                    && is_string($postToolBaseline)
+                    && ChatGptTransport::stoppedRecoveryNotice($snapshot, $postToolBaseline, $regularEmptyIdle);
                 // A disabled Send control or canceled HTTP stream alone cannot prove a
                 // tool-only response ended. Observe Stop after the exact latest receipt,
                 // then its return to an idle composer. Saved chats use a short final-content
@@ -8646,6 +8658,7 @@ JS;
                         'source_transport_unsettled'=>$toolCapable && !$emptyTransportSettled,
                         'allow_empty_terminal'=>true,
                         'allow_regular_idle'=>$regularEmptyIdle,
+                        'allow_unchanged_recovery'=>$failedRecoveryNotice,
                     ], $now);
                 $this->chatGptTurns[$responseId]['empty_response_ui_observation'] = $emptyUiTransition['observation'];
                 $reattachedEmpty = $regularEmptyIdle && $toolCapable && $deliveredAtUs !== null && $deliverySignature !== ''
@@ -8656,6 +8669,14 @@ JS;
                     && $deliverySignature !== '' && ChatGptTransport::idleComposerVisible($snapshot, $regularEmptyIdle)
                     && ($snapshot['generation_running'] ?? null) === false
                     && ($stoppedCompactSource || $emptyUiTransition['settled'] || $reattachedEmpty);
+                // A saved chat can recheck the same reply by reloading. Temporary Chat
+                // can only reuse its live page, so also require the post-receipt Stop-to-Send witness.
+                $notice = $failedRecoveryNotice && ($regularEmptyIdle || $emptyUiTransition['settled'])
+                    ? ['regular'=>$regularEmptyIdle, 'boundary'=>$postToolBaseline,
+                        'request_id'=>$emptySession['submission_request_id'], 'receipts'=>$deliverySignature]
+                    : null;
+                if ($this->observeStoppedRecoveryNotice($responseId, $logicalResponseId,
+                    $snapshot, $notice, $streamCompletion, $expression, $now)) return;
                 if ($this->observeEmptyResponseSettlement($responseId, $logicalResponseId, $snapshot, [
                     'response_id' => $logicalResponseId,
                     'session_id' => (string) $turn['session_id'],
@@ -9195,6 +9216,99 @@ JS;
             && !empty($anchor['assistant_id']) && ($state['assistant_id'] ?? '') === $anchor['assistant_id']
             && ($snapshot['response_id'] ?? '') === $anchor['assistant_id']
             && ($turn['bound_assistant_id'] ?? '') === $anchor['assistant_id'];
+    }
+
+    /**
+     * Verify a stalled native recovery panel after a failed POST and a drained tool round.
+     * Only the first saved-chat refresh or a fenced continuation on an idle Temporary Chat is permitted.
+     */
+    private function observeStoppedRecoveryNotice(string $responseId, string $logicalId, array $snapshot,
+        ?array $notice, ?array $completion, string $expression, float $now): bool
+    {
+        if ($notice === null || ($completion['status'] ?? '') !== 'running'
+            || (int)($completion['invocation_count'] ?? 0) < 1) {
+            unset($this->chatGptTurns[$responseId]['stopped_recovery_notice']);
+            return false;
+        }
+        $turn = $this->chatGptTurns[$responseId];
+        $revision = (int)$completion['activity_revision'];
+        $key = hash('sha256', json_encode([$logicalId, $turn['document_nonce'], $snapshot['new_user_id'],
+            $snapshot['response_id'], $notice['request_id'], $notice['receipts'], $revision,
+            $snapshot['visible_text'] ?? '', $snapshot['commentary_blocks'] ?? []], JSON_THROW_ON_ERROR));
+        $previous = $turn['stopped_recovery_notice'] ?? [];
+        $since = ($previous['key'] ?? '') === $key && $now >= $previous['observed_at']
+            && $now - $previous['observed_at'] <= self::STOPPED_RECOVERY_NOTICE_MAX_GAP_SECONDS ? $previous['since'] : $now;
+        $this->chatGptTurns[$responseId]['stopped_recovery_notice'] = ['key'=>$key, 'since'=>$since, 'observed_at'=>$now];
+        if ($now - $since < self::STOPPED_RECOVERY_NOTICE_GRACE_SECONDS) return false;
+        try {
+            if (ModelCooldown::remainingSeconds() > 0) return false;
+            $drainedRevision = ToolBroker::beginCompletionFenceForResponse($logicalId);
+        } catch (GatewayError) {
+            $drainedRevision = null;
+        }
+        if ($drainedRevision !== $revision) {
+            unset($this->chatGptTurns[$responseId]['stopped_recovery_notice']);
+            return false;
+        }
+
+        $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression($expression),
+            function ($error, $baseline) use ($responseId, $logicalId, $turn, $notice, $snapshot, $key, $revision): void {
+                $current = $this->chatGptTurns[$responseId] ?? [];
+                $session = $this->taskSessions[$turn['session_id']] ?? [];
+                $fresh = $baseline['recovery_response'] ?? [];
+                $users = (array)($baseline['user_ids'] ?? []);
+                $assistants = (array)($baseline['assistant_ids'] ?? []);
+                if ($error !== null || ($current['logical_response_id'] ?? $responseId) !== $logicalId
+                    || ($current['document_nonce'] ?? '') !== $turn['document_nonce']
+                    || ($session['submission_request_id'] ?? '') !== $notice['request_id']
+                    || empty($baseline['editor_ready']) || ($baseline['generation_running'] ?? null) !== false
+                    || empty($baseline['document_id'])
+                    || ($notice['regular'] && ($snapshot['recovery_anchor']['document_id'] ?? '') !== $baseline['document_id'])
+                    || ($baseline['url'] ?? '') !== $snapshot['url'] || ($fresh['url'] ?? '') !== $snapshot['url']
+                    || ($fresh['new_user_id'] ?? '') !== $snapshot['new_user_id']
+                    || ($fresh['response_id'] ?? '') !== $snapshot['response_id']
+                    || ($fresh['visible_text'] ?? '') !== ($snapshot['visible_text'] ?? '')
+                    || ($fresh['commentary_blocks'] ?? []) !== ($snapshot['commentary_blocks'] ?? [])
+                    || ($users[array_key_last($users)] ?? '') !== $snapshot['new_user_id']
+                    || ($assistants[array_key_last($assistants)] ?? '') !== $snapshot['response_id']
+                    || !ChatGptTransport::stoppedRecoveryNotice($fresh, $notice['boundary'], $notice['regular'])) {
+                    unset($this->chatGptTurns[$responseId]['stopped_recovery_notice']);
+                    $this->scheduleTaskPoll($responseId, 0.5);
+                    return;
+                }
+                try {
+                    if (ModelCooldown::remainingSeconds() > 0) {
+                        $this->scheduleTaskPoll($responseId, 5.0);
+                        return;
+                    }
+                    $facts = $notice['regular'] ? [
+                        'action'=>'recovery_notice_refresh', 'terminal'=>true, 'document_id'=>$baseline['document_id'],
+                        'user_id'=>$fresh['new_user_id'], 'assistant_id'=>$fresh['response_id'],
+                        'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids'],
+                    ] : null;
+                    $reservation = TaskLedger::reserveTaskNetworkRetry($logicalId, $turn['owner_incarnation'],
+                        (int)$turn['fencing_version'], $turn['document_nonce'], $key, false, !$notice['regular'], $facts, $revision);
+                    if (($reservation['regular_action'] ?? '') === 'refresh') {
+                        $this->waitRegularStreamRefresh($responseId);
+                    } elseif (!empty($reservation['continue'])) {
+                        $this->prepareTaskStreamContinuation($responseId, $logicalId, $baseline, $reservation);
+                    } elseif (!empty($reservation['exhausted'])) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
+                            'ChatGPT stopped with an interrupted stream after the last retry. The chat and tool receipts are preserved.', true);
+                    } else {
+                        unset($this->chatGptTurns[$responseId]['stopped_recovery_notice']);
+                        $this->scheduleTaskPoll($responseId, 1.0);
+                    }
+                } catch (GatewayError $failure) {
+                    if (in_array($failure->errorCode, ['storage_unavailable', 'surface_fence_lost', 'task_network_retry_unavailable'], true)) {
+                        unset($this->chatGptTurns[$responseId]['stopped_recovery_notice']);
+                        $this->scheduleTaskPoll($responseId, 1.0);
+                        return;
+                    }
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                }
+            }, 15.0);
+        return true;
     }
 
     private function observeEmptyResponseSettlement(string $responseId, string $logicalResponseId,
@@ -10608,9 +10722,9 @@ JS;
                                 : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : ''))),
                             'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']]);
                     if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 1.0); return; }
-                    if ($reattachedEmpty && !empty($reservation['exhausted'])) {
+                    if (!empty($reservation['exhausted'])) {
                         $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
-                            'The saved Web chat stopped without a final answer and reached the recovery limit. Tool results and conversation history were preserved.', true);
+                            'The saved Web chat reached the recovery limit. Tool results and conversation history were preserved.', true);
                         return;
                     }
                     if (!empty($reservation['published'])) {

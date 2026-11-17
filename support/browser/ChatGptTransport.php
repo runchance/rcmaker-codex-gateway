@@ -51,6 +51,29 @@ final class ChatGptTransport
     }
 
     /**
+     * Identify an idle, bound reply that shows the native recovery notice and only pre-receipt text.
+     * @param array $snapshot An owned reply observation from the browser adapter.
+     * @param string $toolBoundary Markdown observed when the last host tool batch was delivered to Codex.
+     * @param bool $regularIdle Permit the saved-chat Voice control under its existing rules.
+     * @return bool Whether to check the interrupted transport without treating its notice as a final answer.
+     */
+    public static function stoppedRecoveryNotice(array $snapshot, string $toolBoundary, bool $regularIdle): bool
+    {
+        return ($snapshot['transport_recovery_visible'] ?? null) === true
+            && ($snapshot['generation_running'] ?? null) === false
+            && ($snapshot['response_present'] ?? null) === true
+            && !empty($snapshot['new_user_id'])
+            && !empty($snapshot['response_id'])
+            && self::idleComposerVisible($snapshot, $regularIdle)
+            && empty($snapshot['stop_confirmation_pending'])
+            && empty($snapshot['completion_action_visible'])
+            && empty($snapshot['network_retry'])
+            && empty($snapshot['error'])
+            && empty($snapshot['artifact_candidates'])
+            && ($snapshot['markdown'] ?? null) === $toolBoundary;
+    }
+
+    /**
      * Observe UI generation after an exact host receipt when the original HTTP stream ended early.
      * This supplies UI evidence only: stable-answer completion and empty-response recovery
      * still require their separate MCP fences and settling rules. It acknowledges no receipt.
@@ -63,6 +86,8 @@ final class ChatGptTransport
      *     allow_empty_terminal also permits observing a Stop-to-Send transition without answer text;
      *     the separate empty health rule applies a mode-specific drained-tool grace.
      *     allow_regular_idle accepts Voice in a verified ordinary chat under those same witness rules.
+     *     allow_unchanged_recovery permits the prior tool boundary only for a separately verified
+     *     idle recovery notice with a failed submission stream.
      * @param float $now Current observation time in seconds.
      * @return array{observation:?array,settled:bool} Updated witness and optional terminal UI evidence.
      * @throws \JsonException When the exact observation identity cannot be encoded.
@@ -99,7 +124,9 @@ final class ChatGptTransport
             || !self::idleComposerVisible($snapshot, ($evidence['allow_regular_idle'] ?? null) === true)
             || !is_string($snapshot['markdown'] ?? null)) return $empty;
         $emptyTerminal = ($evidence['allow_empty_terminal'] ?? null) === true && trim($snapshot['markdown']) === '';
-        if (!$emptyTerminal && (trim($snapshot['markdown']) === ''
+        $unchangedRecovery = ($evidence['allow_unchanged_recovery'] ?? null) === true
+            && $snapshot['markdown'] === $evidence['post_tool_baseline'];
+        if (!$emptyTerminal && !$unchangedRecovery && (trim($snapshot['markdown']) === ''
             || $snapshot['markdown'] === $evidence['post_tool_baseline'])) return $empty;
         return ['observation'=>$witness, 'settled'=>true];
     }

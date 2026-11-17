@@ -2842,23 +2842,25 @@ final class TaskLedger
      * @param string $incarnation Browser worker owning the exact surface.
      * @param int $fence Surface ownership version.
      * @param string $documentNonce Exact retained page identity.
-     * @param string $failureKey SHA-256 of the observed native error-card identity.
+     * @param string $failureKey SHA-256 of the owned stream failure observation.
      * @param bool $nativeControlAvailable Whether the observed native Retry can be clicked now.
      * A disabled button cannot reserve a click or prevent receipt-based page recovery.
      * @param bool $preferSamePage Caller proved a stopped, owned page with a returned Send button.
      * @param array|null $regularRecovery Ordinary-chat-only anchored document facts; stopped_thinking requires fresh baseline IDs.
      * The internal catalog_refresh action additionally proves the accepted physical source, pending marker and unsent prompt hash.
+     * @param int|null $expectedActivityRevision When supplied, current tool activity must still match the drained observation.
      * @return array{retry:bool,waiting:bool,exhausted:bool,attempt:int,recover?:bool,continue?:bool,marker?:string,deadline_at?:int,regular_action?:string,state?:array,published?:bool}
      * @throws GatewayError For changed ownership, unknown effects or unavailable storage.
      */
     public static function reserveTaskNetworkRetry(string $responseId, string $incarnation,
         int $fence, string $documentNonce, string $failureKey, bool $nativeControlAvailable = true,
-        bool $preferSamePage = false, ?array $regularRecovery = null): array
+        bool $preferSamePage = false, ?array $regularRecovery = null, ?int $expectedActivityRevision = null): array
     {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $failureKey) !== 1) {
             throw new GatewayError('task_network_retry_invalid', '网页网络重试标识无效。', 400);
         }
-        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey, $nativeControlAvailable, $preferSamePage, $regularRecovery): array {
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $failureKey,
+            $nativeControlAvailable, $preferSamePage, $regularRecovery, $expectedActivityRevision): array {
             $db = SDB(null, 'medoo', 'sqlite');
             [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
             self::assertFence($surface, $incarnation, $fence);
@@ -2893,6 +2895,9 @@ final class TaskLedger
             }
             $idle = ['retry'=>false,'waiting'=>false,'exhausted'=>false,'attempt'=>0];
             if (($regularRecovery !== null || $preferSamePage) && self::recoveryHumanUpdatePendingUnlocked($job, $turn)) {
+                return array_replace($idle, ['waiting'=>true]);
+            }
+            if ($expectedActivityRevision !== null && (int)($binding['activity_revision'] ?? -1) !== $expectedActivityRevision) {
                 return array_replace($idle, ['waiting'=>true]);
             }
             if (($regularRecovery['action'] ?? '') === 'refresh_observed' && is_array($binding)) {
@@ -3067,11 +3072,13 @@ final class TaskLedger
      * Advance only a drained ordinary response. A stopped saved chat is refreshed first so a
      * server-side generation hidden by a stale page can be reattached without sending anything.
      * A confirmed stopped fresh document may then use Retry or a short resume before the fenced
-     * fresh-chat fallback. Explicit stopped-thinking terminals retain their existing bounded
+     * fresh-chat fallback. After tool work, a reattached page uses the short receipt-based resume.
+     * Explicit stopped-thinking terminals retain their existing bounded
      * same-page continuation contract.
      * Caller owns the writer transaction and has validated task, capability, deadline and document.
      * @param array $facts Current bound user/assistant IDs and document time origin; resume adds fresh baseline proof.
      * catalog_refresh abandons only a drained, proven-unsent control and restores its original observer before reloading.
+     * recovery_notice_refresh permits only an initial refresh, with completed host work and no native Retry.
      * @return array One durable action, bounded wait, or a request for the separately fenced fresh-chat fallback.
      * @throws GatewayError On changed chat/account/ownership or unavailable storage.
      */
@@ -3101,6 +3108,10 @@ final class TaskLedger
         $resumeAfterRetry = ($facts['action'] ?? '') === 'retry_settled';
         $refreshObserved = ($facts['action'] ?? '') === 'refresh_observed';
         $reattachedEmpty = ($facts['action'] ?? '') === 'reattached_empty';
+        if (($facts['action'] ?? '') === 'recovery_notice_refresh' && ($state !== [] || $hostCalls < 1
+            || $nativeControl || empty($facts['terminal']))) {
+            return array_replace($idle, ['waiting'=>true]);
+        }
         if ($reattachedEmpty && (($state['stage'] ?? '') !== 'reattached'
             || ($state['document_nonce'] ?? '') !== $surface['document_nonce']
             || ($state['document_id'] ?? '') !== $facts['document_id']
@@ -3261,7 +3272,7 @@ final class TaskLedger
                 || !in_array($facts['assistant_id'], $facts['assistant_ids'], true)) {
                 throw new GatewayError('CHATGPT_CHAT_IDENTITY_CHANGED', 'The saved Web chat identity could not be confirmed.', 409);
             }
-            if ($nativeControl) $stage = 'retry';
+            if ($nativeControl && $hostCalls === 0) $stage = 'retry';
             else {
                 $continued = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
                     $failureKey, $hostCalls, $idle, 'stream_recovery');
