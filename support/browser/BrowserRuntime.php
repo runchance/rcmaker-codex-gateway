@@ -7980,7 +7980,9 @@ JS;
             // pre-submit baseline plus the exact rendered marker or fenced POST witness.
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular',
-            $temporarySubmission, $acceptedTemporarySubmission);
+            $temporarySubmission, $acceptedTemporarySubmission,
+            in_array($ledger['job']['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+                && !empty($ledger['job']['previous_response_id']) && $toolCapable);
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId, $regularRecoveryState, $expression): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
@@ -8126,17 +8128,37 @@ JS;
                 $snapshot['error'] = ['code'=>'CHATGPT_MESSAGE_STREAM_ERROR',
                     'message'=>'ChatGPT temporarily limited this request; waiting to resume the same chat.'];
             }
-            if (self::compactionSourceIdleControls($turn, $snapshot)
+            $stoppedCompactSource = ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING'
+                && ($snapshot['stopped_thinking_visible'] ?? null) === true
+                && ($snapshot['response_present'] ?? null) === true
+                && ($snapshot['generation_running'] ?? null) === false;
+            if ($stoppedCompactSource || (self::compactionSourceIdleControls($turn, $snapshot)
                 && (empty($session['submission_request_id']) || (!empty($session['submission_finished'])
                     && !empty($session['submission_failed']) && ($session['submission_canceled'] ?? null) === false))
                 && in_array($snapshot['error']['code'] ?? '', ['', 'CHATGPT_STOPPED_THINKING',
-                    'CHATGPT_NETWORK_ERROR', 'CHATGPT_MESSAGE_STREAM_ERROR'], true)) {
+                    'CHATGPT_NETWORK_ERROR', 'CHATGPT_MESSAGE_STREAM_ERROR'], true))) {
                 $currentId = (string)($turn['logical_response_id'] ?? $responseId);
                 try {
                     $current = ResponseJob::pollState($currentId);
                     if (in_array($current['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
                         && !empty($current['previous_response_id']) && !empty($turn['tool_capable'])
-                        && $this->compactionSourceTransportClosed($currentId, $session)) {
+                        && $current['submit_intent_at'] === null && $current['accepted_at'] === null
+                        && ($stoppedCompactSource || $this->compactionSourceTransportClosed($currentId, $session))) {
+                        if ($stoppedCompactSource) {
+                            // Native stopped-source UI is not a failed summary: its one-shot
+                            // message has not been sent. Wait for real idle controls, then
+                            // reuse the drained receipt fence and stable document readback.
+                            $this->recordStoppedThinkingObservation($responseId, $snapshot);
+                            if (!self::compactionSourceIdleControls($turn, $snapshot)) {
+                                $this->deliverPendingToolWithoutSnapshot($responseId);
+                                $this->scheduleTaskPoll($responseId, 0.5);
+                                return;
+                            }
+                            $this->chatGptTurns[$responseId]['compaction_idle_source'] = true;
+                            $this->chatGptTurns[$responseId]['compaction_phase'] = 'stopping_source';
+                            $this->stopCompactionSource($responseId, $currentId);
+                            return;
+                        }
                         // Closed transport plus a stopped page must not wait for delivery to the old receiver.
                         $this->chatGptTurns[$responseId]['compaction_closed_source'] = true;
                         $this->chatGptTurns[$responseId]['compaction_phase'] = 'stopping_source';
@@ -9457,7 +9479,7 @@ JS;
             'network_retry_available' => !empty($snapshot['network_retry']['available']),
             'request_fingerprint' => hash('sha256', (string) ($session['submission_request_id'] ?? ''))];
         try {
-            $job = ResponseJob::execution((string) ($turn['logical_response_id'] ?? $responseId));
+            $job = ResponseJob::pollState((string) ($turn['logical_response_id'] ?? $responseId));
             $db = SDB(null, 'medoo', 'sqlite');
             $facts['tool_invocations_pending'] = (int) $db->table('gateway_tool_invocations')
                 ->where('task_id', $job['task_id'])->where('status', 'IN', ['registered', 'delivered'])->count();
@@ -9487,8 +9509,9 @@ JS;
      * Recognize an idle composer for source-to-checkpoint handoff, never task completion.
      * Ordinary ChatGPT replaces Send with Start voice when its composer is empty. The
      * adapter proves that control belongs to the single visible composer; Stop still
-     * wins. Temporary chats retain their Send-only rule. Caller must also prove the
-     * exact document/owner, drained native work and stable idle before any handoff.
+     * wins. Temporary chats also require native stopped-source evidence for Voice.
+     * The caller must prove the exact document/owner, drained native work and
+     * stable idle before any handoff.
      * @param array $turn Current task observer, including its persisted chat mode.
      * @param array $snapshot Read-only controls from that task's fenced document.
      * @return bool Whether the visible controls positively prove an idle composer.
@@ -9497,7 +9520,12 @@ JS;
     {
         return ($snapshot['generation_running'] ?? null) === false
             && (($snapshot['send_button_visible'] ?? null) === true
-                || (($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                || ((($turn['web_chat']['mode'] ?? 'temporary') === 'regular'
+                        || (in_array($turn['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+                            && (!empty($turn['compaction_idle_source'])
+                                || (($snapshot['stopped_thinking_visible'] ?? null) === true
+                                    && ($snapshot['response_present'] ?? null) === true
+                                    && ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING'))))
                     && ($snapshot['recovery_idle_button_visible'] ?? null) === true));
     }
 
@@ -9506,7 +9534,7 @@ JS;
      * This never reports the interrupted partial answer as completion of the human task.
      * After an owned Stop, confirm idle on the fenced document even if historical DOM groups change.
      * A failed source transport uses read-only idle confirmation and exact native checkpoint receipts.
-     * A canceled ordinary source may acknowledge idle without its virtualized message witness,
+     * A canceled ordinary or natively stopped source may acknowledge idle without its message witness,
      * but uses the normal fully delivered receipt fence and never clicks Stop or its confirmation.
      * @param string $responseId Physical source observer.
      * @param string $logicalResponseId Its currently reserved compact response.
@@ -9516,8 +9544,7 @@ JS;
     {
         if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
         $turn = $this->chatGptTurns[$responseId];
-        $idleSource = !empty($turn['compaction_idle_source'])
-            && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular';
+        $idleSource = !empty($turn['compaction_idle_source']);
         try {
             $closedSource = (!empty($turn['compaction_closed_source']) && !empty($turn['compaction_stop_clicked']))
                 || $this->compactionSourceTransportClosed($logicalResponseId,
@@ -9593,7 +9620,7 @@ JS;
             $turn = $this->chatGptTurns[$responseId];
             $read = WebModelPage::responseExpression((array)$turn['baseline_users'], (array)$turn['baseline_assistants'],
                 '', (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), '',
-                ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
+                ($turn['web_chat']['mode'] ?? 'temporary') === 'regular', '', false, true);
             $this->evaluateTask($responseId, $read, function ($readError, $snapshot) use ($responseId, $logicalResponseId, $revision): void {
                 if (!$this->compactionStopOwns($responseId, $logicalResponseId)) return;
                 $closedSource = !empty($this->chatGptTurns[$responseId]['compaction_closed_source']);

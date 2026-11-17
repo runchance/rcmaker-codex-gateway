@@ -1350,12 +1350,13 @@ JS));
      * @param bool $regularRecovery Accept an owned native stream-error Retry card in ordinary mode only.
      * @param string $temporarySubmission Current physical temporary response ID, scoped to this document.
      * @param bool $acceptedTemporarySubmission Ledger confirms this physical send on the current document.
+     * @param bool $compactionSourceIdle Observe the primary idle control while draining a checkpoint's source.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false,
         string $initialBindingMarker = '', bool $regularRecovery = false, string $temporarySubmission = '',
-        bool $acceptedTemporarySubmission = false): string
+        bool $acceptedTemporarySubmission = false, bool $compactionSourceIdle = false): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1475,7 +1476,7 @@ const endSend=endComposer?composerSendButtons(endComposer):[];
 const sendButtonVisible=endSend.length===1&&endSend[0].getAttribute('data-testid')!=='stop-button'
     &&!/^(?:Stop|Stop generating|停止|停止生成)$/i.test(String(endSend[0].getAttribute('aria-label')||'').trim());
 const endForm=endComposer?.closest('form')||null;
-// An empty saved-chat composer replaces Send with one primary voice action. Its label is
+// An empty composer replaces Send with one primary voice action. Its label is
 // localized and can change independently of the control shape, so prefer the native primary
 // action structure. Retain the observed labels only as compatibility for older renderers.
 const structuralIdleActions=endForm?[...endForm.querySelectorAll('button[type="button"]')].filter(button=>visible(button)
@@ -1484,7 +1485,7 @@ const structuralIdleActions=endForm?[...endForm.querySelectorAll('button[type="b
     &&button.classList.contains('bg-composer-primary')&&!!button.querySelector('svg.icon-primary-action')):[];
 const legacyVoiceActions=endForm?[...endForm.querySelectorAll('button[aria-label]')].filter(button=>visible(button)
     &&/^(?:开始语音|開始語音|Start voice(?: mode)?|Use voice mode)$/i.test(String(button.getAttribute('aria-label')||'').trim())):[];
-const recoveryIdleButtonVisible=__REGULAR_RECOVERY__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length===1
+const recoveryIdleButtonVisible=__RECOVERY_IDLE__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length===1
     &&!!endForm&&(structuralIdleActions.length===1
         ||(structuralIdleActions.length===0&&legacyVoiceActions.length===1));
 let markdown='';let markdownSegments=[];let metricCardLegacy=null;let visibleText='';let responseHtml='';let completion=false;let responsePresent=false;let contentPresent=false;let answerRootCount=0;let commentaryRootCount=0;let artifactCandidates=[];let commentaryBlocks=[];let stoppedThinkingVisible=false;let transportRecoveryVisible=false;
@@ -1731,9 +1732,10 @@ return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__',
-                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__'],
+                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__', '__RECOVERY_IDLE__'],
             [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound,
-                $initialBinding, $regularRecovery ? 'true' : 'false', $temporary, $acceptedTemporarySubmission ? 'true' : 'false'],
+                $initialBinding, $regularRecovery ? 'true' : 'false', $temporary, $acceptedTemporarySubmission ? 'true' : 'false',
+                $regularRecovery || $compactionSourceIdle ? 'true' : 'false'],
             $body
         ), $legacyCitations);
     }

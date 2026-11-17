@@ -1556,6 +1556,7 @@ final class ContextCompaction
                 'delivered_tool_calls'=>count(array_filter($calls, static fn(array $call): bool => $call['result_delivered_at'] !== null)),
                 'completed_tool_calls'=>count($calls),
                 'confirmed_user_stop'=>$state['confirmedStop'],
+                'confirmed_stopped_source'=>$state['stoppedSource'],
                 'native_base_task_id'=>$spec['readonly_source_base_task_id'] ?? null,
                 'expanded_native_receipts'=>$state['expandedReceipts']], JSON_THROW_ON_ERROR), 'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', '源摘要等待替换证据无法保存。', 503);
@@ -1637,6 +1638,8 @@ final class ContextCompaction
             && (string) $source['surface_id'] === (string) $job['surface_id'];
         $confirmedStop = !$running && $sameScope
             && self::hasConfirmedUnsentSourceStopUnlocked($job, $turn, $epoch, $surface);
+        $stoppedSource = !$running && $sameScope
+            && self::hasStoppedUnsentSourceUnlocked($job, $turn, $epoch, $surface);
         $movedFailure = false;
         $settledSourceRequired = false;
         if ($running) {
@@ -1649,7 +1652,7 @@ final class ContextCompaction
             if (!$sameScope) {
                 $movedFailure = self::hasFailedReadonlyMigrationUnlocked($job, $source, $turn, $epoch, $surface);
                 if (!$movedFailure) return null;
-            } elseif (!$confirmedStop && ($epoch['status'] !== 'retired' || $surface['status'] !== 'retired')) {
+            } elseif (!$confirmedStop && !$stoppedSource && ($epoch['status'] !== 'retired' || $surface['status'] !== 'retired')) {
                 // A missing physical page is not an unknown host effect when its source
                 // already committed a completion fence and the summary was never sent.
                 // Verify that source fence below before releasing this failed checkpoint.
@@ -1758,7 +1761,7 @@ final class ContextCompaction
         $after = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
         $expandedReceipts = [];
         $comparison = $after;
-        if (!$running && ($retiredSource || $confirmedStop) && $job['model'] === ($spec['model'] ?? null)
+        if (!$running && ($retiredSource || $confirmedStop || $stoppedSource) && $job['model'] === ($spec['model'] ?? null)
             && $job['reasoning_effort'] === ($spec['reasoning_effort'] ?? null)
             && ($job['integration_id'] ?? null) === ($spec['integration_id'] ?? null)) {
             $comparison = self::compareExpandedNativeReceipts($before, $after, $calls, $job, $source, $expandedReceipts);
@@ -1769,7 +1772,42 @@ final class ContextCompaction
         $receiptSpec = $spec;
         if ($expandedReceipts !== []) $receiptSpec['context_json'] = $receiptSpec['full_context_json'] = ContextHistory::canonical($comparison);
         self::assertRetiredSourceReceiptsUnlocked($receiptSpec, $job, $taskId);
-        return compact('task', 'checkpoint', 'job', 'source', 'turn', 'epoch', 'surface', 'calls', 'expandedReceipts', 'confirmedStop');
+        return compact('task', 'checkpoint', 'job', 'source', 'turn', 'epoch', 'surface', 'calls', 'expandedReceipts', 'confirmedStop', 'stoppedSource');
+    }
+
+    /**
+     * Recover an older worker's unsent checkpoint only with its fenced native stopped-source
+     * observation. The caller still proves the whole history, exact delivered receipts,
+     * no active host work and no summary send, and retires the old page before replacement.
+     * Error text, a cancelled HTTP request or a failed checkpoint alone prove none of this.
+     */
+    private static function hasStoppedUnsentSourceUnlocked(array $job, array $turn, array $epoch, array $surface): bool
+    {
+        $error = json_decode((string) ($job['error_json'] ?? ''), true);
+        if (($error['error']['code'] ?? '') !== 'CHATGPT_STOPPED_THINKING'
+            || $turn['status'] !== 'failed' || ($turn['error_code'] ?? '') !== 'CHATGPT_STOPPED_THINKING'
+            || $turn['retired_at'] === null || (int) $turn['retired_at'] > (int) $job['finished_at']
+            || $epoch['status'] !== 'active' || $surface['status'] !== 'ready'
+            || (int) $turn['fencing_version'] !== (int) $surface['fencing_version']
+            || $turn['owner_incarnation'] !== $surface['owner_incarnation']
+            || empty($job['submitted_document_nonce'])
+            || $job['submitted_document_nonce'] !== $surface['document_nonce']) return false;
+        $event = SDB(null, 'medoo', 'sqlite')->table('gateway_task_events')
+            ->where('task_id', (string) $job['task_id'])->where('turn_id', (string) $turn['id'])
+            ->where('response_id', (string) $job['id'])->where('surface_id', (string) $surface['id'])
+            ->where('event_type', 'browser_response_transport')->order([['id', 'DESC']])->limit(1)->find();
+        if (!is_array($event) || (int) $event['created_at'] < (int) $job['created_at']
+            || (int) $event['created_at'] > (int) $job['finished_at']) return false;
+        $facts = json_decode((string) $event['data_json'], true);
+        return ($facts['state'] ?? '') === 'stopped_thinking'
+            && ($facts['page_error_code'] ?? '') === 'CHATGPT_STOPPED_THINKING'
+            && ($facts['stopped_thinking_visible'] ?? null) === true
+            && ($facts['response_present'] ?? null) === true
+            && ($facts['generation_running'] ?? null) === false
+            && ($facts['request_finished'] ?? null) === true
+            && ($facts['tool_invocations_pending'] ?? null) === 0
+            && ($facts['tool_receipts_pending'] ?? null) === 0
+            && ($facts['mcp_activities_pending'] ?? null) === 0;
     }
 
     /**
@@ -2092,6 +2130,9 @@ final class ContextCompaction
         foreach ($known as $record) if (is_string($record['id'] ?? null)) $ids[$record['id']] = true;
         foreach (array_slice($records, count($known) + $offset) as $record) {
             if (in_array($record['role'] ?? '', ['developer', 'agent_message'], true)) continue;
+            // Goal/Page/browser envelopes are native context, never host receipts.
+            // Keep their full payload while applying the same structured parser proof.
+            if (ResponsesProtocol::isCodexContextOutput($record, true)) continue;
             if (($record['role'] ?? '') !== 'user' || !is_string($record['id'] ?? null) || $record['id'] === ''
                 || isset($ids[$record['id']])) return false;
             $ids[$record['id']] = true;

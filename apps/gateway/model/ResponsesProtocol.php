@@ -1066,11 +1066,13 @@ final class ResponsesProtocol
      * Preserve these records in history, outside the host-receipt batch. Each
      * supported envelope has its own shape check after validating the turn and timestamp fields.
      * @param array $item A function_call_output record from the native input history.
+     * @param bool $compiledHistory True only for canonical history whose compiler removed item IDs.
      * @return bool Whether the record is an identified context envelope without a call ID.
      */
-    private static function isCodexContextOutput(array $item): bool
+    public static function isCodexContextOutput(array $item, bool $compiledHistory = false): bool
     {
-        if (($item['namespace'] ?? null) !== 'agent' || array_key_exists('call_id', $item)
+        if (($item['type'] ?? '') !== 'function_call_output'
+            || ($item['namespace'] ?? null) !== 'agent' || array_key_exists('call_id', $item)
             || !is_string($item['name'] ?? null) || !is_string($item['output'] ?? null)) return false;
         $name = $item['name'];
         $output = $item['output'];
@@ -1087,8 +1089,9 @@ final class ResponsesProtocol
             // Both Codex Responses formats identify the plain-text objective by its
             // native fco item ID. Objective text can be any language.
             $id = $item['id'] ?? null;
-            return is_string($id) && str_starts_with($id, 'fco_')
-                && CodexCancellation::uuid(substr($id, 4)) && trim($output) !== '';
+            return (($compiledHistory && !array_key_exists('id', $item))
+                    || (is_string($id) && str_starts_with($id, 'fco_') && CodexCancellation::uuid(substr($id, 4))))
+                && trim($output) !== '';
         }
         if ($name === 'browser_tabs') {
             $output = trim($output);
