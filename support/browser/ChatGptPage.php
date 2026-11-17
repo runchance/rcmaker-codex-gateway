@@ -1334,6 +1334,8 @@ JS));
      * copy-source and DIL message IDs prove their origin without accepting arbitrary page prose.
      * Native stream errors stay scoped UI chrome; quoted alerts remain content and active
      * native recovery chrome is returned only as transport_recovery_visible metadata.
+     * A previously bound UUID group can retain its matching native user bubble after
+     * older baseline groups are virtualized away.
      * A new group wrapper may retain the bound answer through its unique native inner
      * message anchor, but never through another user's group or model-authored markup.
      * The first ordinary submission can also retain its identity through ChatGPT's
@@ -1392,7 +1394,15 @@ const reorderedAgent=uniqueUser&&identityAssistants.length===1
 // require an old anchor or the agent renderer's known assistant-before-user order.
 const identityUser=uniqueUser&&((baselineVisible&&(!baselineAssistant||after(baselineAssistant.el,uniqueUser.el)))||reorderedAgent)
     ?uniqueUser:null;
-const newUser=continuationUser||countGrowthUser||identityUser;
+// A known native reply group still owns its same user bubble after older groups unmount.
+// Require the exact bound UUID, shared native element and one new latest user.
+const boundGroups=/^group:assistant:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(boundResponseId)
+    &&!beforeAssistants.has(boundResponseId)?assistants.filter(entry=>entry.id===boundResponseId):[];
+const boundGroupUser=uniqueUser===lastUser&&uniqueUser&&boundGroups.length===1
+    &&uniqueUser.id==='group:user:'+boundResponseId.slice('group:assistant:'.length)
+    &&uniqueUser.el===boundGroups[0].el
+    &&!uniqueUser.el.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,[data-user-message-bubble]')?uniqueUser:null;
+const newUser=continuationUser||countGrowthUser||identityUser||boundGroupUser;
 const initialBindingWitness=!!expectedInitialBinding&&!!newUser&&[newUser.el?.innerText,newUser.el?.textContent].some(t=>String(t||'').includes('<rcmaker_chat_binding>'+expectedInitialBinding+'</rcmaker_chat_binding>'));
 const answerCandidates=newUser?assistants.filter(entry=>after(newUser.el,entry.el)&&!beforeAssistants.has(entry.id)):[];
 // The current ChatGPT renderer can virtualize the original user bubble after
