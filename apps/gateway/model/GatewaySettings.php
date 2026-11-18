@@ -42,6 +42,7 @@ final class GatewaySettings
             'skill_transport' => (string) $row['skill_transport'],
             'official_handoff_summary' => (bool) $row['official_handoff_summary'],
             'steering_full_context' => (bool) $row['steering_full_context'],
+            'steering_live_send' => (bool) $row['steering_live_send'],
             'auto_cleanup_inactive_tasks' => (bool) $row['auto_cleanup_inactive_tasks'],
             'web_initial_contract_template' => self::effectiveContract($row, 'web_initial_contract_template'),
             'web_resume_contract_template' => self::effectiveContract($row, 'web_resume_contract_template'),
@@ -79,7 +80,7 @@ final class GatewaySettings
             'tunnel_id', 'runtime_key', 'runtime_key_action',
             'context_transport', 'context_max_parts', 'context_extended', 'response_timeout_seconds',
             'context_stage_timeout_seconds', 'compaction_timeout_seconds',
-            'skill_transport', 'official_handoff_summary', 'steering_full_context',
+            'skill_transport', 'official_handoff_summary', 'steering_full_context', 'steering_live_send',
             'web_initial_contract_template', 'web_resume_contract_template',
             'web_readonly_contract_template', 'web_compact_contract_template',
         ];
@@ -99,7 +100,7 @@ final class GatewaySettings
         }
         foreach (['context_transport', 'context_max_parts', 'context_extended', 'response_timeout_seconds',
             'context_stage_timeout_seconds', 'compaction_timeout_seconds', 'skill_transport',
-            'official_handoff_summary', 'steering_full_context', 'web_initial_contract_template', 'web_resume_contract_template',
+            'official_handoff_summary', 'steering_full_context', 'steering_live_send', 'web_initial_contract_template', 'web_resume_contract_template',
             'web_readonly_contract_template', 'web_compact_contract_template'] as $field) {
             $input[$field] ??= $current[$field];
         }
@@ -141,6 +142,7 @@ final class GatewaySettings
                 'skill_transport' => ['rule' => 'string', 'len' => [4, 6], 'name' => '技能传输方式'],
                 'official_handoff_summary' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '官方交接摘要'],
                 'steering_full_context' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '插话全量重发'],
+                'steering_live_send' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => '网页直接插话'],
                 'web_initial_contract_template' => ['rule' => 'string', 'len' => [0, 32768], 'required' => false, 'name' => '首轮 Web 契约'],
                 'web_resume_contract_template' => ['rule' => 'string', 'len' => [0, 32768], 'required' => false, 'name' => '后续 Web 契约'],
                 'web_readonly_contract_template' => ['rule' => 'string', 'len' => [0, 32768], 'required' => false, 'name' => '无宿主工具 Web 契约'],
@@ -202,7 +204,7 @@ final class GatewaySettings
         foreach (['mcp_invoke_timeout_ms', 'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'context_max_parts', 'context_extended', 'response_timeout_seconds', 'context_stage_timeout_seconds',
             'compaction_timeout_seconds', 'official_handoff_summary', 'steering_full_context', 'pro_weekly_budget',
-            'auto_cleanup_inactive_tasks', 'temporary_chat_reuse_on_model_switch'] as $field) {
+            'auto_cleanup_inactive_tasks', 'temporary_chat_reuse_on_model_switch', 'steering_live_send'] as $field) {
             $data[$field] = (int) $data[$field];
         }
         $data['protected_runtime_key'] = $protected;

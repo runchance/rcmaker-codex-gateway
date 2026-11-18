@@ -48,6 +48,8 @@ window.GatewayTranslations = {
     "ChatGPT 网页连续停止且未返回最终答复，自动续做已达三次；原上下文和工具回执仍保留。": "ChatGPT stopped repeatedly without a final answer. Automatic continuation reached its three-attempt limit; the original context and tool receipts are preserved.",
     "摘要发布记录暂不可读取。": "Summary publication records are temporarily unavailable.",
     "插话时全量重发上下文": "Resend full context when steering",
+    "网页直接插话（实验性）": "Send Web steering directly (experimental)",
+    "默认关闭。开启后，同页插话和目标更新会在网页允许发送时直接提交。模型切换、全量重发和手动停止仍按各自流程处理。": "Off by default. When enabled, same-chat steering and goal updates are sent as soon as the Web composer allows. Model switches, full-context sends, and manual stops follow their own flows.",
     "临时对话切换模型不新建聊天": "Keep Temporary Chat when switching models",
     "默认开启。切换模型或推理档位时，优先复用可验证的原临时聊天。重启或原页不可用时，新建临时聊天并带入上下文。": "On by default. Reuse the verified Temporary Chat when switching models or reasoning levels. After a restart or if the page is unavailable, open a new Temporary Chat with the context.",
     "默认关闭：已受理工具结清后，停止原页生成并发送新增需求和必要回执。开启后沿用全量重发。重启、原页丢失或异常时，仍可验证完整上下文与准确回执后恢复。": "Off by default: drain accepted tools, stop the current generation, then send new instructions and required receipts. Enable to retain full-context resending. Recovery after a restart, missing page or page failure still uses verified full context and exact receipts.",

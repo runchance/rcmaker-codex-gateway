@@ -557,6 +557,9 @@ final class Schema
             69 => [
                 'ALTER TABLE gateway_settings ADD COLUMN temporary_chat_reuse_on_model_switch INTEGER NOT NULL DEFAULT 1',
             ],
+            70 => [
+                'ALTER TABLE gateway_settings ADD COLUMN steering_live_send INTEGER NOT NULL DEFAULT 0 CHECK(steering_live_send IN (0,1))',
+            ],
         ];
     }
 

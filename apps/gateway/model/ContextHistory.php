@@ -596,6 +596,12 @@ final class ContextHistory
         return ($message['role'] ?? '') === 'user' && ($message['origin'] ?? '') === 'codex_subagent_notification';
     }
 
+    /** Recognize a structured Codex goal in compiled history while preserving its native role. */
+    public static function isGoalContext(array $record): bool
+    {
+        return ($record['name'] ?? '') === 'goal_objective' && ResponsesProtocol::isCodexContextOutput($record, true);
+    }
+
     /** Native environment and subagent notifications may arrive with role=user. */
     public static function isOperationalUserMessage(array $message): bool
     {
@@ -814,6 +820,7 @@ final class ContextHistory
                     TaskLedger::supersedeDeferredStopUnlocked($prior);
                 }
                 if (isset($pending['steering_full_context'])) $spec['steering_full_context'] = $pending['steering_full_context'];
+                if (isset($pending['steering_live_send'])) $spec['steering_live_send'] = $pending['steering_live_send'];
                 $spec['tool_context_updates'] = $contextUpdates;
                 $round['messages'] = array_merge($round['messages'], (array) ($contextUpdates['messages'] ?? []), $steering);
                 $transport = json_decode((string) ($prior['transport_context_json'] ?? $prior['context_json']), true, 128, JSON_THROW_ON_ERROR);
@@ -1223,6 +1230,7 @@ final class ContextHistory
         $afterReceipt = false;
         $messages = [];
         $known = (array) ($prior['messages'] ?? []);
+        $liveSteering = null;
         foreach ((array) ($context['messages'] ?? []) as $record) {
             if (in_array($record['type'] ?? '', ['function_call_output', 'custom_tool_call_output', 'tool_search_output'], true)
                 && isset($ids[$record['call_id'] ?? ''])) {
@@ -1230,6 +1238,8 @@ final class ContextHistory
                 continue;
             }
             if (($afterReceipt && in_array($record['role'] ?? '', ['developer', 'agent_message'], true))
+                || (self::isGoalContext($record) && ($liveSteering ??= (bool) GatewaySettings::internal()['steering_live_send'])
+                    && !self::containsRecord($known, $record))
                 || (self::isOperationalUserMessage($record) && !self::containsRecord($known, $record))) {
                 if (self::isSubagentNotification($record) && self::containsRecord($messages, $record)) continue;
                 $messages[] = $record;
@@ -1516,6 +1526,7 @@ final class ContextHistory
         $hasMailbox = false;
         $hasHuman = false;
         $knownUserIds = [];
+        $liveSteering = null;
         foreach ($known as $record) {
             if (($record['role'] ?? '') === 'user' && !empty($record['id'])) $knownUserIds[(string) $record['id']] = true;
         }
@@ -1531,6 +1542,9 @@ final class ContextHistory
             } elseif ($humanSteering && ($record['role'] ?? '') === 'developer') {
                 // Codex appends privileged runtime updates between native turns. Keep
                 // their role after the exact source proof, alongside the new human input.
+                $updates[] = $record;
+            } elseif ($humanSteering && self::isGoalContext($record)
+                && ($liveSteering ??= (bool) GatewaySettings::internal()['steering_live_send'])) {
                 $updates[] = $record;
             } elseif (($record['role'] ?? '') === 'agent_message') {
                 $updates[] = $record;
@@ -1665,6 +1679,7 @@ final class ContextHistory
             static fn(array $message): bool => !self::containsRecord($context['messages'], $message)));
         if ($queued !== []) array_splice($context['messages'], count($known), 0, $queued);
         $spec['operational_context_event_ids'] = $pending['event_ids'];
+        if (isset($pending['steering_live_send'])) $spec['steering_live_send'] = $pending['steering_live_send'];
         unset($context['continuation']);
         $full = self::canonical($context);
         $spec['steering_restart'] = true;

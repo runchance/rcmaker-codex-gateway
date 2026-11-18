@@ -323,10 +323,13 @@ final class TaskWebChat
         $known = array_fill_keys(array_map([ContextHistory::class, 'canonical'], (array) ($prior['messages'] ?? [])), true);
         $selected = array_fill_keys(array_map([ContextHistory::class, 'canonical'], $messages), true);
         $updates = [];
+        $liveSteering = null;
         foreach ((array) ($full['messages'] ?? []) as $record) {
             $key = ContextHistory::canonical($record);
             if (!isset($known[$key]) && !isset($selected[$key])
-                && (in_array($record['role'] ?? '', ['developer', 'system'], true) || ContextHistory::isOperationalUserMessage($record))) $updates[] = $record;
+                && (in_array($record['role'] ?? '', ['developer', 'system'], true) || ContextHistory::isOperationalUserMessage($record)
+                    || (!empty($spec['steering_restart']) && ContextHistory::isGoalContext($record)
+                        && ($liveSteering ??= (bool) ($spec['steering_live_send'] ?? GatewaySettings::internal()['steering_live_send']))))) $updates[] = $record;
         }
         $delta = ['version' => $full['version'] ?? 3, 'system' => ContextHistory::canonical($full['system'] ?? []) === ContextHistory::canonical($prior['system'] ?? [])
             ? [] : ($full['system'] ?? []), 'messages' => [...$updates, ...$messages]];

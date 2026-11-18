@@ -273,6 +273,18 @@ final class ResponseJob
                 && (!empty($spec['budget']['regular_chat'])
                     || !($spec['steering_full_context'] ?? GatewaySettings::internal()['steering_full_context']))) {
                 $spec = SteeringContext::prepareUnlocked($spec);
+                if (!empty($spec['steering_restart']) && !empty($spec['steering_delta'])
+                    && empty($spec['receipt_model_switch']) && empty($spec['stopped_source_response_id'])
+                    && empty($spec['postcompact_user_input'])
+                    && ($spec['steering_live_send'] ?? GatewaySettings::internal()['steering_live_send'])) {
+                    $source = $db->table('gateway_response_jobs')
+                        ->where('id', (string) $spec['budget']['steering_delta']['witness_response_id'])
+                        ->find('model,reasoning_effort');
+                    if (is_array($source) && $source['model'] === $spec['model']
+                        && $source['reasoning_effort'] === ($spec['reasoning_effort'] ?? null)) {
+                        $spec['budget']['steering_delta']['live_send'] = true;
+                    }
+                }
                 $budget = $spec['budget'];
             }
             $logicalContext = (string) ($spec['full_context_json'] ?? $spec['context_json']);

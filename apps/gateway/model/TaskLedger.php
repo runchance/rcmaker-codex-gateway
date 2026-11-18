@@ -4203,6 +4203,7 @@ final class TaskLedger
             if (($message['role'] ?? '') === 'user' && !ContextHistory::isOperationalUserMessage($message)
                 && !empty($message['id'])) $humanIds[(string) $message['id']] = (string) $data['record_hash'];
         }
+        $settings = $steeringJoin ? GatewaySettings::internal() : [];
         foreach ((array) ($updates['messages'] ?? []) as $message) {
             if ($settled && !ContextHistory::isOperationalUserMessage($message)) {
                 throw new GatewayError('invalid_context_update', 'A settled response can only retain native operational context.', 400);
@@ -4210,6 +4211,7 @@ final class TaskLedger
             if (!ContextHistory::isOperationalUserMessage($message)
                 && !(($mailboxJoin || $steeringJoin) && ($message['role'] ?? '') === 'agent_message')
                 && !($steeringJoin && ($message['role'] ?? '') === 'developer')
+                && !(!empty($settings['steering_live_send']) && ContextHistory::isGoalContext($message))
                 && !($steeringJoin && ($message['role'] ?? '') === 'user')) {
                 throw new GatewayError('invalid_context_update', '此通道只接收 Codex 环境信息。', 400);
             }
@@ -4222,7 +4224,10 @@ final class TaskLedger
             self::eventUnlocked((string) $source['task_id'], (string) $source['durable_turn_id'],
                 (string) $source['id'], (string) $source['surface_id'], 'native_context_update_queued',
                 ['record_hash' => $hash, 'message' => $message,
-                    ...($steeringJoin ? ['steering_full_context' => (bool) GatewaySettings::internal()['steering_full_context']] : [])]);
+                    ...($steeringJoin ? [
+                        'steering_full_context' => (bool) $settings['steering_full_context'],
+                        'steering_live_send' => (bool) $settings['steering_live_send'],
+                    ] : [])]);
             $known[$hash] = true;
         }
         if (!$joinResponse) return;
@@ -4345,13 +4350,14 @@ final class TaskLedger
             $data = json_decode((string) $event['data_json'], true, 128, JSON_THROW_ON_ERROR);
             if ($event['event_type'] === 'native_context_update_queued') {
                 $pending[(int) $event['id']] = $data['message'];
-                if (isset($data['steering_full_context'])) $policies[(int) $event['id']] = (bool) $data['steering_full_context'];
+                if (isset($data['steering_full_context'])) $policies[(int) $event['id']] = array_intersect_key(
+                    $data, ['steering_full_context'=>true, 'steering_live_send'=>true]);
             }
             else foreach ((array) ($data['event_ids'] ?? []) as $id) unset($pending[(int) $id]);
         }
         $policies = array_intersect_key($policies, $pending);
         return ['messages' => array_values($pending), 'event_ids' => array_keys($pending),
-            ...($policies !== [] ? ['steering_full_context' => end($policies)] : [])];
+            ...($policies !== [] ? end($policies) : [])];
     }
 
     /** The receipt job and update attachment are committed atomically; this is not an MCP delivery claim. */

@@ -239,6 +239,15 @@ final class SteeringContext
             && ($proof['source_response_id'] ?? '') === ($job['continuation_source_response_id'] ?? null);
     }
 
+    /** Identify the exact opt-in physical send, including after a browser-worker restart. */
+    public static function liveSendMarker(array $job): string
+    {
+        if (($job['operation_kind'] ?? '') !== 'response' || !self::isDelta($job)) return '';
+        $budget = $job['budget'] ?? json_decode((string) ($job['budget_json'] ?? '{}'), true, 128, JSON_THROW_ON_ERROR);
+        return !empty($budget['steering_delta']['live_send'])
+            ? '<rcmaker_steering_binding>' . $job['id'] . '</rcmaker_steering_binding>' : '';
+    }
+
     /**
      * Verify the pinned physical source again after worker reattachment, never borrowing another epoch.
      * @param array $job Steering response. @param array $surface Current destination ledger row.

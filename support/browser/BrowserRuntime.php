@@ -19,6 +19,7 @@ use app\gateway\model\SubagentCapacity;
 use app\gateway\model\NetworkSettings;
 use app\gateway\model\ModelCooldown;
 use app\gateway\model\ResponseJob;
+use app\gateway\model\SteeringContext;
 use app\gateway\model\TaskLedger;
 use app\gateway\model\TaskPageRetirement;
 use app\gateway\model\TaskWebChat;
@@ -3979,7 +3980,8 @@ JS;
     }
 
     /**
-     * Stop the proven source, observe idle twice, then submit the incremental user message.
+     * Prepare an owned same-page revision. The experimental path uses the native composer
+     * while the source works; the default path stops it and verifies stable idle first.
      * A slow stop observation retains this document until the existing durable deadline;
      * only positively invalid/lost page evidence permits full-context recovery.
      * Repair a missed initial ordinary-chat binding from its submitted header before
@@ -4001,6 +4003,8 @@ JS;
             return;
         }
         $source = ResponseJob::execution((string) $job['budget']['steering_delta']['witness_response_id']);
+        $liveSend = SteeringContext::liveSendMarker($job) !== '';
+        $prepareWhileBusy = $liveSend && empty($job['attachments']);
         $owner = $this->taskSessions[$sessionId];
         $initialBinding = self::submittedChatBindingMarker($source, $surface, $owner['web_chat']['mode'] ?? 'temporary');
         $savedChat = TaskWebChat::retained($job, $surface);
@@ -4021,11 +4025,11 @@ JS;
         $witnesses = count(array_unique($tokens[0])) === 1 ? [(string) $tokens[0][0]] : [(string) $source['prompt']];
         if (!empty($source['transport_transaction_id'])) $witnesses[] = (string) $source['transport_transaction_id'];
         $expression = WebModelPage::userStopExpression((string) $surface['url'], $witnesses,
-            (array) $source['baseline_users'], !$clicked, true, self::acceptedInitialUser($source, $surface),
-            $owner['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, true, $initialBinding,
+            (array) $source['baseline_users'], !$liveSend && !$clicked, true, self::acceptedInitialUser($source, $surface),
+            $owner['web_chat']['mode'] ?? 'temporary', $verifiedSavedChat, !$liveSend, $initialBinding,
             self::acceptedTemporaryStopSource($source, $surface, $owner['web_chat']['mode'] ?? 'temporary'));
         $this->evaluateTaskSession($sessionId, $expression,
-            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface, $initialBinding): void {
+            function ($error, $state) use ($responseId, $commandId, $sessionId, $deadline, $clicked, $idleSince, $surface, $initialBinding, $liveSend, $prepareWhileBusy): void {
                 if (!$this->steeringSessionOwns($responseId, $sessionId)) {
                     $this->releaseSteeringPreparation($responseId, $sessionId);
                     return;
@@ -4061,6 +4065,11 @@ JS;
                     }
                     $clicked = $clicked || !empty($state['stopped']);
                     $bindingReady = $initialBinding === '' || !empty($this->taskSessions[$sessionId]['web_chat']['conversation_id']);
+                    if ($prepareWhileBusy && $bindingReady && !empty($state['editor_ready'])
+                        && !empty($state['generation_running'])) {
+                        $this->startTaskTurn($responseId, $commandId, $sessionId, false);
+                        return;
+                    }
                     if (empty($state['generation_running']) && !empty($state['editor_ready']) && $bindingReady) {
                         if ($idleSince !== null && microtime(true) - $idleSince >= 1.0) {
                             $this->startTaskTurn($responseId, $commandId, $sessionId, false);
@@ -4097,7 +4106,11 @@ JS;
                             $deadline, $clicked, $idleSince), null, false);
                         return;
                     }
-                    $this->taskFailTurn($responseId, 'steering_stop_unconfirmed', '未能确认插话原页已停止且历史仍在；未发送新消息或全量重发。', true);
+                    if ($liveSend) {
+                        $this->taskFailTurn($responseId, 'CHATGPT_STEERING_COMPOSER_UNAVAILABLE', 'The original Web chat did not expose an owned composer for this update.', true);
+                    } else {
+                        $this->taskFailTurn($responseId, 'steering_stop_unconfirmed', '未能确认插话原页已停止且历史仍在；未发送新消息或全量重发。', true);
+                    }
                     $this->releaseSteeringPreparation($responseId, $sessionId);
                     return;
                 }
@@ -4131,18 +4144,23 @@ JS;
         return true;
     }
 
-    /** Reject late stop callbacks after another steer, compaction, cancellation or session claim wins. */
-    private function steeringSessionOwns(string $responseId, string $sessionId): bool
+    /** Reject callbacks after another steer, compaction, cancellation or session claim wins. */
+    private function steeringSessionOwns(string $responseId, string $sessionId, ?string $submitDocument = null): bool
     {
         $session = $this->taskSessions[$sessionId] ?? null;
         if (!is_array($session) || ($session['response_id'] ?? '') !== $responseId) return false;
-        $ledger = TaskLedger::execution($responseId);
-        $job = ResponseJob::execution($responseId);
+        $ledger = TaskLedger::pollExecution($responseId);
+        $job = $ledger['job'];
+        $surface = $ledger['surface'];
         return $ledger['turn']['response_id'] === $responseId && $ledger['turn']['generation_id'] === $job['generation_id']
-            && $ledger['turn']['status'] === 'queued' && empty($ledger['turn']['error_code'])
-            && in_array($job['status'], ['queued', 'running'], true) && empty($job['submit_intent_at'])
-            && $ledger['surface']['owner_incarnation'] === $session['owner_incarnation']
-            && (int) $ledger['surface']['fencing_version'] === (int) $session['fencing_version'];
+            && empty($ledger['turn']['error_code']) && in_array($job['status'], ['queued', 'running'], true)
+            && $surface['owner_incarnation'] === $session['owner_incarnation']
+            && (int) $surface['fencing_version'] === (int) $session['fencing_version']
+            && ($submitDocument === null
+                ? $ledger['turn']['status'] === 'queued' && empty($job['submit_intent_at'])
+                : $ledger['turn']['status'] === 'submit_intent' && !empty($job['submit_intent_at'])
+                    && $job['submitted_document_nonce'] === $submitDocument
+                    && $surface['document_nonce'] === $submitDocument && $surface['session_id'] === $sessionId);
     }
 
     /** Release a pre-composer observer without closing its target or detaching a newer surface owner. */
@@ -4341,6 +4359,7 @@ JS;
             $surface = $ledger['surface'];
             $session = $this->taskSessions[$sessionId] ?? null;
             if (!is_array($session)) throw new GatewayError('CHATGPT_SURFACE_ATTACH_FAILED', '任务页面控制会话已经失效。', 409);
+            $steeringMarker = SteeringContext::liveSendMarker($job);
             $roundPrefix = '';
             $continuation = false;
             if (is_string($job['previous_response_id'] ?? null) && $job['previous_response_id'] !== '') {
@@ -4363,7 +4382,10 @@ JS;
                 'operation_kind' => (string) ($job['operation_kind'] ?? 'response'),
                 'generation_id' => (string) ($job['generation_id'] ?? ''),
                 'durable_turn_id' => (string) ($job['durable_turn_id'] ?? ''),
-                'prompt' => (string) $job['prompt'],
+                'prompt' => $steeringMarker === '' ? (string) $job['prompt'] : $steeringMarker . "\n" . $job['prompt'],
+                'steering_send_marker' => $steeringMarker,
+                'steering_prepare_while_busy' => $steeringMarker !== '' && empty($job['attachments'])
+                    && empty($job['transport_transaction_id']),
                 'attachments' => (array) ($job['attachments'] ?? []),
                 'requested_effort' => $job['reasoning_effort'] ?? null,
                 // A newly created/about:blank surface must still prove the Temporary Chat
@@ -4507,7 +4529,8 @@ JS;
                     || $this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''), true))
                 && (($turn['web_chat']['mode'] ?? 'temporary') !== 'regular' || !empty($turn['web_chat']['conversation_id'])
                     || (array) ($baseline['user_ids'] ?? []) === [])
-                && !empty($baseline['editor_ready']) && empty($baseline['generation_running']);
+                && !empty($baseline['editor_ready'])
+                && (empty($baseline['generation_running']) || !empty($turn['steering_prepare_while_busy']));
             if (!$ready) {
                 if ($this->deferSavedChatLoad($responseId, (string) $turn['session_id'],
                     fn() => $this->confirmTaskEditor($responseId))) return;
@@ -5038,6 +5061,13 @@ JS;
                     is_string($turn['transport_transaction_id'] ?? null) ? (string) $turn['transport_transaction_id'] : null,
                     $attachmentTokens, $decisionEvidence, $this->isFirstFreeConversation($job, $capabilities)
             ) : null;
+            if (is_array($plan) && !empty($turn['steering_prepare_while_busy'])) {
+                // Staging uses its own model and messages. Let the source settle naturally
+                // before re-entering the existing multipart preparation on this document.
+                $this->chatGptTurns[$responseId]['steering_prepare_while_busy'] = false;
+                $this->closeTaskEffortMenu($responseId, fn() => $this->confirmTaskEditor($responseId, (float)$turn['deadline']), $recover);
+                return;
+            }
             \app\gateway\model\ContextDecision::record($responseId, (string)$turn['prompt'], $effectiveBudget, $plan, $attachmentTokens, $decisionEvidence);
             if (is_array($plan)) {
                 // A pinned recovery cannot repartition acknowledged history. Validate only the
@@ -6325,6 +6355,9 @@ JS;
         $stagedUrl = $staged ? (string)($turn['multipart_chat_url'] ?? '') : '';
         $stageAck = $staged && $stagedUrl === '' ? trim((string)($stages[$stageCount - 1]['ack'] ?? '')) : '';
         $expected = $stagedUrl !== '' ? ['url'=>$stagedUrl] : ($stageAck !== '' ? ['stage_ack'=>$stageAck] : []);
+        if (!$searchOnly && !empty($turn['steering_prepare_while_busy'])) {
+            $expected = ['url'=>(string) $execution['surface']['url'], 'live_steering'=>true];
+        }
         $operation = bin2hex(random_bytes(8));
         $this->chatGptTurns[$responseId]['connector_clear_id'] = $operation;
         $keys = array_flip(['session_id','surface_id','target_id','document_nonce','owner_incarnation','fencing_version',
@@ -6525,6 +6558,19 @@ JS;
                     };
                     if ($checkpoint && $this->deferTaskCooldown($responseId, $retry, true)) return;
                     $retry();
+                    return;
+                }
+                if (!empty($turn['steering_send_marker']) && empty($turn['continuation_sending'])) {
+                    // An unavailable Connector is not evidence that the source stopped.
+                    // Keep the document and never reload or replace it from this observer.
+                    try {
+                        if ($this->steeringSessionOwns($responseId, (string) $turn['session_id'])) {
+                            $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_UNAVAILABLE',
+                                'The exact connector was unavailable in the original Web chat. The update remains unsent.', true);
+                        }
+                    } catch (GatewayError $failure) {
+                        $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    }
                     return;
                 }
                 // A saved ordinary chat can lose its loaded App catalog between messages.
@@ -7284,13 +7330,15 @@ JS;
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
+        $steering = !empty($turn['steering_send_marker']) && empty($turn['continuation_sending']);
+        if ($steering) $deadline = (float) $turn['deadline'];
         if ($this->deferTaskCooldown($responseId,
             fn() => $this->waitTaskSendReady($responseId, min((float)$turn['deadline'], microtime(true) + 120), $owner))) return;
         $keys = array_flip(['surface_id', 'target_id', 'session_id', 'document_nonce', 'owner_incarnation',
             'fencing_version', 'logical_response_id', 'transport_transaction_id', 'transport_stage_sent', 'transport_stage_acked']);
         $owner ??= array_intersect_key($turn, $keys);
         if (array_intersect_key($turn, $keys) !== $owner) return;
-        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(), function ($error, $state) use ($responseId, $deadline, $keys, $owner): void {
+        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression($steering), function ($error, $state) use ($responseId, $deadline, $keys, $owner): void {
             $current = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($current) || array_intersect_key($current, $keys) !== $owner) return;
             if ($error === null && is_array($state) && !empty($state['ready']) && microtime(true) < $deadline) {
@@ -7315,7 +7363,8 @@ JS;
             'fencing_version', 'logical_response_id', 'transport_transaction_id', 'transport_stage_sent', 'transport_stage_acked']);
         $owner ??= array_intersect_key($turn, $keys);
         if (array_intersect_key($turn, $keys) !== $owner) return;
-        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression(),
+        $steering = !empty($turn['steering_send_marker']) && empty($turn['continuation_sending']);
+        $this->evaluateTask($responseId, WebModelPage::sendReadinessExpression($steering),
             function ($readyError, $ready) use ($responseId, $deadline, $keys, $owner): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || array_intersect_key($turn, $keys) !== $owner) return;
@@ -7639,11 +7688,24 @@ JS;
         if (!is_array($turn)) return;
         if ($this->deferTaskCooldown($responseId,
             fn() => $this->waitTaskSendReady($responseId, min((float)$turn['deadline'], microtime(true) + 120)), true)) return;
-        $this->evaluateTask($responseId, WebModelPage::capabilityExpression(),
-            function ($surfaceError, $surface) use ($responseId): void {
+        $steering = !empty($turn['steering_send_marker']) && empty($turn['continuation_sending']);
+        $this->evaluateTask($responseId, $steering ? WebModelPage::baselineExpression() : WebModelPage::capabilityExpression(),
+            function ($surfaceError, $surface) use ($responseId, $steering): void {
                 if (!isset($this->chatGptTurns[$responseId])) return;
-                $turn = $this->chatGptTurns[$responseId] ?? null;
-                $rootRequired = is_array($turn) && !empty($turn['require_root_before_send'])
+                $turn = $this->chatGptTurns[$responseId];
+                if ($steering) {
+                    try {
+                        if (!$this->steeringSessionOwns($responseId, (string) $turn['session_id'])) return;
+                    } catch (GatewayError $failure) {
+                        $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                        return;
+                    }
+                    if ($surfaceError !== null || !is_array($surface) || empty($surface['editor_ready'])) {
+                        $this->waitTaskSendReady($responseId, (float) $turn['deadline']);
+                        return;
+                    }
+                }
+                $rootRequired = !empty($turn['require_root_before_send'])
                     && empty($turn['accepted']) && empty($turn['continuation_sending'])
                     && (int) ($turn['transport_stage_acked'] ?? 0) === 0;
                 if ($surfaceError !== null || !is_array($surface)
@@ -7651,6 +7713,10 @@ JS;
                     || ($rootRequired && !$this->taskChatMatches($responseId, (string) ($surface['url'] ?? ''), true))) {
                     $this->taskFailTurn($responseId, 'CHATGPT_TEMPORARY_CHAT_LOST', '发送前任务页面与绑定的网页对话不匹配，已停止发送。');
                     return;
+                }
+                if ($steering) {
+                    $this->chatGptTurns[$responseId]['baseline_users'] = (array) ($surface['user_ids'] ?? []);
+                    $this->chatGptTurns[$responseId]['baseline_assistants'] = (array) ($surface['assistant_ids'] ?? []);
                 }
                 $this->commitTaskSend($responseId);
             });
@@ -7663,7 +7729,9 @@ JS;
         if (!is_array($turn)) return;
         if ($this->deferTaskCooldown($responseId,
             fn() => $this->waitTaskSendReady($responseId, min((float)$turn['deadline'], microtime(true) + 120)))) return;
+        $steering = !empty($turn['steering_send_marker']) && empty($turn['continuation_sending']);
         try {
+            if ($steering && !$this->steeringSessionOwns($responseId, (string) $turn['session_id'])) return;
             ResponseJob::recordTransportSelection((string) ($turn['logical_response_id'] ?? $responseId),
                 (array) ($turn['requested_mode'] ?? []));
             if (!empty($turn['tool_capable'])) {
@@ -7735,14 +7803,38 @@ JS;
             $this->taskFailTurn($responseId, $error->errorCode, $error->getMessage());
             return;
         }
-        $this->evaluateTask($responseId, WebModelPage::focusSendExpression(), function ($error, $focused) use ($responseId): void {
-            if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
+        $this->focusCommittedTaskSend($responseId, $steering);
+    }
+
+    /** Re-read a moving Send button only before this worker dispatches its one native key. */
+    private function focusCommittedTaskSend(string $responseId, bool $steering): void
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $marker = $steering ? (string) $turn['steering_send_marker'] : '';
+        $this->evaluateTask($responseId, WebModelPage::focusSendExpression($steering, $marker), function ($error, $focused) use ($responseId, $steering): void {
+            $turn = $this->chatGptTurns[$responseId] ?? null;
+            if (!is_array($turn)) return;
+            if ($steering) {
+                if (!empty($turn['sent_at'])) return;
+                try {
+                    if (!$this->steeringSessionOwns($responseId, (string) $turn['session_id'], (string) $turn['document_nonce'])) return;
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                    return;
+                }
+            }
+            if ($error !== null || !is_array($focused) || empty($focused['ok'])
+                || ($steering && microtime(true) >= (float) $turn['deadline'])) {
+                if ($steering && microtime(true) < (float) $turn['deadline']) {
+                    Timer::add(0.25, fn() => $this->focusCommittedTaskSend($responseId, true), null, false);
+                    return;
+                }
                 $code = is_array($focused) ? (string) ($focused['code'] ?? 'CHATGPT_SEND_FOCUS_FAILED') : 'CHATGPT_SEND_FOCUS_FAILED';
                 $this->taskFailTurn($responseId, $code, 'ChatGPT 发送按钮无法获得键盘焦点。', true);
                 return;
             }
-            $turn = $this->chatGptTurns[$responseId] ?? null;
-            if (is_array($turn) && !empty($turn['compaction_repair_used'])) {
+            if (!empty($turn['compaction_repair_used'])) {
                 $logicalResponseId = (string) ($turn['logical_response_id'] ?? $responseId);
                 if (ContextCompaction::acceptedRetainedHandoffSummary($logicalResponseId) !== null) {
                     $this->chatGptTurns[$responseId]['compaction_phase'] = 'waiting';
@@ -7982,7 +8074,8 @@ JS;
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular',
             $temporarySubmission, $acceptedTemporarySubmission,
             in_array($ledger['job']['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
-                && !empty($ledger['job']['previous_response_id']) && $toolCapable);
+                && !empty($ledger['job']['previous_response_id']) && $toolCapable,
+            (string) ($turn['steering_send_marker'] ?? ''));
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId, $regularRecoveryState, $expression): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
@@ -8098,6 +8191,13 @@ JS;
                 return;
             }
             $session = $this->taskSessions[(string)$turn['session_id']] ?? [];
+            $awaitingSteeringUser = !empty($turn['steering_send_marker'])
+                && empty($turn['accepted']) && empty($snapshot['steering_user_accepted']);
+            if ($awaitingSteeringUser && !empty($this->chatGptTurns[$responseId]['response_deadline_expired'])) {
+                $this->taskFailTurn($responseId, 'CHATGPT_SEND_UNCONFIRMED',
+                    'The Web page did not confirm receipt of the update within the turn deadline.', true);
+                return;
+            }
             if ((int)($session['submission_http_status'] ?? 0) === 429
                 && !empty($session['submission_rate_limit_key']) && ($snapshot['generation_running'] ?? null) === false) {
                 if (ModelCooldown::remainingSeconds() > 0
@@ -8127,6 +8227,14 @@ JS;
                 // Existing button, identity and exact-receipt fences still authorize the action.
                 $snapshot['error'] = ['code'=>'CHATGPT_MESSAGE_STREAM_ERROR',
                     'message'=>'ChatGPT temporarily limited this request; waiting to resume the same chat.'];
+            }
+            if ($awaitingSteeringUser) {
+                // Source text and Stop can outlive the key dispatch. They cannot accept
+                // the revision or authorize native Retry on the source response.
+                if ($this->handleTaskPayloadRejection($responseId, $snapshot, $session)) return;
+                $this->deliverPendingToolWithoutSnapshot($responseId);
+                $this->scheduleTaskPoll($responseId, 0.25);
+                return;
             }
             $stoppedCompactSource = ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING'
                 && ($snapshot['stopped_thinking_visible'] ?? null) === true
@@ -10248,7 +10356,7 @@ JS;
     }
 
     /**
-     * Stop Web generation promptly for a queued human update while accepted host calls drain.
+     * Drain accepted host calls before sending a queued human update.
      * This keeps the observer and capability alive, delivers already registered calls, and
      * leaves exact results to the existing receipt/steering transaction. It never completes
      * the old answer, revokes tools, or submits the new instruction before that transaction.
@@ -10274,6 +10382,12 @@ JS;
                 }
             }
             $state['checked_at'] = $now;
+            if ($state['pending']) {
+                $settings = GatewaySettings::internal();
+                $state['live_send'] = ($updates['steering_live_send'] ?? $settings['steering_live_send'])
+                    && (($turn['web_chat']['mode'] ?? '') === 'regular'
+                        || !($updates['steering_full_context'] ?? $settings['steering_full_context']));
+            }
             if (!$state['pending']) {
                 $state['clicked'] = false;
                 $state['idle_confirmed'] = false;
@@ -10284,6 +10398,10 @@ JS;
         // The page's Stop button affects its generator, not the native invocation ledger.
         // Registered calls remain deliverable even after the Web stream disconnects.
         $this->deliverPendingToolWithoutSnapshot($responseId);
+        if (!empty($state['live_send'])) {
+            $this->scheduleTaskPoll($responseId, 0.25);
+            return true;
+        }
         if (!empty($state['idle_confirmed'])) {
             $this->scheduleTaskPoll($responseId, 0.25);
             return true;
@@ -10568,7 +10686,8 @@ JS;
         $expression = WebModelPage::responseExpression((array)($turn['baseline_users'] ?? []),
             (array)($turn['baseline_assistants'] ?? []), (string)($turn['continuation_marker'] ?? ''),
             (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), $responseId,
-            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular');
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular', '', false, false,
+            (string) ($turn['steering_send_marker'] ?? ''));
         $this->evaluateTaskSession((string)($turn['session_id'] ?? ''), $expression,
             function ($error, $fresh) use ($responseId, $logicalId, $turn, $terminal,
                 $proof, $prepared, $planningKey, $started): void {
@@ -11383,7 +11502,8 @@ JS;
             (array) $turn['baseline_users'], (array) $turn['baseline_assistants'], $href, $filename,
             (string) ($turn['bound_assistant_id'] ?? ''),
             ($turn['web_chat']['mode'] ?? 'temporary') === 'temporary' ? $responseId : '',
-            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : ''
+            ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
+            empty($turn['continuation_marker']) ? (string) ($turn['steering_send_marker'] ?? '') : ''
         ), function ($error, $focused) use ($responseId, $index): void {
             if (!isset($this->chatGptTurns[$responseId])) return;
             if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
@@ -11790,12 +11910,18 @@ JS;
                 $this->taskSessions[$sessionId]['saved_chat_load_requests'] = array_slice($reads, -8, null, true);
             }
             $turn = $this->chatGptTurns[(string) ($owner['response_id'] ?? '')] ?? [];
+            $steeringMarker = empty($turn['continuation_marker']) && !empty($turn['sent_at'])
+                ? (string) ($turn['steering_send_marker'] ?? '') : '';
+            $mainFrame = (string) ($owner['main_frame_id'] ?? '');
             if (((float) ($turn['sent_at'] ?? 0) > 0 || (int) ($turn['transport_stage_sent'] ?? 0) > 0)
-                && WebModelPage::isConversationSubmission($params, (string) ($owner['main_frame_id'] ?? ''), self::modelUrl())) {
+                && ($steeringMarker !== ''
+                    ? WebModelPage::isLiveSteeringSubmission($params, $mainFrame, self::modelUrl(), $steeringMarker)
+                    : WebModelPage::isConversationSubmission($params, $mainFrame, self::modelUrl()))) {
                 $this->taskSessions[$sessionId] = array_replace($owner, [
                     'submission_request_id'=>(string) ($params['requestId'] ?? ''), 'submission_finished'=>false,
                     'submission_request_bytes'=>is_string($params['request']['postData'] ?? null)
                         ? strlen($params['request']['postData']) : null,
+                    'submission_live_steering'=>$steeringMarker !== '',
                     'submission_request_started_at'=>microtime(true), 'submission_finished_at'=>0.0,
                     'submission_failed'=>false,
                     'submission_canceled'=>false, 'submission_error_code'=>null, 'submission_http_status'=>null,
@@ -11894,7 +12020,7 @@ JS;
             }
             $status = (int) round((float) ($response['status'] ?? 0));
             if (($params['requestId'] ?? '') !== '' && ($params['requestId'] ?? '') === ($owner['submission_request_id'] ?? '')
-                && WebModelPage::isBackendMessageTooLarge($url, $status, self::modelUrl())) {
+                && WebModelPage::isBackendMessageTooLarge($url, $status, self::modelUrl(), !empty($owner['submission_live_steering']))) {
                 $responseId = (string) ($owner['response_id'] ?? '');
                 if ($responseId !== '') {
                     $turn = $this->chatGptTurns[$responseId] ?? [];
@@ -11978,7 +12104,8 @@ JS;
             || empty($turn['tool_capable']) || empty($turn['sent_at']) || !empty($turn['accepted'])
             || !empty($turn['continuation_sending']) || !empty($turn['continuation_pending'])
             || !empty($turn['compaction_phase'])
-            || parse_url((string) ($params['request']['url'] ?? ''), PHP_URL_PATH) !== '/backend-api/f/conversation') return;
+            || (empty($owner['submission_live_steering'])
+                && parse_url((string) ($params['request']['url'] ?? ''), PHP_URL_PATH) !== '/backend-api/f/conversation')) return;
         preg_match_all('/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/',
             (string) ($turn['prompt'] ?? ''), $tokens);
         if (count($tokens[0]) !== 1) return;
@@ -11992,7 +12119,8 @@ JS;
                 || !empty($turn['continuation_sending']) || !empty($turn['continuation_pending'])
                 || !empty($turn['compaction_phase'])
                 || !WebModelPage::isTaskUserMessageSubmission($params,
-                    (string) ($owner['main_frame_id'] ?? ''), self::modelUrl(), $postData, $currentToken)) return;
+                    (string) ($owner['main_frame_id'] ?? ''), self::modelUrl(), $postData, $currentToken,
+                    !empty($owner['submission_live_steering']))) return;
             try {
                 if (ToolBroker::markSentByObservedSubmission($responseId,
                     (string) $turn['surface_id'], (string) $turn['target_id'], $sessionId,
@@ -12008,7 +12136,8 @@ JS;
         if (is_string($postData) && $postData !== '') {
             $observe($postData);
             if (WebModelPage::isTaskUserMessageSubmission($params,
-                (string) ($owner['main_frame_id'] ?? ''), self::modelUrl(), $postData, $currentToken)) return;
+                (string) ($owner['main_frame_id'] ?? ''), self::modelUrl(), $postData, $currentToken,
+                !empty($owner['submission_live_steering']))) return;
         }
         $this->taskCdp->send('Network.getRequestPostData', ['requestId' => $requestId], $sessionId,
             function ($error, $result) use ($observe): void {

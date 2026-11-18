@@ -237,31 +237,48 @@ JS;
     }
 
     /** Match a conversation POST rejection that still needs renderer classification. */
-    public static function isBackendMessageTooLarge(string $url, int $status, string $modelUrl): bool
+    public static function isBackendMessageTooLarge(string $url, int $status, string $modelUrl, bool $steering = false): bool
     {
         if ($status !== 413 || !self::isBackendUrl($url, $modelUrl)) return false;
         $path = (string) (parse_url($url, PHP_URL_PATH) ?: '');
-        return in_array($path, ['/backend-api/f/conversation', '/backend-api/conversation'], true);
+        return in_array($path, ['/backend-api/f/conversation', '/backend-api/conversation'], true)
+            || ($steering && $path === '/backend-api/f/steer_turn');
     }
 
     /** Only the owned main frame's actual conversation POST can classify this submission. */
-    public static function isConversationSubmission(array $params, string $mainFrame, string $modelUrl): bool
+    public static function isConversationSubmission(array $params, string $mainFrame, string $modelUrl, bool $steering = false): bool
     {
         $request = (array) ($params['request'] ?? []);
         $url = (string) ($request['url'] ?? '');
+        $path = parse_url($url, PHP_URL_PATH);
         return $mainFrame !== '' && ($params['frameId'] ?? '') === $mainFrame
             && ($request['method'] ?? '') === 'POST' && self::isBackendUrl($url, $modelUrl)
-            && in_array(parse_url($url, PHP_URL_PATH), ['/backend-api/f/conversation','/backend-api/conversation'], true);
+            && (in_array($path, ['/backend-api/f/conversation','/backend-api/conversation'], true)
+                || ($steering && $path === '/backend-api/f/steer_turn'));
     }
 
     /** A task send is the current main frame's exact new user-message request. */
     public static function isTaskUserMessageSubmission(array $params, string $mainFrame,
-        string $modelUrl, string $postData, string $currentToken): bool
+        string $modelUrl, string $postData, string $currentToken, bool $steering = false): bool
     {
-        if (!self::isConversationSubmission($params, $mainFrame, $modelUrl)
-            || parse_url((string) ($params['request']['url'] ?? ''), PHP_URL_PATH) !== '/backend-api/f/conversation'
-            || strlen($postData) > 4194304
+        if (!self::isConversationSubmission($params, $mainFrame, $modelUrl, $steering)
+            || (!$steering && parse_url((string) ($params['request']['url'] ?? ''), PHP_URL_PATH) !== '/backend-api/f/conversation')
             || preg_match('/\Aturn_[A-Za-z0-9_-]{32}\z/D', $currentToken) !== 1) return false;
+        return self::submissionHasUserWitness($postData, $currentToken);
+    }
+
+    /** Accept network status for a live revision only when its own unique draft was posted. */
+    public static function isLiveSteeringSubmission(array $params, string $mainFrame, string $modelUrl, string $marker): bool
+    {
+        $postData = $params['request']['postData'] ?? null;
+        return $marker !== '' && is_string($postData)
+            && self::isConversationSubmission($params, $mainFrame, $modelUrl, true)
+            && self::submissionHasUserWitness($postData, $marker);
+    }
+
+    private static function submissionHasUserWitness(string $postData, string $witness): bool
+    {
+        if (strlen($postData) > 4194304) return false;
         $body = json_decode($postData, true, 64);
         if (!is_array($body) || ($body['action'] ?? null) !== 'next') return false;
         $messages = $body['messages'] ?? null;
@@ -271,7 +288,7 @@ JS;
         $parts = $message['content']['parts'] ?? null;
         return is_array($parts) && array_is_list($parts)
             && count(array_filter($parts, static fn(mixed $part): bool => is_string($part)
-                && str_contains($part, $currentToken))) > 0;
+                && str_contains($part, $witness))) > 0;
     }
 
     /** Parse top-level upstream errors, including a rejected HTTP-200 SSE; never model-authored text. */
@@ -868,7 +885,8 @@ const composer=composers[0];
 const facts={composer_count:1,generation_running:!!generationStop(),disabled:!!composer.disabled,
     read_only:!!composer.readOnly,aria_disabled:composer.getAttribute('aria-disabled')==='true',
     editable:'value' in composer||composer.isContentEditable};
-if(facts.generation_running||facts.disabled||facts.read_only||facts.aria_disabled||!facts.editable)
+if((facts.generation_running&&!expected.live_steering)||facts.disabled||facts.read_only||facts.aria_disabled||!facts.editable
+    ||(expected.live_steering&&generationStopConfirmation().present))
     return {ok:false,code:'CHATGPT_EDITOR_NOT_READY',...facts};
 if(__FOCUS__)composer.focus();
 const selection=getSelection(),inside='value' in composer
@@ -990,16 +1008,19 @@ return {ok:true,text:text.replace(/\u00a0/g,' ').replace(/^\s+/,'')};
 JS);
     }
 
-    public static function sendReadinessExpression(): string
+    /** Read the native submit control; experimental steering also rejects a blocking dialog. */
+    public static function sendReadinessExpression(bool $steering = false): string
     {
-        return self::wrap(<<<'JS'
+        return self::wrap(str_replace('__STEERING__', $steering ? 'true' : 'false', <<<'JS'
 const composer=visibleOne(COMPOSER);if(!composer)return {ready:false,code:'CHATGPT_EDITOR_MISSING'};
+if(__STEERING__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length!==1)return {ready:false,code:'CHATGPT_EDITOR_AMBIGUOUS'};
 const buttons=composerSendButtons(composer);
 if(buttons.length!==1)return {ready:false,code:buttons.length?'CHATGPT_SEND_BUTTON_AMBIGUOUS':'CHATGPT_SEND_BUTTON_MISSING'};
 const button=buttons[0];
+if(__STEERING__&&(button===generationStop()||generationStopConfirmation().present))return {ready:false,code:'CHATGPT_SEND_NOT_READY'};
 if(button.disabled||button.getAttribute('aria-disabled')==='true')return {ready:false,code:'CHATGPT_SEND_DISABLED'};
 return {ready:true,code:null};
-JS);
+JS));
     }
 
     /** Follow the newest visible ChatGPT turn only through its uniquely named scroll control. */
@@ -1143,16 +1164,21 @@ JS));
     }
 
     /** Focus the exact active send button so CDP Enter follows ChatGPT's native keyboard path. */
-    public static function focusSendExpression(): string
+    public static function focusSendExpression(bool $steering = false, string $steeringMarker = ''): string
     {
-        return self::wrap(<<<'JS'
+        return self::wrap(str_replace(['__STEERING__', '__MARKER__'], [$steering ? 'true' : 'false',
+            json_encode($steeringMarker, JSON_THROW_ON_ERROR)], <<<'JS'
 const composer=visibleOne(COMPOSER);if(!composer)return {ok:false,code:'CHATGPT_EDITOR_MISSING'};
+if(__STEERING__&&[...document.querySelectorAll(COMPOSER)].filter(visible).length!==1)return {ok:false,code:'CHATGPT_EDITOR_AMBIGUOUS'};
+const marker=__MARKER__;
+if(marker&&!composerText(composer).includes(marker))return {ok:false,code:'CHATGPT_EDITOR_VERIFY_FAILED'};
 const buttons=composerSendButtons(composer);
 if(buttons.length!==1)return {ok:false,code:buttons.length?'CHATGPT_SEND_BUTTON_AMBIGUOUS':'CHATGPT_SEND_BUTTON_MISSING'};
 const button=buttons[0];
+if(__STEERING__&&(button===generationStop()||generationStopConfirmation().present))return {ok:false,code:'CHATGPT_SEND_NOT_READY'};
 if(button.disabled||button.getAttribute('aria-disabled')==='true')return {ok:false,code:'CHATGPT_SEND_DISABLED'};
 button.focus();return {ok:document.activeElement===button,code:document.activeElement===button?null:'CHATGPT_SEND_FOCUS_FAILED'};
-JS);
+JS));
     }
 
     public static function sendExpression(): string
@@ -1351,12 +1377,13 @@ JS));
      * @param string $temporarySubmission Current physical temporary response ID, scoped to this document.
      * @param bool $acceptedTemporarySubmission Ledger confirms this physical send on the current document.
      * @param bool $compactionSourceIdle Observe the primary idle control while draining a checkpoint's source.
+     * @param string $steeringMarker Marker in the new physical steering message, required to bind its reply.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false,
         string $initialBindingMarker = '', bool $regularRecovery = false, string $temporarySubmission = '',
-        bool $acceptedTemporarySubmission = false, bool $compactionSourceIdle = false): string
+        bool $acceptedTemporarySubmission = false, bool $compactionSourceIdle = false, string $steeringMarker = ''): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1366,10 +1393,12 @@ JS));
         $bound = json_encode($boundResponseId, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $initialBinding = json_encode($initialBindingMarker, JSON_THROW_ON_ERROR);
         $temporary = json_encode($temporarySubmission, JSON_THROW_ON_ERROR);
+        $steering = json_encode($steeringMarker, JSON_THROW_ON_ERROR);
         $body = <<<'JS'
 const beforeUsers=new Set(__USERS__);const beforeAssistants=new Set(__ASSISTANTS__);
 const beforeUserCount=__USER_COUNT__;const beforeAssistantCount=__ASSISTANT_COUNT__;
 const expectedContinuationMarker=__MARKER__,boundResponseId=__BOUND__;
+const expectedSteeringMarker=__STEERING_MARKER__;
 const expectedInitialBinding=__INITIAL_BINDING__;
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
 const assistants=assistantTurns().map((el,i)=>({el,id:turnId(el,i,'assistant')}));
@@ -1403,7 +1432,12 @@ const boundGroupUser=uniqueUser===lastUser&&uniqueUser&&boundGroups.length===1
     &&uniqueUser.id==='group:user:'+boundResponseId.slice('group:assistant:'.length)
     &&uniqueUser.el===boundGroups[0].el
     &&!uniqueUser.el.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,[data-user-message-bubble]')?uniqueUser:null;
-const newUser=continuationUser||countGrowthUser||identityUser||boundGroupUser;
+// During a live steer the old stream can still create or remount an assistant row.
+// Require the uniquely marked, latest native user bubble before binding its reply.
+const markedUser=expectedSteeringMarker?markedSteeringUser(expectedSteeringMarker):null;
+const steeringUser=markedUser&&!beforeUsers.has(markedUser.id)?markedUser:null;
+const steeringResponse=!!expectedSteeringMarker&&!continuationUser;
+const newUser=continuationUser||(expectedSteeringMarker?steeringUser:(countGrowthUser||identityUser||boundGroupUser));
 const initialBindingWitness=!!expectedInitialBinding&&!!newUser&&[newUser.el?.innerText,newUser.el?.textContent].some(t=>String(t||'').includes('<rcmaker_chat_binding>'+expectedInitialBinding+'</rcmaker_chat_binding>'));
 const answerCandidates=newUser?assistants.filter(entry=>after(newUser.el,entry.el)&&!beforeAssistants.has(entry.id)):[];
 // The current ChatGPT renderer can virtualize the original user bubble after
@@ -1417,9 +1451,9 @@ const answerCandidates=newUser?assistants.filter(entry=>after(newUser.el,entry.e
 const sameGroupResponseId=newUser?.id.startsWith('group:user:')
     ?'group:assistant:'+newUser.id.slice('group:user:'.length):null;
 const sameGroupAnswers=sameGroupResponseId?assistants.filter(entry=>entry.id===sameGroupResponseId&&!beforeAssistants.has(entry.id)):[];
-const unboundAnswer=sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAnswers[0]:null)
+const unboundAnswer=expectedSteeringMarker&&!newUser?null:sameGroupResponseId?(sameGroupAnswers.length===1?sameGroupAnswers[0]:null)
     :answerCandidates.length===1?answerCandidates[0]
-        :((newUser||users.length===0)&&identityAssistants.length===1?identityAssistants[0]:null);
+        :(!expectedSteeringMarker&&(newUser||users.length===0)&&identityAssistants.length===1?identityAssistants[0]:null);
 const temporarySubmission=__TEMPORARY_SUBMISSION__;
 const initialTemporary=temporarySubmission&&!expectedContinuationMarker&&beforeUsers.size===0&&beforeAssistants.size===0
     &&users.length===1&&assistants.length===1&&unboundAnswer?.el===newUser?.el
@@ -1435,7 +1469,19 @@ const promoted=boundMatches.length===0
             ?observeNativeInitialGroup(temporarySubmission,boundResponseId,unboundAnswer,__ACCEPTED_TEMPORARY_SUBMISSION__):null)
         ||(initialRegular&&boundResponseId
             ?observeNativeInitialGroup(expectedInitialBinding,boundResponseId,unboundAnswer,false,true):null):null;
-const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
+// The native steer request can add an inline user unit to the same renderer group.
+// Treat only the suffix after that unit as this submission's reply, even if the group
+// already had an answer before the send. A separately rendered follow-up still works.
+const steeringGroup=steeringResponse?steeringUser?.el.closest('[data-turn-key]'):null;
+const groupedSteeringAnswer=steeringGroup&&steeringUser&&[...steeringGroup.querySelectorAll(
+    '[data-chatgpt-agent-turn-start],[data-content-search-unit-key$=":assistant"],[data-message-author-role="assistant"],[data-conversation-role="assistant"]')]
+    .some(node=>afterSteeringUser(steeringUser,node))
+    ?{el:steeringGroup,id:turnId(steeringGroup,0,'assistant')}:null;
+const answer=steeringResponse?(steeringUser?groupedSteeringAnswer||unboundAnswer:null)
+    :boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted):unboundAnswer;
+const inlineSteeringUser=groupedSteeringAnswer?steeringUser:null;
+const answerNodes=(root,selector)=>[...root.querySelectorAll(selector)]
+    .filter(node=>!inlineSteeringUser||afterSteeringUser(inlineSteeringUser,node));
 if(initialTemporary&&(!boundResponseId||boundMatches.length===1)){
     observeNativeInitialGroup(temporarySubmission,boundResponseId,unboundAnswer);
 }
@@ -1454,7 +1500,7 @@ if(temporarySubmission&&temporaryChatPage(location.pathname,location.search)
 // This does not infer acceptance or ownership: stop callers still require the
 // durable accepted submission, current task fence and freshly verified account.
 // Never seed it from a historical answer, prose, an assistant quote or a count alone.
-if(expectedInitialBinding&&beforeUsers.size===0&&beforeAssistants.size===0&&answer
+if(!steeringResponse&&expectedInitialBinding&&beforeUsers.size===0&&beforeAssistants.size===0&&answer
     &&strong(answer.id)
     &&!new URLSearchParams(location.search).has('temporary-chat')){
     const key=Symbol.for('rcmaker.initial.response'),prior=globalThis[key];
@@ -1496,9 +1542,9 @@ if(answer){
     // Agent Activity precedes the final assistant search unit. Both belong to the same
     // response, and newer DIL responses may lack the legacy .markdown class.
     const rootSelector='.markdown,[data-markdown-text-style],[data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]';
-    const activityContainers=[...answer.el.querySelectorAll('[data-chatgpt-agent-turn-start]')]
+    const activityContainers=answerNodes(answer.el,'[data-chatgpt-agent-turn-start]')
         .map(marker=>marker.parentElement).filter(Boolean);
-    const allMarkdown=[...answer.el.querySelectorAll(rootSelector)]
+    const allMarkdown=answerNodes(answer.el,rootSelector)
         .filter(candidate=>!candidate.parentElement?.closest(rootSelector))
         .filter(candidate=>{
             if(!answer.el.hasAttribute('data-content-search-turn-key')&&!answer.el.hasAttribute('data-turn-key'))return true;
@@ -1509,7 +1555,7 @@ if(answer){
                     ||ownedAssistantMessageRoot(candidate,answer.el)
                     ||activityContainers.some(container=>container.contains(candidate));
         });
-    const statuses=[...answer.el.querySelectorAll('[data-streaming-response-status]')];
+    const statuses=answerNodes(answer.el,'[data-streaming-response-status]');
     const firstStatus=statuses[0]||null;
     const activityRoots=allMarkdown.filter(candidate=>candidate.getAttribute('data-markdown-text-tone')==='tertiary'
         && !candidate.closest('[data-content-search-unit-key]')
@@ -1528,7 +1574,7 @@ if(answer){
     // status text such as image-analysis progress. It can persist across several polls and then be
     // replaced wholesale by the real answer, so it must never become an irrevocable text prefix.
     if(allMarkdown.length===0&&!running){
-        const fallback=answer.el.querySelector('[data-message-author-role="assistant"],[data-conversation-role="assistant"]')
+        const fallback=answerNodes(answer.el,'[data-message-author-role="assistant"],[data-conversation-role="assistant"]')[0]
             ||(answer.el.hasAttribute('data-turn-key')?null:answer.el);
         if(fallback)roots=[fallback];
     }
@@ -1558,7 +1604,7 @@ if(answer){
         }
         return true;
     };
-    transportRecoveryVisible=[...answer.el.querySelectorAll('.text-chatgpt-recovery')]
+    transportRecoveryVisible=answerNodes(answer.el,'.text-chatgpt-recovery')
         .some(node=>nativeRecoveryPanel(node)!==null&&publiclyVisible(node));
     roots=roots.filter(notHidden);
     answerRootCount=roots.length;
@@ -1612,7 +1658,7 @@ if(answer){
         filename=filename.replace(/[\r\n\t]/g,' ').trim().slice(0,180)||'artifact';
         pushArtifact(href,filename,'anchor');
     }
-    const artifactRows=[...answer.el.querySelectorAll('*')].filter(row=>String(row.className||'').split(/\s+/).includes('group/artifact-row'));
+    const artifactRows=answerNodes(answer.el,'*').filter(row=>String(row.className||'').split(/\s+/).includes('group/artifact-row'));
     for(const row of artifactRows){
         const openers=[...row.querySelectorAll('button')].filter(button=>visible(button)&&String(button.className||'').split(/\s+/).includes('group/open-file'));
         if(openers.length!==1)continue;
@@ -1625,7 +1671,7 @@ if(answer){
     // The modern action bar may follow the answer search unit, but remains inside
     // the same stable assistant turn container. Never climb into another turn's controls.
     const actionHost=answer.el.closest('[data-turn-key],[data-content-search-turn-key],[data-turn-id],[data-turn-id-container]')||answer.el;
-    const copies=[...actionHost.querySelectorAll('button[data-testid="copy-turn-action-button"],.turn-action-controls button')]
+    const copies=answerNodes(actionHost,'button[data-testid="copy-turn-action-button"],.turn-action-controls button')
         .filter(button=>visible(button)&&!rendered?.contains(button)&&rendered!==null&&after(rendered,button));
     // Search-unit answers can have a plain Copy control in the immediately following sibling.
     // Keep that fallback local so another turn's action bar cannot complete this answer.
@@ -1673,6 +1719,7 @@ if(answer){
         return true;
     };
     const isStoppedStatus=candidate=>{
+        if(inlineSteeringUser&&!afterSteeringUser(inlineSteeringUser,candidate))return false;
         if(overlaps(candidate,stoppedAnswerRoots)||overlaps(candidate,commentary)||candidate.closest('pre,code,blockquote'))return false;
         // A grouped turn also contains its user's bubble; user-authored labels are never UI evidence.
         if(overlaps(candidate,userContentRoots)||candidate.closest(userContentSelector))return false;
@@ -1682,6 +1729,7 @@ if(answer){
     // Scope it to the bound answer ancestry so a historical cancelled turn cannot stop this one.
     const cancelledTurnState=[actionHost,...actionHost.querySelectorAll('[data-talvt-turn-state]')]
         .some(candidate=>String(candidate.getAttribute('data-talvt-turn-state')||'').toLowerCase()==='cancelled'
+            &&(!inlineSteeringUser||afterSteeringUser(inlineSteeringUser,candidate))
             &&(candidate===actionHost||candidate.contains(answer.el)||answer.el.contains(candidate))
             &&statusRendered(candidate));
     stoppedThinkingVisible=!running&&cancelledTurnState;
@@ -1703,6 +1751,7 @@ let error=null;
 // inside answer.el; otherwise the gateway waits for the full generation deadline.
 const currentTurn=(newUser?.el||answer?.el)?.closest('[data-content-search-turn-key],[data-turn-key],[data-turn-id],[data-testid^="conversation-turn-"]')||null;
 const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(candidate=>{
+    if(steeringResponse&&(!steeringUser||!afterSteeringUser(steeringUser,candidate)))return false;
     const label=String(candidate.innerText||candidate.textContent||'').replace(/\s+/g,' ').trim();
     if(!/^(?:消息流中的错误|訊息串流發生錯誤|Error in message stream|Error in the message stream)(?:\s|$)/i.test(label)
         ||!visible(candidate))return false;
@@ -1712,30 +1761,31 @@ const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(can
     if(currentTurn)return currentTurn.contains(candidate);
     return newUser?after(newUser.el,candidate):false;
 });
-const conversationReplacement=conversationReplacementCard(newUser,answer);
-if(conversationReplacement&&!answer&&newUser&&newUser===lastUser&&strong(newUser.id)
+const conversationReplacement=conversationReplacementCard(newUser,answer,steeringResponse?steeringUser:null);
+if(conversationReplacement&&!answer&&newUser&&(newUser===lastUser||newUser===steeringUser)&&strong(newUser.id)
     &&answerCandidates.length===0&&sameGroupAnswers.length===0){
     conversationReplacement.descriptor.current_user_without_answer=true;
 }
-const networkCard=conversationReplacement?null:networkErrorCard(newUser,answer,__REGULAR_RECOVERY__);
+const networkCard=conversationReplacement?null:networkErrorCard(newUser,answer,__REGULAR_RECOVERY__,steeringResponse?steeringUser:null);
 const networkRetry=networkCard?.descriptor||null;
+if(networkRetry&&steeringResponse&&steeringUser)networkRetry.steering_marker=expectedSteeringMarker;
 if(conversationReplacement)error={code:'CHATGPT_CONVERSATION_EXHAUSTED',message:'This ChatGPT conversation has reached its terminal capacity and must continue in a new chat.'};
 else if(networkCard)error={code:'CHATGPT_NETWORK_ERROR',message:'ChatGPT 当前回答出现网络错误，页面提供重试。'};
 else if(stoppedThinkingVisible)error={code:'CHATGPT_STOPPED_THINKING',message:'ChatGPT 已停止思考，当前回答不能确认为完成。'};
 else if(/your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i.test(pageText))error={code:'CHATGPT_SESSION_EXPIRED',message:'ChatGPT 网页会话已过期。'};
 else if(streamErrorAlert)error={code:'CHATGPT_MESSAGE_STREAM_ERROR',message:'ChatGPT 当前回答的消息流已断开，页面提供重试；原页面不能继续确认本回合。'};
-else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
-else if(answer?.el.querySelector('[data-testid="regenerate-thread-error-button"]')||/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
+else if(answer&&answerNodes(answer.el,'[data-testid="regenerate-thread-error-button"]').length&&/你提交的消息过长|你提交的訊息過長|the message you submitted was too long|message is too long|input is too long/i.test(visibleText))error={code:'CHATGPT_MESSAGE_TOO_LARGE',message:'ChatGPT 拒绝了当前消息：消息过长。请压缩上下文后继续。'};
+else if((answer&&answerNodes(answer.el,'[data-testid="regenerate-thread-error-button"]').length)||(!steeringResponse&&/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText)))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
 const recoveryAnchor=__REGULAR_RECOVERY__?{document_id:String(globalThis.performance?.timeOrigin??''),
     user_id:users.at(-1)?.id||null,assistant_id:assistants.at(-1)?.id||null}:null;
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,recovery_anchor:recoveryAnchor,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,steering_user_accepted:!!steeringUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,recovery_anchor:recoveryAnchor,error};
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__',
-                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__', '__RECOVERY_IDLE__'],
+                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__', '__RECOVERY_IDLE__', '__STEERING_MARKER__'],
             [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound,
                 $initialBinding, $regularRecovery ? 'true' : 'false', $temporary, $acceptedTemporarySubmission ? 'true' : 'false',
-                $regularRecovery || $compactionSourceIdle ? 'true' : 'false'],
+                $regularRecovery || $compactionSourceIdle ? 'true' : 'false', $steering],
             $body
         ), $legacyCitations);
     }
@@ -1757,12 +1807,14 @@ if(!/^[a-f0-9]{64}$/.test(String(expected.attempt_key||'')))return {clicked:fals
 if(generationStop())return {clicked:false,code:'generation_running'};
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
 const assistants=assistantTurns().map((el,i)=>({el,id:turnId(el,i,'assistant')}));
-const user=expected.user_id?users.find(entry=>entry.id===expected.user_id):null;
+const steeringUser=expected.steering_marker?markedSteeringUser(expected.steering_marker):null;
+if(expected.steering_marker&&steeringUser?.id!==expected.user_id)return {clicked:false,code:'response_changed'};
+const user=steeringUser||(expected.user_id?users.find(entry=>entry.id===expected.user_id):null);
 const answer=expected.response_id?(assistants.find(entry=>entry.id===expected.response_id)
     ||retainedInitialAssistant(assistants,new Set(),expected.response_id)):null;
 if((expected.user_id&&!user)||(expected.response_id&&!answer))return {clicked:false,code:'response_changed'};
-if((user&&users.at(-1)?.id!==user.id)||(answer&&assistants.at(-1)?.el!==answer.el))return {clicked:false,code:'response_changed'};
-const card=networkErrorCard(user,answer,expected.allow_message_stream===true);
+if((user&&!steeringUser&&users.at(-1)?.id!==user.id)||(answer&&assistants.at(-1)?.el!==answer.el))return {clicked:false,code:'response_changed'};
+const card=networkErrorCard(user,answer,expected.allow_message_stream===true,steeringUser);
 if(!card||card.descriptor.fingerprint!==expected.fingerprint
     ||card.descriptor.failure_id!==expected.failure_id)return {clicked:false,code:'error_changed'};
 if(!card.descriptor.available)return {clicked:false,code:'retry_unavailable'};
@@ -1786,11 +1838,12 @@ JS));
      * @param string $boundResponseId Stable assistant identity bound to the submitted message.
      * @param string $temporarySubmission Physical Temporary Chat response identity, if present.
      * @param string $initialBindingMarker Physical first saved-chat submission identity, if present.
+     * @param string $steeringMarker Exact native user update in a grouped reply, if present.
      * @return string CDP expression returning ok/code/count/kind; activation uses native keyboard input.
      */
     public static function focusArtifactDownloadExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $href, string $filename, string $boundResponseId = '', string $temporarySubmission = '',
-        string $initialBindingMarker = ''): string
+        string $initialBindingMarker = '', string $steeringMarker = ''): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1799,9 +1852,10 @@ JS));
         $bound = json_encode($boundResponseId, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $temporary = json_encode($temporarySubmission, JSON_THROW_ON_ERROR);
         $initialBinding = json_encode($initialBindingMarker, JSON_THROW_ON_ERROR);
+        $steering = json_encode($steeringMarker, JSON_THROW_ON_ERROR);
         return self::wrap(str_replace(
-            ['__USERS__', '__ASSISTANTS__', '__HREF__', '__FILENAME__', '__BOUND__', '__TEMPORARY_SUBMISSION__', '__INITIAL_BINDING__'],
-            [$users, $assistants, $expectedHref, $expectedFilename, $bound, $temporary, $initialBinding],
+            ['__USERS__', '__ASSISTANTS__', '__HREF__', '__FILENAME__', '__BOUND__', '__TEMPORARY_SUBMISSION__', '__INITIAL_BINDING__', '__STEERING_MARKER__'],
+            [$users, $assistants, $expectedHref, $expectedFilename, $bound, $temporary, $initialBinding, $steering],
             <<<'JS'
 const beforeUsers=new Set(__USERS__);const beforeAssistants=new Set(__ASSISTANTS__);const expectedHref=__HREF__,expectedFilename=__FILENAME__,boundResponseId=__BOUND__;
 const users=userTurns().map((el,i)=>({el,id:turnId(el,i,'user')}));
@@ -1844,7 +1898,11 @@ const answer=boundResponseId?(boundMatches.length===1?boundMatches[0]:promoted)
     :answerCandidates.length===1?answerCandidates[0]
         :(!newUser&&users.length===0&&identityAssistants.length===1?identityAssistants[0]:null);
 if(!answer)return {ok:false,code:'CHATGPT_ARTIFACT_RESPONSE_MISSING',count:0};
-const allMarkdown=[...answer.el.querySelectorAll('.markdown,[data-markdown-text-style]')]
+const steeringUser=__STEERING_MARKER__?markedSteeringUser(__STEERING_MARKER__):null;
+if(__STEERING_MARKER__&&(!steeringUser||!afterSteeringUser(steeringUser,answer.el)&&!answer.el.contains(steeringUser.el)))
+    return {ok:false,code:'CHATGPT_ARTIFACT_RESPONSE_MISSING',count:0};
+const scopedNodes=selector=>[...answer.el.querySelectorAll(selector)].filter(node=>!steeringUser||afterSteeringUser(steeringUser,node));
+const allMarkdown=scopedNodes('.markdown,[data-markdown-text-style]')
     .filter(candidate=>{
         if(!answer.el.hasAttribute('data-turn-key'))return true;
         const unit=candidate.closest('[data-content-search-unit-key]');
@@ -1853,7 +1911,7 @@ const allMarkdown=[...answer.el.querySelectorAll('.markdown,[data-markdown-text-
             :candidate.closest('[data-conversation-role="assistant"]')!==null
                 ||ownedAssistantMessageRoot(candidate,answer.el,true);
     });
-const statuses=[...answer.el.querySelectorAll('[data-streaming-response-status]')];
+const statuses=scopedNodes('[data-streaming-response-status]');
 const firstStatus=statuses[0]||null;
 const commentary=allMarkdown.filter(candidate=>candidate.closest('[data-streaming-response-status]')!==null
     ||candidate.closest('[data-testid^="cot-v5"]')!==null
@@ -1862,7 +1920,7 @@ const commentary=allMarkdown.filter(candidate=>candidate.closest('[data-streamin
     ||(firstStatus!==null&&Boolean(candidate.compareDocumentPosition(firstStatus)&Node.DOCUMENT_POSITION_FOLLOWING)));
 let roots=allMarkdown.filter(candidate=>!commentary.includes(candidate));
 if(allMarkdown.length===0){
-    const fallback=answer.el.querySelector('[data-message-author-role="assistant"],[data-conversation-role="assistant"]')
+    const fallback=scopedNodes('[data-message-author-role="assistant"],[data-conversation-role="assistant"]')[0]
         ||(answer.el.hasAttribute('data-turn-key')?null:answer.el);
     if(fallback)roots=[fallback];
 }
@@ -1881,7 +1939,7 @@ if(candidates.length>1)return {ok:false,code:'CHATGPT_ARTIFACT_LINK_AMBIGUOUS',c
 let target=candidates[0]||null;let kind=target?'anchor':null;
 if(!target){
     const rowTargets=[];
-    for(const row of [...answer.el.querySelectorAll('*')].filter(node=>String(node.className||'').split(/\s+/).includes('group/artifact-row'))){
+    for(const row of scopedNodes('*').filter(node=>String(node.className||'').split(/\s+/).includes('group/artifact-row'))){
         const buttons=[...row.querySelectorAll('button')].filter(visible);
         const openers=buttons.filter(button=>String(button.className||'').split(/\s+/).includes('group/open-file')&&String(button.getAttribute('aria-label')||'').trim()===expectedFilename);
         if(openers.length!==1)continue;
@@ -2186,6 +2244,20 @@ const turnId=(el,index,role)=>el.hasAttribute('data-turn-key')
     ||el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids')?.split(/\s+/)[0]
     ||el.getAttribute('data-testid')||el.getAttribute('data-content-search-unit-key')
     ||el.getAttribute('data-content-search-turn-key')||('turn-'+index);
+// An in-flight steer embeds a native user unit in the existing outer group.
+// This lookup is additional to userTurns(), whose group semantics other callers use.
+const markedSteeringUser=marker=>{
+    const bubbleSelector='[data-user-message-bubble],[data-message-author-role="user"]';
+    const entries=[...document.querySelectorAll(bubbleSelector)].filter(bubble=>visible(bubble)
+        &&!bubble.parentElement?.closest(bubbleSelector+',.markdown,[data-markdown-text-style],pre,code,blockquote'));
+    const matching=entries.filter(bubble=>[bubble.innerText,bubble.textContent].some(text=>String(text||'').includes(marker)));
+    if(matching.length!==1||matching[0]!==entries.at(-1))return null;
+    const bubble=matching[0];
+    const el=bubble.closest('[data-content-search-unit-key$=":user"],[data-turn="user"]')||bubble;
+    return {el,id:turnId(el,entries.length-1,'user')};
+};
+const afterSteeringUser=(user,node)=>node!==user.el&&!user.el.contains(node)
+    &&Boolean(user.el.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING);
 // The first native response may acquire its saved UUID after being rendered at /.
 // Pin that first UUID; a later SPA navigation must never move this witness to chat B.
 const initialResponseUrlMatches=(from,to)=>{
@@ -2344,7 +2416,7 @@ const nativeNewConversationAction=button=>{
 };
 // A current-turn danger callout whose sole action matches ChatGPT's localized New Chat
 // control proves that this conversation cannot accept another message. It is never Retry.
-const conversationReplacementCard=(user,answer)=>{
+const conversationReplacementCard=(user,answer,steeringUser=null)=>{
     const stateKey=Symbol.for('rcmaker.conversation.replacement.observation');
     const state=window[stateKey]||(window[stateKey]={card:null,sequence:0,failureId:''});
     if(generationStop()||(!user&&!answer)){state.card=null;return null;}
@@ -2362,6 +2434,7 @@ const conversationReplacementCard=(user,answer)=>{
         return true;
     };
     const candidates=[...document.querySelectorAll('aside[role="alert"]')].filter(card=>{
+        if(steeringUser&&!afterSteeringUser(steeringUser,card))return false;
         if(!rendered(card)||card.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,'+userSelector)
             ||!card.classList.contains('text-danger')||!card.classList.contains('border-text-danger/20'))return false;
         const owner=card.closest(turnSelector);
@@ -2400,7 +2473,7 @@ const conversationReplacementCard=(user,answer)=>{
 // and sole non-navigation retry action, independently of its localized timeout/error text.
 // Keep the old renderer's complete labels as a compatibility fallback, never as prose tests.
 // Keep the observed latest response identity, including grouped agent turns, as the UI boundary.
-const networkErrorCard=(user,answer,allowMessageStream=false)=>{
+const networkErrorCard=(user,answer,allowMessageStream=false,steeringUser=null)=>{
     const stateKey=Symbol.for('rcmaker.network.error.observation');
     const state=window[stateKey]||(window[stateKey]={card:null,sequence:0,failureId:''});
     if(generationStop()||(!user&&!answer)){state.card=null;return null;}
@@ -2419,6 +2492,7 @@ const networkErrorCard=(user,answer,allowMessageStream=false)=>{
     };
     const norm=value=>String(value||'').replace(/\s+/g,' ').trim();
     const candidates=[...document.querySelectorAll('[role="alert"]')].filter(card=>{
+        if(steeringUser&&!afterSteeringUser(steeringUser,card))return false;
         if(!rendered(card)||card.closest('.markdown,[data-markdown-text-style],pre,code,blockquote,'+userSelector))return false;
         const owner=card.closest(turnSelector);
         if(owner&&!owned.has(owner)){

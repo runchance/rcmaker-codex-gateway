@@ -4501,13 +4501,17 @@ final class ToolBroker
         ], $ordinaryFollowup);
         $browserNotice = self::browserToolNotice($hostToolNames, $contextJson);
         if (!$contextOnly) {
+            $canSpawn = in_array('collaboration__spawn_agent', $hostToolNames, true);
+            $execName = in_array('functions__exec', $hostToolNames, true) ? 'functions__exec'
+                : (in_array('exec', $hostToolNames, true) ? 'exec' : '');
             if ($hostToolNames !== []) {
                 $browserNotice = trim(self::efficientToolNotice($hostToolNames) . "\n" . $browserNotice);
             }
-            $execName = in_array('functions__exec', $hostToolNames, true) ? 'functions__exec'
-                : (in_array('exec', $hostToolNames, true) ? 'exec' : '');
             if ($execName !== '') {
                 $browserNotice = trim(self::codeModeToolNotice($execName) . "\n" . $browserNotice);
+            }
+            if ($canSpawn || $execName !== '') {
+                $browserNotice .= "\n" . self::subagentToolNotice((int) $settings['subagent_max_concurrency']);
             }
         }
         if ($browserNotice === '') return $prompt;
@@ -4586,12 +4590,6 @@ final class ToolBroker
             . "\n</codex_tool_efficiency>";
         $commandNotice = self::commandPermissionNotice($hostToolNames);
         if ($commandNotice !== '') $notice .= "\n" . $commandNotice;
-        if (in_array('collaboration__spawn_agent', $hostToolNames, true)) {
-            $notice .= "\n<codex_web_subagents>RCMAKER applies the console's Web child model and reasoning selection. "
-                . 'New native agents must inherit this Web transport; omit model and reasoning_effort overrides. '
-                . 'If a native-model child failed its initial assignment with invalid_encrypted_content before work started, create a fresh Web-inherited child for that unstarted assignment. '
-                . 'Reusing its ID cannot change its original model. Reuse healthy Web children and preserve completed work and exact receipts.</codex_web_subagents>';
-        }
         $async = in_array('request_user_input_async', $hostToolNames, true) ? 'request_user_input_async'
             : (in_array('functions__request_user_input_async', $hostToolNames, true) ? 'functions__request_user_input_async' : '');
         $blocking = in_array('request_user_input', $hostToolNames, true) ? 'request_user_input'
@@ -4605,6 +4603,18 @@ final class ToolBroker
             ? 'This asynchronous tool acknowledges that a question was shown; that receipt and any preselected option are not the user answer. The answer arrives as a later user message. Continue independent authorized work without waiting for a reply. An unanswered optional question does not prevent completing the task; do not idle, poll or resend it. Only steps requiring the missing decision or approval must wait. When an answer arrives, handle its actual intent together with the current task state, reusing work and results already completed. '
             : 'Use this tool only in a mode allowed by its current description. If unavailable, ask in ordinary public text; do not force a mode change. ';
         return $notice . "\n</codex_user_questions>";
+    }
+
+    /** Explain the configured shared concurrency ceiling for direct and Code Mode collaboration. */
+    private static function subagentToolNotice(int $limit): string
+    {
+        return "<codex_web_subagents>If your current tools expose native collaboration, plan for a maximum of {$limit} concurrent Web subagents across the gateway. "
+            . 'Other tasks share this limit, so fewer slots may be available. Count running children and pending starts. '
+            . 'At capacity, wait for a running child to finish or continue independent work yourself. Reuse healthy idle children when their context helps. '
+            . "RCMAKER applies the console's Web child model and reasoning selection. "
+            . 'New native agents must inherit this Web transport; omit model and reasoning_effort overrides. '
+            . 'If a native-model child failed its initial assignment with invalid_encrypted_content before work started, create a fresh Web-inherited child for that unstarted assignment when capacity permits. '
+            . 'Reusing its ID cannot change its original model. Preserve completed work and exact receipts.</codex_web_subagents>';
     }
 
     /** Explain the actual host browser route only when this turn advertises it and the task needs it. */
