@@ -8064,6 +8064,19 @@ JS;
         $acceptedTemporarySubmission = $temporarySubmission !== '' && $logicalResponseId === $responseId
             && ($ledger['job']['operation_kind'] ?? '') === 'response'
             && self::acceptedTemporaryStopSource($ledger['job'], $ledger['surface'], 'temporary') === $responseId;
+        $steeringMarker = (string) ($turn['steering_send_marker'] ?? '');
+        $mayConfirmSteering = $steeringMarker !== '' && $toolCapable && $ledger['job']['operation_kind'] === 'response';
+        if ($mayConfirmSteering && empty($turn['steering_connector_started'])) {
+            try {
+                $submission = $logicalResponseId === $responseId ? $ledger['job'] : ResponseJob::pollState($responseId);
+                if ($submission['submitted_document_nonce'] === $turn['document_nonce']
+                    && ToolBroker::steeringStartObserved($submission, $ledger['job'])) {
+                    $this->chatGptTurns[$responseId]['steering_connector_started'] = $turn['steering_connector_started'] = true;
+                }
+            } catch (GatewayError) {
+                // The original marker remains sufficient while optional Connector evidence is unavailable.
+            }
+        }
         $expression = WebModelPage::responseExpression((array) $turn['baseline_users'], (array) $turn['baseline_assistants'],
             (string)($turn['continuation_marker'] ?? ''), (string)($turn['bound_assistant_id'] ?? ''),
             self::hasLegacyCitationPrefix($turn),
@@ -8075,7 +8088,7 @@ JS;
             $temporarySubmission, $acceptedTemporarySubmission,
             in_array($ledger['job']['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
                 && !empty($ledger['job']['previous_response_id']) && $toolCapable,
-            (string) ($turn['steering_send_marker'] ?? ''));
+            $steeringMarker, $mayConfirmSteering && !empty($turn['steering_connector_started']));
         $this->observeTaskResponse($responseId, $expression, function ($error, $snapshot) use ($responseId, $regularRecoveryState, $expression): void {
             $turn = $this->chatGptTurns[$responseId] ?? null;
             if (!is_array($turn)) return;
@@ -8191,6 +8204,7 @@ JS;
                 return;
             }
             $session = $this->taskSessions[(string)$turn['session_id']] ?? [];
+            $this->chatGptTurns[$responseId]['steering_connector_group'] = !empty($snapshot['steering_connector_group']);
             $awaitingSteeringUser = !empty($turn['steering_send_marker'])
                 && empty($turn['accepted']) && empty($snapshot['steering_user_accepted']);
             if ($awaitingSteeringUser && !empty($this->chatGptTurns[$responseId]['response_deadline_expired'])) {
@@ -10687,7 +10701,7 @@ JS;
             (array)($turn['baseline_assistants'] ?? []), (string)($turn['continuation_marker'] ?? ''),
             (string)($turn['bound_assistant_id'] ?? ''), self::hasLegacyCitationPrefix($turn), $responseId,
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular', '', false, false,
-            (string) ($turn['steering_send_marker'] ?? ''));
+            (string) ($turn['steering_send_marker'] ?? ''), !empty($turn['steering_connector_started']));
         $this->evaluateTaskSession((string)($turn['session_id'] ?? ''), $expression,
             function ($error, $fresh) use ($responseId, $logicalId, $turn, $terminal,
                 $proof, $prepared, $planningKey, $started): void {
@@ -11503,7 +11517,8 @@ JS;
             (string) ($turn['bound_assistant_id'] ?? ''),
             ($turn['web_chat']['mode'] ?? 'temporary') === 'temporary' ? $responseId : '',
             ($turn['web_chat']['mode'] ?? 'temporary') === 'regular' ? $responseId : '',
-            empty($turn['continuation_marker']) ? (string) ($turn['steering_send_marker'] ?? '') : ''
+            empty($turn['continuation_marker']) && empty($turn['steering_connector_group'])
+                ? (string) ($turn['steering_send_marker'] ?? '') : ''
         ), function ($error, $focused) use ($responseId, $index): void {
             if (!isset($this->chatGptTurns[$responseId])) return;
             if ($error !== null || !is_array($focused) || empty($focused['ok'])) {

@@ -3050,6 +3050,23 @@ final class ToolBroker
         return (string) $binding['current_response_id'];
     }
 
+    /** Verify the rotated capability started after this physical steering submission's intent. */
+    public static function steeringStartObserved(array $submission, array $current): bool
+    {
+        if (empty($submission['submit_intent_at']) || empty($submission['mcp_binding_id'])
+            || ($current['operation_kind'] ?? '') !== 'response') return false;
+        foreach (['task_id', 'durable_turn_id', 'surface_id', 'command_id', 'mcp_binding_id'] as $key) {
+            if (($submission[$key] ?? null) !== ($current[$key] ?? null)) return false;
+        }
+        if ($submission['id'] !== $current['id'] && empty($submission['accepted_at'])) return false;
+        $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')
+            ->where('id', $submission['mcp_binding_id'])->find('current_response_id,task_id,turn_id,status,started_at,revoked_at');
+        return is_array($binding) && $binding['current_response_id'] === $current['id']
+            && $binding['task_id'] === $current['task_id'] && $binding['turn_id'] === $current['durable_turn_id']
+            && in_array($binding['status'], ['awaiting_start', 'running', 'completed'], true)
+            && empty($binding['revoked_at']) && (int) $binding['started_at'] >= (int) $submission['submit_intent_at'];
+    }
+
     /** Current logical Responses round for one live MCP turn token. */
     public static function currentResponseForToken(string $token): string
     {

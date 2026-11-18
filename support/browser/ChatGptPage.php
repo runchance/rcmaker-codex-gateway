@@ -1378,12 +1378,14 @@ JS));
      * @param bool $acceptedTemporarySubmission Ledger confirms this physical send on the current document.
      * @param bool $compactionSourceIdle Observe the primary idle control while draining a checkpoint's source.
      * @param string $steeringMarker Marker in the new physical steering message, required to bind its reply.
+     * @param bool $steeringConnectorStarted The exact fenced revision's rotated Connector token has started.
      * @return string Read-only CDP expression yielding response/progress/terminal observations.
      */
     public static function responseExpression(array $baselineUserIds, array $baselineAssistantIds,
         string $continuationMarker = '', string $boundResponseId = '', bool $legacyCitations = false,
         string $initialBindingMarker = '', bool $regularRecovery = false, string $temporarySubmission = '',
-        bool $acceptedTemporarySubmission = false, bool $compactionSourceIdle = false, string $steeringMarker = ''): string
+        bool $acceptedTemporarySubmission = false, bool $compactionSourceIdle = false, string $steeringMarker = '',
+        bool $steeringConnectorStarted = false): string
     {
         $users = json_encode(array_values($baselineUserIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $assistants = json_encode(array_values($baselineAssistantIds), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -1435,7 +1437,12 @@ const boundGroupUser=uniqueUser===lastUser&&uniqueUser&&boundGroups.length===1
 // During a live steer the old stream can still create or remount an assistant row.
 // Require the uniquely marked, latest native user bubble before binding its reply.
 const markedUser=expectedSteeringMarker?markedSteeringUser(expectedSteeringMarker):null;
-const steeringUser=markedUser&&!beforeUsers.has(markedUser.id)?markedUser:null;
+// A saved reply can render a new prompt without the steering header. Only a
+// proven new Connector start may bind a distinct native group beyond the last
+// original user. An inline update still needs its exact rendered boundary.
+const connectorSteeringUser=expectedSteeringMarker&&!markedUser&&__STEERING_CONNECTOR_STARTED__
+    ?separateSteeringUser(users,beforeUsers,beforeAssistants,boundResponseId):null;
+const steeringUser=markedUser&&!beforeUsers.has(markedUser.id)?markedUser:connectorSteeringUser;
 const steeringResponse=!!expectedSteeringMarker&&!continuationUser;
 const newUser=continuationUser||(expectedSteeringMarker?steeringUser:(countGrowthUser||identityUser||boundGroupUser));
 const initialBindingWitness=!!expectedInitialBinding&&!!newUser&&[newUser.el?.innerText,newUser.el?.textContent].some(t=>String(t||'').includes('<rcmaker_chat_binding>'+expectedInitialBinding+'</rcmaker_chat_binding>'));
@@ -1472,7 +1479,7 @@ const promoted=boundMatches.length===0
 // The native steer request can add an inline user unit to the same renderer group.
 // Treat only the suffix after that unit as this submission's reply, even if the group
 // already had an answer before the send. A separately rendered follow-up still works.
-const steeringGroup=steeringResponse?steeringUser?.el.closest('[data-turn-key]'):null;
+const steeringGroup=steeringResponse&&steeringUser!==connectorSteeringUser?steeringUser?.el.closest('[data-turn-key]'):null;
 const groupedSteeringAnswer=steeringGroup&&steeringUser&&[...steeringGroup.querySelectorAll(
     '[data-chatgpt-agent-turn-start],[data-content-search-unit-key$=":assistant"],[data-message-author-role="assistant"],[data-conversation-role="assistant"]')]
     .some(node=>afterSteeringUser(steeringUser,node))
@@ -1751,7 +1758,7 @@ let error=null;
 // inside answer.el; otherwise the gateway waits for the full generation deadline.
 const currentTurn=(newUser?.el||answer?.el)?.closest('[data-content-search-turn-key],[data-turn-key],[data-turn-id],[data-testid^="conversation-turn-"]')||null;
 const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(candidate=>{
-    if(steeringResponse&&(!steeringUser||!afterSteeringUser(steeringUser,candidate)))return false;
+    if(steeringResponse&&(!steeringUser||(!connectorSteeringUser&&!afterSteeringUser(steeringUser,candidate))))return false;
     const label=String(candidate.innerText||candidate.textContent||'').replace(/\s+/g,' ').trim();
     if(!/^(?:消息流中的错误|訊息串流發生錯誤|Error in message stream|Error in the message stream)(?:\s|$)/i.test(label)
         ||!visible(candidate))return false;
@@ -1761,14 +1768,15 @@ const streamErrorAlert=[...document.querySelectorAll('[role="alert"]')].find(can
     if(currentTurn)return currentTurn.contains(candidate);
     return newUser?after(newUser.el,candidate):false;
 });
-const conversationReplacement=conversationReplacementCard(newUser,answer,steeringResponse?steeringUser:null);
+const steeringCutoff=steeringResponse&&!connectorSteeringUser?steeringUser:null;
+const conversationReplacement=conversationReplacementCard(newUser,answer,steeringCutoff);
 if(conversationReplacement&&!answer&&newUser&&(newUser===lastUser||newUser===steeringUser)&&strong(newUser.id)
     &&answerCandidates.length===0&&sameGroupAnswers.length===0){
     conversationReplacement.descriptor.current_user_without_answer=true;
 }
-const networkCard=conversationReplacement?null:networkErrorCard(newUser,answer,__REGULAR_RECOVERY__,steeringResponse?steeringUser:null);
+const networkCard=conversationReplacement?null:networkErrorCard(newUser,answer,__REGULAR_RECOVERY__,steeringCutoff);
 const networkRetry=networkCard?.descriptor||null;
-if(networkRetry&&steeringResponse&&steeringUser)networkRetry.steering_marker=expectedSteeringMarker;
+if(networkRetry&&steeringCutoff)networkRetry.steering_marker=expectedSteeringMarker;
 if(conversationReplacement)error={code:'CHATGPT_CONVERSATION_EXHAUSTED',message:'This ChatGPT conversation has reached its terminal capacity and must continue in a new chat.'};
 else if(networkCard)error={code:'CHATGPT_NETWORK_ERROR',message:'ChatGPT 当前回答出现网络错误，页面提供重试。'};
 else if(stoppedThinkingVisible)error={code:'CHATGPT_STOPPED_THINKING',message:'ChatGPT 已停止思考，当前回答不能确认为完成。'};
@@ -1778,14 +1786,14 @@ else if(answer&&answerNodes(answer.el,'[data-testid="regenerate-thread-error-but
 else if((answer&&answerNodes(answer.el,'[data-testid="regenerate-thread-error-button"]').length)||(!steeringResponse&&/something went wrong[\s\S]{0,300}help\.openai\.com/i.test(pageText)))error={code:'CHATGPT_UPSTREAM_ERROR',message:'ChatGPT 页面显示生成错误。'};
 const recoveryAnchor=__REGULAR_RECOVERY__?{document_id:String(globalThis.performance?.timeOrigin??''),
     user_id:users.at(-1)?.id||null,assistant_id:assistants.at(-1)?.id||null}:null;
-return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,steering_user_accepted:!!steeringUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,recovery_anchor:recoveryAnchor,error};
+return {url:String(location.href||''),temporary_chat:temporaryChatPage(location.pathname,location.search),new_user:!!newUser,new_user_id:newUser?.id||null,initial_binding_witness:initialBindingWitness,continuation_user_accepted:!!continuationUser,steering_user_accepted:!!steeringUser,steering_connector_group:steeringResponse&&!!connectorSteeringUser,response_present:responsePresent,response_id:answer?.id||null,generation_running:running,send_button_visible:sendButtonVisible,recovery_idle_button_visible:recoveryIdleButtonVisible,send_button_disabled:sendButtonVisible?!!endSend[0].disabled:null,completion_action_visible:completion,stopped_thinking_visible:stoppedThinkingVisible,transport_recovery_visible:transportRecoveryVisible,conversation_replacement:conversationReplacement?.descriptor||null,network_retry:networkRetry,content_present:contentPresent,markdown,markdown_segments:markdownSegments,metric_card_legacy:metricCardLegacy,visible_text:visibleText,response_html:responseHtml,artifact_candidates:artifactCandidates,commentary_blocks:commentaryBlocks,answer_root_count:answerRootCount,commentary_root_count:commentaryRootCount,baseline_user_count:beforeUserCount,baseline_assistant_count:beforeAssistantCount,user_count:users.length,assistant_count:assistants.length,identity_new_user_count:identityUsers.length,identity_new_assistant_count:identityAssistants.length,answer_candidate_count:answerCandidates.length,stop_confirmation_pending:generationStopConfirmation().present,recovery_anchor:recoveryAnchor,error};
 JS;
         return self::wrap(str_replace(
             ['__USERS__', '__ASSISTANTS__', '__USER_COUNT__', '__ASSISTANT_COUNT__', '__MARKER__', '__BOUND__',
-                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__', '__RECOVERY_IDLE__', '__STEERING_MARKER__'],
+                '__INITIAL_BINDING__', '__REGULAR_RECOVERY__', '__TEMPORARY_SUBMISSION__', '__ACCEPTED_TEMPORARY_SUBMISSION__', '__RECOVERY_IDLE__', '__STEERING_MARKER__', '__STEERING_CONNECTOR_STARTED__'],
             [$users, $assistants, (string) $userCount, (string) $assistantCount, $marker, $bound,
                 $initialBinding, $regularRecovery ? 'true' : 'false', $temporary, $acceptedTemporarySubmission ? 'true' : 'false',
-                $regularRecovery || $compactionSourceIdle ? 'true' : 'false', $steering],
+                $regularRecovery || $compactionSourceIdle ? 'true' : 'false', $steering, $steeringConnectorStarted ? 'true' : 'false'],
             $body
         ), $legacyCitations);
     }
@@ -2258,6 +2266,20 @@ const markedSteeringUser=marker=>{
 };
 const afterSteeringUser=(user,node)=>node!==user.el&&!user.el.contains(node)
     &&Boolean(user.el.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING);
+const separateSteeringUser=(users,beforeUsers,beforeAssistants,boundAnswer)=>{
+    const latest=users.at(-1);
+    if(!latest||!/^group:user:[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(latest.id)
+        ||beforeUsers.has(latest.id)||users.filter(entry=>entry.id===latest.id).length!==1
+        ||latest.el.querySelectorAll('[data-user-message-bubble]').length!==1)return null;
+    const answer='group:assistant:'+latest.id.slice('group:user:'.length);
+    if(beforeAssistants.has(answer))return null;
+    if(boundAnswer)return boundAnswer===answer?latest:null;
+    const source=users.find(entry=>entry.id===[...beforeUsers].at(-1));
+    // Multiple new user groups or a remount without the actual last source
+    // group leave the delivery ambiguous, even after the Connector starts.
+    return source&&users.at(-2)===source
+        &&!!(source.el.compareDocumentPosition(latest.el)&Node.DOCUMENT_POSITION_FOLLOWING)?latest:null;
+};
 // The first native response may acquire its saved UUID after being rendered at /.
 // Pin that first UUID; a later SPA navigation must never move this witness to chat B.
 const initialResponseUrlMatches=(from,to)=>{
