@@ -397,6 +397,47 @@ return {ok:current!==null&&document.activeElement===current,expanded:current?.ge
 JS));
     }
 
+    /**
+     * Inspect the first picker and its composer before reading model capabilities.
+     * @param bool $moveFocus Whether to request focus when the model control is interactive and the picker is closed.
+     * @return string CDP expression returning the control's focus, picker state, and any blocker.
+     * @throws \JsonException If the shared DOM selectors cannot be encoded.
+     */
+    public static function initialEffortControlExpression(bool $moveFocus): string
+    {
+        $picker = json_encode(self::EFFORT_MENU, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        return self::wrap(str_replace(['__MOVE_FOCUS__','__PICKER__'], [$moveFocus ? 'true' : 'false', $picker], <<<'JS'
+const inspectControl=()=>{
+    const composers=[...document.querySelectorAll(COMPOSER)].filter(visible);
+    const composer=composers.length===1?composers[0]:null;
+    const form=composer?.closest('form');
+    const controls=form?[...form.querySelectorAll(MODEL_CONTROL)].filter(visible):[];
+    const control=controls.length===1?controls[0]:null;
+    const modalCount=[...document.querySelectorAll('[role="dialog"][aria-modal="true"],[role="alertdialog"][aria-modal="true"],dialog:modal')]
+        .filter(node=>modelRendered(node)&&!node.closest(USER+','+ASSISTANT+',pre,code')).length;
+    const expanded=control?.getAttribute('aria-expanded')==='true';
+    const disabled=!!control&&(control.matches(':disabled')||control.getAttribute('aria-disabled')==='true');
+    const interactable=!disabled&&modalCount===0&&modelRendered(control);
+    const pickerId=control?.getAttribute('aria-controls');
+    const picker=expanded?(pickerId?document.getElementById(pickerId):modelPickerMenu()):null;
+    const pickerOpen=modalCount===0&&modelRendered(picker)&&picker.matches(__PICKER__);
+    const ok=interactable&&document.activeElement===control;
+    const code=ok||pickerOpen?null:modalCount>0?'CHATGPT_MODEL_DIALOG_BLOCKING'
+        :composers.length>1?'CHATGPT_EDITOR_AMBIGUOUS'
+        :!form?'CHATGPT_EDITOR_FORM_MISSING':!control?'CHATGPT_MODEL_CONTROL_INVALID'
+        :disabled?'CHATGPT_MODEL_CONTROL_DISABLED':!interactable?'CHATGPT_MODEL_CONTROL_NOT_INTERACTIVE':'CHATGPT_MODEL_FOCUS_UNCONFIRMED';
+    return {control,interactable,ok,code,expanded,picker_open:pickerOpen,count:controls.length,
+        modal_count:modalCount,document_focused:document.hasFocus()};
+};
+const before=inspectControl();
+if(__MOVE_FOCUS__&&before.interactable&&!before.ok&&!before.picker_open)before.control.focus();
+const after=__MOVE_FOCUS__?inspectControl():before;
+// ChatGPT can replace the controlled button during focus. Verify the current node.
+const {control,interactable,...facts}=after;
+return {...facts,remounted:control!==null&&control!==before.control};
+JS));
+    }
+
     /** Dismiss only the optional Google-app setup dialog that appears immediately after sign-in. */
     public static function dismissOptionalSetupDialogExpression(): string
     {

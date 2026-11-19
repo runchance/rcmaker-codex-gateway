@@ -4929,72 +4929,109 @@ JS;
             });
     }
 
-    /** Open the initial capability picker; preserve its deadline and bounded remount retries. */
-    private function openTaskEffortMenu(string $responseId, bool $recover, float $deadline, int $reopenAttempts = 0): void
+    /** Open the initial picker only after scoped focus, or read an already open picker. */
+    private function openTaskEffortMenu(string $responseId, bool $recover, float $deadline, int $reopenAttempts = 0,
+        ?array $owner = null, bool $readback = false): void
     {
-        $this->evaluateModelSelection($responseId, WebModelPage::focusEffortControlExpression(),
-            function ($error, $focused) use ($responseId, $recover, $deadline, $reopenAttempts): void {
-                if ($error !== null || !is_array($focused) || empty($focused['ok'])) {
-                    // The final multipart commit follows two page updates. Its effort
-                    // control can briefly be detached while ChatGPT settles the editor.
-                    // Focusing is reversible; retry within the existing menu deadline.
-                    $this->evaluateModelSelection($responseId, WebModelPage::dismissOptionalSetupDialogExpression(),
-                        function ($dismissError, $dismissed) use ($responseId, $recover, $deadline, $reopenAttempts): void {
-                            if ($dismissError === null && !empty($dismissed['ok']) && !empty($dismissed['dismissed'])
-                                && microtime(true) < $deadline) {
-                                Timer::add(0.15, fn() => $this->openTaskEffortMenu($responseId, $recover,
-                                    $deadline, $reopenAttempts), null, false);
-                                return;
-                            }
-                            if (microtime(true) < $deadline) {
-                                Timer::add(0.15, fn() => $this->openTaskEffortMenu($responseId, $recover, $deadline, $reopenAttempts), null, false);
-                                return;
-                            }
-                            $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE',
-                                'ChatGPT 模型控制器无法获得焦点；请检查并关闭 ChatGPT 弹窗。', $recover);
-                        });
+        $owner ??= $this->modelReadbackOwner($responseId);
+        if ($owner === null || $this->modelReadbackOwner($responseId) !== $owner) return;
+        $remaining = $deadline - microtime(true);
+        $this->evaluateModelSelection($responseId, WebModelPage::initialEffortControlExpression(!$readback && $remaining > 0.0),
+            function ($error, $focused) use ($responseId, $recover, $deadline, $reopenAttempts, $owner, $readback): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                $focused = is_array($focused) ? $focused : [];
+                if (microtime(true) >= $deadline) {
+                    $this->failInitialEffortControl($responseId, $recover, $owner, $error, $focused);
                     return;
                 }
-                if (!empty($focused['expanded'])) {
-                    $this->waitTaskEffortSlider($responseId, $recover, $deadline, $reopenAttempts);
-                    return;
-                }
-                $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $recover, $deadline, $reopenAttempts): void {
-                    if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
-                        $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 模型菜单无法打开。', $recover);
+                $readSlider = fn() => $this->waitTaskEffortSlider($responseId, $recover, $deadline, $reopenAttempts, $owner);
+                if ($error === null && (!empty($focused['picker_open']) || !empty($focused['ok']))) {
+                    if (!empty($focused['expanded'])) {
+                        $readSlider();
                         return;
                     }
-                    $this->waitTaskEffortSlider($responseId, $recover, $deadline, $reopenAttempts);
-                });
-            });
+                    $this->dispatchModelSelectionKey($responseId, 'Enter', function ($keyError) use ($responseId, $recover, $owner, $readSlider): void {
+                        if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                        if ($keyError !== null && ($keyError['message'] ?? '') !== 'BROWSER_CDP_TIMEOUT') {
+                            $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 模型菜单无法打开。', $recover);
+                            return;
+                        }
+                        $readSlider();
+                    });
+                    return;
+                }
+                // Focus may land after the synchronous return or a delayed CDP result.
+                // Read the current element before requesting focus again.
+                $retry = fn() => Timer::add(0.15, fn() => $this->openTaskEffortMenu(
+                    $responseId, $recover, $deadline, $reopenAttempts, $owner, !$readback), null, false);
+                if ($readback && $error === null && !empty($focused['modal_count'])) {
+                    $this->evaluateModelSelection($responseId, WebModelPage::dismissOptionalSetupDialogExpression(),
+                        static function () use ($retry): void { $retry(); },
+                        min(10.0, max(0.1, $deadline - microtime(true))));
+                    return;
+                }
+                $retry();
+            }, min(10.0, max(0.1, $remaining)));
+    }
+
+    /** Report what the last bounded read established about the initial model control. */
+    private function failInitialEffortControl(string $responseId, bool $recover, array $owner, ?array $error, array $focused): void
+    {
+        $code = $focused['code'] ?? null;
+        $reason = match (true) {
+            ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT' => 'CDP_TIMEOUT',
+            $error !== null => 'CDP_ERROR',
+            in_array($code, ['CHATGPT_MODEL_DIALOG_BLOCKING','CHATGPT_EDITOR_FORM_MISSING','CHATGPT_EDITOR_AMBIGUOUS','CHATGPT_MODEL_CONTROL_INVALID',
+                'CHATGPT_MODEL_CONTROL_DISABLED','CHATGPT_MODEL_CONTROL_NOT_INTERACTIVE','CHATGPT_MODEL_FOCUS_UNCONFIRMED'], true) => $code,
+            !empty($focused['ok']) || !empty($focused['picker_open']) => 'PREPARATION_DEADLINE',
+            default => 'FOCUS_NOT_CONFIRMED',
+        };
+        self::writeBrowserDiagnostic(['event'=>'initial_effort_control_failure',
+            'command_id'=>(int) ($this->chatGptTurns[$responseId]['command_id'] ?? $owner['command_id'] ?? 0),
+            'reason'=>$reason, 'cdp_code'=>(int) ($error['code'] ?? 0),
+            'control_count'=>(int) ($focused['count'] ?? -1), 'modal_count'=>(int) ($focused['modal_count'] ?? -1),
+            'expanded'=>($focused['expanded'] ?? null) === true, 'picker_open'=>($focused['picker_open'] ?? null) === true,
+            'document_focused'=>($focused['document_focused'] ?? null) === true]);
+        $message = $reason === 'CHATGPT_MODEL_DIALOG_BLOCKING'
+            ? 'A ChatGPT dialog is blocking the model controls.'
+            : 'The ChatGPT model control did not become ready before the preparation deadline.';
+        $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', $message . ' [focus=' . $reason . ']', $recover);
     }
 
     /** Read initial capabilities; reopen only after independently observing a closed picker. */
-    private function waitTaskEffortSlider(string $responseId, bool $recover, float $deadline, int $reopenAttempts = 0): void
+    private function waitTaskEffortSlider(string $responseId, bool $recover, float $deadline, int $reopenAttempts, array $owner): void
     {
+        if ($this->modelReadbackOwner($responseId) !== $owner) return;
+        $remaining = $deadline - microtime(true);
+        if ($remaining <= 0.0) {
+            $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位滑块没有进入可验证状态。', $recover);
+            return;
+        }
         $this->evaluateModelSelection($responseId, WebModelPage::effortSliderExpression(),
-            function ($error, $slider) use ($responseId, $recover, $deadline, $reopenAttempts): void {
-                if ($error === null && is_array($slider) && !empty($slider['ok'])) {
+            function ($error, $slider) use ($responseId, $recover, $deadline, $reopenAttempts, $owner): void {
+                if ($this->modelReadbackOwner($responseId) !== $owner) return;
+                if ($error === null && is_array($slider) && !empty($slider['ok']) && microtime(true) < $deadline) {
                     $this->applyTaskModelCapabilities($responseId, ChatGptTransport::modelCapabilities($slider), $recover, $slider);
                     return;
                 }
                 if (microtime(true) < $deadline) {
                     $this->evaluateModelSelection($responseId, WebModelPage::modelControlStateExpression(),
-                        function ($stateError, $state) use ($responseId, $recover, $deadline, $reopenAttempts): void {
+                        function ($stateError, $state) use ($responseId, $recover, $deadline, $reopenAttempts, $owner): void {
+                            if ($this->modelReadbackOwner($responseId) !== $owner) return;
                             $closed = $stateError === null && is_array($state)
                                 && ($state['effort_menu_expanded'] ?? null) === false;
                             if ($closed && $reopenAttempts < 2 && microtime(true) < $deadline) {
                                 Timer::add(0.08, fn() => $this->openTaskEffortMenu(
-                                    $responseId, $recover, $deadline, $reopenAttempts + 1), null, false);
+                                    $responseId, $recover, $deadline, $reopenAttempts + 1, $owner), null, false);
                                 return;
                             }
                             Timer::add(0.08, fn() => $this->waitTaskEffortSlider(
-                                $responseId, $recover, $deadline, $reopenAttempts), null, false);
-                        });
+                                $responseId, $recover, $deadline, $reopenAttempts, $owner), null, false);
+                        }, min(10.0, max(0.1, $deadline - microtime(true))));
                     return;
                 }
                 $this->failModelSelection($responseId, 'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'ChatGPT 推理档位滑块没有进入可验证状态。', $recover);
-            });
+            }, min(10.0, $remaining));
     }
 
     private function applyTaskModelCapabilities(string $responseId, array $capabilities, bool $recover, ?array $openSlider = null): void
