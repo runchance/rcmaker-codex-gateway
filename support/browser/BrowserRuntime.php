@@ -7136,9 +7136,10 @@ JS;
      * immediately. Retries retain the original surface/document/owner and never reselect or send.
      * @param callable():void $onSelected Next integrity check after positive identity evidence.
      * @param float|null $deadline Absolute clock, bounded by the current turn's deadline.
+     * @param callable():bool|null $stillCurrent Additional scope check for a reserved checkpoint.
      */
     private function confirmTaskConnector(string $responseId, string $connectorName, callable $onSelected,
-        string $failureMessage, ?float $deadline = null): void
+        string $failureMessage, ?float $deadline = null, ?callable $stillCurrent = null): void
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn)) return;
@@ -7146,9 +7147,10 @@ JS;
         $owner = array_intersect_key($turn, array_flip([
             'surface_id', 'target_id', 'session_id', 'document_nonce', 'owner_incarnation', 'fencing_version',
         ]));
-        $sameOwner = function () use ($responseId, $owner): bool {
+        $sameOwner = function () use ($responseId, $owner, $stillCurrent): bool {
             $current = $this->chatGptTurns[$responseId] ?? null;
-            return is_array($current) && array_intersect_key($current, $owner) === $owner;
+            return is_array($current) && array_intersect_key($current, $owner) === $owner
+                && ($stillCurrent === null || $stillCurrent());
         };
         $lastFailureCode = 'CHATGPT_CONNECTOR_SELECTION_LOST';
         $lastDetail = '';
@@ -7651,11 +7653,24 @@ JS;
                 $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_SELECTION_LOST', '原任务页面的连接器绑定已失效，未发送。');
                 return;
             }
-            $controlHandoff = ($turn['compaction_phase'] ?? null) === 'preparing';
-            $readPrompt = function () use ($responseId, $controlHandoff): void {
-                $expression = $controlHandoff
-                    ? WebModelPage::promptTextExpression() : WebModelPage::composerTextExpression();
-                $this->evaluateTask($responseId, $expression, function ($error, $draft) use ($responseId): void {
+            if (($turn['compaction_phase'] ?? null) === 'preparing') {
+                $owner = $this->modelReadbackOwner($responseId);
+                if ($owner === null) return;
+                $handoffId = (string) ($turn['compaction_handoff_id'] ?? '');
+                $prompt = (string) $turn['prompt'];
+                $sameHandoff = function () use ($responseId, $owner, $handoffId, $prompt): bool {
+                    $current = $this->chatGptTurns[$responseId] ?? [];
+                    return $this->modelReadbackOwner($responseId) === $owner
+                        && ($current['compaction_phase'] ?? null) === 'preparing'
+                        && ($current['compaction_handoff_id'] ?? null) === $handoffId
+                        && ($current['prompt'] ?? null) === $prompt;
+                };
+                $this->verifyRetainedCheckpointDraft($responseId, $connectorName, str_replace("\u{00A0}", ' ', $prompt),
+                    min((float) $turn['deadline'], microtime(true) + 30.0), $sameHandoff);
+                return;
+            }
+            $this->evaluateTask($responseId, WebModelPage::composerTextExpression(),
+                function ($error, $draft) use ($responseId): void {
                     $turn = $this->chatGptTurns[$responseId] ?? null;
                     if (!is_array($turn)) return;
                     if ($error !== null || empty($draft['ok']) || str_replace("\u{00A0}", ' ', (string)($draft['text'] ?? ''))
@@ -7665,13 +7680,6 @@ JS;
                     }
                     $this->verifyTaskAttachmentsThenSend($responseId);
                 });
-            };
-            if ($controlHandoff) {
-                $this->confirmTaskConnector($responseId, $connectorName, $readPrompt,
-                    '检查点消息未能确认原工具连接器，未发送。');
-                return;
-            }
-            $readPrompt();
             return;
         }
         $this->confirmTaskConnector($responseId, $connectorName,
@@ -7692,6 +7700,52 @@ JS;
                         $this->verifyTaskAttachmentsThenSend($responseId);
                     });
             }, '发送前稳定等待后未能确认工具连接器，未发送。');
+    }
+
+    /** Allow the resumed editor to settle before sending its exact one-shot checkpoint. */
+    private function verifyRetainedCheckpointDraft(string $responseId, string $connectorName, string $expected,
+        float $deadline, callable $sameHandoff, array $lastRead = []): void
+    {
+        if (!$sameHandoff()) return;
+        // A new cooldown during the readback also invalidates earlier UI proof.
+        if ($lastRead !== [] && $this->deferTaskCooldown($responseId, function () use ($responseId, $sameHandoff): void {
+            if ($sameHandoff()) $this->waitTaskSendReady($responseId,
+                min((float) $this->chatGptTurns[$responseId]['deadline'], microtime(true) + 120.0));
+        })) return;
+        if (microtime(true) >= $deadline) {
+            self::writeBrowserDiagnostic(['event'=>'retained_checkpoint_draft_unverified',
+                'command_id'=>(int) ($this->chatGptTurns[$responseId]['command_id'] ?? 0),
+                'expected_bytes'=>strlen($expected)] + $lastRead);
+            $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_VERIFY_FAILED',
+                'The checkpoint draft could not be verified on the original ChatGPT page. The checkpoint was not sent.');
+            return;
+        }
+        // Recheck the attachment on each attempt. Readback never rewrites the draft
+        // or selects another Connector, and only the normal send gate may submit.
+        $this->confirmTaskConnector($responseId, $connectorName,
+            function () use ($responseId, $connectorName, $expected, $deadline, $sameHandoff): void {
+                if (!$sameHandoff()) return;
+                $this->evaluateTask($responseId, WebModelPage::promptTextExpression(),
+                    function ($error, $draft) use ($responseId, $connectorName, $expected, $deadline, $sameHandoff): void {
+                        if (!$sameHandoff()) return;
+                        $actual = $error === null && !empty($draft['ok']) && is_string($draft['text'] ?? null)
+                            ? str_replace("\u{00A0}", ' ', $draft['text']) : null;
+                        if ($actual === $expected && microtime(true) < $deadline) {
+                            $this->verifyTaskAttachmentsThenSend($responseId);
+                            return;
+                        }
+                        $reason = match (true) {
+                            ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT' => 'cdp_timeout',
+                            $error !== null => 'cdp_error',
+                            $actual === null => 'draft_unavailable',
+                            $actual !== $expected => 'draft_mismatch',
+                            default => 'deadline',
+                        };
+                        $read = ['reason'=>$reason, 'actual_bytes'=>$actual === null ? null : strlen($actual)];
+                        Timer::add(0.3, fn() => $this->verifyRetainedCheckpointDraft(
+                            $responseId, $connectorName, $expected, $deadline, $sameHandoff, $read), null, false);
+                    }, min(12.0, max(0.1, $deadline - microtime(true))));
+            }, '检查点消息未能确认原工具连接器，未发送。', $deadline, $sameHandoff);
     }
 
     /** Final file-integrity fence in this task's pinned chat mode immediately before irreversible submit. */

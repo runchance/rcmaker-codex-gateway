@@ -610,10 +610,15 @@ final class ContextCompaction
         $routedSpec = $spec;
         if (is_array($link)) $routedSpec['browser_owner_key'] = (string) $link['current_owner_key'];
         $persistedFailure = $db->table('gateway_response_jobs')->where('id', (string)$job['id'])->find();
+        $retainedDraftFailure = !empty($job['previous_response_id'])
+            && ($job['error']['error']['code'] ?? null) === 'CHATGPT_EDITOR_VERIFY_FAILED';
         if (($job['task_id'] ?? '') !== $taskId) {
             // A metadata retry may already have repaired this legacy failure on the new
             // conversation task. An exact old HTTP replay observes that producer as well.
-            if (is_array($persistedFailure) && self::unpublishedDraftFailure($persistedFailure)) {
+            $draftRetired = $retainedDraftFailure && is_array($db->table('gateway_task_events')
+                ->where('task_id', (string) $job['task_id'])->where('response_id', (string) $job['id'])
+                ->where('event_type', 'failed_handoff_checkpoint_abandoned')->find('id'));
+            if (is_array($persistedFailure) && ($draftRetired || self::unpublishedDraftFailure($persistedFailure))) {
                 $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
                 $latest = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
                     ->where('state', 'IN', ['generating', 'committed'])->order([['rowid', 'DESC']])->limit(1)->find();
@@ -634,6 +639,14 @@ final class ContextCompaction
         }
         $checkpoint = $db->table('gateway_context_checkpoints')->where('id', (string) $job['compact_id'])->find();
         if (!is_array($checkpoint) || $checkpoint['task_id'] !== $taskId) return $job;
+        if ($checkpoint['state'] === 'generating' && $retainedDraftFailure && is_array($persistedFailure)) {
+            $handoff = $db->table('gateway_compaction_handoffs')->where('compact_response_id', $job['id'])->find();
+            if (is_array($handoff) && self::retainedHandoffNeverSubmitted($persistedFailure, $handoff)) {
+                // Exact HTTP retries bypass ordinary conversation routing. Enter the same
+                // receipt-verified retirement transaction under one stable retry identity.
+                return ResponseJob::createOrReuse($sourceSpec, $sourceKey);
+            }
+        }
         $legacySpec = $routedSpec;
         $legacySpec['request_hash'] = $sourceHash;
         $legacySpec['turn_id'] = $sourceSpec['turn_id'];
@@ -1381,7 +1394,7 @@ final class ContextCompaction
 
     /**
      * Retire only a failed active-source checkpoint whose one-shot handoff was never accepted.
-     * Recover failed submitted handoffs or proved unsent model/Connector preparation failures only after the incoming history
+     * Recover failed submitted handoffs or proved unsent model, Connector, or editor failures only after the incoming history
      * proves the delivered host results. The caller owns the task-routing transaction and
      * carries that readable history into a fresh task; old Web work and host calls are not replayed.
      * @param string $taskId Task owning the failed checkpoint selected by the conversation routing transaction.
@@ -1431,17 +1444,16 @@ final class ContextCompaction
             || !hash_equals((string) $observedSource['sha256'], hash('sha256', (string) $observedSource['text']))) return false;
         $error = json_decode((string) $job['error_json'], true);
         $failureCode = (string)($error['error']['code'] ?? '');
-        $unsentModelFailure = $task['status'] === 'active' && $handoff['state'] === 'prepared'
+        $neverSubmitted = self::retainedHandoffNeverSubmitted($job, $handoff);
+        $unsentModelFailure = $neverSubmitted && $task['status'] === 'active'
             && in_array($failureCode, ['CHATGPT_MODEL_SELECTION_DRIFT', 'CHATGPT_MODEL_SELECTION_UNPROVEN',
-                'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'CHATGPT_MODEL_UNAVAILABLE', 'CHATGPT_PRO_QUOTA_EXHAUSTED'], true)
-            && $handoff['submit_intent_at'] === null
-            && $job['submit_intent_at'] === null && $job['accepted_at'] === null;
+                'CHATGPT_MODEL_CONTROL_UNAVAILABLE', 'CHATGPT_MODEL_UNAVAILABLE', 'CHATGPT_PRO_QUOTA_EXHAUSTED'], true);
+        $unsentDraftFailure = $neverSubmitted && $task['status'] === 'active'
+            && $failureCode === 'CHATGPT_EDITOR_VERIFY_FAILED';
         // Older checkpoint menu timeouts marked the outcome unknown despite never submitting
         // the message. Prove the prepared state and all send audits before releasing that slot.
-        $unsentConnectorFailure = $failureCode === 'CHATGPT_CONNECTOR_UNAVAILABLE'
-            && $handoff['state'] === 'prepared' && $handoff['submit_intent_at'] === null
-            && $job['submit_intent_at'] === null && $job['accepted_at'] === null;
-        $unsentPreparationFailure = $unsentModelFailure || $unsentConnectorFailure;
+        $unsentConnectorFailure = $neverSubmitted && $failureCode === 'CHATGPT_CONNECTOR_UNAVAILABLE';
+        $unsentPreparationFailure = $unsentModelFailure || $unsentConnectorFailure || $unsentDraftFailure;
         if (!$unsentPreparationFailure && ($task['status'] !== 'needs_attention' || $handoff['state'] !== 'submit_intent'
             || !in_array($failureCode, ['compaction_handoff_missing', 'compaction_handoff_page_unavailable'], true))) return false;
         if ($unsentPreparationFailure) {
@@ -1475,7 +1487,9 @@ final class ContextCompaction
             || !is_numeric($activeTurns) || (int) $activeTurns !== 0
             || !is_array($calls) || !is_array($bindings)) return false;
         foreach ($calls as $call) {
-            if ($call['status'] !== 'completed' || $call['result_delivered_at'] === null) return false;
+            if ($call['status'] !== 'completed') return false;
+            if ($call['result_delivered_at'] === null && (!$unsentDraftFailure
+                || !self::priorHandoffSettledReceiptUnlocked($call, $job))) return false;
         }
         foreach ($bindings as $binding) {
             if (!in_array($binding['status'], ['completed', 'revoked'], true)) return false;
@@ -1486,7 +1500,7 @@ final class ContextCompaction
         // The failed compact owns the complete source through its delivered final batch.
         // Reuse the existing receipt/checkpoint proof before releasing its slot; a new
         // read-only task must not silently omit or fabricate previously executed results.
-        self::assertRetiredSourceReceiptsUnlocked($spec, $job, $taskId);
+        self::assertRetiredSourceReceiptsUnlocked($spec, $job, $taskId, $calls);
         $updated = $db->table('gateway_context_checkpoints')->where('id', (string) $checkpoint['id'])
             ->where('response_id', (string) $job['id'])->where('state', 'generating')
             ->update(['state' => 'abandoned']);
@@ -1511,6 +1525,43 @@ final class ContextCompaction
             'created_at' => time(),
         ])) throw new GatewayError('storage_unavailable', '失败摘要恢复证据无法保存。', 503);
         return true;
+    }
+
+    /** Both the reserved handoff and its response must lack physical submission evidence. */
+    private static function retainedHandoffNeverSubmitted(array $job, array $handoff): bool
+    {
+        return $handoff['state'] === 'prepared' && $handoff['submit_intent_at'] === null
+            && $job['submit_intent_at'] === null && $job['accepted_at'] === null;
+    }
+
+    /** Verify an older, atomically committed receipt handoff without inventing a delivery ACK. */
+    private static function priorHandoffSettledReceiptUnlocked(array $call, array $job): bool
+    {
+        if ((int) $call['delivery_count'] < 1 || (int) $call['completed_at'] <= 0
+            || empty($call['turn_id']) || empty($call['binding_id'])
+            || $call['turn_id'] === $job['durable_turn_id'] || $call['binding_id'] === $job['mcp_binding_id']) return false;
+        $result = json_decode((string) $call['result_json'], true);
+        $producerId = $result['canonical_handoff_response_id'] ?? null;
+        if (!is_string($producerId) || $producerId === '') return false;
+        $taskId = (string) $job['task_id'];
+        $db = SDB(null, 'medoo', 'sqlite');
+        $producer = $db->table('gateway_response_jobs')->where('id', $producerId)->where('task_id', $taskId)
+            ->where('durable_turn_id', $call['turn_id'])->where('mcp_binding_id', $call['binding_id'])
+            ->where('status', 'completed')->where('operation_kind', 'IN', ['compact_v1', 'compact_v2'])
+            ->find('previous_response_id,compact_id,operation_kind');
+        if (!is_array($producer) || empty($producer['previous_response_id']) || empty($producer['compact_id'])) return false;
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('id', $producer['compact_id'])
+            ->where('response_id', $producerId)->where('task_id', $taskId)->where('state', 'committed')
+            ->where('protocol', $producer['operation_kind'])->where('source_response_id', $producer['previous_response_id'])
+            ->find('committed_at');
+        $handoff = $db->table('gateway_compaction_handoffs')->where('compact_response_id', $producerId)
+            ->where('checkpoint_id', $producer['compact_id'])->where('task_id', $taskId)->where('state', 'consumed')
+            ->where('source_response_id', $producer['previous_response_id'])->find('accepted_at,consumed_at');
+        return is_array($checkpoint) && is_array($handoff)
+            && (int) $call['completed_at'] <= (int) $handoff['accepted_at']
+            && (int) $handoff['accepted_at'] <= (int) $checkpoint['committed_at']
+            && (int) $checkpoint['committed_at'] <= (int) $handoff['consumed_at']
+            && (int) $handoff['consumed_at'] <= (int) $job['created_at'];
     }
 
     /**
@@ -2696,15 +2747,17 @@ final class ContextCompaction
      * @param array $spec Current normalized compaction request with complete readable history.
      * @param array $sourceLast Last completed text job on the retired source epoch.
      * @param string $taskId Durable task owning the source and host invocation receipts.
+     * @param array|null $calls Completed invocation rows already read under this transaction, if available.
      * @throws GatewayError If a source-owned result is missing or altered in the new request.
      */
-    private static function assertRetiredSourceReceiptsUnlocked(array $spec, array $sourceLast, string $taskId): void
+    private static function assertRetiredSourceReceiptsUnlocked(array $spec, array $sourceLast, string $taskId,
+        ?array $calls = null): void
     {
         $sourceContext = json_decode((string) $sourceLast['context_json'], true, 128, JSON_THROW_ON_ERROR);
         $requestedContext = json_decode((string) ($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
         $source = self::receiptOutputs($sourceContext);
         $requested = self::receiptOutputs($requestedContext);
-        $calls = SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
+        $calls ??= SDB(null, 'medoo', 'sqlite')->table('gateway_tool_invocations')
             ->where('task_id', $taskId)->where('status', 'completed')->select();
         if (!is_array($calls)) throw new GatewayError('storage_unavailable', '已完成工具回执暂不可读取。', 503);
         $checkpointAt = null;
