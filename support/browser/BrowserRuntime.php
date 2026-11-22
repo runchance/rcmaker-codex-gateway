@@ -6269,7 +6269,7 @@ JS;
                     return;
                 }
                 if (!empty($selected['selected'])) {
-                    $this->prepareSelectedTaskConnector($responseId, $connectorName, $attempt);
+                    $this->prepareSelectedTaskConnector($responseId, $connectorName, $attempt, $checkpointCurrent);
                     return;
                 }
                 if (($this->chatGptTurns[$responseId]['web_chat']['mode'] ?? '') === 'regular') {
@@ -7026,7 +7026,7 @@ JS;
                     return;
                 }
                 if ($error === null && is_array($selected) && !empty($selected['selected'])) {
-                    $this->prepareSelectedTaskConnector($responseId, $connectorName, 1);
+                    $this->prepareSelectedTaskConnector($responseId, $connectorName, 1, $isCurrent);
                     return;
                 }
                 if (microtime(true) < $deadline) {
@@ -7037,18 +7037,98 @@ JS;
             });
     }
 
-    /** A selected Connector is reusable only when its composer body is provably empty. */
-    private function prepareSelectedTaskConnector(string $responseId, string $connectorName, int $attempt): void
+    /**
+     * Wait for the selected Connector and its writable composer to settle on the owned document.
+     * Transient renderer/CDP reads remain read-only until the body is known. The parent
+     * menu or checkpoint fence stays in force throughout the wait and the draft cleanup.
+     */
+    private function prepareSelectedTaskConnector(string $responseId, string $connectorName, int $attempt,
+        ?callable $selectionCurrent = null): void
     {
-        if (!isset($this->chatGptTurns[$responseId])) return;
-        $this->evaluateTask($responseId, WebModelPage::promptTextExpression(),
-            function ($readError, $draft) use ($responseId, $connectorName, $attempt): void {
-                if (!isset($this->chatGptTurns[$responseId])) return;
-                if ($readError !== null || !is_array($draft) || empty($draft['ok'])) {
-                    $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_STATE_UNAVAILABLE', '无法确认 ChatGPT 工具编辑器是否为空。');
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn)) return;
+        $owner = $this->modelReadbackOwner($responseId);
+        $connectorAttempt = $turn['connector_attempt'] ?? 0;
+        $compactionPhase = $turn['compaction_phase'] ?? null;
+        $logicalId = (string) ($turn['logical_response_id'] ?? $responseId);
+        try { $ledger = TaskLedger::pollExecution($logicalId); }
+        catch (\Throwable) { return; }
+        // A retained checkpoint can use a physical page that already sent earlier
+        // multipart stages. Capture preparation progress from its own logical response.
+        $progressKeys = array_flip(['generation_id','submit_intent_at','accepted_at','mcp_binding_id',
+            'transport_transaction_id','transport_stage_sent','transport_stage_acked']);
+        $progress = array_intersect_key($ledger['job'], $progressKeys);
+        if (empty($turn['continuation_sending']) && (!empty($progress['submit_intent_at']) || !empty($progress['accepted_at']))) return;
+        $isCurrent = function () use ($responseId, $logicalId, $selectionCurrent, $owner, $connectorAttempt,
+            $compactionPhase, $progressKeys, $progress): bool {
+            $current = $this->chatGptTurns[$responseId] ?? [];
+            if (empty($current['connector_preparing']) || !empty($current['connector_catalog_refresh_pending'])
+                || ($current['connector_attempt'] ?? 0) !== $connectorAttempt
+                || ($current['compaction_phase'] ?? null) !== $compactionPhase
+                || $this->modelReadbackOwner($responseId) !== $owner
+                || ($selectionCurrent !== null && !$selectionCurrent())) return false;
+            try { $ledger = TaskLedger::pollExecution($logicalId); }
+            catch (\Throwable) { return false; }
+            ['job'=>$job,'turn'=>$durable,'surface'=>$surface] = $ledger;
+            return in_array($job['status'], ['queued','running'], true)
+                && $job['id'] === $durable['response_id'] && $job['generation_id'] === $durable['generation_id']
+                && array_intersect_key($job, $progressKeys) === $progress
+                && in_array($durable['status'], ['queued','submit_intent','submitted','running'], true)
+                && !in_array($durable['error_code'] ?? '',
+                    ['CODEX_USER_STOP_PENDING','CODEX_USER_STOP_WAITING_TOOLS','CODEX_USER_STOPPED'], true)
+                && $surface['id'] === $current['surface_id'] && $surface['task_id'] === $job['task_id']
+                && $surface['session_id'] === $current['session_id'] && $surface['target_id'] === $current['target_id']
+                && $surface['document_nonce'] === $current['document_nonce']
+                && $surface['owner_incarnation'] === $current['owner_incarnation']
+                && (int) $surface['fencing_version'] === (int) $current['fencing_version'];
+        };
+        $deadline = min((float) $turn['deadline'], microtime(true) + self::TASK_CONNECTOR_READY_SECONDS);
+        $rootRequired = !empty($turn['require_root_before_send']) && empty($turn['accepted'])
+            && empty($turn['continuation_sending']) && (int) ($turn['transport_stage_acked'] ?? 0) === 0;
+        $temporaryPath = ($turn['web_chat']['mode'] ?? null) === 'temporary'
+            ? (string) parse_url((string) $ledger['surface']['url'], PHP_URL_PATH) : '';
+        $expression = WebModelPage::selectedConnectorComposerExpression($connectorName, !empty($turn['steering_prepare_while_busy']));
+        $read = function (array $last = []) use ($responseId, $connectorName, $attempt, $expression, $isCurrent,
+            $rootRequired, $temporaryPath, $deadline, &$read): void {
+            if (!$isCurrent()) return;
+            $remaining = $deadline - microtime(true);
+            if ($remaining <= 0.0) {
+                self::writeBrowserDiagnostic(['event'=>'selected_connector_composer_unverified',
+                    'command_id'=>(int) $this->chatGptTurns[$responseId]['command_id']] + $last + ['reason'=>'deadline']);
+                $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_STATE_UNAVAILABLE', '无法确认 ChatGPT 工具编辑器是否为空。');
+                return;
+            }
+            $this->evaluateTask($responseId, $expression, function ($error, $draft) use (
+                $responseId, $connectorName, $attempt, $rootRequired, $temporaryPath, $deadline, $isCurrent, &$read): void {
+                if (!$isCurrent()) return;
+                $url = is_string($draft['url'] ?? null) ? $draft['url'] : '';
+                if ($error === null && $url !== '' && (!$this->taskChatMatches($responseId, $url, $rootRequired)
+                    || (str_starts_with($temporaryPath, '/c/') && parse_url($url, PHP_URL_PATH) !== $temporaryPath))) {
+                    $this->taskFailTurn($responseId, 'CHATGPT_CHAT_IDENTITY_CHANGED', 'The Web chat identity could not be confirmed.');
                     return;
                 }
-                if ((string) ($draft['text'] ?? '') === '') {
+                if ($error === null && ($draft['code'] ?? null) === 'CHATGPT_CONNECTOR_DUPLICATE') {
+                    $this->taskFailTurn($responseId, 'CHATGPT_CONNECTOR_DUPLICATE', 'ChatGPT 页面出现了重复的同名工具连接器。');
+                    return;
+                }
+                $observed = $error === null && $url !== '' && !empty($draft['ok']) && is_bool($draft['empty'] ?? null);
+                if (!$observed || microtime(true) >= $deadline) {
+                    $reason = match (true) {
+                        ($error['message'] ?? '') === 'BROWSER_CDP_TIMEOUT' => 'cdp_timeout',
+                        $error !== null => 'cdp_error',
+                        $observed => 'deadline',
+                        in_array($draft['code'] ?? null, ['CHATGPT_EDITOR_MISSING','CHATGPT_EDITOR_AMBIGUOUS','CHATGPT_EDITOR_NOT_READY',
+                            'CHATGPT_CONNECTOR_CONFLICT','CHATGPT_CONNECTOR_NOT_SELECTED'], true) => $draft['code'],
+                        default => 'invalid_observation',
+                    };
+                    $facts = ['reason'=>$reason,'cdp_code'=>(int) ($error['code'] ?? 0),
+                        'composer_count'=>(int) ($draft['composer_count'] ?? -1),'connector_count'=>(int) ($draft['connector_count'] ?? -1)];
+                    $delay = min(0.35, $deadline - microtime(true));
+                    if ($delay <= 0.0) $read($facts);
+                    else Timer::add($delay, fn() => $read($facts), null, false);
+                    return;
+                }
+                if ($draft['empty']) {
                     $this->insertTaskPrompt($responseId, true, $connectorName);
                     return;
                 }
@@ -7060,15 +7140,17 @@ JS;
                     return;
                 }
                 $this->evaluateTask($responseId, WebModelPage::focusAndClearExpression(),
-                    function ($clearError, $cleared) use ($responseId, $connectorName, $attempt): void {
-                        if (!isset($this->chatGptTurns[$responseId])) return;
+                    function ($clearError, $cleared) use ($responseId, $connectorName, $attempt, $isCurrent): void {
+                        if (!$isCurrent()) return;
                         if ($clearError !== null || !is_array($cleared) || empty($cleared['ok']) || (string) ($cleared['text'] ?? '') !== '') {
                             $this->taskFailTurn($responseId, 'CHATGPT_EDITOR_CLEAR_FAILED', 'ChatGPT 中存在上次遗留草稿，且无法安全清空。');
                             return;
                         }
                         $this->prepareTaskConnector($responseId, $connectorName, $attempt);
                     });
-            });
+            }, min(12.0, max(0.01, $remaining)));
+        };
+        $read();
     }
 
     private function insertTaskPrompt(string $responseId, bool $withConnector, string $connectorName = ''): void

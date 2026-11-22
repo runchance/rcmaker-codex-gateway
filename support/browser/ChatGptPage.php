@@ -14,6 +14,19 @@ final class ChatGptPage
     private const EFFORT_CONTROL = 'button[aria-haspopup="menu"][data-tone="neutral"],button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"],button[data-codex-intelligence-trigger="true"][data-composer-navigation-target="reasoning"][aria-haspopup="menu"],button[aria-haspopup="menu"][aria-label="选择 ChatGPT 模型"],button[aria-haspopup="menu"][aria-label="Choose ChatGPT model"]';
     private const EFFORT_MENU = '[data-testid="composer-intelligence-picker-content"],[role="menu"],[role="group"]';
     private const EFFORT_SLIDER_CONTAINER = '[data-model-reasoning-effort-slider],[data-model-picker-power-slider],[role="menuitem"][data-reasoning-slider][aria-label="强度"],[role="menuitem"][data-reasoning-slider][aria-label="Reasoning effort"]';
+    private const CONNECTOR_SELECTION_SCRIPT = <<<'JS'
+const pills=[...composer.querySelectorAll('[data-id^="plugin:"],[app-mention-path^="app://"],[data-prompt-link-href^="app://"]')];
+const controls=pills.filter(el=>
+    visible(el)&&(el.hasAttribute('data-keyword')?String(el.getAttribute('data-keyword')||'')===name:
+        String(el.getAttribute('app-mention-display-name')||'')===name
+        &&el.getAttribute('app-mention-path')===el.getAttribute('data-prompt-link-href')));
+const selected=controls.length===1&&pills.length===1;
+JS;
+    private const CONNECTOR_PROMPT_SCRIPT = <<<'JS'
+const clone=composer.cloneNode(true);clone.querySelectorAll('[data-id^="plugin:"][data-keyword],[app-mention-path^="app://"][app-mention-display-name][data-prompt-link-href^="app://"],[data-inline-selection-pill-cursor-target]').forEach(el=>el.remove());
+const body=('value'in clone?String(clone.value||''):[...clone.childNodes].map(node=>String(node.textContent||'')).join('\n'));
+const text=body.replace(/\u00a0/g,' ').replace(/^\s+/,'');
+JS;
 
     /** Build the isolated Temporary Chat URL on the configured ChatGPT origin. */
     public static function temporaryChatUrl(string $modelUrl): string
@@ -975,17 +988,42 @@ JS));
     public static function connectorSelectedExpression(string $connectorName): string
     {
         $name = json_encode($connectorName, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        return self::wrap(str_replace('__CONNECTOR__', $name, <<<'JS'
+        return self::wrap(strtr(<<<'JS'
 const composer=visibleOne(COMPOSER);if(!composer)return {selected:false,count:0,code:'CHATGPT_EDITOR_MISSING'};
 const name=__CONNECTOR__;
-const pills=[...composer.querySelectorAll('[data-id^="plugin:"],[app-mention-path^="app://"],[data-prompt-link-href^="app://"]')];
-const controls=pills.filter(el=>
-    visible(el)&&(el.hasAttribute('data-keyword')?String(el.getAttribute('data-keyword')||'')===name:
-        String(el.getAttribute('app-mention-display-name')||'')===name
-        &&el.getAttribute('app-mention-path')===el.getAttribute('data-prompt-link-href')));
-return {selected:controls.length===1&&pills.length===1,count:controls.length,total_count:pills.length,
+__CONNECTOR_SELECTION__
+return {selected,count:controls.length,total_count:pills.length,
     code:pills.length>1?'CHATGPT_CONNECTOR_CONFLICT':null};
-JS));
+JS, ['__CONNECTOR__'=>$name, '__CONNECTOR_SELECTION__'=>self::CONNECTOR_SELECTION_SCRIPT]));
+    }
+
+    /**
+     * Read the exact Connector and body from the same rendered, writable composer.
+     * @param string $connectorName Exact name pinned to the current task's tool binding.
+     * @param bool $liveSteering Allow generation only during the existing inline-steering phase.
+     * @return string Read-only CDP expression returning page identity, readiness and body emptiness.
+     * @throws \JsonException If the connector name cannot be encoded.
+     */
+    public static function selectedConnectorComposerExpression(string $connectorName, bool $liveSteering = false): string
+    {
+        $name = json_encode($connectorName, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        return self::wrap(strtr(<<<'JS'
+const url=String(location.href),composers=[...document.querySelectorAll(COMPOSER)].filter(visible);
+const facts={url,composer_count:composers.length};
+if(composers.length!==1)return {ok:false,...facts,code:composers.length?'CHATGPT_EDITOR_AMBIGUOUS':'CHATGPT_EDITOR_MISSING'};
+const composer=composers[0],name=__CONNECTOR__;
+facts.generation_running=!!generationStop();
+if((facts.generation_running&&!__LIVE_STEERING__)||generationStopConfirmation().present||composer.disabled
+    ||composer.readOnly||composer.getAttribute('aria-disabled')==='true'||!('value' in composer||composer.isContentEditable))
+    return {ok:false,...facts,code:'CHATGPT_EDITOR_NOT_READY'};
+__CONNECTOR_SELECTION__
+facts.connector_count=pills.length;
+if(!selected)return {ok:false,...facts,code:controls.length>1?'CHATGPT_CONNECTOR_DUPLICATE':
+    pills.length>1?'CHATGPT_CONNECTOR_CONFLICT':'CHATGPT_CONNECTOR_NOT_SELECTED'};
+__CONNECTOR_PROMPT__
+return {ok:true,...facts,empty:text===''};
+JS, ['__CONNECTOR__'=>$name, '__LIVE_STEERING__'=>$liveSteering ? 'true' : 'false',
+            '__CONNECTOR_SELECTION__'=>self::CONNECTOR_SELECTION_SCRIPT, '__CONNECTOR_PROMPT__'=>self::CONNECTOR_PROMPT_SCRIPT]));
     }
 
     /** All selected connector identities, used to prove setup verification leaves the composer clean. */
@@ -1041,12 +1079,11 @@ JS));
     /** Composer text with connector pills removed, used for exact prompt-integrity verification. */
     public static function promptTextExpression(): string
     {
-        return self::wrap(<<<'JS'
+        return self::wrap(strtr(<<<'JS'
 const composer=visibleOne(COMPOSER);if(!composer)return {ok:false,text:''};
-const clone=composer.cloneNode(true);clone.querySelectorAll('[data-id^="plugin:"][data-keyword],[app-mention-path^="app://"][app-mention-display-name][data-prompt-link-href^="app://"],[data-inline-selection-pill-cursor-target]').forEach(el=>el.remove());
-const text=('value'in clone?String(clone.value||''):[...clone.childNodes].map(node=>String(node.textContent||'')).join('\n'));
-return {ok:true,text:text.replace(/\u00a0/g,' ').replace(/^\s+/,'')};
-JS);
+__CONNECTOR_PROMPT__
+return {ok:true,text};
+JS, ['__CONNECTOR_PROMPT__'=>self::CONNECTOR_PROMPT_SCRIPT]));
     }
 
     /** Read the native submit control; experimental steering also rejects a blocking dialog. */
