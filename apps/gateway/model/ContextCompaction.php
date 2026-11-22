@@ -458,6 +458,115 @@ final class ContextCompaction
     }
 
     /**
+     * Recover a never-sent read-only checkpoint whose saved page was inherited from an older task ID.
+     * The old prepared request already proved the original transcript and carries its short physical
+     * prompt. Reuse it only for the same saved conversation with that exact history and a native suffix.
+     * @param array $spec Routed compact request with the complete native history.
+     * @param array $task Current task owner from the native conversation mapping.
+     * @param bool $retire True only inside the reservation transaction; a replay may check the proof first.
+     * @return array|null Request carrying the original source and no live tool receipts, or null without proof.
+     * @throws GatewayError On unavailable durable evidence or a saved page still awaiting confirmed Stop.
+     */
+    public static function prepareUnsentSavedCheckpointRetryUnlocked(array $spec, array $task, bool $retire = true): ?array
+    {
+        if (!in_array($spec['operation_kind'] ?? '', ['compact_v1', 'compact_v2'], true)
+            || !in_array($task['status'], ['active', 'cancelled'], true) || !empty($spec['input_is_delta'])
+            || !empty($spec['previous_response_id']) || (array)($spec['tools'] ?? []) !== []
+            || ($spec['tool_choice'] ?? null) !== 'none' || empty($task['thread_id'])
+            || $task['client_id'] !== ($spec['client_id'] ?? 'responses') || $task['thread_id'] !== ($spec['thread_id'] ?? null)
+            || $task['branch_id'] !== ($spec['branch_id'] ?? 'main') || $task['owner_key'] !== ($spec['browser_owner_key'] ?? '')) return null;
+
+        $taskId = $task['id'];
+        $latest = ResponseJob::latestForTaskUnlocked($taskId, true);
+        if (($latest['status'] ?? null) !== 'failed' || $latest['operation_kind'] !== $spec['operation_kind']) return null;
+        $chat = TaskWebChat::state($taskId);
+        if ($chat['mode'] !== 'regular' || empty($chat['conversation_id']) || empty($chat['account_key'])) return null;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $old = $db->table('gateway_response_jobs')->where('id', $latest['id'])->find();
+        if (!is_array($old) || $old['task_id'] !== $taskId || empty($old['compact_id'])
+            || !empty($old['previous_response_id']) || !empty($old['mcp_binding_id'])
+            || $old['terminal_type'] !== 'response.failed' || empty($old['finished_at'])
+            || $old['round_kind'] !== 'text' || $old['epoch_id'] !== $task['current_epoch_id']
+            || (int)$old['transport_stage_sent'] !== 0 || (int)$old['transport_stage_acked'] !== 0
+            || $old['model'] !== $spec['model'] || $old['reasoning_effort'] !== ($spec['reasoning_effort'] ?? null)
+            || $old['integration_id'] !== ($spec['integration_id'] ?? null)
+            || $old['compaction_epoch'] !== ($spec['compaction_epoch'] ?? 'base') || trim((string)$old['prompt']) === '') return null;
+        $budget = json_decode((string)$old['budget_json'], true);
+        $pin = $budget['regular_chat'] ?? null;
+        if (($pin['task_id'] ?? null) !== $taskId || ($pin['request_hash'] ?? null) !== $old['request_hash']
+            || ($pin['conversation_id'] ?? null) !== $chat['conversation_id'] || empty($pin['source_response_id'])
+            || $pin['source_response_id'] !== $old['continuation_source_response_id']) return null;
+
+        $checkpoints = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
+            ->where('state', 'generating')->limit(2)->select();
+        if (!is_array($checkpoints) || count($checkpoints) !== 1) return null;
+        $checkpoint = $checkpoints[0];
+        if ($checkpoint['id'] !== $old['compact_id'] || $checkpoint['response_id'] !== $old['id']
+            || $checkpoint['request_hash'] !== $old['request_hash'] || $checkpoint['protocol'] !== $spec['operation_kind']
+            || $checkpoint['source_response_id'] !== null || $checkpoint['summary'] !== null
+            || $checkpoint['response_json'] !== null || $checkpoint['committed_at'] !== null || $checkpoint['consumed_at'] !== null
+            || !ContextRecovery::canRetryFailedBeforeCommitUnlocked($old['id'])) return null;
+        $turn = $db->table('gateway_task_turns')->where('id', $old['durable_turn_id'])
+            ->find('task_id,response_id,epoch_id,surface_id,generation_id');
+        if (!is_array($turn) || $turn['task_id'] !== $taskId || $turn['response_id'] !== $old['id']
+            || $turn['epoch_id'] !== $old['epoch_id'] || $turn['surface_id'] !== $old['surface_id']
+            || $turn['generation_id'] !== $old['generation_id']) return null;
+        $transport = json_decode((string)$old['transport_context_json'], true);
+        $environment = json_decode((string)$old['tool_environment_json'], true);
+        if (($transport['messages'] ?? null) !== [] || ($transport['system'] ?? null) !== []
+            || ($environment['tools'] ?? null) !== []) return null;
+
+        $before = json_decode((string)$old['context_json'], true, 128, JSON_THROW_ON_ERROR);
+        $after = json_decode((string)($spec['full_context_json'] ?? $spec['context_json']), true, 128, JSON_THROW_ON_ERROR);
+        if (empty($before['messages']) || !self::hasCompleteSourcePrefix($before, $after,
+            !empty($spec['native_responses_lite']), $prefixLength)) return null;
+        // Any trailing native receipt is still present in the exact checked archive prefix.
+        $knownReceipts = self::receiptOutputs($before);
+        foreach ((array)($spec['tool_outputs'] ?? []) as $output) {
+            if (!array_key_exists((string)($output['call_id'] ?? ''), $knownReceipts)) return null;
+        }
+
+        $outbound = $db->table('gateway_web_messages')->where('turn_id', $old['durable_turn_id'])
+            ->where('response_id', $old['id'])->where('direction', 'outbound')->find('id');
+        $handoff = $db->table('gateway_compaction_handoffs')->where('compact_response_id', $old['id'])->find('checkpoint_id');
+        if ($outbound !== null || $handoff !== null) return null;
+        foreach (['gateway_tool_invocations', 'gateway_mcp_bindings'] as $table) {
+            if ($db->table($table)->where('task_id', $taskId)->limit(1)->find('id') !== null) return null;
+        }
+        $source = $db->table('gateway_response_jobs')->where('id', $pin['source_response_id'])
+            ->find('id,task_id,epoch_id,surface_id,status,finished_at');
+        if (!is_array($source) || $source['task_id'] === $taskId || empty($source['finished_at'])
+            || (int)$source['finished_at'] > (int)$old['created_at']
+            || !in_array($source['status'], ['completed', 'failed'], true)) return null;
+        $origin = $db->table('gateway_tasks')->where('id', $source['task_id'])->find('client_id,thread_id,branch_id,status');
+        if (!is_array($origin) || !in_array($origin['status'], ['cancelled', 'needs_attention'], true)
+            || $origin['client_id'] !== $task['client_id'] || $origin['thread_id'] !== $task['thread_id']
+            || $origin['branch_id'] !== $task['branch_id']) return null;
+        TaskPageRetirement::assertStoppedSavedCheckpointSourceUnlocked($source, $chat);
+        if ($task['status'] === 'cancelled') {
+            $previousPage = $db->table('gateway_browser_surfaces')->where('id', $old['surface_id'])
+                ->where('task_id', $taskId)->where('epoch_id', $old['epoch_id'])->where('status', 'retired')->find('url,target_id');
+            if (!is_array($previousPage)) return null;
+            if (!empty($previousPage['target_id']) || !in_array($previousPage['url'], ['', 'about:blank'], true)) {
+                TaskPageRetirement::assertStoppedSavedCheckpointSourceUnlocked($old, $chat);
+            }
+        }
+
+        if ($retire) self::supersedeFailedCheckpointUnlocked($checkpoint, $old, $source['id']);
+        $spec['context_json'] = $spec['full_context_json'] = ContextHistory::canonical($after);
+        $spec['tool_outputs'] = [];
+        $spec['regular_recovery_source_task_id'] = $source['task_id'];
+        $spec['regular_recovery_source_response_id'] = $source['id'];
+        $spec['regular_compaction_recovery'] = ['source_response_id'=>$source['id'],
+            'context_sha256'=>hash('sha256', $spec['full_context_json']), 'unsent_prompt'=>$old['prompt']];
+        if (count($after['messages']) > $prefixLength) {
+            $spec['regular_compaction_recovery']['source_prefix_length'] = $prefixLength;
+        }
+        return $spec;
+    }
+
+    /**
      * Omit only the exact committed checkpoint prefix when resuming a persistent ordinary conversation.
      * Unlike a temporary document proof, the saved conversation survives a closed tab or process restart.
      * @param array $spec Routed request with its full native checkpoint context.
@@ -610,6 +719,24 @@ final class ContextCompaction
         $routedSpec = $spec;
         if (is_array($link)) $routedSpec['browser_owner_key'] = (string) $link['current_owner_key'];
         $persistedFailure = $db->table('gateway_response_jobs')->where('id', (string)$job['id'])->find();
+        if (is_array($persistedFailure) && empty($persistedFailure['previous_response_id'])
+            && !empty($persistedFailure['continuation_source_response_id'])) {
+            $savedRetry = Schema::transaction(static function () use ($db, $baseTaskId, $spec, $persistedFailure): string|bool {
+                $link = $db->table('gateway_task_conversations')->where('base_task_id', $baseTaskId)->find();
+                if ($link === false) throw new GatewayError('storage_unavailable', 'Checkpoint task ownership could not be read.', 503);
+                $currentId = $link['current_task_id'] ?? $baseTaskId;
+                $currentSpec = $spec;
+                if (is_array($link)) $currentSpec['browser_owner_key'] = $link['current_owner_key'];
+                $producer = self::savedCheckpointRetryProducer($currentSpec, $currentId, $persistedFailure);
+                if ($producer !== null) return $producer;
+                if ($currentId !== $persistedFailure['task_id']
+                    || (ResponseJob::latestForTaskUnlocked($currentId, true)['id'] ?? null) !== $persistedFailure['id']) return false;
+                $task = $db->table('gateway_tasks')->where('id', $currentId)->find();
+                return is_array($task) && self::prepareUnsentSavedCheckpointRetryUnlocked($currentSpec, $task, false) !== null;
+            });
+            if (is_string($savedRetry)) return ResponseJob::get($savedRetry);
+            if ($savedRetry) return ResponseJob::createOrReuse($sourceSpec, $sourceKey);
+        }
         $retainedDraftFailure = !empty($job['previous_response_id'])
             && ($job['error']['error']['code'] ?? null) === 'CHATGPT_EDITOR_VERIFY_FAILED';
         if (($job['task_id'] ?? '') !== $taskId) {
@@ -695,6 +822,39 @@ final class ContextCompaction
         if (!is_array($task) || $task['status'] !== 'active'
             || !self::safeUnsentRetryUnlocked($checkpoint, $job, $spec, $taskId)) return $job;
         return ResponseJob::createOrReuse($retrySpec, $retryKey);
+    }
+
+    /**
+     * Let an exact replay observe a same-source producer reserved by a concurrent native request.
+     * @param array $spec Original compact request scoped to the current native owner.
+     * @param string $taskId Current task in that conversation's durable mapping.
+     * @param array $old Immutable failed response selected by the original request identity.
+     * @return string|null Existing producer ID with identical history and saved conversation.
+     */
+    private static function savedCheckpointRetryProducer(array $spec, string $taskId, array $old): ?string
+    {
+        $sourceId = $old['continuation_source_response_id'];
+        $db = SDB(null, 'medoo', 'sqlite');
+        $event = $db->table('gateway_task_events')->where('response_id', $old['id'])->where('task_id', $old['task_id'])
+            ->where('event_type', 'inert_checkpoint_superseded')->find('data_json');
+        $evidence = is_array($event) ? json_decode($event['data_json'], true) : null;
+        if (($evidence['saved_source_response_id'] ?? null) !== $sourceId
+            || ($evidence['checkpoint_id'] ?? null) !== $old['compact_id']) return null;
+        $task = $db->table('gateway_tasks')->where('id', $taskId)->find();
+        $checkpoint = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)
+            ->where('state', 'IN', ['generating','committed'])->order([['rowid','DESC']])->limit(1)->find();
+        if (!is_array($checkpoint)) return null;
+        $candidate = $db->table('gateway_response_jobs')->where('id', $checkpoint['response_id'])->find();
+        if (!is_array($candidate) || $candidate['status'] === 'failed'
+            || $candidate['continuation_source_response_id'] !== $sourceId
+            || $candidate['request_hash'] !== $checkpoint['request_hash']
+            || $candidate['integration_id'] !== ($spec['integration_id'] ?? null)) return null;
+        $oldPin = json_decode((string)$old['budget_json'], true)['regular_chat'] ?? null;
+        $pin = json_decode((string)$candidate['budget_json'], true)['regular_chat'] ?? null;
+        if (($oldPin['source_response_id'] ?? null) !== $sourceId || ($pin['source_response_id'] ?? null) !== $sourceId
+            || ($pin['task_id'] ?? null) !== $taskId || ($pin['request_hash'] ?? null) !== $candidate['request_hash']
+            || empty($oldPin['conversation_id']) || ($pin['conversation_id'] ?? null) !== $oldPin['conversation_id']) return null;
+        return self::matchesCheckpointRequestUnlocked($checkpoint, $candidate, $spec, $task) ? $candidate['id'] : null;
     }
 
     /**
@@ -2285,6 +2445,12 @@ final class ContextCompaction
         $source = $source !== '' ? $source : 'import_' . substr($spec['request_hash'], 0, 24);
         $epoch = $db->table('gateway_task_epochs')->where('id', $source)->find();
         $existing = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)->where('source_epoch_id', $source)->find();
+        if (($existing['state'] ?? null) === 'abandoned' && isset($spec['regular_compaction_recovery']['unsent_prompt'])) {
+            // A failed control message may already have reserved this epoch's checkpoint key.
+            // Keep that audit row and reserve the verified retry under its own import key.
+            $source = 'import_' . substr(hash('sha256', $source . '|' . $spec['request_hash']), 0, 24);
+            $existing = $db->table('gateway_context_checkpoints')->where('task_id', $taskId)->where('source_epoch_id', $source)->find();
+        }
         // Wire metadata can change on a native retry without changing its source history.
         // Reuse the real response before a retired source is assigned a new import key.
         // Failed checkpoints still pass through the bounded no-send recovery below first.
@@ -2476,7 +2642,8 @@ final class ContextCompaction
                     throw new GatewayError('compaction_source_unavailable', 'The saved Web chat checkpoint history does not match the current task.', 409);
                 }
             }
-            $spec['prompt'] = self::prompt(ContextHistory::canonical($requested), true);
+            $spec['prompt'] = $recoveredSourceId !== null && isset($recovery['unsent_prompt'])
+                ? $recovery['unsent_prompt'] : self::prompt(ContextHistory::canonical($requested), true);
             if ($recoveredSourceId !== null && !empty($recovery['expanded_receipt_ids'])) {
                 $restoredIds = array_fill_keys($recovery['expanded_receipt_ids'], true);
                 $restored = array_values(array_filter((array)$requested['messages'], static fn(array $record): bool =>
@@ -2720,7 +2887,15 @@ final class ContextCompaction
         return $ownBinding;
     }
 
-    private static function supersedeFailedCheckpointUnlocked(array $checkpoint, array $old): void
+    /**
+     * Retire one terminal summary reservation while preserving the failed response and its evidence.
+     * @param array $checkpoint Sole generating checkpoint proved eligible for replacement.
+     * @param array $old Its immutable failed response.
+     * @param string|null $savedSourceId Original saved-page response proved for an unsent retry.
+     * @return void
+     * @throws GatewayError If retirement or its evidence cannot be persisted.
+     */
+    private static function supersedeFailedCheckpointUnlocked(array $checkpoint, array $old, ?string $savedSourceId = null): void
     {
         $db = SDB(null, 'medoo', 'sqlite');
         $updated = $db->table('gateway_context_checkpoints')->where('id', $checkpoint['id'])
@@ -2728,14 +2903,15 @@ final class ContextCompaction
         if (!$updated || $updated->rowCount() !== 1) {
             throw new GatewayError('compaction_conflict', '旧摘要检查点恢复所有权发生变化。', 409);
         }
+        $evidence = ['checkpoint_id'=>$checkpoint['id'], 'final_commit_sent'=>$old['submit_intent_at'] !== null,
+            'known_readonly_failure'=>($old['error_json'] !== null
+                && (json_decode((string) $old['error_json'], true)['error']['code'] ?? '') === 'CHATGPT_CONTEXT_READ_REQUIRED')];
+        if ($savedSourceId !== null) $evidence['saved_source_response_id'] = $savedSourceId;
         if (!$db->table('gateway_task_events')->add([
             'task_id'=>$checkpoint['task_id'], 'turn_id'=>$old['durable_turn_id'],
             'response_id'=>$old['id'], 'surface_id'=>$old['surface_id'],
             'event_type'=>'inert_checkpoint_superseded',
-            'data_json'=>json_encode(['checkpoint_id'=>$checkpoint['id'],
-                'final_commit_sent'=>$old['submit_intent_at'] !== null,
-                'known_readonly_failure'=>($old['error_json'] !== null
-                    && (json_decode((string) $old['error_json'], true)['error']['code'] ?? '') === 'CHATGPT_CONTEXT_READ_REQUIRED')], JSON_THROW_ON_ERROR),
+            'data_json'=>json_encode($evidence, JSON_THROW_ON_ERROR),
             'created_at'=>time(),
         ])) throw new GatewayError('storage_unavailable', '旧摘要检查点状态无法保存。', 503);
     }

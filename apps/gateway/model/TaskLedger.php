@@ -500,6 +500,12 @@ final class TaskLedger
             $spec['tool_outputs'] = [];
             $hasToolOutputs = false;
         }
+        $unsentSavedRetry = is_array($task) && !$sourceWaitingSuperseded && !$failedFreshRecovered
+            ? ContextCompaction::prepareUnsentSavedCheckpointRetryUnlocked($spec, $task) : null;
+        if ($unsentSavedRetry !== null) {
+            $spec = $unsentSavedRetry;
+            $hasToolOutputs = false;
+        }
         $savedCheckpointRecovery = null;
         if (is_array($task) && $hasToolOutputs
             && self::terminalCompactionHistoryCompleteUnlocked($spec, $task, $incoming, $savedCheckpointRecovery)) {
@@ -621,7 +627,7 @@ final class TaskLedger
         // chat preference here too; otherwise this new task looks like a legacy temporary task.
         TaskWebChat::createUnlocked($newTaskId, $taskId, $errorRebuild);
         $newChat = TaskWebChat::state($newTaskId);
-        if ($newChat['mode'] === 'regular' && !empty($newChat['conversation_id'])) {
+        if ($newChat['mode'] === 'regular' && !empty($newChat['conversation_id']) && $unsentSavedRetry === null) {
             $sourceJob = ResponseJob::latestForTaskUnlocked($taskId, true);
             if (is_array($sourceJob)) {
                 $spec['regular_recovery_source_response_id'] = $sourceJob['id'];
