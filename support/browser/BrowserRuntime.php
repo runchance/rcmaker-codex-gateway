@@ -9015,7 +9015,7 @@ JS;
                     'checkpoint_source_stopped' => $stoppedCompactSource,
                     'round_markdown' => $roundMarkdown,
                     'has_artifacts' => $hasArtifacts,
-                ], $now, $stoppedCompactSource)) return;
+                ], $now, $expression, $stoppedCompactSource)) return;
             } else {
                 $this->chatGptTurns[$responseId]['empty_response_health'] = null;
             }
@@ -9628,8 +9628,9 @@ JS;
         return true;
     }
 
+    /** Settle a verified empty reply and preserve the appropriate task-mode recovery boundary. */
     private function observeEmptyResponseSettlement(string $responseId, string $logicalResponseId,
-        array $snapshot, array $evidence, float $now, bool $activeCompact = false): bool
+        array $snapshot, array $evidence, float $now, string $replyRead, bool $activeCompact = false): bool
     {
         $evidence['mcp_revision'] = 0;
         $previousHealth = $this->chatGptTurns[$responseId]['empty_response_health'] ?? null;
@@ -9692,9 +9693,10 @@ JS;
             return true;
         }
         if ($health['error_code'] === 'CHATGPT_EMPTY_RESPONSE' && $toolCapable
-            && ($evidence['ui_receipts_settled'] ?? null) === true
-            && $this->continueStoppedTaskStream($responseId, $snapshot, 'CHATGPT_EMPTY_RESPONSE')) {
-            return true;
+            && ($evidence['ui_receipts_settled'] ?? null) === true) {
+            $settledIdle = !empty($evidence['allow_regular_idle']) && ($evidence['transport_settled'] ?? null) !== true
+                ? ['read'=>$replyRead, 'activity_revision'=>$evidence['mcp_revision']] : null;
+            if ($this->continueStoppedTaskStream($responseId, $snapshot, 'CHATGPT_EMPTY_RESPONSE', $settledIdle)) return true;
         }
         if ($health['error_code'] === 'CHATGPT_MESSAGE_STREAM_ERROR') {
             // The original HTTP stream failed while MCP tools continued. A drained empty
@@ -10955,10 +10957,13 @@ JS;
      * @param string $responseId Physical observer. @param array $snapshot Current fenced DOM observation.
      * @param bool $settledEmptyStream A failed transport with stable empty idle UI and drained tools
      *     has passed observeEmptyResponseSettlement; permits ordinary Voice idle under those proofs.
+     * @param bool $reattachedEmpty Reconcile the unchanged empty reply after a verified reload.
+     * @param array{read:string,activity_revision:int}|null $settledIdle Stable empty UI and exact
+     *     receipt drain without transport closure. Recheck the same reply and MCP revision before refreshing.
      * @return bool Whether ordinary recovery owns this poll; temporary and compact paths are unchanged.
      */
     private function recoverRegularTaskStream(string $responseId, array $snapshot, bool $settledEmptyStream = false,
-        bool $reattachedEmpty = false): bool
+        bool $reattachedEmpty = false, ?array $settledIdle = null): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || ($turn['web_chat']['mode'] ?? 'temporary') !== 'regular'
@@ -10974,13 +10979,14 @@ JS;
         $state = TaskLedger::regularStreamRecoveryState($logicalId);
         $stoppedThinking = ($snapshot['error']['code'] ?? '') === 'CHATGPT_STOPPED_THINKING';
         if ($reattachedEmpty && ($state['stage'] ?? '') !== 'reattached') return false;
-        $failed = $reattachedEmpty || $stoppedThinking
+        $failed = $reattachedEmpty || $settledIdle !== null || $stoppedThinking
             || in_array($snapshot['error']['code'] ?? '', ['CHATGPT_NETWORK_ERROR','CHATGPT_MESSAGE_STREAM_ERROR'], true);
         if (!$failed && ($state['stage'] ?? '') !== 'retry') return false;
         // Absence of a recognized Stop alone is not a stopped-page proof.
         $retry = $snapshot['network_retry'] ?? [];
         $nativeRetry = !empty($retry['available']) && !empty($retry['failure_id']) && !empty($retry['fingerprint']);
-        if (($snapshot['generation_running'] ?? null) !== false
+        if (($settledIdle !== null && !self::emptyRegularRecoverySnapshot($snapshot))
+            || ($snapshot['generation_running'] ?? null) !== false
             || (empty($snapshot['send_button_visible']) && !$nativeRetry && empty($snapshot['completion_action_visible'])
                 && !(($stoppedThinking || ($state['stage'] ?? '') === 'retry' || $settledEmptyStream)
                     && !empty($snapshot['recovery_idle_button_visible'])))
@@ -10995,6 +11001,7 @@ JS;
         }
         $identity = [$snapshot['new_user_id'], $snapshot['response_id'],
             $snapshot['error']['code'] ?? '', $retry['failure_id'] ?? '', $retry['fingerprint'] ?? ''];
+        if ($settledIdle !== null) $identity[] = 'empty_after_receipts';
         if ($reattachedEmpty) $identity[] = ['reattached_empty', $snapshot['recovery_anchor']['document_id']];
         if ($rateLimitKey !== '') $identity[] = $rateLimitKey;
         $key = hash('sha256', json_encode($identity, JSON_THROW_ON_ERROR));
@@ -11012,14 +11019,18 @@ JS;
             $this->scheduleTaskPoll($responseId, 1.0);
             return true;
         }
-        $responseExpression = $reattachedEmpty ? WebModelPage::responseExpression(
+        $responseExpression = $settledIdle['read'] ?? ($reattachedEmpty ? WebModelPage::responseExpression(
             (array)$turn['baseline_users'], (array)$turn['baseline_assistants'],
             (string)($turn['continuation_marker'] ?? ''), (string)$turn['bound_assistant_id'],
-            self::hasLegacyCitationPrefix($turn), '', true) : null;
+            self::hasLegacyCitationPrefix($turn), '', true) : null);
+        $nonce = $turn['document_nonce'];
         $this->evaluateTask($responseId, self::regularRecoveryBaselineExpression($responseExpression),
-            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed, $stoppedThinking, $rateLimitKey, $reattachedEmpty): void {
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $key, $nativeRetry, $retry, $failed,
+                $stoppedThinking, $rateLimitKey, $reattachedEmpty, $settledIdle, $nonce): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || ($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
+                if ($settledIdle !== null && ($turn['document_nonce'] !== $nonce
+                    || ($turn['regular_stopped_observation']['key'] ?? null) !== $key)) return;
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
                     || ($baseline['generation_running'] ?? null) !== false
                     || !$this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''))
@@ -11028,13 +11039,14 @@ JS;
                     $this->scheduleTaskPoll($responseId, 1.0);
                     return;
                 }
-                if ($reattachedEmpty) {
+                if ($reattachedEmpty || $settledIdle !== null) {
                     $fresh = $baseline['recovery_response'] ?? [];
+                    $anchor = $snapshot['recovery_anchor'] ?? [];
                     if (!self::emptyRegularRecoverySnapshot($fresh)
-                        || ($fresh['recovery_anchor'] ?? null) !== $snapshot['recovery_anchor']
+                        || empty($anchor['document_id']) || ($fresh['recovery_anchor'] ?? null) !== $anchor
                         || ($fresh['new_user_id'] ?? '') !== $snapshot['new_user_id']
                         || ($fresh['response_id'] ?? '') !== $snapshot['response_id']
-                        || $baseline['document_id'] !== $snapshot['recovery_anchor']['document_id']) {
+                        || ($baseline['document_id'] ?? '') !== $anchor['document_id']) {
                         $this->chatGptTurns[$responseId]['regular_stopped_observation'] = null;
                         $this->chatGptTurns[$responseId]['empty_response_health'] = null;
                         $this->scheduleTaskPoll($responseId, 0.5);
@@ -11053,7 +11065,8 @@ JS;
                             'action'=>$reattachedEmpty ? 'reattached_empty'
                                 : ($rateLimitKey !== '' ? 'rate_limit' : ($stoppedThinking ? 'stopped_thinking'
                                 : (!$failed && !empty($snapshot['completion_action_visible']) ? 'retry_settled' : ''))),
-                            'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']]);
+                            'user_ids'=>$baseline['user_ids'], 'assistant_ids'=>$baseline['assistant_ids']],
+                        $settledIdle['activity_revision'] ?? null);
                     if (!empty($reservation['waiting'])) { $this->scheduleTaskPoll($responseId, 1.0); return; }
                     if (!empty($reservation['exhausted'])) {
                         $this->taskFailTurn($responseId, 'CHATGPT_NETWORK_RETRY_EXHAUSTED',
@@ -11259,9 +11272,12 @@ JS;
      * @param string $responseId Physical observer, possibly following a newer native receipt round.
      * @param array $snapshot Bound stopped response with Send state, or settled ordinary Voice idle, and an optional native error.
      * @param string|null $recoveryCause Explicitly settled empty cause, or the snapshot's observed error.
+     * @param array{read:string,activity_revision:int}|null $settledIdle Exact ordinary empty observation
+     *     used for a fresh saved-chat read and refresh when the same-page continuation cannot be verified.
      * @return bool Whether this path owns waiting, preparation or failure; false retains legacy recovery.
      */
-    private function continueStoppedTaskStream(string $responseId, array $snapshot, ?string $recoveryCause = null): bool
+    private function continueStoppedTaskStream(string $responseId, array $snapshot, ?string $recoveryCause = null,
+        ?array $settledIdle = null): bool
     {
         $turn = $this->chatGptTurns[$responseId] ?? null;
         if (!is_array($turn) || empty($turn['tool_capable'])
@@ -11283,20 +11299,35 @@ JS;
             $this->scheduleTaskPoll($responseId, 0.5);
             return true;
         }
+        if ($settledIdle !== null && !empty($previous['saved_refresh_required'])) {
+            return $this->recoverRegularTaskStream($responseId, $snapshot, true, false, $settledIdle);
+        }
         if (microtime(true) - (float)$previous['since'] < self::COMPLETION_SETTLE_SECONDS) {
             $this->scheduleTaskPoll($responseId, 0.5);
             return true;
         }
+        $nonce = $turn['document_nonce'];
         $this->evaluateTask($responseId, WebModelPage::baselineExpression(),
-            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $failureKey, $errorCode): void {
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $failureKey, $errorCode, $settledIdle, $nonce): void {
                 $turn = $this->chatGptTurns[$responseId] ?? null;
                 if (!is_array($turn) || (string)($turn['logical_response_id'] ?? $responseId) !== $logicalId) return;
+                if ($settledIdle !== null && ($turn['document_nonce'] !== $nonce
+                    || ($turn['stopped_stream_observation']['signature'] ?? null) !== $failureKey)) return;
+                $fallback = function () use ($responseId, $errorCode, $settledIdle): void {
+                    if ($settledIdle !== null) {
+                        // The saved-chat ledger disallows the generic rebuild. An uncertain
+                        // composer observation must stay with this exact reply and document.
+                        $this->chatGptTurns[$responseId]['stopped_stream_observation']['saved_refresh_required'] = true;
+                        $this->scheduleTaskPoll($responseId, 0.5);
+                        return;
+                    }
+                    $this->recoverFailedMessageStream($responseId, true, $errorCode);
+                };
                 if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
                     || !$this->taskChatMatches($responseId, (string)($baseline['url'] ?? ''))
                     || !in_array($snapshot['new_user_id'], (array)($baseline['user_ids'] ?? []), true)
                     || !in_array($snapshot['response_id'], (array)($baseline['assistant_ids'] ?? []), true)) {
-                    // A genuinely unusable composer retains the existing exact-receipt fallback.
-                    $this->recoverFailedMessageStream($responseId, true, $errorCode);
+                    $fallback();
                     return;
                 }
                 if (!empty($baseline['generation_running'])) {
@@ -11316,7 +11347,7 @@ JS;
                         return;
                     }
                     if (empty($reservation['continue'])) {
-                        $this->recoverFailedMessageStream($responseId, true, $errorCode);
+                        $fallback();
                         return;
                     }
                     $this->prepareTaskStreamContinuation($responseId, $logicalId, $baseline, $reservation);
