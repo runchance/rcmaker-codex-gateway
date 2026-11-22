@@ -289,9 +289,11 @@ final class SubagentCapacity
     /**
      * Release the execution slot of a retired page with no remaining gateway work.
      * The browser observer must positively inventory both the exact target and conversation absent.
+     * An unsent steering rotation may prove the old token through its durable broker event.
      * Preserve the stop obligation and unknown tool results for this task's own recovery.
      * @param array $snapshot Exact owned retirement witness from the browser observer.
      * @return bool Whether a held slot was released.
+     * @throws GatewayError If the atomic release cannot be checked or written.
      */
     public static function releaseAbsentRetiredPage(array $snapshot): bool
     {
@@ -313,16 +315,15 @@ final class SubagentCapacity
             if (!TaskPageRetirement::owns($snapshot)) return false;
             $turn = $db->table('gateway_task_turns')->where('id', $slot['turn_id'])
                 ->where('task_id', $snapshot['task_id'])->where('surface_id', $snapshot['surface_id'])
-                ->where('status', 'IN', ['failed','cancelled','needs_attention'])->find('id');
+                ->where('status', 'IN', ['failed','cancelled','needs_attention'])->find('id,response_id');
             $source = $db->table('gateway_response_jobs')->where('id', $snapshot['source_response_id'])
                 ->where('durable_turn_id', $slot['turn_id'])->where('task_id', $snapshot['task_id'])
-                ->where('surface_id', $snapshot['surface_id'])->find('mcp_binding_id');
+                ->where('surface_id', $snapshot['surface_id'])->find('mcp_binding_id,accepted_at');
             if (!is_array($turn) || empty($source['mcp_binding_id'])) return false;
             $binding = $db->table('gateway_mcp_bindings')->where('id', $source['mcp_binding_id'])
                 ->where('turn_id', $turn['id'])->where('task_id', $snapshot['task_id'])
-                ->where('status', 'revoked')->find('id,token_hash,revoked_at');
-            if (empty($binding['revoked_at'])
-                || !in_array($binding['token_hash'], $snapshot['turn_token_hashes'] ?? [], true)) return false;
+                ->where('status', 'revoked')->find('id,token_hash,revoked_at,current_response_id,sent_at,started_at');
+            if (empty($binding['revoked_at'])) return false;
 
             $active = [
                 $db->table('gateway_response_jobs')->where('task_id', $snapshot['task_id'])->where('status', 'IN', ['queued','running'])->count(),
@@ -333,6 +334,8 @@ final class SubagentCapacity
                 if (!is_numeric($count)) self::unavailable();
                 if ((int)$count !== 0) return false;
             }
+            if (!in_array($binding['token_hash'], $snapshot['turn_token_hashes'] ?? [], true)
+                && !self::matchesUnsentSteeringRotation($snapshot, $turn, $source, $binding)) return false;
             $changed = $db->table('gateway_subagent_slots')->where('id', $slot['id'])
                 ->where('status', 'held')->where('turn_id', $turn['id'])->where('thread_id', $task['thread_id'])
                 ->where('parent_thread_id', $task['native_parent_thread_id'])->where('agent_path', $task['native_agent_path'])
@@ -340,6 +343,38 @@ final class SubagentCapacity
             if (!$changed) self::unavailable();
             return $changed->rowCount() === 1;
         });
+    }
+
+    /** Prove the missing page used the old token of this binding before its unsent steering restart. */
+    private static function matchesUnsentSteeringRotation(array $snapshot, array $turn, array $source, array $binding): bool
+    {
+        $responseId = $turn['response_id'];
+        if (empty($source['accepted_at']) || empty($responseId) || $binding['current_response_id'] !== $responseId
+            || $binding['sent_at'] !== null || $binding['started_at'] !== null) return false;
+
+        $db = SDB(null, 'medoo', 'sqlite');
+        $restart = $db->table('gateway_response_jobs')->where('id', $responseId)
+            ->where('task_id', $snapshot['task_id'])->where('durable_turn_id', $turn['id'])
+            ->where('surface_id', $snapshot['surface_id'])->where('mcp_binding_id', $binding['id'])
+            ->where('status', 'failed')->where('submit_intent_at', null)->where('accepted_at', null)
+            ->where('transport_stage_sent', 0)->find('previous_response_id');
+        if (empty($restart['previous_response_id'])) return false;
+        $outbound = $db->table('gateway_web_messages')->where('response_id', $responseId)
+            ->where('direction', 'outbound')->find('id');
+        if ($outbound !== null) return false;
+
+        $events = $db->table('gateway_task_events')->where('task_id', $snapshot['task_id'])
+            ->where('turn_id', $turn['id'])->where('response_id', $responseId)
+            ->where('event_type', 'IN', ['mcp_steering_restart_prepared', 'mcp_mailbox_context_restart_prepared'])
+            ->where('created_at', '>=', (int)$source['accepted_at'])->where('created_at', '<=', (int)$binding['revoked_at'])
+            ->limit(2)->select('data_json');
+        self::readable($events);
+        if (count($events) !== 1) return false;
+        $rotation = json_decode((string)$events[0]['data_json'], true);
+        return ($rotation['binding_id'] ?? null) === $binding['id']
+            && ($rotation['previous_response_id'] ?? null) === $restart['previous_response_id']
+            && is_string($rotation['retired_token_hash'] ?? null)
+            && in_array($rotation['retired_token_hash'], $snapshot['turn_token_hashes'] ?? [], true);
     }
 
     /**
