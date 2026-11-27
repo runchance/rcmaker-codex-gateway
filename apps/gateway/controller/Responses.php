@@ -12,6 +12,7 @@ use app\gateway\model\GatewayError;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\ResponsesProtocol;
 use app\gateway\model\ModelCatalog;
+use app\gateway\model\ModelCooldown;
 use app\gateway\model\CodexIntegration;
 use app\gateway\model\CodexSubagent;
 use app\gateway\model\ContextCompaction;
@@ -80,14 +81,14 @@ final class Responses
             if (GatewayRoute::nativeModel($body)) {
                 return $this->forward($request, 'responses', $raw);
             }
-            if (BrowserState::profileResetPending()) {
-                throw new GatewayError('browser_profile_reset_pending', '浏览器登录资料正在清空，请稍后重试。', 503);
-            }
             $phase = 'metadata';
             $raw = $this->withMetadata($request, $raw);
             $phase = 'composer_suggestion';
             $suggestion = ResponsesProtocol::localComposerSuggestion($raw);
-            if ($suggestion !== null) return $this->localSuggestionReply($request, $suggestion);
+            if ($suggestion !== null) return $this->composerSuggestion($request, $suggestion);
+            if (BrowserState::profileResetPending()) {
+                throw new GatewayError('browser_profile_reset_pending', '浏览器登录资料正在清空，请稍后重试。', 503);
+            }
             $phase = 'portability';
             if ((int) GatewaySettings::internal()['official_handoff_summary'] === 1) {
                 $plan = ContextPortability::prepareNativeHandoff($raw, $this->nativeHeaders($request));
@@ -97,7 +98,7 @@ final class Responses
             $phase = 'parse';
             $spec = ResponsesProtocol::parse($raw);
             $suggestion = ResponsesProtocol::localComposerSuggestionFromContext($spec);
-            if ($suggestion !== null) return $this->localSuggestionReply($request, $suggestion);
+            if ($suggestion !== null) return $this->composerSuggestion($request, $suggestion);
             $spec['integration_id'] = $this->integrationId($request);
             $idempotencyKey = $this->idempotencyKey($request);
             $connection = $request->RCresponse?->getConnection();
@@ -151,7 +152,34 @@ final class Responses
         }
     }
 
-    /** Format the same local, tool-free advisory response before any browser job is reserved. */
+    /** Route a recognized native draft to the optional tool-free background browser command. */
+    private function composerSuggestion(Request $request, array $suggestion): mixed
+    {
+        $connection = $request->RCresponse?->getConnection();
+        if (!$connection instanceof TcpConnection || $suggestion['prompt'] === '') return $this->localSuggestionReply($request, $suggestion);
+        try {
+            $effort = GatewaySettings::internal()['composer_suggestion_effort'];
+            if ($effort === 'off' || ModelCooldown::remainingSeconds() > 0) {
+                return $this->localSuggestionReply($request, $suggestion);
+            }
+            $deadline = time() + 90;
+            $commandId = BrowserState::enqueueComposerSuggestion([
+                'request_key'=>$suggestion['response']['id'], 'model'=>$suggestion['response']['model'],
+                'effort'=>$effort, 'prompt'=>$suggestion['prompt'], 'deadline_at'=>$deadline,
+                'with_confidence'=>str_contains($suggestion['response']['output'][0]['content'][0]['text'], 'confidence_score'),
+            ]);
+            if ($commandId === null) return $this->localSuggestionReply($request, $suggestion);
+            unset($suggestion['prompt']);
+            ResponseTransport::composerSuggestion($connection, $commandId, $suggestion, $deadline);
+            return $suggestion['stream'] ? $request->response('', 200, ['Content-Type'=>'text/event-stream', 'Cache-Control'=>'no-cache'])
+                : new DeferredResponse($request);
+        } catch (\Throwable) {
+            // Optional suggestions have a schema-valid local fallback while the account or browser is unavailable.
+            return $this->localSuggestionReply($request, $suggestion);
+        }
+    }
+
+    /** Format a tool-free empty suggestion with the same native response schema. */
     private function localSuggestionReply(Request $request, array $suggestion): mixed
     {
         if (!$suggestion['stream']) return $request->json($suggestion['response']);
@@ -160,7 +188,9 @@ final class Responses
             $frames .= 'event: ' . $event['type'] . "\ndata: "
                 . json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n\n";
         }
-        return $request->response($frames, 200, ['Content-Type'=>'text/event-stream', 'Cache-Control'=>'no-cache']);
+        // Workerman treats an exact text/event-stream header as an open stream and drops a preset body.
+        return $request->response($frames . "data: [DONE]\n\n", 200,
+            ['Content-Type'=>'text/event-stream; charset=utf-8', 'Cache-Control'=>'no-cache']);
     }
 
     /**

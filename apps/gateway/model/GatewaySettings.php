@@ -22,6 +22,7 @@ final class GatewaySettings
             'subagent_web_model' => (string) $row['subagent_web_model'],
             'subagent_reasoning_effort' => (string) $row['subagent_reasoning_effort'],
             'subagent_max_concurrency' => (int) $row['subagent_max_concurrency'],
+            'composer_suggestion_effort' => (string) $row['composer_suggestion_effort'],
             'ui_locale' => (string) ($row['ui_locale'] ?: \RC\Config::get('gateway', 'default_locale')),
             'pro_weekly_budget' => (int) ($row['pro_weekly_budget'] ?? 0),
             'mcp_invoke_timeout_ms' => (int) $row['mcp_invoke_timeout_ms'],
@@ -74,7 +75,7 @@ final class GatewaySettings
         $allowed = [
             'ui_locale', 'pro_weekly_budget', 'auto_cleanup_inactive_tasks', 'web_chat_mode',
             'temporary_chat_reuse_on_model_switch',
-            'subagent_web_model', 'subagent_reasoning_effort', 'subagent_max_concurrency',
+            'subagent_web_model', 'subagent_reasoning_effort', 'subagent_max_concurrency', 'composer_suggestion_effort',
             'expected_updated_at', 'mcp_enabled', 'auto_approve_tool_calls', 'connector_name', 'mcp_invoke_timeout_ms',
             'wait_poll_interval_ms', 'max_tool_calls_per_turn', 'tool_result_max_bytes',
             'tunnel_id', 'runtime_key', 'runtime_key_action',
@@ -93,6 +94,7 @@ final class GatewaySettings
         $input['auto_cleanup_inactive_tasks'] ??= $current['auto_cleanup_inactive_tasks'];
         $input['web_chat_mode'] ??= $current['web_chat_mode'] ?? 'temporary';
         $input['temporary_chat_reuse_on_model_switch'] ??= $current['temporary_chat_reuse_on_model_switch'];
+        $input['composer_suggestion_effort'] ??= $current['composer_suggestion_effort'];
         $input['subagent_max_concurrency'] ??= $current['subagent_max_concurrency'];
         foreach (['subagent_web_model','subagent_reasoning_effort'] as $field) {
             $input[$field] ??= $current[$field];
@@ -120,6 +122,7 @@ final class GatewaySettings
                 'subagent_web_model' => ['rule'=>'string', 'len'=>[0,128], 'required'=>false, 'name'=>'Subagent Web model'],
                 'subagent_reasoning_effort' => ['rule'=>'string', 'len'=>[3,6], 'name'=>'Subagent reasoning level'],
                 'subagent_max_concurrency' => ['rule'=>'pint', 'range'=>[1,32], 'name'=>'Global Web subagent concurrency'],
+                'composer_suggestion_effort' => ['rule'=>'string', 'len'=>[3,6], 'name'=>'Next message suggestion reasoning level'],
                 'pro_weekly_budget' => ['rule' => 'nnint', 'range' => [0, 100000], 'name' => 'Weekly Pro tracking budget'],
                 'auto_cleanup_inactive_tasks' => ['rule' => 'nnint', 'range' => [0, 1], 'name' => 'Inactive task cleanup'],
                 'expected_updated_at' => ['rule' => 'nnint', 'name' => '设置版本'],
@@ -153,6 +156,9 @@ final class GatewaySettings
         }
         $data += ['tunnel_id' => '', 'runtime_key' => '', 'subagent_web_model'=>''];
         CodexSubagent::validateSelection($data['subagent_web_model'], $data['subagent_reasoning_effort']);
+        if (!in_array($data['composer_suggestion_effort'], ['off','low','medium','high','xhigh'], true)) {
+            throw new GatewayError('INVALID_SETTINGS', 'Unsupported next message suggestion reasoning level.', 400);
+        }
         if (!in_array($data['ui_locale'], ['en', 'zh-CN'], true)) throw new GatewayError('INVALID_SETTINGS', 'Unsupported language.');
         if (!in_array($data['web_chat_mode'], ['temporary', 'regular'], true)) throw new GatewayError('INVALID_SETTINGS', 'Unsupported Web chat mode.');
         if (!in_array($data['context_transport'], ['auto', 'single'], true)) throw new GatewayError('INVALID_SETTINGS', '上下文传输请选择自动或单条。');

@@ -14,10 +14,11 @@
         disposed: false, timer: null, sequence: 0, listSignature: null
     };
     const taskLabels = {active: I18n.t('可继续'), completed: I18n.t('已完成'), cancelled: I18n.t('已取消'), needs_attention: I18n.t('需要确认')};
-    const taskStatuses = ['active', 'needs_attention', 'completed', 'cancelled'];
+    const taskStatuses = ['active', 'needs_attention', 'completed', 'cancelled', 'suggestions'];
     const emptyLabels = {
         active: I18n.t('还没有可继续的任务。'), needs_attention: I18n.t('没有需要确认的任务。'),
-        completed: I18n.t('还没有已完成的任务。'), cancelled: I18n.t('还没有已取消的任务。')
+        completed: I18n.t('还没有已完成的任务。'), cancelled: I18n.t('还没有已取消的任务。'),
+        suggestions: I18n.t('还没有建议请求。')
     };
     const turnLabels = {
         queued: I18n.t('尚未发送'), submit_intent: I18n.t('准备发送'), submitted: I18n.t('页面已接收'), running: I18n.t('生成中'),
@@ -158,7 +159,8 @@
         byId('metric-attention').textContent = String(state.counts.needs_attention || 0);
         byId('unknown-notice').hidden = !(state.counts.needs_attention > 0);
         taskStatuses.forEach(status => {
-            byId('tab-count-' + status).textContent = String(state.counts[status] || 0);
+            const count = byId('tab-count-' + status);
+            if (count) count.textContent = String(state.counts[status] || 0);
         });
     }
 
@@ -167,6 +169,10 @@
         body.replaceChildren();
         byId('task-empty').hidden = state.total !== 0;
         byId('task-empty').textContent = I18n.t(emptyLabels[state.status]);
+        if (state.status === 'suggestions') {
+            renderSuggestionRows(body);
+            return;
+        }
         state.tasks.forEach(task => {
             const row = document.createElement('tr');
             const identity = document.createElement('td');
@@ -233,6 +239,23 @@
             row.append(identity, phase, page, updated, actions);
             body.append(row);
         });
+    }
+
+    /** Show read-only suggestion metadata in its own category. */
+    function renderSuggestionRows(body) {
+        const labels = {queued: '尚未发送', running: '生成中', succeeded: '已完成', failed: '空建议'};
+        const levels = {low: '低', medium: '中', high: '高', xhigh: '极高'};
+        for (const suggestion of state.tasks) {
+            const row = body.insertRow();
+            const identity = row.insertCell();
+            identity.textContent = I18n.t('建议请求') + ' #' + suggestion.id;
+            const level = levels[suggestion.effort];
+            identity.append(secondary([suggestion.model, level ? I18n.t(level) : ''].filter(Boolean).join(' · ')));
+            row.insertCell().append(badge(I18n.t(labels[suggestion.status] || '需要确认'), suggestion.status));
+            row.insertCell().textContent = I18n.t('临时对话');
+            row.insertCell().textContent = formatTime(suggestion.finished_at || suggestion.started_at || suggestion.created_at);
+            row.insertCell().textContent = '—';
+        }
     }
 
     function renderPagination() {

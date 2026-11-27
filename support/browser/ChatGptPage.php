@@ -1271,6 +1271,37 @@ button.click();return {ok:true};
 JS);
     }
 
+    /** Click once only while the checked draft, temporary document and native send button still agree. */
+    public static function submitComposerSuggestionExpression(string $modelUrl, string $prompt, string $id): string
+    {
+        return self::wrap(strtr(<<<'JS'
+const origin=new URL(__MODEL_URL__).origin;
+if(location.origin!==origin||location.pathname!=='/'||!temporaryChatPage(location.pathname,location.search)
+    ||userTurns().length!==0||assistantTurns().length!==0||generationStop())return {state:'rejected'};
+const composers=[...document.querySelectorAll(COMPOSER)].filter(visible);
+if(composers.length!==1||generationStopConfirmation().present)return {state:'waiting'};
+const composer=composers[0];
+if(composerText(composer)!==__PROMPT__.replace(/\u00a0/g,' '))return {state:'rejected'};
+if(window.__rcmakerComposerSuggestion)return {state:'rejected'};
+const buttons=composerSendButtons(composer);
+if(buttons.length!==1||buttons[0].disabled||buttons[0].getAttribute('aria-disabled')==='true')return {state:'waiting'};
+window.__rcmakerComposerSuggestion=__ID__;
+buttons[0].click();
+return {state:'submitted'};
+JS, [
+            '__MODEL_URL__'=>json_encode($modelUrl, JSON_THROW_ON_ERROR),
+            '__PROMPT__'=>json_encode($prompt, JSON_THROW_ON_ERROR),
+            '__ID__'=>json_encode($id, JSON_THROW_ON_ERROR),
+        ]));
+    }
+
+    /** Require the marker written with the click before reading a reply from that same document. */
+    public static function composerSuggestionResponseExpression(string $id): string
+    {
+        return 'window.__rcmakerComposerSuggestion === ' . json_encode($id, JSON_THROW_ON_ERROR)
+            . ' ? (' . self::responseExpression([], []) . ') : null';
+    }
+
     /**
      * Inspect native permission UI for the configured connector, without approving it.
      * Other Apps are reported separately; their request details cannot identify this connector.

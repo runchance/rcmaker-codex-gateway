@@ -8,7 +8,7 @@
     let modelReading = false;
     let savedNoticeTimer = null;
     const savedForms = {general: null, contracts: null};
-    const generalFields = ['pro-weekly-budget', 'subagent-model', 'subagent-effort', 'subagent-concurrency', 'context-parts', 'skill-transport',
+    const generalFields = ['pro-weekly-budget', 'subagent-model', 'subagent-effort', 'subagent-concurrency', 'composer-suggestion-effort', 'context-parts', 'skill-transport',
         'context-extended', 'official-handoff-summary', 'temporary-chat-reuse-on-model-switch', 'steering-full-context', 'steering-live-send', 'response-timeout', 'stage-timeout',
         'compact-timeout', 'invoke-timeout', 'wait-poll', 'max-tools', 'auto-approve-tools', 'auto-cleanup-inactive-tasks'];
     const contracts = [
@@ -70,6 +70,8 @@
         byId('ui-locale').value = data.ui_locale || 'en';
         byId('pro-weekly-budget').value = data.pro_weekly_budget || 0;
         renderSubagentModels(data.subagent_web_model || '', data.subagent_reasoning_effort || 'xhigh');
+        byId('composer-suggestion-effort').value = data.composer_suggestion_effort || 'low';
+        byId('composer-suggestion-effort').disabled = !Object.hasOwn(data, 'composer_suggestion_effort');
         byId('subagent-concurrency').value = Number(data.subagent_max_concurrency ?? 4);
         byId('subagent-concurrency').disabled = !Object.hasOwn(data, 'subagent_max_concurrency');
         byId('context-parts').value = String(data.context_max_parts || 6);
@@ -180,6 +182,7 @@
                 pro_weekly_budget: Number(byId('pro-weekly-budget').value),
                 subagent_web_model: byId('subagent-model').value,
                 subagent_reasoning_effort: byId('subagent-effort').value,
+                composer_suggestion_effort: byId('composer-suggestion-effort').value,
                 subagent_max_concurrency: Number(byId('subagent-concurrency').value),
                 context_transport: 'auto',
                 context_max_parts: Number(byId('context-parts').value),
@@ -204,6 +207,7 @@
                 tunnel_id: current.tunnel_id || '', runtime_key: '', runtime_key_action: 'keep'
             });
             // Source assets can refresh before the owning PHP worker has reloaded after upgrade.
+            if (!Object.hasOwn(current, 'composer_suggestion_effort')) delete payload.composer_suggestion_effort;
             if (!Object.hasOwn(current, 'subagent_max_concurrency')) delete payload.subagent_max_concurrency;
             if (!Object.hasOwn(current, 'steering_live_send')) delete payload.steering_live_send;
             if (!Object.hasOwn(current, 'temporary_chat_reuse_on_model_switch')) delete payload.temporary_chat_reuse_on_model_switch;

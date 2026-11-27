@@ -17,8 +17,10 @@ use app\gateway\model\GatewayError;
 use app\gateway\model\GatewaySettings;
 use app\gateway\model\SubagentCapacity;
 use app\gateway\model\NetworkSettings;
+use app\gateway\model\ModelCatalog;
 use app\gateway\model\ModelCooldown;
 use app\gateway\model\ResponseJob;
+use app\gateway\model\ResponsesProtocol;
 use app\gateway\model\SteeringContext;
 use app\gateway\model\TaskLedger;
 use app\gateway\model\TaskPageRetirement;
@@ -145,6 +147,7 @@ final class BrowserRuntime
     private array $connectorProbeAccounts = [];
     /** @var array<string,array> Isolated probe picker owners; never added to the task execution registry. */
     private array $connectorModelSelections = [];
+    private ?array $composerSuggestion = null;
     /** @var array<int,array> Verified non-Pro mode for each current readiness command. */
     private array $connectorProbeModes = [];
     /** A connector check owns a background page; the setup browser remains on the user's tab. */
@@ -178,6 +181,7 @@ final class BrowserRuntime
         $browserSocket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
 
         $this->stopping = true;
+        if ($this->composerSuggestion !== null) $this->finishComposerSuggestion($this->composerSuggestion['id']);
         $this->browserTimezone->close();
         if ($this->connectorProbeTargetId !== null && $port > 0) {
             $this->devtoolsRequest($port, '/json/close/' . rawurlencode($this->connectorProbeTargetId));
@@ -209,6 +213,7 @@ final class BrowserRuntime
         BrowserState::write([
             'status' => 'stopped', 'browser_pid' => null, 'debug_port' => null, 'network_revision' => null,
             'active_target' => null, 'session_id' => null, 'url' => '', 'title' => '', 'tabs_json' => '[]',
+            'composer_suggestion_target_id' => null,
             'document_nonce' => bin2hex(random_bytes(12)), 'surface_generation' => (int) $state['surface_generation'] + 1,
             'screenshot_sequence' => 0, 'screenshot_mime' => null, 'last_error' => null,
             'chatgpt_json' => null, 'chatgpt_observed_at' => 0,
@@ -905,10 +910,20 @@ final class BrowserRuntime
                 // Full model discovery reads every family's current range on an isolated page.
                 // The embedded login/user page and active tasks keep their selected model.
                 'probe_models' => $this->probeAccountModelsInBackground((int)$command['id']),
+                'composer_suggestion' => $this->startComposerSuggestion((int) $command['id'], $payload),
                 'chatgpt_text' => $this->chatGptText((int) $command['id'], $payload),
                 default => $this->failCommand((int) $command['id'], 'BROWSER_ACTION_UNSUPPORTED', '浏览器操作不受支持。'),
             };
         } catch (\Throwable $error) {
+            if ($action === 'composer_suggestion') {
+                self::recordQuietBrowserFailure('composer_suggestion_command', $error);
+                if (($this->composerSuggestion['command_id'] ?? null) === (int) $command['id']) {
+                    $this->finishComposerSuggestion($this->composerSuggestion['id']);
+                } else {
+                    $this->settleComposerSuggestionCommand((int) $command['id'], $payload);
+                }
+                return;
+            }
             if ($error instanceof GatewayError) {
                 $code = $error->errorCode;
                 $message = $error->getMessage();
@@ -969,6 +984,215 @@ final class BrowserRuntime
             }
             $this->settleBackgroundProbeCommand($commandId, $ok, $result);
         }))->start(self::taskModelUrl());
+    }
+
+    /** Open or reuse the browser's dedicated draft target without reserving a task slot. */
+    private function startComposerSuggestion(int $commandId, array $payload): void
+    {
+        $this->commandBusy = false;
+        $state = BrowserState::state();
+        if ($this->composerSuggestion !== null || !$this->taskCdp->ready() || ModelCooldown::remainingSeconds() > 0
+            || $state['status'] !== 'ready' || $state['launch_nonce'] !== ($payload['launch_nonce'] ?? null)
+            || GatewaySettings::internal()['composer_suggestion_effort'] !== ($payload['effort'] ?? null)
+            || (int) ($payload['deadline_at'] ?? 0) <= time()) {
+            $this->settleComposerSuggestionCommand($commandId, $payload);
+            return;
+        }
+        $id = 'composer_model_' . $commandId;
+        $blank = 'about:blank#rcmaker-composer-' . substr(hash('sha256', (string) $state['launch_nonce']), 0, 24);
+        $this->composerSuggestion = ['id'=>$id, 'command_id'=>$commandId, 'payload'=>$payload,
+            'deadline_at'=>(int) $payload['deadline_at'], 'target_id'=>null, 'session_id'=>null,
+            'browser_pid'=>$state['browser_pid'], 'launch_nonce'=>$state['launch_nonce']];
+        Timer::add(max(0.1, (float)$payload['deadline_at'] - microtime(true)),
+            fn() => $this->finishComposerSuggestion($id), null, false);
+        $this->taskCdp->send('Target.getTargets', [], null, function ($error, $result) use ($id, $state, $blank): void {
+                if (!$this->composerSuggestionActive($id)) return;
+            if ($error !== null || !is_array($result['targetInfos'] ?? null)) {
+                $this->finishComposerSuggestion($id);
+                return;
+            }
+            $remembered = (string) ($state['composer_suggestion_target_id'] ?? '');
+            $inert = [];
+            foreach ($result['targetInfos'] as $page) {
+                if (($page['type'] ?? null) !== 'page' || empty($page['targetId'])) continue;
+                if ($page['targetId'] === $remembered) { $this->attachComposerSuggestion($id, $remembered); return; }
+                // An unacknowledged create may leave the exact inert target visible.
+                if (($page['url'] ?? '') === $blank) $inert[] = $page['targetId'];
+            }
+            if (count($inert) === 1) { $this->attachComposerSuggestion($id, $inert[0]); return; }
+            if ($inert !== []) { $this->finishComposerSuggestion($id); return; }
+            $this->taskCdp->send('Target.createTarget', NativeBrowserWindow::backgroundPageParameters(
+                ['url'=>$blank,'background'=>true], $state), null, function ($createError, $created) use ($id): void {
+                    if (!$this->composerSuggestionActive($id)) return;
+                    $target = (string) ($created['targetId'] ?? '');
+                    if ($createError !== null || $target === '') { $this->finishComposerSuggestion($id); return; }
+                    $this->attachComposerSuggestion($id, $target);
+                }, 15.0);
+        }, 15.0);
+    }
+
+    /** Pin each draft to a fresh temporary document on its separate target. */
+    private function attachComposerSuggestion(string $id, string $target): void
+    {
+        if (!$this->composerSuggestionActive($id)) return;
+        try {
+            if (!$this->composerSuggestionOwnsBrowser()) { $this->finishComposerSuggestion($id); return; }
+            BrowserState::write(['composer_suggestion_target_id'=>$target]);
+        } catch (\Throwable $failure) {
+            self::recordQuietBrowserFailure('composer_suggestion_target', $failure);
+            $this->finishComposerSuggestion($id);
+            return;
+        }
+        $this->composerSuggestion['target_id'] = $target;
+        $this->taskCdp->send('Target.attachToTarget', ['targetId'=>$target,'flatten'=>true], null,
+            function ($error, $result) use ($id): void {
+                $session = (string) ($result['sessionId'] ?? '');
+                if (!$this->composerSuggestionActive($id)) { $this->detachTaskSessionRaw($session); return; }
+                if ($error !== null || $session === '') { $this->finishComposerSuggestion($id); return; }
+                $this->composerSuggestion['session_id'] = $session;
+                $this->taskCdp->send('Emulation.setFocusEmulationEnabled', ['enabled'=>true], $session,
+                    function ($focusError) use ($id, $session): void {
+                        if (!$this->composerSuggestionActive($id)) return;
+                        if ($focusError !== null) { $this->finishComposerSuggestion($id); return; }
+                        $this->taskCdp->send('Page.navigate', ['url'=>self::taskModelUrl('temporary')], $session,
+                            function ($navigationError, $navigated) use ($id): void {
+                                if (!$this->composerSuggestionActive($id)) return;
+                                if (($navigationError !== null && ($navigationError['code'] ?? null) !== -2)
+                                    || !empty($navigated['errorText'])) {
+                                    $this->finishComposerSuggestion($id);
+                                } else $this->observeComposerSuggestionStart($id);
+                            }, 15.0);
+                    }, 15.0);
+            }, 15.0);
+    }
+
+    /** Wait for an empty temporary editor, then use the same verified model picker as task pages. */
+    private function observeComposerSuggestionStart(string $id): void
+    {
+        $this->evaluateComposerSuggestion($id, WebModelPage::baselineExpression(), function ($error, $page) use ($id): void {
+            if ($error === null && $this->emptyComposerSuggestionPage($page)) {
+                $this->probeTaskModelControls($id, false, $this->modelPreparationDeadline($id), null);
+                return;
+            }
+            Timer::add(0.4, fn() => $this->observeComposerSuggestionStart($id), null, false);
+        });
+    }
+
+    /** Confirm the dedicated target still owns an unused, writable temporary chat. */
+    private function emptyComposerSuggestionPage(mixed $page): bool
+    {
+        return is_array($page) && !empty($page['editor_ready']) && ($page['generation_running'] ?? null) === false
+            && ($page['user_ids'] ?? null) === [] && ($page['assistant_ids'] ?? null) === []
+            && ($page['composer_text'] ?? null) === ''
+            && WebModelPage::isTemporaryChatStartUrl((string) ($page['url'] ?? ''), self::modelUrl());
+    }
+
+    /** Compose one bounded text-only draft, then reverify the selected physical model before sending. */
+    private function prepareComposerSuggestionSend(string $id, array $mode): void
+    {
+        if (!$this->composerSuggestionActive($id)) return;
+        $this->composerSuggestion['payload']['physical_model'] = ChatGptTransport::physicalModel($mode);
+        $this->evaluateComposerSuggestion($id, WebModelPage::baselineExpression(), function ($error, $page) use ($id, $mode): void {
+            if ($error !== null || !$this->emptyComposerSuggestionPage($page)) { $this->finishComposerSuggestion($id); return; }
+            $prompt = $this->composerSuggestion['payload']['prompt'];
+            $this->evaluateComposerSuggestion($id, WebModelPage::insertPlainTextExpression($prompt), function ($insertError, $inserted) use ($id, $mode): void {
+                if ($insertError !== null && ($insertError['code'] ?? null) !== -2) { $this->finishComposerSuggestion($id); return; }
+                $this->verifyModelSelection($id, $mode, fn() => $this->sendComposerSuggestion($id));
+            });
+        });
+    }
+
+    /** Prove the exact draft and submit at most once, even if the browser loses the click reply. */
+    private function sendComposerSuggestion(string $id): void
+    {
+        if (!$this->composerSuggestionActive($id)) return;
+        try {
+            $payload = $this->composerSuggestion['payload'];
+            if (!$this->composerSuggestionOwnsBrowser() || ModelCooldown::remainingSeconds() > 0
+                || GatewaySettings::internal()['composer_suggestion_effort'] !== $payload['effort']) {
+                $this->finishComposerSuggestion($id);
+                return;
+            }
+        } catch (\Throwable $failure) {
+            self::recordQuietBrowserFailure('composer_suggestion_submit', $failure);
+            $this->finishComposerSuggestion($id);
+            return;
+        }
+        $expression = WebModelPage::submitComposerSuggestionExpression(self::modelUrl(), $payload['prompt'], $id);
+        $this->evaluateComposerSuggestion($id, $expression, function ($error, $submitted) use ($id): void {
+            $state = $submitted['state'] ?? null;
+            if ($error === null && $state === 'waiting') {
+                Timer::add(0.4, fn() => $this->sendComposerSuggestion($id), null, false);
+                return;
+            }
+            if ($error === null && $state === 'rejected') { $this->finishComposerSuggestion($id); return; }
+            $this->pollComposerSuggestion($id);
+        });
+    }
+
+    /** Only the completed reply following the one draft submission can supply a suggestion. */
+    private function pollComposerSuggestion(string $id): void
+    {
+        $this->evaluateComposerSuggestion($id, WebModelPage::composerSuggestionResponseExpression($id), function ($error, $page) use ($id): void {
+            if ($error === null && is_array($page) && WebModelPage::isTemporaryChatUrl((string) ($page['url'] ?? ''), self::modelUrl())) {
+                if (is_array($page['error'] ?? null)) { $this->finishComposerSuggestion($id); return; }
+                if ((int) ($page['user_count'] ?? 0) === 1 && !empty($page['new_user_id'])
+                    && ChatGptTransport::hasTerminalAnswer($page, false)) {
+                    $answer = ResponsesProtocol::validatedComposerSuggestion(mb_substr((string) ($page['markdown'] ?? ''), 0, 4096),
+                        !empty($this->composerSuggestion['payload']['with_confidence']));
+                    $this->finishComposerSuggestion($id, $answer ?? '');
+                    return;
+                }
+            }
+            Timer::add(0.4, fn() => $this->pollComposerSuggestion($id), null, false);
+        });
+    }
+
+    private function composerSuggestionActive(string $id): bool
+    {
+        return !$this->stopping && ($this->composerSuggestion['id'] ?? null) === $id
+            && microtime(true) < $this->composerSuggestion['deadline_at'];
+    }
+
+    /** The dedicated draft session belongs to the browser launch that admitted this request. */
+    private function composerSuggestionOwnsBrowser(): bool
+    {
+        $browser = BrowserState::state();
+        return $browser['status'] === 'ready'
+            && $browser['browser_pid'] === $this->composerSuggestion['browser_pid']
+            && $browser['launch_nonce'] === $this->composerSuggestion['launch_nonce'];
+    }
+
+    /** Keep callbacks on the original auxiliary session and stop accepting them at its deadline. */
+    private function evaluateComposerSuggestion(string $id, string $expression, callable $callback, float $timeout = 8.0): void
+    {
+        if (!$this->composerSuggestionActive($id) || empty($this->composerSuggestion['session_id'])) return;
+        $this->evaluateTaskSession($this->composerSuggestion['session_id'], $expression,
+            function ($error, $result) use ($id, $callback): void {
+                if (!$this->composerSuggestionActive($id)) return;
+                try { $callback($error, $result); }
+                catch (\Throwable $failure) {
+                    self::recordQuietBrowserFailure('composer_suggestion_observation', $failure);
+                    $this->finishComposerSuggestion($id);
+                }
+            }, min($timeout, max(0.1, $this->composerSuggestion['deadline_at'] - microtime(true))));
+    }
+
+    /** Release only the background session; the dedicated target can host a new isolated document. */
+    private function finishComposerSuggestion(string $id, string $text = ''): void
+    {
+        $owner = $this->composerSuggestion;
+        if (($owner['id'] ?? null) !== $id) return;
+        $this->composerSuggestion = null;
+        $this->detachTaskSessionRaw((string) ($owner['session_id'] ?? ''));
+        $this->settleComposerSuggestionCommand($owner['command_id'], $owner['payload'], $text);
+    }
+
+    /** Keep an optional draft storage failure out of the primary browser command path. */
+    private function settleComposerSuggestionCommand(int $commandId, array $payload, string $text = ''): void
+    {
+        try { BrowserState::finishComposerSuggestion($commandId, $payload, $text); }
+        catch (\Throwable $failure) { self::recordQuietBrowserFailure('composer_suggestion_terminal', $failure); }
     }
 
     /**
@@ -1166,6 +1390,7 @@ final class BrowserRuntime
             'status' => 'starting', 'browser_kind' => $launch['kind'], 'executable' => $launch['path'],
             'browser_pid' => $launch['pid'], 'debug_port' => $port, 'network_revision' => $revisionId,
             'active_target' => null, 'session_id' => null, 'surface_generation' => $generation,
+            'composer_suggestion_target_id' => null,
             'document_nonce' => bin2hex(random_bytes(12)), 'lease_mode' => 'manual', 'url' => '', 'title' => '',
             'tabs_json' => '[]', 'screenshot_sequence' => 0, 'screenshot_mime' => null,
             'last_error' => null, 'owner_identity' => self::identity(), 'launch_nonce' => bin2hex(random_bytes(16)),
@@ -1957,6 +2182,7 @@ final class BrowserRuntime
     /** Existing picker operations share one implementation, with task and probe ownership kept separate. */
     private function modelSelectionActive(string $selectionId): bool
     {
+        if (str_starts_with($selectionId, 'composer_model_')) return $this->composerSuggestionActive($selectionId);
         if (!str_starts_with($selectionId, 'connector_model_')) return isset($this->chatGptTurns[$selectionId]);
         $owner = $this->connectorModelSelections[$selectionId] ?? null;
         return is_array($owner) && $owner['session_id'] !== null
@@ -1968,12 +2194,16 @@ final class BrowserRuntime
     private function modelPreparationDeadline(string $selectionId): float
     {
         return min(microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS,
-            (float) ($this->chatGptTurns[$selectionId]['deadline'] ?? INF));
+            (float) ($this->modelReadbackOwner($selectionId)['deadline_at'] ?? $this->chatGptTurns[$selectionId]['deadline'] ?? INF));
     }
 
     /** Route a picker read only to its owned session; stale probe callbacks cannot reach a task tab. */
     private function evaluateModelSelection(string $selectionId, string $expression, callable $callback, float $timeout = 3.0): void
     {
+        if (str_starts_with($selectionId, 'composer_model_')) {
+            $this->evaluateComposerSuggestion($selectionId, $expression, $callback, $timeout);
+            return;
+        }
         if (!str_starts_with($selectionId, 'connector_model_')) {
             $this->evaluateTask($selectionId, $expression, $callback, $timeout);
             return;
@@ -1987,6 +2217,14 @@ final class BrowserRuntime
     /** Dispatch picker keys through the same native path, fenced to the task or readiness surface. */
     private function dispatchModelSelectionKey(string $selectionId, string $key, callable $callback): void
     {
+        if (str_starts_with($selectionId, 'composer_model_')) {
+            if (!$this->composerSuggestionActive($selectionId)) return;
+            $this->dispatchCdpKey($this->taskCdp, $this->composerSuggestion['session_id'], $key,
+                function ($error) use ($selectionId, $callback): void {
+                    if ($this->composerSuggestionActive($selectionId)) $callback($error);
+                });
+            return;
+        }
         if (!str_starts_with($selectionId, 'connector_model_')) {
             $this->dispatchTaskKey($selectionId, $key, $callback);
             return;
@@ -2000,6 +2238,10 @@ final class BrowserRuntime
     /** A failed non-Pro selection fails only its readiness command and sends no probe. */
     private function failModelSelection(string $selectionId, string $code, string $message, bool $recover = false): void
     {
+        if (str_starts_with($selectionId, 'composer_model_')) {
+            $this->finishComposerSuggestion($selectionId);
+            return;
+        }
         if (!str_starts_with($selectionId, 'connector_model_')) {
             $this->taskFailTurn($selectionId, $code, $message, $recover);
             return;
@@ -2064,6 +2306,7 @@ JS;
         $version = $port > 0 ? $this->devtoolsRequest($port, '/json/version') : null;
         $browserSocket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
         $this->stopping = true;
+        if ($this->composerSuggestion !== null) $this->finishComposerSuggestion($this->composerSuggestion['id']);
         $this->cdp->close('BROWSER_STOPPING');
         if (!$finish) $this->taskCdp->close('BROWSER_RESTARTING');
         $this->browserTimezone->close();
@@ -2081,6 +2324,7 @@ JS;
         BrowserState::write([
             'status' => 'stopped', 'browser_pid' => null, 'debug_port' => null, 'network_revision' => null,
             'active_target' => null, 'session_id' => null, 'url' => '', 'title' => '', 'tabs_json' => '[]',
+            'composer_suggestion_target_id' => null,
             'document_nonce' => bin2hex(random_bytes(12)), 'surface_generation' => (int) $state['surface_generation'] + 1,
             'screenshot_sequence' => 0, 'screenshot_mime' => null, 'last_error' => null,
         ]);
@@ -2118,6 +2362,7 @@ JS;
         $version = $port > 0 ? $this->devtoolsRequest($port, '/json/version') : null;
         $browserSocket = is_array($version) ? (string) ($version['webSocketDebuggerUrl'] ?? '') : '';
         $this->stopping = true;
+        if ($this->composerSuggestion !== null) $this->finishComposerSuggestion($this->composerSuggestion['id']);
         $this->cdp->close('BROWSER_PROFILE_RESET');
         $this->taskCdp->close('BROWSER_PROFILE_RESET');
         try {
@@ -2162,6 +2407,7 @@ JS;
         BrowserState::write([
             'status' => 'stopped', 'browser_pid' => null, 'debug_port' => null, 'network_revision' => null,
             'active_target' => null, 'session_id' => null, 'url' => '', 'title' => '', 'tabs_json' => '[]',
+            'composer_suggestion_target_id' => null,
             'document_nonce' => bin2hex(random_bytes(12)),
             'surface_generation' => (int) $state['surface_generation'] + 1,
             'lease_mode' => 'manual', 'auto_start' => 0, 'setup_completed' => 0,
@@ -2265,6 +2511,7 @@ JS;
             return;
         }
         if (!$this->ensureBrowserTimezone($state, $browserSocket)) return;
+        unset($targets[(string) ($state['composer_suggestion_target_id'] ?? '')]);
         if ($targets === []) {
             if ($this->pendingStartCommand !== null && $ownedHere) {
                 $this->recordStartupStage('page_target_wait');
@@ -2771,7 +3018,10 @@ JS;
         $state = BrowserState::state();
         $port = (int) ($state['debug_port'] ?? 0);
         $targets = $this->discoverTargets($port);
-        if (!isset($targets[$targetId])) { $this->failCommand($commandId, 'BROWSER_TAB_NOT_FOUND', '标签页已经关闭或不存在。'); return; }
+        if (!isset($targets[$targetId]) || $targetId === ($state['composer_suggestion_target_id'] ?? null)) {
+            $this->failCommand($commandId, 'BROWSER_TAB_NOT_FOUND', '标签页已经关闭或不存在。');
+            return;
+        }
         $activated = $this->devtoolsRequest($port, '/json/activate/' . rawurlencode($targetId));
         if ($activated === null) { $this->failCommand($commandId, 'BROWSER_TAB_ACTIVATE_FAILED', '无法切换到所选标签页。'); return; }
         $this->connectTarget($targetId, $commandId, $targets);
@@ -2782,6 +3032,7 @@ JS;
         $state = BrowserState::state();
         $port = (int) ($state['debug_port'] ?? 0);
         $targets = $this->discoverTargets($port);
+        unset($targets[(string) ($state['composer_suggestion_target_id'] ?? '')]);
         if (!isset($targets[$targetId])) {
             $this->failCommand($commandId, 'BROWSER_TAB_NOT_FOUND', '标签页已经关闭或不存在。');
             return;
@@ -2819,6 +3070,7 @@ JS;
         if ($port < 1) return;
         $managed = array_fill_keys(TaskLedger::managedTargetIds(), true);
         if ($this->connectorProbeTargetId !== null) $managed[$this->connectorProbeTargetId] = true;
+        if (!empty($state['composer_suggestion_target_id'])) $managed[$state['composer_suggestion_target_id']] = true;
         $allTargets = $this->discoverTargetsIfAvailable($port);
         if ($allTargets === null) return;
         $previousNativeTarget = NativeBrowserWindow::targetId($state);
@@ -2960,7 +3212,9 @@ JS;
             return false;
         }
         $targetId = (string) ($current['active_target'] ?? '');
-        if ($targetId === '' || $targetId === $this->connectorProbeTargetId || in_array($targetId, TaskLedger::managedTargetIds(), true)) {
+        if ($targetId === '' || $targetId === $this->connectorProbeTargetId
+            || $targetId === ($current['composer_suggestion_target_id'] ?? null)
+            || in_array($targetId, TaskLedger::managedTargetIds(), true)) {
             $this->closedNativeSetupRefresh = null;
             return false;
         }
@@ -4896,8 +5150,7 @@ JS;
                 if ($count === 1 && !empty($state['sol_available'])) {
                     // The button can hydrate before its asynchronous picker. Give the menu
                     // its existing readiness budget, bounded by the owning task's deadline.
-                    $menuDeadline = min(microtime(true) + self::TASK_MODEL_CONTROL_READY_SECONDS,
-                        (float) ($this->chatGptTurns[$responseId]['deadline'] ?? INF));
+                    $menuDeadline = $this->modelPreparationDeadline($responseId);
                     $this->openTaskEffortMenu($responseId, $recover, $menuDeadline);
                     return;
                 }
@@ -5036,6 +5289,26 @@ JS;
 
     private function applyTaskModelCapabilities(string $responseId, array $capabilities, bool $recover, ?array $openSlider = null): void
     {
+        if (str_starts_with($responseId, 'composer_model_')) {
+            if (!$this->composerSuggestionActive($responseId)) return;
+            $payload = $this->composerSuggestion['payload'];
+            try {
+                $family = ModelCatalog::identity($payload['model'], null)['family'] ?? null;
+                if ($family !== null && empty($capabilities['sol_available'])) {
+                    $this->finishComposerSuggestion($responseId);
+                    return;
+                }
+                $job = ['model'=>$family === null ? ResponsesProtocol::MODEL_ID : 'chatgpt-web/model/'.$family,
+                    'reasoning_effort'=>$payload['effort']];
+                $mode = ChatGptTransport::executionMode($job, ModelCatalog::taskCapabilities($job, $capabilities));
+                $this->selectTaskEffort($responseId, $mode, $openSlider,
+                    fn() => $this->prepareComposerSuggestionSend($responseId, $mode), false);
+            } catch (\Throwable $error) {
+                self::recordQuietBrowserFailure('composer_suggestion_model', $error);
+                $this->finishComposerSuggestion($responseId);
+            }
+            return;
+        }
         if (str_starts_with($responseId, 'connector_model_')) {
             if (!$this->modelSelectionActive($responseId)) return;
             $owner = $this->connectorModelSelections[$responseId];
@@ -7564,6 +7837,9 @@ JS;
     private function modelReadbackOwner(string $responseId): ?array
     {
         if (!$this->modelSelectionActive($responseId)) return null;
+        if (str_starts_with($responseId, 'composer_model_')) {
+            return array_intersect_key($this->composerSuggestion, array_flip(['id','target_id','session_id','deadline_at']));
+        }
         if (str_starts_with($responseId, 'connector_model_')) return $this->connectorModelSelections[$responseId];
         return array_intersect_key($this->chatGptTurns[$responseId], array_flip([
             'surface_id','target_id','session_id','document_nonce','owner_incarnation','fencing_version',

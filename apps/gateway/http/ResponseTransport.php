@@ -7,6 +7,7 @@ use Workerman\Connection\TcpConnection;
 use Workerman\Protocols\Http\Response as WorkermanResponse;
 use Workerman\Protocols\Http\ServerSentEvents;
 use Workerman\Timer;
+use app\gateway\model\BrowserState;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\ResponsesProtocol;
 use app\gateway\model\TaskLedger;
@@ -19,6 +20,44 @@ final class ResponseTransport
     private const HEARTBEAT_SECONDS = 2.0;
     private const BACKPRESSURE_BYTES = 262144;
     private const ABANDON_BYTES = 1048576;
+
+    /**
+     * Await a short, independent browser draft without registering a native task subscriber.
+     * @param TcpConnection $connection Original local Responses client.
+     * @param int $commandId Exact browser command for the app-generated request.
+     * @param array $fallback Schema-valid empty response for unavailable or invalid drafts.
+     * @param int $deadline Absolute request deadline. @return void
+     */
+    public static function composerSuggestion(TcpConnection $connection, int $commandId, array $fallback, int $deadline): void
+    {
+        $timer = null;
+        $lastHeartbeat = microtime(true);
+        $timer = Timer::add(0.4, function () use ($connection, $commandId, $fallback, $deadline, &$timer, &$lastHeartbeat): void {
+            if (!self::open($connection)) { Timer::del($timer); return; }
+            try {
+                $command = BrowserState::composerSuggestionStatus($commandId);
+                if (time() < $deadline && in_array($command['status'] ?? '', ['queued','running'], true)) {
+                    if ($fallback['stream'] && microtime(true) - $lastHeartbeat >= self::HEARTBEAT_SECONDS) {
+                        $connection->send("event: response.heartbeat\ndata: {\"type\":\"response.heartbeat\"}\n\n", true);
+                        $lastHeartbeat = microtime(true);
+                    }
+                    return;
+                }
+                $result = ($command['status'] ?? '') === 'succeeded' ? json_decode($command['result_json'], true) : [];
+                $reply = ResponsesProtocol::composerSuggestionResult($fallback, (string) ($result['text'] ?? ''));
+            } catch (\Throwable) {
+                $reply = $fallback;
+            }
+            Timer::del($timer);
+            if (!$reply['stream']) { self::finishJson($connection, 200, $reply['response']); return; }
+            foreach ($reply['events'] as $event) {
+                $payload = json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+                $connection->send((string) new ServerSentEvents(['event'=>$event['type'],'data'=>$payload]), true);
+            }
+            $connection->send("data: [DONE]\n\n", true);
+            $connection->close();
+        }, null, true);
+    }
 
     /**
      * Stream a durable response job and send parser-visible heartbeats while it is idle.

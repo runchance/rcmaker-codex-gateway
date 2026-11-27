@@ -560,6 +560,11 @@ final class Schema
             70 => [
                 'ALTER TABLE gateway_settings ADD COLUMN steering_live_send INTEGER NOT NULL DEFAULT 0 CHECK(steering_live_send IN (0,1))',
             ],
+            71 => [
+                "ALTER TABLE gateway_settings ADD COLUMN composer_suggestion_effort TEXT NOT NULL DEFAULT 'low' CHECK(composer_suggestion_effort IN ('off','low','medium','high','xhigh'))",
+                'ALTER TABLE gateway_browser_state ADD COLUMN composer_suggestion_target_id TEXT',
+                "CREATE INDEX gateway_browser_composer_suggestions ON gateway_browser_commands(action,id) WHERE action='composer_suggestion'",
+            ],
         ];
     }
 

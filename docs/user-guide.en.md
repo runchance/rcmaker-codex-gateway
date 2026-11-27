@@ -510,6 +510,12 @@ If Codex supplies the initial assignment as encrypted agent content, the gateway
 
 Finishing a child or parent response does not prove that the native agent will never receive a follow-up. Reusable child pages are therefore retained; a parent answer or primary-page pressure alone does not trigger their cleanup. Explicit page/task closure or deletion uses the existing Stop, confirmation and close workflow and preserves outstanding-work guards. Child errors retain their own task diagnostics without revoking parent or sibling tool capabilities. Account limits and connector availability still apply. A Temporary Chat without the connector reports an error instead of switching chat mode.
 
+### Next message suggestions
+
+In **Settings → Next message suggestions**, choose Low, Medium, High, Extra High or Off. Recognized Codex composer requests default to the lowest level in the same model family. The gateway drafts from a short excerpt of recent visible dialogue in an independent Temporary Chat, with a dedicated browser target that can be reused. Suggestions leave the five primary page slots and the Web subagent limit available for tasks.
+
+**Task Center → Suggestion requests** shows draft status, model, reasoning level and time. Off returns an empty suggestion immediately. A busy draft page or unavailable requested level also yields an empty suggestion. Codex presents a generated draft for the user to accept or edit.
+
 ### Context parts, compaction and Pro
 
 **Multipart delivery** sends longer history in batches. **Compaction** creates a summary for subsequent work. Both can add waiting time without implying failure. History includes instructions, skills and tool results, not just the few messages you typed.

@@ -4,6 +4,7 @@ namespace app\gateway\controller;
 
 use RC\Request;
 use app\gateway\database\Schema;
+use app\gateway\model\BrowserState;
 use app\gateway\model\GatewayError;
 use app\gateway\model\ResponseJob;
 use app\gateway\model\TaskLedger;
@@ -27,6 +28,7 @@ final class Tasks
             if ($pageSize < 5 || $pageSize > 100) {
                 throw new GatewayError('invalid_pagination', '每页数量必须在 5 到 100 之间。', 400);
             }
+            if ($status === 'suggestions') return BrowserState::composerSuggestionHistory($page, $pageSize);
             if (!in_array($status, ['active', 'needs_attention', 'completed', 'cancelled'], true)) {
                 throw new GatewayError('invalid_task_status', '任务状态筛选无效。', 400);
             }

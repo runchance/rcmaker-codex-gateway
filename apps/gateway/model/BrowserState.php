@@ -87,6 +87,93 @@ final class BrowserState
         return Schema::transaction(fn(): int => self::enqueueUnlocked($action, $payload, $documentBound, $requiredLease));
     }
 
+    /**
+     * Admit one background draft on the existing browser queue without reserving a task surface.
+     * @param array $payload Bounded request excerpt, selected model/effort and stable request key.
+     * @return int|null Command ID for a draft or its replay, or null while another draft is active.
+     * @throws GatewayError If browser state cannot be read or the queue is unavailable.
+     */
+    public static function enqueueComposerSuggestion(array $payload): ?int
+    {
+        return Schema::transaction(function () use ($payload): ?int {
+            $state = self::state();
+            if ($state['status'] !== 'ready' || !self::isWorkerReady($state) || empty($state['launch_nonce'])) return null;
+            $payload['launch_nonce'] = $state['launch_nonce'];
+            $query = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('action', 'composer_suggestion');
+            $latest = $query->order([['id','DESC']])->limit(1)->find('id,status,created_at,payload_json');
+            if ($latest === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '建议请求状态暂不可读取。', 503);
+            if (is_array($latest)) {
+                $previous = json_decode((string) $latest['payload_json'], true);
+                $active = in_array($latest['status'], ['queued','running'], true);
+                $sameLaunch = ($previous['launch_nonce'] ?? null) === $payload['launch_nonce'];
+                if ($active && (!$sameLaunch || (int) ($previous['deadline_at'] ?? 0) <= time())) {
+                    self::finishComposerSuggestion((int) $latest['id'], is_array($previous) ? $previous : []);
+                    $active = false;
+                }
+                if ($latest['created_at'] >= time() - 180 && ($previous['request_key'] ?? null) === $payload['request_key']
+                    && $sameLaunch && ($previous['effort'] ?? null) === $payload['effort']) return (int) $latest['id'];
+                if ($active) return null;
+            }
+            return self::enqueueUnlocked('composer_suggestion', $payload, false);
+        });
+    }
+
+    /** Return one draft command's transport state, scoped to its immutable queue identity. */
+    public static function composerSuggestionStatus(int $commandId): ?array
+    {
+        $row = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('id', $commandId)
+            ->where('action','composer_suggestion')->find('status,result_json');
+        if ($row === false) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '建议请求状态暂不可读取。', 503);
+        return $row;
+    }
+
+    /**
+     * Inspect optional suggestion work without including prompts or drafts in the task list.
+     * @param int $page One-based console page. @param int $pageSize Validated page size.
+     * @return array Bounded queue metadata and pagination.
+     * @throws GatewayError If the suggestion log is unavailable.
+     */
+    public static function composerSuggestionHistory(int $page, int $pageSize): array
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $query = static fn() => $db->table('gateway_browser_commands')->where('action','composer_suggestion');
+        $total = $query()->count();
+        if (!is_numeric($total)) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '建议请求状态暂不可读取。', 503);
+        $pages = max(1, (int) ceil($total / $pageSize));
+        if ($page > $pages) return ['items'=>[], 'total'=>(int) $total, 'pages'=>$pages];
+        $rows = $query()->order([['id','DESC']])->limit($pageSize, ($page - 1) * $pageSize)
+            ->select('id,status,created_at,started_at,finished_at,payload_json');
+        if (!is_array($rows)) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '建议请求状态暂不可读取。', 503);
+        $items = [];
+        foreach ($rows as $row) {
+            $payload = json_decode((string) $row['payload_json'], true);
+            unset($row['payload_json']);
+            $items[] = $row + ['model'=>(string) ($payload['physical_model'] ?? $payload['model'] ?? ''),
+                'effort'=>(string) ($payload['effort'] ?? '')];
+        }
+        return ['items'=>$items,'total'=>(int) $total,'pages'=>$pages];
+    }
+
+    /**
+     * Settle a draft and discard its transient source excerpt.
+     * @param int $commandId One immutable suggestion command.
+     * @param array $payload Original command metadata, including its replay key.
+     * @param string $text Final Web draft, or empty for a skipped or unverified suggestion.
+     * @throws GatewayError If the terminal state cannot be saved.
+     */
+    public static function finishComposerSuggestion(int $commandId, array $payload, string $text = ''): void
+    {
+        unset($payload['prompt']);
+        $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_browser_commands')->where('id', $commandId)
+            ->where('action','composer_suggestion')->where('status','IN',['queued','running'])->update([
+                'status'=>$text === '' ? 'failed' : 'succeeded',
+                'payload_json'=>json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+                'result_json'=>json_encode(['text'=>$text], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+                'finished_at'=>time(),
+            ]);
+        if (!$updated) throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '建议请求结果无法保存。', 503);
+    }
+
     /** Reserve an automatic model probe in the caller's catalog transaction. */
     public static function enqueueModelProbeUnlocked(bool $background): int
     {
@@ -236,7 +323,8 @@ final class BrowserState
         $responses = $db->table('gateway_response_jobs')->where('status', 'IN', ['queued', 'running'])->count();
         $turns = $db->table('gateway_task_turns')
             ->where('status', 'IN', ['queued', 'submit_intent', 'submitted', 'running'])->count();
-        $commands = $db->table('gateway_browser_commands')->where('status', 'IN', ['queued', 'running']);
+        $commands = $db->table('gateway_browser_commands')->where('status', 'IN', ['queued', 'running'])
+            ->where('action', '<>', 'composer_suggestion');
         if ($resetCommandId !== null) $commands->where('id', '<>', $resetCommandId);
         $otherCommands = $commands->count();
         if ($responses === false || $turns === false || $otherCommands === false) {
@@ -299,8 +387,11 @@ final class BrowserState
                     if ($state['status'] !== 'ready') {
                         // A queued login/native operation cannot overtake slow Chrome startup.
                         $query->where('action', 'IN', ['install', 'start', 'restart', 'stop', 'reset_profile']);
-                    }
+                    } else $query->where('action', '<>', 'composer_suggestion');
                     $row = $query->order([['id', 'ASC']])->find();
+                    if ($row === null && $state['status'] === 'ready') {
+                        $row = $queued()->where('action','composer_suggestion')->order([['id','ASC']])->find();
+                    }
                 }
             }
             if ($row === false) {
@@ -313,15 +404,19 @@ final class BrowserState
                 : (in_array((string) $row['action'], ['chatgpt_text', 'verify_connector', 'probe_models'], true) ? 180 : 30);
             if ((int) $row['created_at'] < time() - $maxQueueAge
                 && !self::ownedTaskQueueDeadlineOpen($row)) {
+                if ($row['action'] === 'composer_suggestion') {
+                    self::finishComposerSuggestion((int)$row['id'], json_decode($row['payload_json'], true, 32, JSON_THROW_ON_ERROR));
+                    return null;
+                }
                 $rejected = ['command'=>$row, 'code'=>'BROWSER_COMMAND_EXPIRED', 'message'=>'浏览器操作等待过久，已取消。'];
                 self::finish((int)$row['id'], false, ['code'=>$rejected['code'], 'message'=>$rejected['message']]);
                 return null;
             }
             // Connector verification navigates to its own check page. A harmless page change
             // after enqueue must not discard the automatic runtime recheck before it starts.
-            $documentBound = !in_array($row['action'], ['install', 'start', 'restart', 'stop', 'reset_profile', 'lease', 'new_tab', 'switch_tab', 'close_tab', 'chatgpt_text', 'verify_connector', 'native_window'], true);
+            $documentBound = !in_array($row['action'], ['install', 'start', 'restart', 'stop', 'reset_profile', 'lease', 'new_tab', 'switch_tab', 'close_tab', 'chatgpt_text', 'verify_connector', 'native_window', 'composer_suggestion'], true);
             if ($row['action'] === 'probe_models') $documentBound = false;
-            $pageIndependent = in_array($row['action'], ['chatgpt_text', 'verify_connector', 'reset_profile', 'restart'], true);
+            $pageIndependent = in_array($row['action'], ['chatgpt_text', 'verify_connector', 'reset_profile', 'restart', 'composer_suggestion'], true);
             if ((!$pageIndependent && (int) $row['surface_generation'] !== (int) $state['surface_generation'])
                 || ($documentBound && $row['document_nonce'] !== $state['document_nonce'])) {
                 $rejected = ['command'=>$row, 'code'=>'BROWSER_SURFACE_STALE', 'message'=>'页面已变化，旧操作未执行。'];
@@ -480,6 +575,10 @@ final class BrowserState
                 throw new GatewayError('BROWSER_STATE_UNAVAILABLE', '浏览器操作恢复失败。', 503);
             }
             foreach ($rows as $row) {
+                if ($row['action'] === 'composer_suggestion') {
+                    self::finishComposerSuggestion((int)$row['id'], json_decode((string)$row['payload_json'], true) ?: []);
+                    continue;
+                }
                 $payload = (string) $row['action'] === 'chatgpt_text'
                     ? json_decode((string) $row['payload_json'], true) : null;
                 if (is_array($payload) && is_string($payload['response_id'] ?? null)
