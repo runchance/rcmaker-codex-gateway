@@ -9164,17 +9164,9 @@ JS;
                         $waitFailure = ToolBroker::settledWaitTransportFailureForResponse($logicalResponseId);
                     }
                     if ($waitFailure !== null) {
-                        // All native effects are known, but a typed failed RPC never
-                        // delivered their last result. Preserve the Web model's final
-                        // as visible commentary and end the broken transport explicitly;
-                        // do not fabricate a delivery receipt or successful completion.
-                        if (ToolBroker::failSettledWaitTransportForResponse($logicalResponseId, $roundMarkdown,
-                            (string)$turn['owner_incarnation'], (int)$turn['fencing_version'])) {
-                            $this->taskFailTurn($responseId, 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED',
-                                '工具等待连接提前结束，真实结果已保留。', false);
-                        } else {
-                            $this->scheduleTaskPoll($responseId, 0.10);
-                        }
+                        if ($waitFailure === 'tool_receipt_wait_closed'
+                            && $this->recoverClosedReceiptWait($responseId, $logicalResponseId, $snapshot, $roundMarkdown)) return;
+                        $this->finishFailedReceiptWait($responseId, $logicalResponseId, $roundMarkdown);
                         return;
                     }
                     try {
@@ -11358,12 +11350,67 @@ JS;
         return true;
     }
 
+    /** Recheck a stopped reply before reserving a one-shot reminder to collect its stored receipts. */
+    private function recoverClosedReceiptWait(string $responseId, string $logicalId, array $snapshot, string $answer): bool
+    {
+        $turn = $this->chatGptTurns[$responseId] ?? null;
+        if (!is_array($turn) || !$turn['accepted'] || !empty($turn['continuation_pending'])
+            || ($snapshot['generation_running'] ?? null) !== false || empty($snapshot['new_user_id'])
+            || empty($snapshot['response_id']) || $snapshot['response_id'] !== ($turn['bound_assistant_id'] ?? null)) return false;
+        $documentNonce = (string) $turn['document_nonce'];
+        $prepareBy = $this->chatGptTurns[$responseId]['receipt_wait_prepare_by'] ??= min(
+            (float) $turn['deadline'], microtime(true) + 60.0);
+        $this->evaluateTask($responseId, WebModelPage::baselineExpression(),
+            function ($error, $baseline) use ($responseId, $logicalId, $snapshot, $answer, $turn, $documentNonce, $prepareBy): void {
+                $current = $this->chatGptTurns[$responseId] ?? null;
+                if (!is_array($current) || ($current['logical_response_id'] ?? $responseId) !== $logicalId
+                    || $current['document_nonce'] !== $documentNonce || $current['owner_incarnation'] !== $turn['owner_incarnation']
+                    || $current['fencing_version'] !== $turn['fencing_version'] || !empty($current['continuation_pending'])) return;
+                try {
+                    $users = (array) ($baseline['user_ids'] ?? []);
+                    $assistants = (array) ($baseline['assistant_ids'] ?? []);
+                    if ($error !== null || !is_array($baseline) || empty($baseline['editor_ready'])
+                        || ($baseline['generation_running'] ?? null) !== false || ($baseline['composer_text'] ?? '') !== ''
+                        || !$this->taskChatMatches($responseId, (string) ($baseline['url'] ?? ''))
+                        || end($users) !== $snapshot['new_user_id'] || end($assistants) !== $snapshot['response_id']) {
+                        if (microtime(true) < $prepareBy) $this->scheduleTaskPoll($responseId, 0.5);
+                        else $this->finishFailedReceiptWait($responseId, $logicalId, $answer);
+                        return;
+                    }
+                    $reservation = TaskLedger::reserveClosedReceiptContinuation($logicalId,
+                        (string) $turn['owner_incarnation'], (int) $turn['fencing_version'], $documentNonce, $baseline);
+                    if (!empty($reservation['waiting'])) $this->scheduleTaskPoll($responseId, 0.5);
+                    elseif (!empty($reservation['continue'])) {
+                        unset($this->chatGptTurns[$responseId]['receipt_wait_prepare_by']);
+                        $this->prepareTaskStreamContinuation($responseId, $logicalId, $baseline, $reservation, true);
+                    } else $this->finishFailedReceiptWait($responseId, $logicalId, $answer);
+                } catch (GatewayError $failure) {
+                    $this->taskFailTurn($responseId, $failure->errorCode, $failure->getMessage(), true);
+                }
+            });
+        return true;
+    }
+
+    /** Preserve the observed final when the exact result could not reach this browser generation. */
+    private function finishFailedReceiptWait(string $responseId, string $logicalId, string $answer): void
+    {
+        $turn = $this->chatGptTurns[$responseId];
+        if (ToolBroker::failSettledWaitTransportForResponse($logicalId, $answer,
+            (string) $turn['owner_incarnation'], (int) $turn['fencing_version'])) {
+            $this->taskFailTurn($responseId, 'CHATGPT_TOOL_RESULT_TRANSPORT_FAILED',
+                '工具等待连接提前结束，真实结果已保留。', false);
+        } else {
+            $this->scheduleTaskPoll($responseId, 0.10);
+        }
+    }
+
     /** Apply the existing control-only continuation transport after a fenced durable reservation. */
-    private function prepareTaskStreamContinuation(string $responseId, string $logicalId, array $baseline, array $reservation): void
+    private function prepareTaskStreamContinuation(string $responseId, string $logicalId, array $baseline, array $reservation,
+        bool $receiptOnly = false): void
     {
         $turn = $this->chatGptTurns[$responseId];
         $prompt = ToolBroker::continuationPromptForResponse($logicalId, $reservation['marker'], false, true);
-        if (($turn['web_chat']['mode'] ?? 'temporary') === 'regular') {
+        if (!$receiptOnly && ($turn['web_chat']['mode'] ?? 'temporary') === 'regular') {
             $prompt .= "\nFirst briefly acknowledge the recovery in visible text, state what remains under the latest human intent, then continue only that authorized work.\n";
         }
         ResponseJob::finishDraftText($logicalId);

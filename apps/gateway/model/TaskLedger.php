@@ -3063,6 +3063,81 @@ final class TaskLedger
         return ($continuation['marker'] ?? '') !== ($state['marker'] ?? '') || !empty($continuation['pending']);
     }
 
+    /**
+     * Keep this physical round from starting new tools while recovery receipts are outstanding.
+     * @param array $binding Live capability checked by the invocation transaction.
+     * @param list<string> $unacknowledged Already projected call IDs lacking a confirmed delivery.
+     * @return bool Whether this round must return the original stored results first.
+     * @throws GatewayError If continuation or receipt state is unavailable.
+     */
+    public static function closedReceiptContinuationPending(array $binding, array $unacknowledged): bool
+    {
+        $db = SDB(null, 'medoo', 'sqlite');
+        $intent = $db->table('gateway_task_events')->where('task_id', $binding['task_id'])->where('turn_id', $binding['turn_id'])
+            ->where('response_id', $binding['current_response_id'])->where('event_type', 'task_continuation_intent')
+            ->order([['id','DESC']])->limit(1)->find('data_json');
+        if ($intent === false) throw new GatewayError('storage_unavailable', '任务继续状态暂不可读取。', 503);
+        $state = json_decode($intent['data_json'] ?? '{}', true);
+        return ($state['reason'] ?? '') === 'closed_receipt_recovery'
+            && array_intersect($unacknowledged, $state['receipt_call_ids']) !== [];
+    }
+
+    /**
+     * Reserve a receipt-only reminder on the verified stopped document. The exact native
+     * results are already stored, so the reminder never dispatches or includes their payloads.
+     * @param string $responseId Owned text round with a settled browser answer.
+     * @param string $incarnation Current browser owner. @param int $fence Its exact ownership version.
+     * @param string $documentNonce Document verified with the stopped reply and composer.
+     * @param array $baseline Fresh user and assistant IDs read from that same document.
+     * @return array Reserved marker, a waiting state, or an empty array when the one-shot recovery is unavailable.
+     * @throws GatewayError If the ledger or marker cannot be read or saved.
+     */
+    public static function reserveClosedReceiptContinuation(string $responseId, string $incarnation, int $fence,
+        string $documentNonce, array $baseline): array
+    {
+        return Schema::transaction(function () use ($responseId, $incarnation, $fence, $documentNonce, $baseline): array {
+            [$job, $turn, $surface] = self::executionRowsUnlocked($responseId);
+            if (!self::ownsCurrentGeneration($job, $turn) || $surface['status'] !== 'busy'
+                || $surface['owner_incarnation'] !== $incarnation || (int) $surface['fencing_version'] !== $fence
+                || $turn['owner_incarnation'] !== $incarnation || (int) $turn['fencing_version'] !== $fence
+                || $surface['task_id'] !== $job['task_id'] || $surface['epoch_id'] !== $job['epoch_id']
+                || empty($surface['target_id']) || empty($surface['session_id']) || $documentNonce === ''
+                || $surface['document_nonce'] !== $documentNonce || $job['submitted_document_nonce'] !== $documentNonce
+                || (int) $turn['deadline_at'] <= time() || !in_array($turn['status'], ['submitted','running'], true)
+                || !empty($job['output_started']) || $job['output_text'] !== '') return [];
+            if (self::recoveryHumanUpdatePendingUnlocked($job, $turn)) return ['waiting'=>true];
+            $db = SDB(null, 'medoo', 'sqlite');
+            $binding = $db->table('gateway_mcp_bindings')->where('id', $job['mcp_binding_id'])->find();
+            if (!is_array($binding) || $binding['status'] !== 'running' || $binding['task_id'] !== $job['task_id']
+                || $binding['turn_id'] !== $turn['id'] || $binding['current_response_id'] !== $responseId
+                || (int) $binding['expires_at'] <= time()) return [];
+            $receipts = [];
+            if (ToolBroker::settledWaitTransportFailureForResponse($responseId, $receipts) !== 'tool_receipt_wait_closed') return [];
+            $callIds = array_column($receipts, 'call_id');
+            $previous = self::continuationStateUnlocked($turn['id']);
+            if (!empty($previous['pending'])) return ['waiting'=>true];
+            if (($previous['reason'] ?? '') === 'closed_receipt_recovery'
+                && array_intersect($callIds, $previous['receipt_call_ids']) !== []) return [];
+            try {
+                ContextCompaction::assertClosedWaitReceiptsCoverageUnlocked($job, $receipts, $job['task_id']);
+            } catch (GatewayError $error) {
+                if ($error->errorCode === 'compaction_context_incomplete') return [];
+                throw $error;
+            }
+            sort($callIds, SORT_STRING);
+            $key = hash('sha256', 'closed_receipt_recovery:' . implode(',', $callIds));
+            $reservation = self::reserveStreamContinuationUnlocked($job, $turn, $surface, $binding,
+                $key, count($callIds), [], 'closed_receipt_recovery', $callIds);
+            if (empty($reservation['continue'])) return $reservation;
+            $written = $db->table('gateway_response_jobs')->where('id', $responseId)->where('generation_id', $job['generation_id'])->update([
+                'baseline_users_json'=>json_encode($baseline['user_ids'], JSON_THROW_ON_ERROR),
+                'baseline_assistants_json'=>json_encode($baseline['assistant_ids'], JSON_THROW_ON_ERROR),
+            ]);
+            if (!$written || $written->rowCount() !== 1) throw new GatewayError('surface_fence_lost', 'Web recovery ownership changed.', 409);
+            return $reservation;
+        });
+    }
+
     /** A queued human update or explicit stop always takes priority over automated stream recovery. */
     private static function recoveryHumanUpdatePendingUnlocked(array $job, array $turn): bool
     {
@@ -3342,10 +3417,12 @@ final class TaskLedger
      * @param int $hostCalls Number of completed calls on this capability.
      * @param array $idle Default retry projection returned for a duplicate or exhausted intent.
      * @param string $reason Internal retry family; existing stream and stopped-thinking budgets stay distinct.
+     * @param list<string> $receiptCallIds Optional exact native results for a receipt-only continuation.
      * @return array Retry projection with the reserved continuation marker or bounded wait.
      */
     private static function reserveStreamContinuationUnlocked(array $job, array $turn, array $surface,
-        array $binding, string $failureKey, int $hostCalls, array $idle, string $reason = 'stream_recovery'): array
+        array $binding, string $failureKey, int $hostCalls, array $idle, string $reason = 'stream_recovery',
+        array $receiptCallIds = []): array
     {
         $previous = self::continuationStateUnlocked((string)$turn['id']);
         if (!empty($previous['pending']) || ($previous['answer_hash'] ?? '') === $failureKey) {
@@ -3355,6 +3432,7 @@ final class TaskLedger
         // Older releases used these markers for ordinary unfinished-work follow-ups.
         // Preserve their marker sequence without counting them as failed-stream retries.
         $sameFamily = ($previous['reason'] ?? '') === $reason
+            && $reason !== 'closed_receipt_recovery'
             && ($reason !== 'stopped_thinking_recovery' || $hostCalls <= (int) ($previous['host_calls'] ?? 0));
         $streamAttempt = $sameFamily
             ? (int)($previous['stream_recovery_attempt'] ?? 0) + 1 : 1;
@@ -3373,7 +3451,7 @@ final class TaskLedger
             'attempt'=>$attempt,'stream_recovery_attempt'=>$streamAttempt,'reason'=>$reason,'marker'=>$marker,'answer_hash'=>$failureKey,
             'activity_revision'=>(int)$binding['activity_revision'],'host_calls'=>$hostCalls,
             'no_progress_attempts'=>0,'intent_at'=>time(),'deadline_at'=>$deadline,
-        ]);
+        ] + ($receiptCallIds === [] ? [] : ['receipt_call_ids'=>$receiptCallIds]));
         return array_replace($idle, ['continue'=>true,'marker'=>$marker,'attempt'=>$attempt,'deadline_at'=>$deadline]);
     }
 

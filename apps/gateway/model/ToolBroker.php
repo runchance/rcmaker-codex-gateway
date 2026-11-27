@@ -1688,9 +1688,13 @@ final class ToolBroker
                 ->where('binding_id', (string) $binding['id'])
                 ->where('status', 'completed')
                 ->where('result_delivered_at', null)
-                ->select('response_id');
+                ->select('response_id,call_id');
             if (!is_array($inFlight) || !is_array($awaitingReceipt)) {
                 throw new GatewayError('storage_unavailable', '工具调用状态暂不可读取。', 503);
+            }
+            if ($awaitingReceipt !== [] && TaskLedger::closedReceiptContinuationPending($binding, array_column($awaitingReceipt, 'call_id'))) {
+                return ['ok'=>true, 'paused'=>true,
+                    'instruction'=>'Read the exact existing call_id receipts using codex.control.wait_result before requesting any new action. This request was not registered or executed.'];
             }
             $queueForNextRound = $closedToolRound;
             $olderPending = false;
@@ -2039,8 +2043,8 @@ final class ToolBroker
     {
         return Schema::transaction(static function () use ($token, $callId): ?array {
             [$binding, $call, $retired] = self::receiptForTokenUnlocked($token, $callId);
-            if ($retired || $binding['status'] !== 'running'
-                || !in_array($call['status'], ['registered', 'delivered'], true)) return null;
+            if ($retired || $binding['status'] !== 'running' || $call['result_delivered_at'] !== null
+                || !in_array($call['status'], ['registered', 'delivered', 'completed'], true)) return null;
             return self::newActivityUnlocked($binding, (string) $call['call_key']);
         });
     }
@@ -2281,10 +2285,12 @@ final class ToolBroker
      * Distinguish a proven failed RPC from host work still pending execution, approval or delivery.
      * The browser caller must separately prove a stable stopped final before ending this transport.
      * @param string $responseId Exact current ordinary text round.
+     * @param array|null $failedReceipts When requested, receives the exact unacknowledged rows.
      * @return string|null Typed failed wait code only after every host result is known and no RPC is active.
      */
-    public static function settledWaitTransportFailureForResponse(string $responseId): ?string
+    public static function settledWaitTransportFailureForResponse(string $responseId, ?array &$failedReceipts = null): ?string
     {
+        $failedReceipts = null;
         $binding = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')->where('current_response_id', $responseId)
             ->find('id,status,turn_id,task_id');
         if (!is_array($binding) || !in_array($binding['status'], ['running','revoked'], true)) return null;
@@ -2303,7 +2309,7 @@ final class ToolBroker
         if (!is_numeric($calls) || (int)$calls !== 0) return null;
         $undelivered = $db->table('gateway_tool_invocations')->where('binding_id', $binding['id'])
             ->where('status', 'completed')->where('result_delivered_at', null)
-            ->select('id,task_id,turn_id,binding_id,response_id,call_id,status,delivered_at,completed_at,result_delivered_at,result_json,result_hash');
+            ->select('id,task_id,turn_id,binding_id,response_id,call_id,call_key,status,delivered_at,completed_at,result_delivered_at,result_json,result_hash');
         if (!is_array($undelivered) || $undelivered === []) return null;
         $events = $db->table('gateway_task_events')->where('turn_id', $binding['turn_id'])
             ->where('event_type', 'tool_result_transport_failed')->select('data_json');
@@ -2327,8 +2333,18 @@ final class ToolBroker
         foreach ($waiting as $call) {
             if (!isset($failed[$call['id']]) || !is_string($call['result_json'])
                 || !is_array(json_decode($call['result_json'], true))) return null;
+            if ($failed[$call['id']] === 'tool_receipt_wait_closed' && !empty($call['call_key'])) {
+                // A fresh receipt-only request can finish its worker before its response flush is acknowledged.
+                $prefix = 'activity_receipt_' . hash('sha256', (string) $call['call_key']) . '_';
+                $recent = $db->table('gateway_mcp_activities')->where('binding_id', $binding['id'])
+                    ->where('status', 'completed')->where('updated_at', '>', time() - self::RECEIPT_ORPHAN_GRACE_SECONDS)
+                    ->where('id', 'LIKE', $prefix . '%')->select('id');
+                if (!is_array($recent)) return null;
+                foreach ($recent as $activity) if (str_starts_with((string) $activity['id'], $prefix)) return null;
+            }
             $codes[$failed[$call['id']]] = true;
         }
+        $failedReceipts = $waiting;
         return count($codes) === 1 ? (string) array_key_first($codes) : 'tool_result_transport_failed';
     }
 
@@ -4911,6 +4927,14 @@ final class ToolBroker
         }
         $tokens = array_values($tokens);
         if (count($tokens) !== 1) throw new GatewayError('continuation_token_missing', '无法核对当前工具令牌，已停止网页续做。', 409);
+        $continuation = TaskLedger::continuationState($responseId, forBrowserObservation: true);
+        if (($continuation['reason'] ?? '') === 'closed_receipt_recovery' && ($continuation['marker'] ?? '') === $marker) {
+            $calls = json_encode($continuation['receipt_call_ids'], JSON_THROW_ON_ERROR);
+            return $marker . "\nThis continues the same active Codex turn. Codex completed these previously issued calls: " . $calls . '. '
+                . 'Retrieve each stored result through the attached RCMAKER Connector using codex_tool_call, '
+                . 'wire_name="codex.control.wait_result", arguments={"call_id": the exact listed ID}, and turn_token ' . $tokens[0] . '. '
+                . 'Do not run the original actions again. Read all results before deciding whether any authorized work remains or giving the final answer.';
+        }
         $environment = json_decode((string) $binding['tool_environment_json'], true);
         $commandNotice = self::commandPermissionNotice(array_column((array)($environment['tools'] ?? []), 'wire_name'));
         $regularResume = $streamRecovery && TaskWebChat::state((string)$job['task_id'])['mode'] === 'regular';
