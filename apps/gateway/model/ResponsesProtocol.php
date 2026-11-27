@@ -52,24 +52,12 @@ final class ResponsesProtocol
                 || !is_string($part->text ?? null)) return null;
             $text = $part->text;
         }
-        if (!str_starts_with($text,
-            "This is an app-generated request for a suggested next user message. The user did not write this message.\n\n")
+        $appRequest = 'This is an app-generated request for a suggested next user message. The user did not write this message.';
+        if (!str_starts_with($text, $appRequest) || strspn($text, " \t\r\n", strlen($appRequest)) === 0
             || !str_contains($text, "Your suggestion will appear in the user's empty message composer. They can accept it, edit it, or ignore it; it will not be sent automatically.")
             || !preg_match('/Return (?:only )?JSON matching this schema:\s*(\{[^\n]+\})\.\s*$/D', $text, $match)) return null;
-        $schema = json_decode($match[1], true);
-        if (!is_array($schema) || ($schema['type'] ?? null) !== 'object'
-            || ($schema['required'] ?? null) !== ['suggestion'] || ($schema['additionalProperties'] ?? null) !== false
-            || !is_array($schema['properties'] ?? null)
-            || array_keys($schema['properties'] ?? []) !== ['suggestion']
-            || !is_array($schema['properties']['suggestion'])
-            // Codex emits either nullable-string spelling. Match only equivalent unconstrained
-            // shapes so a contract that forbids null still follows normal model handling.
-            || !in_array($schema['properties']['suggestion'], [
-                ['anyOf'=>[['type'=>'string'], ['type'=>'null']]],
-                ['anyOf'=>[['type'=>'null'], ['type'=>'string']]],
-                ['type'=>['string','null']],
-                ['type'=>['null','string']],
-            ], true)) return null;
+        $answer = self::emptyComposerSuggestion($text, json_decode($match[1], true));
+        if ($answer === null) return null;
         try {
             foreach ($controls as $control) {
                 if ($control->type === 'configuration_update') self::configurationEffort(get_object_vars($control));
@@ -82,7 +70,6 @@ final class ResponsesProtocol
         $key = substr(hash('sha256', $raw), 0, 24);
         $responseId = 'resp_' . $key;
         $itemId = 'msg_' . $key;
-        $answer = '{"suggestion":null}';
         $events = array_merge(self::initialEvents($responseId), self::openOutputEvents($itemId),
             [self::deltaEvent($itemId, $answer)], self::completionEvents($responseId, $itemId, $answer));
         foreach ($events as $sequence => &$event) {
@@ -95,6 +82,34 @@ final class ResponsesProtocol
         unset($event);
         return ['stream'=>($body->stream ?? false) === true,
             'response'=>$events[array_key_last($events)]['response'], 'events'=>$events];
+    }
+
+    /** Construct a reply only for the known nullable desktop composer contracts. */
+    private static function emptyComposerSuggestion(string $text, mixed $schema): ?string
+    {
+        if (!is_array($schema) || ($schema['type'] ?? null) !== 'object'
+            || ($schema['additionalProperties'] ?? null) !== false || !is_array($schema['properties'] ?? null)) return null;
+        $properties = $schema['properties'];
+        // Codex has used both spellings for the same nullable string contract.
+        if (!in_array($properties['suggestion'] ?? null, [
+            ['anyOf'=>[['type'=>'string'], ['type'=>'null']]],
+            ['anyOf'=>[['type'=>'null'], ['type'=>'string']]],
+            ['type'=>['string','null']],
+            ['type'=>['null','string']],
+        ], true)) return null;
+        $required = $schema['required'] ?? null;
+        if ($required === ['suggestion'] && count($properties) === 1) return '{"suggestion":null}';
+        // The newer request explicitly defines the neutral confidence value. Keep the
+        // schema proof strict so unrelated structured output takes its normal route.
+        $confidence = $properties['confidence_score'] ?? null;
+        if (count($properties) !== 2 || !in_array($required, [
+            ['suggestion','confidence_score'], ['confidence_score','suggestion'],
+        ], true) || !is_array($confidence) || count($confidence) !== 3
+            || ($confidence['type'] ?? null) !== 'number' || ($confidence['minimum'] ?? null) !== 0
+            || ($confidence['maximum'] ?? null) !== 1
+            || array_diff_key($schema, array_flip(['$schema','type','properties','required','additionalProperties'])) !== []
+            || !str_contains($text, 'Set confidence_score to 0 when suggestion is null.')) return null;
+        return '{"suggestion":null,"confidence_score":0}';
     }
 
     /**
