@@ -203,6 +203,7 @@ final class ResponsesProtocol
         // It belongs to the executable environment, never to user-authored history.
         $toolInventories = [$data['tools'] ?? []];
         $toolsProvided = array_key_exists('tools', $data);
+        $hasDeclarations = $toolInventories[0] !== [];
         $nativeResponsesLite = false;
         if (is_array($data['input'])) foreach ($data['input'] as $item) {
             if ($item instanceof \stdClass && ($item->type ?? '') === 'additional_tools') {
@@ -210,16 +211,17 @@ final class ResponsesProtocol
                 $toolsProvided = true;
                 if (!is_array($item->tools ?? null)) throw new GatewayError('invalid_request_error', 'additional_tools.tools 必须是数组。', 400);
                 $toolInventories[] = $item->tools;
+                $hasDeclarations = $hasDeclarations || $item->tools !== [];
             }
             if ($item instanceof \stdClass && ($item->type ?? '') === 'tool_search_output'
-                && is_array($item->tools ?? null)) {
-                // Discovered client tools remain callable even when Codex omits them from
-                // the next request's top-level tools list.
-                $toolsProvided = true;
-                $toolInventories[] = $item->tools;
+                && ($item->execution ?? 'client') === 'client') {
+                $definitions = self::successfulSearchDefinitions($item->status ?? 'completed', $item->tools ?? null);
+                if ($definitions !== null) $toolInventories[] = $definitions;
             }
         }
-        $tools = self::mergeToolInventories($toolInventories);
+        // Search results extend a declared registry. The broker verifies receipt-only
+        // updates against the original binding. An explicit empty registry stays empty.
+        $tools = $hasDeclarations ? self::mergeToolInventories($toolInventories) : [];
         $toolOutputs = self::toolOutputs($data['input']);
         $attachments = [];
         $settings = GatewaySettings::internal();
@@ -852,37 +854,35 @@ final class ResponsesProtocol
      * Keep existing duplicate handling within each inventory and reject ambiguous wire aliases
      * across updates, so namespace encoding cannot silently change a tool's native identity.
      * @param array<int,mixed> $inventories Top-level tools followed by native input control items.
-     * @return array<int,array<string,mixed>> Validated tools for this request only.
+     * @param array<int,array<string,mixed>> $tools Optional normalized base for a verified receipt-only update.
+     * @return array<int,array<string,mixed>> Merged tools in stable native declaration order.
      * @throws GatewayError If any inventory is malformed or two identities share a wire name.
      */
-    private static function mergeToolInventories(array $inventories): array
+    private static function mergeToolInventories(array $inventories, array $tools = []): array
     {
-        $tools = [];
-        $positions = [];
+        $positions = array_flip(array_column($tools, 'wire_name'));
         foreach ($inventories as $inventory) {
             if ($inventory === null) continue;
             if (!is_array($inventory)) throw new GatewayError('invalid_request_error', 'tools 必须是数组。', 400);
-            $definitions = [];
-            $definitionNames = [];
+            $seen = [];
             foreach ($inventory as $definition) {
-                $entry = $definition instanceof \stdClass ? get_object_vars($definition) : $definition;
-                if (!is_array($entry)) { $definitions[] = $definition; continue; }
-                $key = (string)($entry['type'] ?? 'function') . ':' . (string)($entry['name'] ?? 'tool_search');
-                if (isset($definitionNames[$key])) continue;
-                $definitionNames[$key] = true;
-                $definitions[] = $definition;
-            }
-            foreach (self::tools($definitions) as $tool) {
-                $wireName = $tool['wire_name'];
-                if (isset($positions[$wireName])) {
-                    $prior = $tools[$positions[$wireName]];
-                    if ($prior['name'] !== $tool['name'] || $prior['namespace'] !== $tool['namespace']) {
-                        throw new GatewayError('invalid_request_error', 'tools 中存在重复工具名称。', 400);
+                // Normalize before deduplicating so identical leaf names in different
+                // namespaces and disjoint fragments of one namespace remain discoverable.
+                foreach (self::tools([$definition]) as $tool) {
+                    $wireName = $tool['wire_name'];
+                    if (isset($positions[$wireName])) {
+                        $position = $positions[$wireName];
+                        $prior = $tools[$position];
+                        if ($prior['name'] !== $tool['name'] || $prior['namespace'] !== $tool['namespace']
+                            || (isset($seen[$wireName]) && $prior['type'] !== $tool['type'])) {
+                            throw new GatewayError('invalid_request_error', 'tools 中存在重复工具名称。', 400);
+                        }
+                        if (!isset($seen[$wireName])) $tools[$position] = $tool;
+                    } else {
+                        $positions[$wireName] = count($tools);
+                        $tools[] = $tool;
                     }
-                    $tools[$positions[$wireName]] = $tool;
-                } else {
-                    $positions[$wireName] = count($tools);
-                    $tools[] = $tool;
+                    $seen[$wireName] = true;
                 }
             }
         }
@@ -906,6 +906,7 @@ final class ResponsesProtocol
             if (!is_array($entry)) throw new GatewayError('invalid_request_error', 'tool 定义必须是对象。', 400);
             $type = (string) ($entry['type'] ?? 'function');
             if ($type === 'tool_search') {
+                if (($entry['execution'] ?? 'client') !== 'client') continue;
                 // Codex executes discovery on the client and expects a tool_search_call item.
                 // Keep it in the same durable registry as other client-executed tools.
                 $entry['name'] = 'tool_search';
@@ -947,18 +948,30 @@ final class ResponsesProtocol
         return $tools;
     }
 
-    /** Normalize only tool specs returned by an acknowledged Codex discovery result. */
-    public static function discoveredToolsFromOutputs(array $outputs): array
+    /**
+     * Merge successful client discovery payloads from an already verified receipt batch.
+     * @param array $outputs Normalized Codex outputs with exact issued call IDs.
+     * @param array $baseTools Existing normalized declarations for that same capability.
+     * @return array Merged tool rows with original namespaces and schemas.
+     * @throws GatewayError If a declaration is malformed or has an ambiguous wire name.
+     */
+    public static function discoveredToolsFromOutputs(array $outputs, array $baseTools = []): array
     {
-        $definitions = [];
+        $inventories = [];
         foreach ($outputs as $output) {
-            if (($output['type'] ?? '') !== 'tool_search_output') continue;
-            $record = json_decode((string)($output['output'] ?? ''), true);
-            if (!is_array($record) || !in_array(($record['status'] ?? ''), ['completed','success'], true)
-                || !is_array($record['tools'] ?? null)) continue;
-            foreach ($record['tools'] as $tool) $definitions[] = $tool;
+            if (($output['type'] ?? '') !== 'tool_search_output' || ($output['execution'] ?? 'client') !== 'client') continue;
+            $record = json_decode((string) ($output['output'] ?? ''));
+            if (!$record instanceof \stdClass) continue;
+            $definitions = self::successfulSearchDefinitions($record->status ?? '', $record->tools ?? null);
+            if ($definitions !== null) $inventories[] = $definitions;
         }
-        return self::tools($definitions);
+        return self::mergeToolInventories($inventories, $baseTools);
+    }
+
+    /** Only successful client searches contribute tool declarations. */
+    private static function successfulSearchDefinitions(mixed $status, mixed $tools): ?array
+    {
+        return in_array($status, ['completed','success'], true) && is_array($tools) ? $tools : null;
     }
 
     /** Store one native tool with normalized namespace and description metadata. */
@@ -1071,7 +1084,9 @@ final class ResponsesProtocol
                     : json_encode($item['output'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
             }
             $outputs[] = ['call_id' => $callId, 'output' => $output, 'type' => $type,
-                ...($contentParts !== null ? ['content_parts' => $contentParts] : [])];
+                ...($contentParts !== null ? ['content_parts' => $contentParts] : []),
+                ...($type === 'tool_search_output' && ($item['execution'] ?? 'client') !== 'client'
+                    ? ['execution'=>$item['execution']] : [])];
         }
         return array_reverse($outputs);
     }

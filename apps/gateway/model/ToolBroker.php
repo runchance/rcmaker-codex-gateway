@@ -393,6 +393,7 @@ final class ToolBroker
                 throw new GatewayError('tool_binding_scope_mismatch', '工具结果不属于当前 Codex 回合。', 409);
             }
             self::assertCompleteOutputBatchUnlocked($binding, $previous, $outputs);
+            $discoveryEnvironment = [];
             $activeCompaction = in_array((string) ($spec['operation_kind'] ?? ''), ['compact_v1', 'compact_v2'], true)
                 && ($spec['active_compaction_source'] ?? null) === $previous;
             if ($activeCompaction) {
@@ -402,13 +403,14 @@ final class ToolBroker
                     throw new GatewayError('compaction_source_unavailable', '活动摘要工具栅栏无法验证。', 409);
                 }
             } else {
-                self::assertEnvironmentUnlocked($binding, $spec);
+                $discoveryEnvironment = self::assertEnvironmentUnlocked($binding, $spec);
+                $spec = $discoveryEnvironment + $spec;
             }
             if ((array) ($spec['steering_messages'] ?? []) !== []) {
                 if ($activeCompaction || ($spec['operation_kind'] ?? 'response') !== 'response') {
                     throw new GatewayError('tool_steering_state_invalid', '活动摘要期间不能切换用户指令。', 409);
                 }
-                return self::prepareContextRestartUnlocked($binding, $spec, $outputs, $previous, $responseId);
+                return self::prepareContextRestartUnlocked($binding, $spec, $outputs, $previous, $responseId) + $discoveryEnvironment;
             }
             $parallelToolCalls = !empty($spec['parallel_tool_calls_provided'])
                 ? !empty($spec['parallel_tool_calls']) : !empty($binding['parallel_tool_calls']);
@@ -430,7 +432,7 @@ final class ToolBroker
                 'token' => null,
                 'control_prompt' => '',
                 'is_continuation' => true,
-            ];
+            ] + $discoveryEnvironment;
         }
 
         $archive = !empty($spec['budget']['original_context_required']);
@@ -3860,17 +3862,21 @@ final class ToolBroker
         });
     }
 
-    private static function assertEnvironmentUnlocked(array $binding, array $spec): void
+    /** Verify the current scope and return the durable environment for a receipt-only discovery update. */
+    private static function assertEnvironmentUnlocked(array $binding, array $spec): array
     {
         $tools = (array) ($spec['tools'] ?? []);
         $provided = (bool) ($spec['tools_provided'] ?? ($tools !== []));
+        $scopeProvided = !empty($spec['tool_environment_provided']);
         if (($spec['tool_choice'] ?? null) === 'none') {
             throw new GatewayError('tool_environment_changed', '工具回传显式撤销了后续工具能力，已停止此网页回合。', 409);
         }
         // An omitted inventory is a compact receipt. Explicit [] is revocation, never inheritance.
-        if (!$provided && empty($spec['tool_environment_provided'])) return;
+        $discoveryOnly = !$provided && in_array('tool_search_output', array_column((array) ($spec['tool_outputs'] ?? []), 'type'), true);
+        if (!$provided && !$scopeProvided && !$discoveryOnly) return [];
         $prior = json_decode((string) $binding['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
         $current = json_decode((string) $spec['tool_environment_json'], true, 128, JSON_THROW_ON_ERROR);
+        if ($discoveryOnly && !$scopeProvided) $current = $prior;
         if (!$provided) $current['tools'] = $prior['tools'];
         $priorScope = $prior;
         $currentScope = $current;
@@ -3878,11 +3884,25 @@ final class ToolBroker
         if (ContextHistory::canonical($priorScope) !== ContextHistory::canonical($currentScope)) {
             throw new GatewayError('tool_environment_changed', '同一 Codex 回合的工具环境发生变化，已拒绝继续。', 409);
         }
-        if (!$provided) return;
-        if ($tools === []) throw new GatewayError('tool_environment_changed', '工具回传显式撤销了后续工具能力，已停止此网页回合。', 409);
+        if (!$provided && !$discoveryOnly) return [];
+        if ($provided && $tools === []) throw new GatewayError('tool_environment_changed', '工具回传显式撤销了后续工具能力，已停止此网页回合。', 409);
+
+        $discoveryEnvironment = [];
+        if ($discoveryOnly) {
+            // Preserve empty schema objects and the existing declarations' original JSON.
+            $priorWire = json_decode((string) $binding['tool_environment_json'], false, 128, JSON_THROW_ON_ERROR);
+            $base = array_map(static fn(\stdClass $tool): array => get_object_vars($tool), $priorWire->tools);
+            $current['tools'] = ResponsesProtocol::discoveredToolsFromOutputs($spec['tool_outputs'], $base);
+            $json = ContextHistory::canonical($current['tools']) === ContextHistory::canonical($base)
+                ? $binding['tool_environment_json']
+                : json_encode($current, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            $discoveryEnvironment = ['tool_environment_json'=>$json, 'tool_environment_hash'=>hash('sha256', $json)];
+            $spec = $discoveryEnvironment + $spec;
+            if ($binding['tool_environment_hash'] === $spec['tool_environment_hash']) return $discoveryEnvironment;
+        }
         // Codex may refresh schemas or add tools between native result rounds. The
         // verified turn and stable workspace scope remain the authority boundary.
-        if (ContextHistory::canonical($prior['tools'] ?? []) === ContextHistory::canonical($current['tools'] ?? [])) return;
+        if (!$discoveryOnly && ContextHistory::canonical($prior['tools'] ?? []) === ContextHistory::canonical($current['tools'] ?? [])) return [];
         $updated = SDB(null, 'medoo', 'sqlite')->table('gateway_mcp_bindings')
             ->where('id', $binding['id'])->where('tool_environment_hash', $binding['tool_environment_hash'])
             ->update(['tool_environment_json'=>$spec['tool_environment_json'],
@@ -3890,6 +3910,7 @@ final class ToolBroker
         if (!$updated || $updated->rowCount() !== 1) {
             throw new GatewayError('tool_environment_changed', '工具清单刷新期间能力发生并发变化。', 409);
         }
+        return $discoveryEnvironment;
     }
 
     private static function assertLiveUnlocked(array $binding, bool $requireReady): void
@@ -4612,10 +4633,13 @@ final class ToolBroker
      */
     private static function efficientToolNotice(array $hostToolNames): string
     {
+        $deferred = in_array('tool_search', $hostToolNames, true)
+            ? 'If a needed app, MCP plugin or native capability is missing from the connector inventory, use the native discovery_tools entry through codex_tool_call. After its receipt arrives, look up the returned tool by exact wire_name and use its declared parameters. ChatGPT search and the Codex tool directory are separate. ' : '';
         $notice = "<codex_tool_efficiency>\n"
             . 'Match effort to the request. For a small, well-specified change, read the relevant code, make the authorized edit and run the smallest meaningful check; avoid unrelated investigation and repeating unchanged checks. '
             . 'Plan the next small group of required observations before calling tools. Batch independent reads/searches/tests when supported; keep dependent steps sequential and inspect their results before choosing a mutation. '
             . 'For a known wire_name use codex_tool_inventory with query set to that name and exact=true. Reuse its returned definition within this turn; rediscover after a capability change or an unavailable-tool result, not before every call. '
+            . $deferred
             . 'Search narrowly and read relevant ranges. Choose appropriate native output limits before execution; retain errors, exit status, useful evidence and continuation handles. Do not dump entire catalogs, logs or files when only a few records are needed, and do not hide failed or pending operations. '
             . 'Report a tool or service as unavailable, uninitialized, denied or failed only when an exact current-turn tool receipt says so. If it was not invoked, say it was not attempted; an empty or unrelated inventory search is not a runtime failure. '
             . 'When needed evidence already exists in this page or exact tool receipts, use it; query archived history only for missing facts or a required recovery check. '

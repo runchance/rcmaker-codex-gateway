@@ -295,7 +295,15 @@ final class McpProtocol
                     $native['instruction'] .= ' This invocation is native tool discovery: its eventual result lists tool names and descriptions; use each returned name as wire_name. Already available tools are supplied separately.';
                     return $native;
                 }
-                if (($native['__mcp_result']['structuredContent']['code'] ?? null) === ToolBroker::NATIVE_CODE_MODE_UNAVAILABLE) {
+                $advisory = $native['__mcp_result']['structuredContent'] ?? [];
+                if (($advisory['kind'] ?? '') === 'code_mode_cell' && !empty($advisory['pending'])) {
+                    $advisory['available_tools'] = $page;
+                    $advisory['instruction'] .= ' This script is discovering tools. Use the exact name and signature from its eventual catalog result.';
+                    array_pop($native['__mcp_result']['content']);
+                    self::appendNativeAdvisory($native, $advisory);
+                    return $native;
+                }
+                if (($advisory['code'] ?? null) === ToolBroker::NATIVE_CODE_MODE_UNAVAILABLE) {
                     $execRejected = true;
                 }
             }
@@ -436,6 +444,9 @@ final class McpProtocol
         } elseif ($isExecGateway) {
             $description .= "\n\n" . self::AGENT_WAIT_TRANSPORT_RULE
                 . ' This rule is enforced for wait_agent calls made inside exec; recursive raw exec is unavailable.';
+        } elseif (!empty($tool['tool_search'])) {
+            $description = trim($description . ' Search the current native Codex registry for deferred app, plugin and MCP tools. '
+                . 'Use a focused query, then look up the returned tool by exact wire_name after this native search result returns.');
         }
         $entry = [
             'wire_name' => $wireName,
@@ -1489,9 +1500,11 @@ AWK;
             [
                 'name' => 'codex_tool_inventory',
                 'title' => 'Discover tools from the current Codex harness',
-                'description' => 'Search the tool registry supplied to the current outer Codex turn, including configured MCP/app tools. '
+                'description' => 'Search the current Codex tool registry, including authorized apps and MCP plugins. '
                     . 'For a known wire_name, set query to that name and exact=true: an already bound tool returns its current schema without a native discovery call. '
-                    . 'Otherwise discovery still searches the current native nested registry. Reuse discovered definitions within this turn unless the runtime reports a capability change.',
+                    . 'Search by capability or omit query to list the registry and follow next_offset for more pages. '
+                    . 'When a needed deferred tool is missing, call a returned discovery_tools entry through codex_tool_call, then look up the discovered name. '
+                    . 'Reuse definitions within this turn until the runtime reports a capability change.',
                 'inputSchema' => [
                     '$schema' => 'http://json-schema.org/draft-07/schema#', 'type' => 'object',
                     'properties' => [
